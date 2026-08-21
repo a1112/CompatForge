@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -92,6 +93,10 @@ RUNTIME_DESCRIPTOR_KEYS = {
 
 class AcceptanceError(Exception):
     """Report a closed developer-local acceptance failure."""
+
+
+class IntegrityError(AcceptanceError):
+    """Report that a preflight-bound input changed during orchestration."""
 
 
 class ClosedArgumentParser(argparse.ArgumentParser):
@@ -276,35 +281,35 @@ def _revalidate_binding(binding: PathBinding, field: str) -> None:
         try:
             metadata = component.lstat()
         except OSError as error:
-            raise AcceptanceError(f"{field} identity changed") from error
+            raise IntegrityError(f"{field} identity changed") from error
         if (
             stat.S_ISLNK(metadata.st_mode)
             or _is_reparse(metadata)
             or _node_identity(metadata) != expected
         ):
-            raise AcceptanceError(f"{field} identity changed")
+            raise IntegrityError(f"{field} identity changed")
     for component in binding.absent_components:
         try:
             component.lstat()
         except FileNotFoundError:
             continue
         except OSError as error:
-            raise AcceptanceError(f"{field} identity changed") from error
-        raise AcceptanceError(f"{field} identity changed")
+            raise IntegrityError(f"{field} identity changed") from error
+        raise IntegrityError(f"{field} identity changed")
     try:
         target_metadata = binding.path.lstat()
     except FileNotFoundError:
         target_metadata = None
     except OSError as error:
-        raise AcceptanceError(f"{field} identity changed") from error
+        raise IntegrityError(f"{field} identity changed") from error
     if (target_metadata is not None) != binding.target_existed:
-        raise AcceptanceError(f"{field} identity changed")
+        raise IntegrityError(f"{field} identity changed")
     if target_metadata is not None and binding.target_size is not None:
         if (
             target_metadata.st_size != binding.target_size
             or target_metadata.st_mtime_ns != binding.target_mtime_ns
         ):
-            raise AcceptanceError(f"{field} identity changed")
+            raise IntegrityError(f"{field} identity changed")
 
 
 def _revalidate_bindings(paths: AcceptancePaths) -> None:
@@ -724,7 +729,80 @@ def _process_poll(process: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _stop_process(process: object) -> bool:
+def _process_group_options(host_system: str | None = None) -> dict[str, object]:
+    system = platform.system() if host_system is None else host_system
+    if system == "Windows":
+        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", None)
+        if isinstance(creation_flag, int):
+            return {"creationflags": creation_flag}
+        return {}
+    return {"start_new_session": True}
+
+
+def _posix_process_group(process: object, options: dict[str, object]) -> int | None:
+    if os.name != "posix" or options.get("start_new_session") is not True:
+        return None
+    if not isinstance(process, subprocess.Popen):
+        return None
+    process_id = getattr(process, "pid", None)
+    if (
+        not isinstance(process_id, int)
+        or isinstance(process_id, bool)
+        or process_id <= 1
+        or process_id == os.getpgrp()
+    ):
+        raise AcceptanceError("managed process group is invalid")
+    return process_id
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return True
+
+
+def _signal_process_group(process_group: int, requested_signal: int) -> bool:
+    if process_group <= 1 or process_group == os.getpgrp():
+        return False
+    try:
+        os.killpg(process_group, requested_signal)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _stop_posix_process_group(process: object, process_group: int) -> bool:
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return False
+    if not _signal_process_group(process_group, signal.SIGTERM):
+        return False
+    try:
+        wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+    except Exception:
+        pass
+    if _process_group_exists(process_group):
+        if not _signal_process_group(process_group, signal.SIGKILL):
+            return False
+        try:
+            wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+    deadline = time.monotonic() + PROCESS_STOP_TIMEOUT_SECONDS
+    while _process_group_exists(process_group) and time.monotonic() < deadline:
+        time.sleep(PROCESS_POLL_SECONDS)
+    return _process_poll(process) is not None and not _process_group_exists(process_group)
+
+
+def _stop_process(process: object, *, process_group: int | None = None) -> bool:
+    if process_group is not None:
+        return _stop_posix_process_group(process, process_group)
     terminate = getattr(process, "terminate", None)
     kill = getattr(process, "kill", None)
     wait = getattr(process, "wait", None)
@@ -760,6 +838,12 @@ def _stop_process(process: object) -> bool:
     return _process_poll(process) is not None
 
 
+def _reap_residual_process_group(process: object, process_group: int | None) -> bool:
+    if process_group is None or not _process_group_exists(process_group):
+        return True
+    return _stop_process(process, process_group=process_group)
+
+
 def _close_process_streams(process: object) -> None:
     for name in ("stdout", "stderr"):
         stream = getattr(process, name, None)
@@ -774,6 +858,7 @@ def _close_process_streams(process: object) -> None:
 def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
     if timeout <= 0:
         raise AcceptanceError("child process timeout is invalid")
+    group_options = _process_group_options()
     try:
         process = subprocess.Popen(
             list(arguments),
@@ -783,11 +868,13 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
             stderr=subprocess.PIPE,
             env=dict(CHILD_ENV),
             shell=False,
+            **group_options,
         )
     except OSError as error:
         raise AcceptanceError("child process could not be started") from error
+    process_group = _posix_process_group(process, group_options)
     if process.stdout is None or process.stderr is None:
-        if not _stop_process(process):
+        if not _stop_process(process, process_group=process_group):
             _close_process_streams(process)
             raise AcceptanceError("child process cleanup failed")
         _close_process_streams(process)
@@ -842,13 +929,13 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
             break
         time.sleep(PROCESS_POLL_SECONDS)
     if timed_out or overflow.is_set() or reader_failed.is_set():
-        if not _stop_process(process):
+        if not _stop_process(process, process_group=process_group):
             _close_process_streams(process)
             raise AcceptanceError("child process cleanup failed")
     for thread in threads:
         thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
     if any(thread.is_alive() for thread in threads):
-        if not _stop_process(process):
+        if not _stop_process(process, process_group=process_group):
             _close_process_streams(process)
             raise AcceptanceError("child process cleanup failed")
         _close_process_streams(process)
@@ -864,9 +951,11 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
         raise AcceptanceError("child process capture failed")
     returncode = _process_poll(process)
     if returncode is None:
-        if not _stop_process(process):
+        if not _stop_process(process, process_group=process_group):
             raise AcceptanceError("child process cleanup failed")
         raise AcceptanceError("child process did not report an exit status")
+    if not _reap_residual_process_group(process, process_group):
+        raise AcceptanceError("child process cleanup failed")
     try:
         stdout = bytes(captured["stdout"]).decode("utf-8")
         stderr = bytes(captured["stderr"]).decode("utf-8")
@@ -944,6 +1033,68 @@ def _prepare_layout(paths: AcceptancePaths) -> None:
     except OSError as error:
         raise AcceptanceError("acceptance layout could not be created") from error
     _refresh_root_bindings(paths)
+
+
+def _write_all(file_descriptor: int, payload: bytes) -> None:
+    written = 0
+    while written < len(payload):
+        count = os.write(file_descriptor, payload[written:])
+        if count <= 0:
+            raise OSError("summary output write did not advance")
+        written += count
+
+
+def _safe_create_summary(paths: AcceptancePaths, encoded: str) -> None:
+    _revalidate_bindings(paths)
+    payload = (encoded + "\n").encode("utf-8")
+    create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    create_flags |= getattr(os, "O_CLOEXEC", 0)
+    create_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor: int | None = None
+    directory_descriptor: int | None = None
+    try:
+        if os.name == "posix":
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_CLOEXEC", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            directory_descriptor = os.open(paths.work_root, directory_flags)
+            binding = paths.bindings.get("work-root")
+            if binding is None or _node_identity(os.fstat(directory_descriptor)) != dict(
+                binding.components
+            ).get(paths.work_root):
+                raise IntegrityError("work-root identity changed")
+            file_descriptor = os.open(
+                "summary.json",
+                create_flags,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+        else:
+            create_flags |= getattr(os, "O_BINARY", 0)
+            create_flags |= getattr(os, "O_NOINHERIT", 0)
+            file_descriptor = os.open(paths.work_root / "summary.json", create_flags, 0o600)
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OSError("summary output is not a private regular file")
+        _write_all(file_descriptor, payload)
+        os.fsync(file_descriptor)
+        if directory_descriptor is not None:
+            os.fsync(directory_descriptor)
+    except IntegrityError:
+        raise
+    except (OSError, ValueError) as error:
+        raise AcceptanceError("summary output is unsafe") from error
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
 
 
 def _digest(value: object, field: str) -> str:
@@ -1316,6 +1467,7 @@ def _launch_desktop(
     printer: Printer,
 ) -> tuple[dict[str, object], bool]:
     printer("compatforge-desktop-command: " + json.dumps(command, ensure_ascii=False, separators=(",", ":")))
+    group_options = _process_group_options()
     try:
         process = launcher(
             command,
@@ -1325,6 +1477,7 @@ def _launch_desktop(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             shell=False,
+            **group_options,
         )
     except Exception:
         return (
@@ -1336,9 +1489,29 @@ def _launch_desktop(
             True,
         )
     try:
+        process_group = _posix_process_group(process, group_options)
+    except AcceptanceError:
+        if not _stop_process(process):
+            return (
+                {
+                    "status": "failed",
+                    "failureClass": "cleanup",
+                    "reasonCode": "cleanup-termination-failed",
+                },
+                False,
+            )
+        return (
+            {
+                "status": "failed",
+                "failureClass": "desktop",
+                "reasonCode": "desktop-launch-failed",
+            },
+            True,
+        )
+    try:
         returncode = waiter(process, DESKTOP_TIMEOUT_SECONDS)
     except Exception as error:
-        stopped = _stop_process(process)
+        stopped = _stop_process(process, process_group=process_group)
         if not stopped:
             return (
                 {
@@ -1359,7 +1532,7 @@ def _launch_desktop(
         )
     polled = _process_poll(process)
     if polled is None:
-        stopped = _stop_process(process)
+        stopped = _stop_process(process, process_group=process_group)
         if not stopped:
             return (
                 {
@@ -1376,6 +1549,15 @@ def _launch_desktop(
                 "reasonCode": "desktop-exit-failed",
             },
             True,
+        )
+    if not _reap_residual_process_group(process, process_group):
+        return (
+            {
+                "status": "failed",
+                "failureClass": "cleanup",
+                "reasonCode": "cleanup-termination-failed",
+            },
+            False,
         )
     if (
         not isinstance(returncode, int)
@@ -1410,7 +1592,10 @@ def orchestrate(
         host_machine=platform.machine() if host_machine is None else host_machine,
     )
     _revalidate_bindings(paths)
-    runtimes = discover_runtimes(arguments, runner)
+    try:
+        runtimes = discover_runtimes(arguments, runner)
+    finally:
+        _revalidate_bindings(paths)
     _prepare_layout(paths)
     rounds: list[dict[str, object]] = []
     abort_remaining = False
@@ -1423,18 +1608,26 @@ def orchestrate(
             try:
                 _revalidate_bindings(paths)
                 _revalidate_runtime(descriptor)
-                console_result = _invoke(
-                    _headless_command(paths, round_id, descriptor),
-                    runner,
-                    timeout=CHILD_TIMEOUT_SECONDS,
-                )
+                try:
+                    console_result = _invoke(
+                        _headless_command(paths, round_id, descriptor),
+                        runner,
+                        timeout=CHILD_TIMEOUT_SECONDS,
+                    )
+                finally:
+                    _revalidate_bindings(paths)
+                    _revalidate_runtime(descriptor)
                 if console_result.returncode != 0:
                     raise AcceptanceError("Console runner failed")
                 console = _project_console(
                     parse_closed_json(console_result.stdout, "Console summary"), descriptor
                 )
+            except IntegrityError:
+                raise
             except AcceptanceError:
                 console = _failure("console", runtime_id, "core", "console-runner-failed")
+            _revalidate_bindings(paths)
+            _revalidate_runtime(descriptor)
             applications.append(console)
             if console["status"] != "accepted":
                 applications.extend(
@@ -1450,11 +1643,15 @@ def orchestrate(
                 try:
                     _revalidate_bindings(paths)
                     _revalidate_runtime(descriptor)
-                    gui_result = _invoke(
-                        _gui_command(paths, round_id, descriptor),
-                        runner,
-                        timeout=CHILD_TIMEOUT_SECONDS,
-                    )
+                    try:
+                        gui_result = _invoke(
+                            _gui_command(paths, round_id, descriptor),
+                            runner,
+                            timeout=CHILD_TIMEOUT_SECONDS,
+                        )
+                    finally:
+                        _revalidate_bindings(paths)
+                        _revalidate_runtime(descriptor)
                     runtime_evidence, gui_applications = _project_gui(
                         parse_closed_json(gui_result.stdout, "GUI summary"), descriptor
                     )
@@ -1466,6 +1663,8 @@ def orchestrate(
                         application["status"] == "accepted" for application in gui_applications
                     ):
                         raise AcceptanceError("GUI exit status disagrees with its summary")
+                except IntegrityError:
+                    raise
                 except AcceptanceError:
                     gui_applications = [
                         _failure(application_id, runtime_id, "application", "gui-summary-invalid")
@@ -1474,11 +1673,17 @@ def orchestrate(
                 applications.extend(gui_applications)
                 _revalidate_bindings(paths)
                 _revalidate_runtime(descriptor)
-                desktop, continue_safe = _launch_desktop(
-                    _desktop_command(paths, round_id, descriptor), launcher, waiter, printer
-                )
+                try:
+                    desktop, continue_safe = _launch_desktop(
+                        _desktop_command(paths, round_id, descriptor), launcher, waiter, printer
+                    )
+                finally:
+                    _revalidate_bindings(paths)
+                    _revalidate_runtime(descriptor)
                 if not continue_safe:
                     abort_remaining = True
+            _revalidate_bindings(paths)
+            _revalidate_runtime(descriptor)
             runtime_results.append(
                 {
                     "runtimeId": runtime_id,
@@ -1489,9 +1694,15 @@ def orchestrate(
             )
             if abort_remaining:
                 break
+        _revalidate_bindings(paths)
+        for descriptor in runtimes:
+            _revalidate_runtime(descriptor)
         rounds.append({"roundId": round_id, "runtimes": runtime_results})
         if abort_remaining:
             break
+    _revalidate_bindings(paths)
+    for descriptor in runtimes:
+        _revalidate_runtime(descriptor)
     accepted = aggregate_is_accepted(rounds)
     summary: dict[str, object] = {
         "schemaVersion": "1",
@@ -1501,10 +1712,10 @@ def orchestrate(
     encoded = json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_JSON_BYTES:
         raise AcceptanceError("aggregate summary exceeds its size bound")
-    try:
-        (paths.work_root / "summary.json").write_text(encoded + "\n", encoding="utf-8")
-    except OSError as error:
-        raise AcceptanceError("aggregate summary could not be written") from error
+    _revalidate_bindings(paths)
+    for descriptor in runtimes:
+        _revalidate_runtime(descriptor)
+    _safe_create_summary(paths, encoded)
     return summary
 
 

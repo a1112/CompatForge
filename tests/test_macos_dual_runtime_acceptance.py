@@ -8,6 +8,7 @@ import unittest
 import argparse
 import json
 import subprocess
+import time
 from unittest import mock
 from pathlib import Path
 
@@ -273,6 +274,43 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 for app_id in ("7zip", "sumatrapdf", "notepad-plus-plus")
             ],
         }
+
+    def _successful_runner(
+        self, argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if argv[-1] == "--all":
+            payload = self._discovery()
+        elif Path(argv[3]).name == "run_macos_headless_preview.py":
+            pack_id = argv[argv.index("--pack-id") + 1]
+            runtime_id = "crossover" if "crossover" in pack_id else "whisky"
+            payload = self._console_summary(runtime_id)
+        else:
+            runtime_id = argv[argv.index("--runtime-id") + 1]
+            payload = self._gui_summary(runtime_id)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    def _run_final_wait_mutation(self, mutation) -> None:
+        waits = 0
+
+        def waiter(_process: object, _timeout: int) -> int:
+            nonlocal waits
+            waits += 1
+            if waits == 4:
+                mutation()
+            return 0
+
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "(?:identity changed|summary output)"
+        ):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=self._successful_runner,
+                launcher=lambda *_args, **_kwargs: FinishedDesktopProcess(),
+                waiter=waiter,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
 
     def test_closed_parser_rejects_missing_duplicate_unknown_positional_and_empty(self) -> None:
         invalid_argv = (
@@ -1002,6 +1040,276 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             }
         ]
         self.assertFalse(acceptance.aggregate_is_accepted(incomplete_rounds))
+
+    def test_final_desktop_wait_work_root_swap_never_writes_the_victim(self) -> None:
+        original_work = self.external / "work-original"
+        victim = self.external / "work-victim"
+        victim.mkdir()
+        (victim / "sentinel").write_text("unchanged", encoding="utf-8")
+
+        def mutation() -> None:
+            self.work.rename(original_work)
+            try:
+                os.symlink(victim, self.work, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+        self._run_final_wait_mutation(mutation)
+        self.assertEqual((victim / "sentinel").read_text(encoding="utf-8"), "unchanged")
+        self.assertFalse((victim / "summary.json").exists())
+        self.assertFalse((original_work / "summary.json").exists())
+
+    def test_final_desktop_wait_interaction_swap_is_integrity_fatal(self) -> None:
+        interaction = self.interactions / "round-2" / "whisky.json"
+
+        def mutation() -> None:
+            interaction.write_text(
+                interaction.read_text(encoding="utf-8") + " ", encoding="utf-8"
+            )
+
+        self._run_final_wait_mutation(mutation)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_final_desktop_wait_runtime_swap_is_integrity_fatal(self) -> None:
+        runtime_entrypoint = self.runtime_roots["whisky"] / "bin" / "wine"
+
+        def mutation() -> None:
+            runtime_entrypoint.write_text("mutated", encoding="utf-8")
+
+        self._run_final_wait_mutation(mutation)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_final_desktop_wait_tool_swap_is_integrity_fatal(self) -> None:
+        def mutation() -> None:
+            self.cli.write_text("mutated", encoding="utf-8")
+
+        self._run_final_wait_mutation(mutation)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_failed_console_work_root_swap_is_not_downgraded_or_written(self) -> None:
+        original_work = self.external / "failed-console-work-original"
+        victim = self.external / "failed-console-victim"
+        victim.mkdir()
+        (victim / "sentinel").write_text("unchanged", encoding="utf-8")
+        swapped = False
+
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal swapped
+            if argv[-1] == "--all":
+                return self._successful_runner(argv)
+            if not swapped and Path(argv[3]).name == "run_macos_headless_preview.py":
+                swapped = True
+                self.work.rename(original_work)
+                try:
+                    os.symlink(victim, self.work, target_is_directory=True)
+                except OSError as error:
+                    self.skipTest(f"directory symlinks are unavailable: {error}")
+                return subprocess.CompletedProcess(argv, 9, "/private/output", "closed")
+            self.fail("a child started after the work-root integrity failure")
+
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "(?:identity changed|unsafe path component)"
+        ):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=runner,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual((victim / "sentinel").read_text(encoding="utf-8"), "unchanged")
+        self.assertFalse((victim / "summary.json").exists())
+        self.assertFalse((original_work / "summary.json").exists())
+
+    def test_summary_output_rejects_symlink_without_touching_victim(self) -> None:
+        victim = self.external / "summary-victim"
+        victim.write_text("unchanged", encoding="utf-8")
+
+        def mutation() -> None:
+            try:
+                os.symlink(victim, self.work / "summary.json")
+            except OSError as error:
+                self.skipTest(f"file symlinks are unavailable: {error}")
+
+        self._run_final_wait_mutation(mutation)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+
+    def test_summary_output_rejects_hardlink_without_touching_victim(self) -> None:
+        victim = self.external / "summary-hardlink-victim"
+        victim.write_text("unchanged", encoding="utf-8")
+
+        def mutation() -> None:
+            try:
+                os.link(victim, self.work / "summary.json")
+            except OSError as error:
+                self.skipTest(f"hardlinks are unavailable: {error}")
+
+        self._run_final_wait_mutation(mutation)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+
+    def test_summary_output_rejects_existing_foreign_file(self) -> None:
+        foreign = self.work / "summary.json"
+
+        def mutation() -> None:
+            foreign.write_text("foreign", encoding="utf-8")
+
+        self._run_final_wait_mutation(mutation)
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign")
+
+    def test_process_group_options_are_closed_for_darwin(self) -> None:
+        self.assertEqual(
+            acceptance._process_group_options("Darwin"), {"start_new_session": True}
+        )
+
+    def test_normal_child_and_desktop_returns_reap_a_residual_process_group(self) -> None:
+        class EmptyStream:
+            def read(self, _size: int) -> bytes:
+                return b""
+
+            def close(self) -> None:
+                pass
+
+        class FinishedProcess:
+            def __init__(self) -> None:
+                self.stdout = EmptyStream()
+                self.stderr = EmptyStream()
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, _timeout: int | None = None, **_kwargs: object) -> int:
+                return 0
+
+        for mode in ("child", "desktop"):
+            with self.subTest(mode=mode):
+                process = FinishedProcess()
+                with (
+                    mock.patch.object(acceptance, "_posix_process_group", return_value=4242),
+                    mock.patch.object(acceptance, "_process_group_exists", return_value=True),
+                    mock.patch.object(acceptance, "_stop_process", return_value=True) as stop,
+                ):
+                    if mode == "child":
+                        with mock.patch.object(
+                            acceptance.subprocess, "Popen", return_value=process
+                        ):
+                            result = acceptance._bounded_run(["child"], timeout=1)
+                        self.assertEqual(result.returncode, 0)
+                    else:
+                        evidence, safe = acceptance._launch_desktop(
+                            ["desktop"],
+                            lambda *_args, **_kwargs: process,
+                            lambda _process, _timeout: 0,
+                            lambda _line: None,
+                        )
+                        self.assertTrue(safe)
+                        self.assertEqual(evidence["status"], "accepted")
+                stop.assert_called_once_with(process, process_group=4242)
+
+    def test_normal_return_residual_cleanup_failure_is_fatal(self) -> None:
+        class EmptyStream:
+            def read(self, _size: int) -> bytes:
+                return b""
+
+            def close(self) -> None:
+                pass
+
+        class FinishedProcess:
+            def __init__(self) -> None:
+                self.stdout = EmptyStream()
+                self.stderr = EmptyStream()
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, _timeout: int | None = None, **_kwargs: object) -> int:
+                return 0
+
+        for mode in ("child", "desktop"):
+            with self.subTest(mode=mode):
+                process = FinishedProcess()
+                with (
+                    mock.patch.object(acceptance, "_posix_process_group", return_value=4242),
+                    mock.patch.object(acceptance, "_process_group_exists", return_value=True),
+                    mock.patch.object(acceptance, "_stop_process", return_value=False),
+                ):
+                    if mode == "child":
+                        with mock.patch.object(
+                            acceptance.subprocess, "Popen", return_value=process
+                        ):
+                            with self.assertRaisesRegex(
+                                acceptance.AcceptanceError, "cleanup failed"
+                            ):
+                                acceptance._bounded_run(["child"], timeout=1)
+                    else:
+                        evidence, safe = acceptance._launch_desktop(
+                            ["desktop"],
+                            lambda *_args, **_kwargs: process,
+                            lambda _process, _timeout: 0,
+                            lambda _line: None,
+                        )
+                        self.assertFalse(safe)
+                        self.assertEqual(evidence["failureClass"], "cleanup")
+
+    @unittest.skipUnless(os.name == "posix", "real process-group probe requires POSIX")
+    def test_timeout_reaps_grandchildren_for_child_and_desktop(self) -> None:
+        for mode in ("child", "desktop"):
+            with self.subTest(mode=mode):
+                marker = self.external / f"{mode}-grandchild-marker"
+                grandchild = (
+                    "import pathlib,time; time.sleep(0.5); "
+                    f"pathlib.Path({str(marker)!r}).write_text('escaped')"
+                )
+                parent = (
+                    "import subprocess,sys,time; "
+                    f"subprocess.Popen([sys.executable,'-S','-B','-c',{grandchild!r}]); "
+                    "time.sleep(30)"
+                )
+                command = [sys.executable, "-S", "-B", "-c", parent]
+                if mode == "child":
+                    with self.assertRaisesRegex(acceptance.AcceptanceError, "timed out"):
+                        acceptance._bounded_run(command, timeout=0.1)
+                else:
+                    evidence, safe = acceptance._launch_desktop(
+                        command,
+                        subprocess.Popen,
+                        lambda process, _timeout: process.wait(timeout=0.1),
+                        lambda _line: None,
+                    )
+                    self.assertTrue(safe)
+                    self.assertEqual(evidence["status"], "failed")
+                time.sleep(0.8)
+                self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "real process-group probe requires POSIX")
+    def test_normal_leader_exit_reaps_grandchildren_for_child_and_desktop(self) -> None:
+        for mode in ("child", "desktop"):
+            with self.subTest(mode=mode):
+                marker = self.external / f"{mode}-normal-grandchild-marker"
+                grandchild = (
+                    "import pathlib,time; time.sleep(0.5); "
+                    f"pathlib.Path({str(marker)!r}).write_text('escaped')"
+                )
+                parent = (
+                    "import subprocess,sys; "
+                    "subprocess.Popen([sys.executable,'-S','-B','-c',"
+                    f"{grandchild!r}],stdin=subprocess.DEVNULL,"
+                    "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)"
+                )
+                command = [sys.executable, "-S", "-B", "-c", parent]
+                if mode == "child":
+                    result = acceptance._bounded_run(command, timeout=5)
+                    self.assertEqual(result.returncode, 0)
+                else:
+                    evidence, safe = acceptance._launch_desktop(
+                        command,
+                        subprocess.Popen,
+                        lambda process, _timeout: process.wait(timeout=5),
+                        lambda _line: None,
+                    )
+                    self.assertTrue(safe)
+                    self.assertEqual(evidence["status"], "accepted")
+                time.sleep(0.8)
+                self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":
