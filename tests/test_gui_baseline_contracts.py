@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
@@ -159,6 +160,33 @@ class GuiBaselineContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.assets = load_tool(ASSET_TOOL)
         cls.baseline = load_tool(BASELINE_TOOL)
+
+    @staticmethod
+    def descriptor_receipt() -> dict[str, object]:
+        return {
+            "schemaVersion": "1",
+            "source": "crossover-app",
+            "version": "24.0",
+            "packId": "wine-macos-auto-preview",
+            "packDigest": "sha256:" + "a" * 64,
+        }
+
+    @staticmethod
+    def descriptor_context(
+        storage: Path,
+        receipt: dict[str, object],
+    ) -> dict[str, object]:
+        return {
+            "schemaVersion": "1",
+            "storageRoot": str(storage),
+            "runtimeBindings": [
+                {
+                    "packId": receipt["packId"],
+                    "packDigest": receipt["packDigest"],
+                }
+            ],
+            "supervisor": {},
+        }
 
     def test_rust_code_projection_removes_comment_and_string_decoys(self) -> None:
         source = """
@@ -653,17 +681,11 @@ struct RealCode;
             def fake_invoke(command, *, timeout=self.baseline.MAX_COMMAND_SECONDS):
                 del timeout
                 if command[1:4] == ["local", "macos", "context"]:
+                    receipt = self.descriptor_receipt()
                     Path(command[-1]).write_text(
-                        json.dumps({"schemaVersion": "1", "storageRoot": str(storage)}),
+                        json.dumps(self.descriptor_context(storage, receipt)),
                         encoding="utf-8",
                     )
-                    receipt = {
-                        "schemaVersion": "1",
-                        "source": "auto",
-                        "version": "24.0",
-                        "packId": "wine-macos-auto-preview",
-                        "packDigest": "sha256:" + "a" * 64,
-                    }
                     return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
                 if command[1] == "inspect":
                     return subprocess.CompletedProcess(command, 0, '{"architecture":"x86_64"}', "")
@@ -887,6 +909,13 @@ struct RealCode;
             with mock.patch.object(
                 self.assets,
                 "fetch",
+                side_effect=http.client.IncompleteRead(b"partial", 4096),
+            ):
+                with self.assertRaises(self.baseline.NetworkUnavailableError):
+                    self.baseline.fetch_asset(arguments, "7zip")
+            with mock.patch.object(
+                self.assets,
+                "fetch",
                 side_effect=self.assets.AssetError("cached 7zip digest mismatch"),
             ):
                 with self.assertRaises(self.baseline.AssetFetchError):
@@ -905,6 +934,20 @@ struct RealCode;
                     self.assets.fetch_classified(asset, cache_root, True)
             self.assertIn("DNS unavailable", caught.exception.diagnostic)
             self.assertEqual(str(caught.exception), "network unavailable")
+
+            protocol_failures = (
+                http.client.IncompleteRead(b"partial", 4096),
+                http.client.RemoteDisconnected("response closed before installer body completed"),
+            )
+            for protocol_failure in protocol_failures:
+                with self.subTest(protocol_failure=type(protocol_failure).__name__), mock.patch.object(
+                    self.assets,
+                    "fetch",
+                    side_effect=protocol_failure,
+                ):
+                    with self.assertRaises(self.assets.NetworkUnavailable) as protocol:
+                        self.assets.fetch_classified(asset, cache_root, True)
+                self.assertTrue(protocol.exception.diagnostic)
 
             for detail in (
                 "cached asset digest mismatch",
@@ -931,6 +974,71 @@ struct RealCode;
                 with self.assertRaises(urllib.error.HTTPError) as deterministic_http:
                     self.assets.fetch_classified(asset, cache_root, True)
             self.assertNotIsInstance(deterministic_http.exception, self.assets.NetworkUnavailable)
+
+    def test_protocol_body_failure_flows_through_fetch_asset_and_main_as_blocked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-protocol-body-") as temporary:
+            root = Path(temporary)
+            cli = root / "compatforge"
+            cli.write_bytes(b"placeholder")
+            storage = root / "storage"
+            work = root / "work"
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(storage),
+                "--work-root",
+                str(work),
+                "--allow-network",
+            ]
+
+            def fake_invoke(command, *, timeout=self.baseline.MAX_COMMAND_SECONDS):
+                del timeout
+                if command[1:4] != ["local", "macos", "context"]:
+                    raise AssertionError(f"unexpected command: {command}")
+                receipt = self.descriptor_receipt()
+                Path(command[-1]).write_text(
+                    json.dumps(self.descriptor_context(storage, receipt)),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                mock.patch.object(self.baseline.os, "access", return_value=True),
+                mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                mock.patch.object(
+                    self.assets,
+                    "fetch",
+                    side_effect=http.client.IncompleteRead(b"partial", 4096),
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.baseline.main()
+
+            self.assertEqual(result, 1)
+            compact = json.loads(stdout.getvalue())
+            self.assertEqual(
+                [(item["status"], item["reasonCode"]) for item in compact["applications"]],
+                [("blocked", "network-unavailable")] * 3,
+            )
+            full = json.loads((work / "7zip-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(full["status"], "blocked")
+            self.assertEqual(full["failureClass"], "environment")
+            self.assertTrue(full["diagnostics"][0]["detail"])
+            self.assertNotIn(str(root), stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
 
     def test_allow_network_main_blocks_network_failure_but_fails_deterministic_asset_error(self) -> None:
         cases = (
@@ -976,17 +1084,11 @@ struct RealCode;
                     if command[1:4] != ["local", "macos", "context"]:
                         raise AssertionError(f"unexpected command: {command}")
                     context_path = Path(command[-1])
+                    receipt = self.descriptor_receipt()
                     context_path.write_text(
-                        json.dumps({"schemaVersion": "1", "storageRoot": str(storage)}),
+                        json.dumps(self.descriptor_context(storage, receipt)),
                         encoding="utf-8",
                     )
-                    receipt = {
-                        "schemaVersion": "1",
-                        "source": "crossover-app",
-                        "version": "24.0",
-                        "packId": "wine-macos-auto-preview",
-                        "packDigest": "sha256:" + "a" * 64,
-                    }
                     return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
 
                 stdout = io.StringIO()
@@ -1123,6 +1225,98 @@ struct RealCode;
             self.assertNotIn("/Users/", stdout.getvalue())
             self.assertEqual(stderr.getvalue(), "")
 
+    def test_main_closes_all_runtime_descriptor_context_failures_as_blocked_evidence(self) -> None:
+        cases = (
+            "missing-context",
+            "invalid-json",
+            "nonobject",
+            "schema-mismatch",
+            "missing-bindings",
+            "storage-mismatch",
+            "binding-mismatch",
+            "receipt-runtime-mismatch",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix=f"compatforge-gui-descriptor-{case}-"
+            ) as temporary:
+                root = Path(temporary)
+                cli = root / "compatforge"
+                cli.write_bytes(b"placeholder")
+                storage = root / "storage"
+                work = root / "work"
+                argv = [
+                    str(BASELINE_TOOL),
+                    "--compatforge-cli",
+                    str(cli),
+                    "--cache-root",
+                    str(root / "cache"),
+                    "--runtime-store",
+                    str(root / "runtime-store"),
+                    "--storage-root",
+                    str(storage),
+                    "--work-root",
+                    str(work),
+                ]
+
+                def fake_invoke(command, *, timeout=self.baseline.MAX_COMMAND_SECONDS):
+                    del timeout
+                    self.assertEqual(command[1:4], ["local", "macos", "context"])
+                    receipt = self.descriptor_receipt()
+                    context_path = Path(command[-1])
+                    context = self.descriptor_context(storage, receipt)
+                    if case == "invalid-json":
+                        context_path.write_text("{", encoding="utf-8")
+                    elif case == "nonobject":
+                        context_path.write_text("[]", encoding="utf-8")
+                    elif case == "schema-mismatch":
+                        context["schemaVersion"] = "2"
+                        context_path.write_text(json.dumps(context), encoding="utf-8")
+                    elif case == "missing-bindings":
+                        del context["runtimeBindings"]
+                        context_path.write_text(json.dumps(context), encoding="utf-8")
+                    elif case == "storage-mismatch":
+                        context["storageRoot"] = str(root / "different-storage")
+                        context_path.write_text(json.dumps(context), encoding="utf-8")
+                    elif case == "binding-mismatch":
+                        context["runtimeBindings"][0]["packDigest"] = "sha256:" + "b" * 64
+                        context_path.write_text(json.dumps(context), encoding="utf-8")
+                    elif case == "receipt-runtime-mismatch":
+                        receipt["runtimeId"] = "crossover"
+                        context_path.write_text(json.dumps(context), encoding="utf-8")
+                    elif case != "missing-context":
+                        raise AssertionError(f"unhandled descriptor case: {case}")
+                    return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                    mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                    mock.patch.object(self.baseline.os, "access", return_value=True),
+                    mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                    mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = self.baseline.main()
+
+                self.assertEqual(result, 1)
+                full = json.loads((work / "preflight-evidence.json").read_text(encoding="utf-8"))
+                self.assertEqual(full["status"], "blocked")
+                self.assertEqual(full["failureClass"], "runtime")
+                self.assertEqual(full["reasonCode"], "runtime-descriptor-invalid")
+                compact_text = stdout.getvalue()
+                compact = json.loads(compact_text)
+                self.assertEqual(compact["reasonCode"], "runtime-descriptor-invalid")
+                self.assertEqual(
+                    compact_text,
+                    json.dumps(compact, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+                )
+                self.assertNotIn(str(root), compact_text)
+                self.assertEqual(stderr.getvalue(), "")
+
     def test_main_writes_blocked_tool_and_rosetta_preflight_evidence(self) -> None:
         cases = (
             ("tool", False, True, "tool-unavailable"),
@@ -1193,6 +1387,69 @@ struct RealCode;
         self.baseline.bind_runtime_identity(None, automatic_receipt, automatic_applications)
         self.assertIsNone(automatic_receipt["runtimeId"])
         self.assertIsNone(automatic_applications[0]["runtimeId"])
+
+    def test_compact_validation_is_shape_first_iterative_and_bounded(self) -> None:
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "local-crossover",
+            "version": "24.0",
+            "packDigest": "sha256:" + "a" * 64,
+            "source": "crossover-app",
+        }
+        application = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "appId": "7zip",
+            "status": "failed",
+            "failureClass": "core",
+            "reasonCode": "core-plan-failed",
+            "cleanup": True,
+        }
+
+        nested: object = True
+        for _ in range(1200):
+            nested = {"safe": nested}
+        deep_known_field = {
+            "schemaVersion": "1",
+            "receipt": {**receipt, "activated": nested},
+            "applications": [application],
+        }
+        with self.assertRaises(self.baseline.AcceptanceError) as shape_error:
+            self.baseline.validate_compact_summary(deep_known_field)
+        self.assertEqual(str(shape_error.exception), "compact receipt activated must be a boolean")
+
+        depth_boundary: object = "leaf"
+        for _ in range(self.baseline.MAX_COMPACT_DEPTH):
+            depth_boundary = [depth_boundary]
+        self.baseline._scan_compact_scalars(depth_boundary)
+        too_deep = [depth_boundary]
+        with self.assertRaises(self.baseline.AcceptanceError) as depth_error:
+            self.baseline._scan_compact_scalars(too_deep)
+        self.assertEqual(str(depth_error.exception), "compact summary exceeds structural bounds")
+
+        node_boundary = [None] * (self.baseline.MAX_COMPACT_NODES - 1)
+        self.baseline._scan_compact_scalars(node_boundary)
+        with self.assertRaises(self.baseline.AcceptanceError) as node_error:
+            self.baseline._scan_compact_scalars([*node_boundary, None])
+        self.assertEqual(str(node_error.exception), "compact summary exceeds structural bounds")
+
+        self.baseline._scan_compact_scalars("x" * self.baseline.MAX_COMPACT_TEXT_CHARS)
+        with self.assertRaises(self.baseline.AcceptanceError) as text_error:
+            self.baseline._scan_compact_scalars("x" * (self.baseline.MAX_COMPACT_TEXT_CHARS + 1))
+        self.assertEqual(str(text_error.exception), "compact summary text exceeds its bound")
+
+        with self.assertRaises(self.baseline.AcceptanceError) as key_type_error:
+            self.baseline._scan_compact_scalars({1: True})
+        self.assertEqual(str(key_type_error.exception), "compact summary text is invalid")
+
+        deep_keys: object = {"/Users/developer/private": True}
+        for _ in range(1200):
+            deep_keys = {"safe": deep_keys}
+        with self.assertRaises(self.baseline.AcceptanceError) as key_error:
+            self.baseline._scan_compact_scalars(deep_keys)
+        self.assertEqual(str(key_error.exception), "compact summary exceeds structural bounds")
+        self.assertNotIn("/Users/", str(key_error.exception))
 
     def test_compact_summary_is_canonical_closed_and_path_free(self) -> None:
         receipt = {

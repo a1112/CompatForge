@@ -28,6 +28,9 @@ WINDOW_APPEARANCE_SECONDS = 30
 INTERACTIVE_RUNTIME_MILLISECONDS = 60_000
 MAX_DIAGNOSTICS = 16
 MAX_DIAGNOSTIC_CHARS = 4096
+MAX_COMPACT_DEPTH = 8
+MAX_COMPACT_NODES = 256
+MAX_COMPACT_TEXT_CHARS = 4096
 
 REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
@@ -349,9 +352,52 @@ def bind_runtime_identity(
 ) -> None:
     if runtime_id is not None and runtime_id not in RUNTIME_IDS:
         raise AcceptanceError("Runtime identity is not recognized")
+    if "runtimeId" in receipt and receipt["runtimeId"] != runtime_id:
+        raise AcceptanceError("bootstrap receipt Runtime identity does not match the request")
     receipt["runtimeId"] = runtime_id
     for application in applications:
+        if "runtimeId" in application and application["runtimeId"] != runtime_id:
+            raise AcceptanceError("application Runtime identity does not match the request")
         application["runtimeId"] = runtime_id
+
+
+def validate_runtime_descriptor(
+    receipt: dict[str, object],
+    context: object,
+    requested_storage: Path,
+) -> tuple[dict[str, object], Path]:
+    if receipt.get("schemaVersion") != "1":
+        raise AcceptanceError("bootstrap receipt schemaVersion is invalid")
+    for field in ("source", "version", "packId"):
+        if not isinstance(receipt.get(field), str) or not receipt[field]:
+            raise AcceptanceError("bootstrap receipt omitted Runtime identity")
+    pack_digest = receipt.get("packDigest")
+    if not isinstance(pack_digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", pack_digest) is None:
+        raise AcceptanceError("bootstrap receipt pack digest is invalid")
+    if not isinstance(context, dict):
+        raise AcceptanceError("bootstrap context is not an object")
+    if context.get("schemaVersion") != "1":
+        raise AcceptanceError("bootstrap context schemaVersion is invalid")
+    storage_value = context.get("storageRoot")
+    if not isinstance(storage_value, str):
+        raise AcceptanceError("bootstrap context omitted storageRoot")
+    canonical_storage = absolute(storage_value, "bootstrap context storageRoot")
+    try:
+        requested_resolved = requested_storage.resolve(strict=False)
+        canonical_resolved = canonical_storage.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise AcceptanceError("bootstrap context storageRoot could not be resolved") from error
+    if canonical_resolved != requested_resolved:
+        raise AcceptanceError("bootstrap context storageRoot does not match the request")
+    if not isinstance(context.get("supervisor"), dict):
+        raise AcceptanceError("bootstrap context omitted supervisor policy")
+    bindings = context.get("runtimeBindings")
+    if not isinstance(bindings, list) or len(bindings) != 1 or not isinstance(bindings[0], dict):
+        raise AcceptanceError("bootstrap context Runtime binding is invalid")
+    binding = bindings[0]
+    if binding.get("packId") != receipt["packId"] or binding.get("packDigest") != pack_digest:
+        raise AcceptanceError("bootstrap receipt and context Runtime bindings differ")
+    return context, canonical_storage
 
 
 def _compact_exit(value: object) -> dict[str, object] | None:
@@ -373,27 +419,44 @@ def _compact_exit(value: object) -> dict[str, object] | None:
     }
 
 
-def _validate_compact_tree(value: object) -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            _validate_compact_text(key)
-            _validate_compact_tree(nested)
-        return
-    if isinstance(value, list):
-        for nested in value:
-            _validate_compact_tree(nested)
-        return
-    if isinstance(value, str):
-        _validate_compact_text(value)
-        return
-    if value is None or isinstance(value, (bool, int)):
-        return
-    raise AcceptanceError("compact summary contains an unsupported value type")
+def _scan_compact_scalars(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    visited = 0
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_COMPACT_DEPTH:
+            raise AcceptanceError("compact summary exceeds structural bounds")
+        visited += 1
+        if visited > MAX_COMPACT_NODES:
+            raise AcceptanceError("compact summary exceeds structural bounds")
+        if isinstance(current, dict):
+            children = len(current) * 2
+            remaining = MAX_COMPACT_NODES - visited - len(stack)
+            if children > remaining or (current and depth >= MAX_COMPACT_DEPTH):
+                raise AcceptanceError("compact summary exceeds structural bounds")
+            for key, nested in current.items():
+                if not isinstance(key, str):
+                    raise AcceptanceError("compact summary text is invalid")
+                stack.append((nested, depth + 1))
+                stack.append((key, depth + 1))
+        elif isinstance(current, list):
+            children = len(current)
+            remaining = MAX_COMPACT_NODES - visited - len(stack)
+            if children > remaining or (current and depth >= MAX_COMPACT_DEPTH):
+                raise AcceptanceError("compact summary exceeds structural bounds")
+            for nested in current:
+                stack.append((nested, depth + 1))
+        elif isinstance(current, str):
+            _validate_compact_text(current)
+        elif current is not None and not isinstance(current, (bool, int)):
+            raise AcceptanceError("compact summary contains an unsupported value type")
 
 
 def _validate_compact_text(value: object) -> str:
     if not isinstance(value, str) or not value:
         raise AcceptanceError("compact summary text is invalid")
+    if len(value) > MAX_COMPACT_TEXT_CHARS:
+        raise AcceptanceError("compact summary text exceeds its bound")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise AcceptanceError("compact summary text contains control characters")
     if "/" in value or "\\" in value or "file:" in value.casefold():
@@ -418,6 +481,12 @@ def _require_bool(value: object, label: str) -> bool:
     return value
 
 
+def _require_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AcceptanceError(f"{label} must be non-empty text")
+    return value
+
+
 def _validate_exit_projection(value: object, label: str) -> None:
     if not isinstance(value, dict):
         raise AcceptanceError(f"{label} must be an object")
@@ -430,7 +499,6 @@ def _validate_exit_projection(value: object, label: str) -> None:
 
 
 def validate_compact_summary(value: object) -> None:
-    _validate_compact_tree(value)
     if not isinstance(value, dict):
         raise AcceptanceError("compact summary must be an object")
     _require_exact_keys(value, {"schemaVersion", "receipt", "applications"}, set(), "compact summary")
@@ -451,7 +519,7 @@ def validate_compact_summary(value: object) -> None:
     if runtime_id is not None and runtime_id not in RUNTIME_IDS:
         raise AcceptanceError("compact receipt Runtime identity is invalid")
     for field in ("packId", "version", "source"):
-        _validate_compact_text(receipt[field])
+        _require_text(receipt[field], f"compact receipt {field}")
     digest = receipt["packDigest"]
     if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
         raise AcceptanceError("compact receipt packDigest is invalid")
@@ -521,6 +589,7 @@ def validate_compact_summary(value: object) -> None:
         for field in ("windowAvailable", "screenshotAvailable"):
             if field in application:
                 _require_bool(application[field], f"compact application {field}")
+    _scan_compact_scalars(value)
 
 
 def compact_summary(
@@ -612,7 +681,6 @@ def compact_preflight(evidence: dict[str, object]) -> dict[str, object]:
         for key in ("schemaVersion", "runtimeId", "status", "failureClass", "reasonCode")
         if key in evidence
     }
-    _validate_compact_tree(projected)
     _require_exact_keys(
         projected,
         {"schemaVersion", "runtimeId", "status", "failureClass", "reasonCode"},
@@ -631,6 +699,7 @@ def compact_preflight(evidence: dict[str, object]) -> dict[str, object]:
         or failure_status(reason_code) != "blocked"
     ):
         raise AcceptanceError("compact preflight failure metadata is invalid")
+    _scan_compact_scalars(projected)
     return projected
 
 
@@ -1212,27 +1281,32 @@ def main() -> int:
                 ),
                 "bootstrap receipt",
             )
-        except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
+            context_value = json.loads(context_path.read_text(encoding="utf-8"))
+            context, canonical_storage = validate_runtime_descriptor(
+                receipt,
+                context_value,
+                arguments.storage_root,
+            )
+            bind_runtime_identity(runtime_id, receipt, [])
+        except (
+            AcceptanceError,
+            OSError,
+            UnicodeError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+        ) as error:
             return emit_blocked_preflight(
                 arguments.work_root,
                 runtime_id,
                 "runtime-descriptor",
                 str(error),
             )
-        bind_runtime_identity(runtime_id, receipt, [])
-        context = json.loads(context_path.read_text(encoding="utf-8"))
-        if not isinstance(context, dict):
-            raise AcceptanceError("bootstrap context is not an object")
-        canonical_storage = context.get("storageRoot")
-        if not isinstance(canonical_storage, str) or not Path(canonical_storage).is_absolute():
-            raise AcceptanceError("bootstrap context omitted an absolute storage root")
         # Rust bootstrap canonicalizes macOS aliases such as /tmp ->
         # /private/tmp. Reuse that authoritative root for Bottle paths so
         # string-boundary validation and the filesystem observe the same path.
-        arguments.storage_root = Path(canonical_storage)
-        supervisor = context.setdefault("supervisor", {})
-        if isinstance(supervisor, dict):
-            supervisor["maximumRuntimeMilliseconds"] = 120_000
+        arguments.storage_root = canonical_storage
+        supervisor = context["supervisor"]
+        supervisor["maximumRuntimeMilliseconds"] = 120_000  # type: ignore[index]
         write_json(context_path, context)
         write_json(arguments.work_root / "bootstrap-receipt.json", receipt)
 

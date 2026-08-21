@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import socket
@@ -184,7 +185,13 @@ def fetch_classified(asset: GuiAsset, cache_root: Path, allow_network: bool) -> 
         # An HTTP response proves the network path is available. Treat a
         # deterministic server/content failure as an asset failure instead.
         raise
-    except (urllib.error.URLError, TimeoutError, ConnectionError, socket.gaierror) as error:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        socket.gaierror,
+        http.client.HTTPException,
+    ) as error:
         raise NetworkUnavailable(str(error)) from error
 
 
