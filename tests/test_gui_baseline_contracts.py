@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -25,11 +27,81 @@ def load_tool(path: Path):
     return module
 
 
+def rust_without_comments(source: str) -> str:
+    """Remove nested Rust comments while preserving string literals."""
+    output: list[str] = []
+    index = 0
+    block_depth = 0
+    in_line_comment = False
+    in_string = False
+    escaped = False
+    while index < len(source):
+        pair = source[index : index + 2]
+        character = source[index]
+        if in_line_comment:
+            if character == "\n":
+                in_line_comment = False
+                output.append(character)
+            index += 1
+            continue
+        if block_depth:
+            if pair == "/*":
+                block_depth += 1
+                index += 2
+            elif pair == "*/":
+                block_depth -= 1
+                index += 2
+            else:
+                if character == "\n":
+                    output.append(character)
+                index += 1
+            continue
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if pair == "//":
+            in_line_comment = True
+            index += 2
+        elif pair == "/*":
+            block_depth = 1
+            index += 2
+        else:
+            output.append(character)
+            if character == '"':
+                in_string = True
+            index += 1
+    return "".join(output)
+
+
+def rust_code_only(source: str) -> str:
+    source = rust_without_comments(source)
+    source = re.sub(r'(?s)(?:br|r)(?P<hash>#{0,16})".*?"(?P=hash)', '""', source)
+    return re.sub(r'(?s)b?"(?:\\.|[^"\\])*"', '""', source)
+
+
 class GuiBaselineContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.assets = load_tool(ASSET_TOOL)
         cls.baseline = load_tool(BASELINE_TOOL)
+
+    def test_rust_code_projection_removes_comment_and_string_decoys(self) -> None:
+        source = """
+// pub struct DesktopLaunchOptions;
+/* outer /* Command env PATH */ comment */
+const DECOY: &str = r#"std::env::var_os(\"FORGED\") Command"#;
+struct RealCode;
+"""
+        projected = rust_code_only(source)
+        self.assertIn("struct RealCode", projected)
+        self.assertNotRegex(projected, r"\b(?:DesktopLaunchOptions|Command|env|PATH)\b")
 
     def test_fixed_official_asset_matrix_is_closed(self) -> None:
         self.assertEqual(
@@ -69,7 +141,7 @@ class GuiBaselineContractTests(unittest.TestCase):
         )
 
     def test_tauri_uses_the_shared_application_service(self) -> None:
-        rust = (TAURI / "src" / "lib.rs").read_text(encoding="utf-8")
+        rust = rust_without_comments((TAURI / "src" / "lib.rs").read_text(encoding="utf-8"))
         for symbol in (
             "create_local_context",
             "AutomationService::new",
@@ -86,24 +158,33 @@ class GuiBaselineContractTests(unittest.TestCase):
         for symbol in ("PreparedLaunch::prepare", "ProcessSupervisor::start", "ExecutableMode::BottleInPlace", "NetworkPolicy::Deny"):
             self.assertIn(symbol, service)
 
-    def test_desktop_acceptance_runtime_is_argument_only_and_closed(self) -> None:
-        rust = (TAURI / "src" / "lib.rs").read_text(encoding="utf-8")
-        main = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
-        self.assertIn("struct DesktopLaunchOptions", rust)
-        self.assertIn("MacOsLocalContextRequest", rust)
-        for flag in (
-            "--acceptance-root",
-            "--wine-root",
-            "--wine",
-            "--wineserver",
-            "--version",
-        ):
-            self.assertIn(flag, rust)
-        self.assertIn("compatforge_desktop::run(std::env::args_os())", main)
-        self.assertNotIn("std::process::Command", rust)
-        self.assertNotIn('var_os("PATH")', rust)
-        self.assertNotIn('var("PATH")', rust)
-        self.assertNotRegex(rust, r'var(?:_os)?\("COMPATFORGE_(?!DESKTOP_SMOKE)')
+    def test_desktop_acceptance_runtime_keeps_private_structure_and_abi(self) -> None:
+        rust_source = (TAURI / "src" / "lib.rs").read_text(encoding="utf-8")
+        rust = rust_code_only(rust_source)
+        main = rust_code_only((TAURI / "src" / "main.rs").read_text(encoding="utf-8"))
+        cargo = tomllib.loads((TAURI / "Cargo.toml").read_text(encoding="utf-8"))
+
+        self.assertRegex(rust, r"\bstruct\s+DesktopLaunchOptions\b")
+        self.assertNotRegex(
+            rust,
+            r"\bpub(?:\s*\([^)]*\))?\s+struct\s+(?:DesktopLaunchOptions|RuntimeOverride)\b",
+        )
+        self.assertNotIn("compatforge-ffi", cargo["dependencies"])
+        self.assertNotRegex(rust, r"\b(?:no_mangle|compatforge_ffi|extern)\b")
+
+        normalized_main = re.sub(r"\s+", "", main)
+        self.assertEqual(normalized_main.count("compatforge_desktop::run(std::env::args_os())"), 1)
+
+        allowed_environment_read = 'std::env::var_os("")'
+        self.assertEqual(rust.count(allowed_environment_read), 1)
+        rust_without_smoke = rust.replace(allowed_environment_read, "")
+        self.assertNotRegex(rust_without_smoke, r"\benv\b")
+        self.assertNotRegex(rust, r"\b(?:Command|PATH)\b")
+        self.assertEqual(
+            rust_without_comments(rust_source).count('std::env::var_os("COMPATFORGE_DESKTOP_SMOKE")'),
+            1,
+        )
+
         self.assertNotIn("runtimeId", rust)
         self.assertNotIn("failureClass", rust)
 

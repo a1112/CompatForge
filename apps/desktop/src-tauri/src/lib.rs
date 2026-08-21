@@ -82,7 +82,7 @@ impl DesktopLaunchOptions {
         let wine = wine.unwrap();
         let wineserver = wineserver.unwrap();
         let version = version.unwrap();
-        if !serialized_path_is_absolute(&acceptance_root) || !serialized_path_is_absolute(&wine_root) {
+        if !posix_path_is_absolute(&acceptance_root) || !posix_path_is_absolute(&wine_root) {
             return Err(INVALID_LAUNCH_ARGUMENTS);
         }
         validate_portable_relative_path("wine", &wine).map_err(|_| INVALID_LAUNCH_ARGUMENTS)?;
@@ -111,14 +111,8 @@ fn set_once(slot: &mut Option<String>, value: String) -> Result<(), &'static str
     }
 }
 
-fn serialized_path_is_absolute(value: &str) -> bool {
-    Path::new(value).is_absolute()
-        || value.starts_with('/')
-        || value
-            .as_bytes()
-            .get(1..3)
-            .is_some_and(|separator| separator == b":\\" || separator == b":/")
-        || value.starts_with("\\\\")
+fn posix_path_is_absolute(value: &str) -> bool {
+    value.starts_with('/')
 }
 
 fn valid_runtime_version(value: &str) -> bool {
@@ -486,6 +480,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStringExt;
 
     fn crossover_arguments() -> [&'static str; 11] {
         [
@@ -501,6 +497,15 @@ mod tests {
             "--version",
             "25.0",
         ]
+    }
+
+    fn assert_invalid<I, S>(arguments: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let error = DesktopLaunchOptions::parse(arguments).unwrap_err();
+        assert_eq!(error, "CompatForge 开发者验收启动参数无效");
     }
 
     #[test]
@@ -533,51 +538,116 @@ mod tests {
         let options = DesktopLaunchOptions::parse(["compatforge-desktop"]).unwrap();
         assert!(options.acceptance_root.is_none());
         assert!(options.runtime_override.is_none());
+
+        let request = local_context_request(
+            Path::new("/absolute/default/runtime-store"),
+            Path::new("/absolute/default/storage"),
+            options.runtime_override.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(request.materialized_root, None);
+        assert_eq!(request.wine, None);
+        assert_eq!(request.wineserver, None);
+        assert_eq!(request.version, None);
     }
 
     #[test]
-    fn partial_or_relative_acceptance_arguments_are_rejected() {
-        assert!(DesktopLaunchOptions::parse(["app", "--wine", "bin/wine"]).is_err());
-        assert!(DesktopLaunchOptions::parse(["app", "--acceptance-root", "relative"]).is_err());
+    fn only_posix_absolute_acceptance_and_wine_roots_are_allowed() {
+        for invalid_root in [
+            "relative/runtime",
+            r"C:\Program Files\CrossOver",
+            "C:/Program Files/CrossOver",
+            r"\\server\share\CrossOver",
+        ] {
+            let mut acceptance_root = crossover_arguments();
+            acceptance_root[2] = invalid_root;
+            assert_invalid(acceptance_root);
 
-        let mut relative_entrypoint = crossover_arguments();
-        relative_entrypoint[6] = "../bin/wine";
-        assert!(DesktopLaunchOptions::parse(relative_entrypoint).is_err());
-
-        let mut absolute_entrypoint = crossover_arguments();
-        absolute_entrypoint[6] = "/bin/wine";
-        assert!(DesktopLaunchOptions::parse(absolute_entrypoint).is_err());
+            let mut wine_root = crossover_arguments();
+            wine_root[4] = invalid_root;
+            assert_invalid(wine_root);
+        }
     }
 
     #[test]
-    fn duplicate_unknown_missing_and_positional_arguments_are_rejected() {
+    fn wine_and_wineserver_must_be_safe_relative_entrypoints() {
+        for invalid_entrypoint in [
+            "",
+            "/bin/runtime",
+            "../bin/runtime",
+            "bin/../runtime",
+            "bin/./runtime",
+            "bin//runtime",
+            "bin/runtime/",
+            r"bin\runtime",
+        ] {
+            let mut wine = crossover_arguments();
+            wine[6] = invalid_entrypoint;
+            assert_invalid(wine);
+
+            let mut wineserver = crossover_arguments();
+            wineserver[8] = invalid_entrypoint;
+            assert_invalid(wineserver);
+        }
+    }
+
+    #[test]
+    fn partial_duplicate_unknown_missing_and_positional_arguments_are_rejected() {
+        assert_invalid(["app", "--wine", "bin/wine"]);
+        assert_invalid(["app", "--acceptance-root", "relative"]);
+
         let mut duplicate = crossover_arguments().to_vec();
         duplicate.extend(["--wine", "bin/wine"]);
-        assert!(DesktopLaunchOptions::parse(duplicate).is_err());
+        assert_invalid(duplicate);
 
-        assert!(DesktopLaunchOptions::parse(["app", "--unknown", "value"]).is_err());
-        assert!(DesktopLaunchOptions::parse(["app", "--acceptance-root"]).is_err());
-        assert!(DesktopLaunchOptions::parse(["app", "positional"]).is_err());
+        assert_invalid(["app", "--unknown", "value"]);
+        assert_invalid(["app", "--acceptance-root"]);
+        assert_invalid(["app", "--wine", "--wineserver", "bin/wineserver"]);
+        assert_invalid(["app", "positional"]);
+
+        let mut trailing_positional = crossover_arguments().to_vec();
+        trailing_positional.push("positional");
+        assert_invalid(trailing_positional);
     }
 
     #[test]
     fn runtime_version_is_closed_and_bounded() {
+        let mut vendor_version = crossover_arguments();
+        vendor_version[10] = "10.0 (CrossOverFOSS 25.0.1)";
+        DesktopLaunchOptions::parse(vendor_version).unwrap();
+
         let mut empty = crossover_arguments();
         empty[10] = "";
-        assert!(DesktopLaunchOptions::parse(empty).is_err());
+        assert_invalid(empty);
 
         let mut control_character = crossover_arguments();
         control_character[10] = "25.0\nforged";
-        assert!(DesktopLaunchOptions::parse(control_character).is_err());
+        assert_invalid(control_character);
 
         let mut shell_punctuation = crossover_arguments();
         shell_punctuation[10] = "25.0;forged";
-        assert!(DesktopLaunchOptions::parse(shell_punctuation).is_err());
+        assert_invalid(shell_punctuation);
 
         let long_version = "x".repeat(129);
         let mut too_long = crossover_arguments().map(str::to_owned);
         too_long[10] = long_version;
-        assert!(DesktopLaunchOptions::parse(too_long).is_err());
+        assert_invalid(too_long);
+    }
+
+    #[test]
+    fn launch_argument_errors_are_fixed_and_do_not_reflect_values() {
+        let secret = "/Users/developer/private/acceptance-root";
+        let error = DesktopLaunchOptions::parse(["app", "--unknown", secret]).unwrap_err();
+        assert_eq!(error, "CompatForge 开发者验收启动参数无效");
+        assert!(!error.contains(secret));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_utf8_windows_arguments_are_rejected_with_the_fixed_error() {
+        let mut arguments = crossover_arguments().map(OsString::from);
+        arguments[1] = OsString::from_wide(&[0xD800]);
+        assert_invalid(arguments);
     }
 
     #[test]
