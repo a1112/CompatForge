@@ -367,10 +367,34 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("public-beta-ready", append_guide("This stage is public   beta ready!")),
             ("signed-claim", append_guide("The application is signed.")),
             ("signed-prefix-claim", append_guide("A signed application is available.")),
+            (
+                "signed-after-comma",
+                append_guide("The application, now signed, is available."),
+            ),
             ("notarized-claim", append_guide("The build is NOTARIZED.")),
             ("notarized-suffix-claim", append_guide("Build notarized successfully.")),
+            (
+                "notarized-after-comma",
+                append_guide("The build, now notarized, passed validation."),
+            ),
             ("dmg-claim", append_guide("A DMG is ready for distribution.")),
             ("generated-dmg-claim", append_guide("Generated DMG for distribution.")),
+            (
+                "dmg-generated-after-comma",
+                append_guide("The DMG, generated locally, is available."),
+            ),
+            (
+                "negative-beta-contrasts-with-signed",
+                append_guide(
+                    "This is not a public beta although the application is signed."
+                ),
+            ),
+            (
+                "negative-signing-contrasts-with-generated-dmg",
+                append_guide(
+                    "The application is not signed while it generated a DMG."
+                ),
+            ),
             (
                 "cross-repository-authorization",
                 append_guide(
@@ -386,8 +410,11 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("chinese-signed-notarized", append_guide("应用已签名并完成公证。")),
             ("chinese-signature-valid", append_guide("应用签名有效。")),
             ("chinese-notarization-valid", append_guide("构建公证有效。")),
+            ("chinese-signature-after-comma", append_guide("应用，现已签名。")),
+            ("chinese-notarization-after-comma", append_guide("构建，现已公证。")),
             ("chinese-dmg", append_guide("下一步将生成 DMG。")),
             ("chinese-dmg-generated", append_guide("DMG 已生成。")),
+            ("chinese-dmg-after-comma", append_guide("DMG，已生成。")),
             ("chinese-cross-repository", append_guide("允许修改 ForgeOS。")),
             ("chinese-repository-authorized", append_guide("ForgeOS 获授权。")),
         )
@@ -421,6 +448,8 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "will not be authorized.\n"
                 "本阶段绝非公测或公开发布，绝不会签名或公证，不会生成 DMG，"
                 "严禁修改 ForgeOS、ForgeTools 或 Mac-Win。\n"
+                "PUBLIC BETA is not ready. Public release is forbidden.\n"
+                "中文公测绝不允许，公开发布不会发生。\n"
             )
             guide.write_bytes(source.encode("utf-8"))
             with mock.patch.object(validator, "ROOT", repository_root):

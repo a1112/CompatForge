@@ -4271,8 +4271,13 @@ def _macos_acceptance_prose(source: str) -> str:
 def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", prose).casefold()
     clauses: list[str] = []
-    for sentence in re.split(r"[\n\r。！？!?；;,，]+", normalized):
-        for clause in re.split(r"\b(?:but|and|however)\b|但是|但", sentence):
+    for sentence in re.split(r"[\n\r。！？!?；;]+", normalized):
+        for clause in re.split(
+            r"\b(?:although|while|but|however|whereas|yet|and)\b|"
+            r"但是|然而|不过|可是|并且|但|而|却",
+            sentence,
+        ):
+            clause = re.sub(r"[,，、]+", " __comma__ ", clause)
             compact = re.sub(r"[^\w]+", " ", clause, flags=re.UNICODE).strip()
             if compact:
                 clauses.append(compact)
@@ -4280,15 +4285,58 @@ def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
 
 
 def _macos_acceptance_claim_is_negated(
-    clause: str, match: re.Match[str]
+    topic: str, clause: str, match: re.Match[str]
 ) -> bool:
-    context = clause[max(0, match.start() - 96) : match.end()]
+    matched = match.group()
+    prefix = clause[: match.start()].rstrip()
+    suffix = clause[match.end() :].lstrip()
+
+    if re.search(r"\b(?:not|never|neither|nor|without|no)\b", matched):
+        return True
+    if re.search(r"(?:绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不|未|无)", matched):
+        return True
     if re.search(
-        r"\b(?:not|never|neither|nor|without|forbidden|prohibited)\b",
-        context,
+        r"(?:\b(?:not|never|without|no)\b\s*(?:a|an|the|to|be|being|been)?|"
+        r"绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不是|不属于|不包含|"
+        r"不允许|不授权|不|未(?:完成)?|无)\s*$",
+        prefix,
     ):
         return True
-    return re.search(r"(?:绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不|未|无|非)", context) is not None
+    if re.search(r"\bneither\b.*\bnor(?:\s+(?:a|an|the))?\s*$", prefix):
+        return True
+    if topic == "public" and re.search(
+        r"(?:\bnot\s+(?:a\s+)?|绝非|不是|不属于)"
+        r"\s*"
+        r"(?:public\s+(?:beta|release)|公测|公开测试|公开发布)"
+        r"(?:\s+ready)?\s*(?:or|或|__comma__)\s*$",
+        prefix,
+    ):
+        return True
+    if topic == "signing" and re.search(
+        r"(?:绝不(?:会)?|不会|不|未(?:完成)?)\s*(?:签名|公证)\s*或\s*$",
+        prefix,
+    ):
+        return True
+    if topic == "dmg" and re.search(
+        r"(?:绝不(?:会)?|不会|不|未)"
+        r"\s*(?:生成|创建|构建|分发|发布|交付)\s*或\s*$",
+        prefix,
+    ):
+        return True
+    if topic == "public" and re.match(
+        r"(?:(?:is|are|was|were|will\s+be|would\s+be|has\s+been|have\s+been)\s+)?"
+        r"(?:not\s+(?:ready|allowed|permitted|planned|scheduled|happening|occurring)|"
+        r"forbidden|prohibited)\b",
+        suffix,
+    ):
+        return True
+    if topic == "public" and re.match(
+        r"(?:绝不(?:会)?|不会|严禁|禁止|不得|不可|不)"
+        r"(?:允许|发生|进行|开始|进入|开放|构成|成立|是)?",
+        suffix,
+    ):
+        return True
+    return False
 
 
 def _validate_macos_acceptance_nonclaims(prose: str) -> None:
@@ -4302,41 +4350,45 @@ def _validate_macos_acceptance_nonclaims(prose: str) -> None:
         raise ValueError("macOS acceptance closed non-claims drifted")
 
     claim_patterns = (
-        r"\bpublic\s+(?:beta|release)\b",
-        r"(?:公测|公开测试|公开发布)",
-        r"\brelease\s+ready\b",
-        r"\bready\s+for\s+(?:a\s+)?public\s+(?:beta|release)\b",
-        r"\b(?:this|it|compatforge|stage|gate|build|application|app|artifact|package)"
+        ("public", r"\bpublic\s+(?:beta|release)\b"),
+        ("public", r"(?:公测|公开测试|公开发布)"),
+        ("public", r"\b(?:this|it|compatforge|stage|gate|build|application|app|artifact|package)"
         r"\s+(?:is|are|was|were|will\s+be|has\s+been)\s+released\b",
-        r"\bsigned\s+(?:application|app|build|artifact|binary|package)\b",
-        r"\b(?:application|app|build|artifact|binary|package|this|it)"
+        ),
+        ("signing", r"\bsigned\s+(?:application|app|build|artifact|binary|package)\b"),
+        ("signing", r"\b(?:application|app|build|artifact|binary|package|this|it)"
         r"(?:\s+\w+){0,4}\s+signed\b",
-        r"\bnotarized\s+(?:application|app|build|artifact|binary|package)\b",
-        r"\b(?:application|app|build|artifact|binary|package|this|it)"
+        ),
+        ("signing", r"\bnotarized\s+(?:application|app|build|artifact|binary|package)\b"),
+        ("signing", r"\b(?:application|app|build|artifact|binary|package|this|it)"
         r"(?:\s+\w+){0,4}\s+notarized\b",
-        r"\b(?:a\s+)?dmg\s+(?:is\s+)?ready\b",
-        r"\bgenerated\s+dmg\b",
-        r"\bdmg(?:\s+\w+){0,4}\s+generated\b",
-        r"\b(?:generate|generates|generated|create|creates|created|build|builds|built|ship|ships|publish|publishes|"
+        ),
+        ("dmg", r"\b(?:a\s+)?dmg\s+(?:is\s+)?ready\b"),
+        ("dmg", r"\bgenerated\s+dmg\b"),
+        ("dmg", r"\bdmg(?:\s+\w+){0,4}\s+generated\b"),
+        ("dmg", r"\b(?:generate|generates|generated|create|creates|created|build|builds|built|ship|ships|publish|publishes|"
         r"release|releases|distribute|distributes|provide|provides|deliver|delivers)"
         r"\s+(?:a\s+)?dmg\b",
-        r"\bauthorized\s+to\s+modify\s+(?:forgeos|forgetools|mac\s+win)\b",
-        r"\bmodifications?\s+to\s+(?:forgeos|forgetools|mac\s+win)\s+"
+        ),
+        ("repositories", r"\bauthorized\s+to\s+modify\s+(?:forgeos|forgetools|mac\s+win)\b"),
+        ("repositories", r"\bmodifications?\s+to\s+(?:forgeos|forgetools|mac\s+win)\s+"
         r"(?:are|is)\s+authorized\b",
-        r"\b(?:forgeos|forgetools|mac\s+win)(?:\s+\w+){0,4}\s+authorized\b",
-        r"\b(?:may|can|will|allowed\s+to|authorized\s+to)\s+modify\s+"
+        ),
+        ("repositories", r"\b(?:forgeos|forgetools|mac\s+win)(?:\s+\w+){0,4}\s+authorized\b"),
+        ("repositories", r"\b(?:may|can|will|allowed\s+to|authorized\s+to)\s+modify\s+"
         r"(?:forgeos|forgetools|mac\s+win)\b",
-        r"(?:签名|公证)\s*(?:有效|成功|完成)?",
-        r"(?:生成|创建|构建|分发|发布|交付)\s*dmg",
-        r"dmg\s*(?:已|已经|将|会)?\s*生成",
-        r"(?:允许|授权|可以|将|会|需要)?\s*修改\s*(?:forgeos|forgetools|mac\s+win)",
-        r"(?:forgeos|forgetools|mac\s+win)\s*(?:已|已经)?\s*获授权",
-        r"获授权",
+        ),
+        ("signing", r"(?:签名|公证)\s*(?:有效|成功|完成)?"),
+        ("dmg", r"(?:生成|创建|构建|分发|发布|交付)\s*dmg"),
+        ("dmg", r"dmg(?:\s+__comma__)?\s*(?:已|已经|将|会)?\s*生成"),
+        ("repositories", r"(?:允许|授权|可以|将|会|需要)?\s*修改\s*(?:forgeos|forgetools|mac\s+win)"),
+        ("repositories", r"(?:forgeos|forgetools|mac\s+win)\s*(?:已|已经)?\s*获授权"),
+        ("repositories", r"获授权"),
     )
     for clause in _macos_acceptance_semantic_clauses(prose):
-        for pattern in claim_patterns:
+        for topic, pattern in claim_patterns:
             for match in re.finditer(pattern, clause):
-                if not _macos_acceptance_claim_is_negated(clause, match):
+                if not _macos_acceptance_claim_is_negated(topic, clause, match):
                     raise ValueError(
                         "macOS acceptance guide contains a contradictory claim"
                     )
