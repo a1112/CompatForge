@@ -27,63 +27,128 @@ def load_tool(path: Path):
     return module
 
 
-def rust_without_comments(source: str) -> str:
-    """Remove nested Rust comments while preserving string literals."""
+def project_rust(source: str, *, strip_literals: bool) -> str:
+    """Project Rust source with comments removed and literals optionally masked."""
+
+    def token_boundary(index: int) -> bool:
+        return index == 0 or not (source[index - 1].isalnum() or source[index - 1] == "_")
+
+    def raw_string_end(index: int) -> int | None:
+        prefix_length = 0
+        if source.startswith("br", index) and token_boundary(index):
+            prefix_length = 2
+        elif source.startswith("r", index) and token_boundary(index):
+            prefix_length = 1
+        if not prefix_length:
+            return None
+        cursor = index + prefix_length
+        while cursor < len(source) and source[cursor] == "#":
+            cursor += 1
+        if cursor >= len(source) or source[cursor] != '"':
+            return None
+        hashes = source[index + prefix_length : cursor]
+        closing = '"' + hashes
+        closing_index = source.find(closing, cursor + 1)
+        return len(source) if closing_index < 0 else closing_index + len(closing)
+
+    def quoted_string_end(index: int) -> int | None:
+        quote = index
+        if source.startswith('b"', index) and token_boundary(index):
+            quote += 1
+        elif not source.startswith('"', index):
+            return None
+        cursor = quote + 1
+        while cursor < len(source):
+            if source[cursor] == "\\":
+                cursor += 2
+            elif source[cursor] == '"':
+                return cursor + 1
+            else:
+                cursor += 1
+        return len(source)
+
+    def char_literal_end(index: int) -> int | None:
+        quote = index
+        if source.startswith("b'", index) and token_boundary(index):
+            quote += 1
+        elif not source.startswith("'", index):
+            return None
+        content = quote + 1
+        if content >= len(source):
+            return None
+        if source[content] != "\\":
+            closing = content + 1
+        elif source.startswith("\\u{", content):
+            brace = source.find("}", content + 3)
+            if brace < 0:
+                return None
+            closing = brace + 1
+        elif source.startswith("\\x", content):
+            closing = content + 4
+        else:
+            closing = content + 2
+        if closing < len(source) and source[closing] == "'":
+            return closing + 1
+        return None
+
+    def masked(segment: str, marker: str = " ") -> str:
+        return marker + "\n" * segment.count("\n")
+
     output: list[str] = []
     index = 0
-    block_depth = 0
-    in_line_comment = False
-    in_string = False
-    escaped = False
     while index < len(source):
-        pair = source[index : index + 2]
-        character = source[index]
-        if in_line_comment:
-            if character == "\n":
-                in_line_comment = False
-                output.append(character)
-            index += 1
+        if source.startswith("//", index):
+            end = source.find("\n", index + 2)
+            end = len(source) if end < 0 else end
+            output.append(masked(source[index:end]))
+            index = end
             continue
-        if block_depth:
-            if pair == "/*":
-                block_depth += 1
-                index += 2
-            elif pair == "*/":
-                block_depth -= 1
-                index += 2
-            else:
-                if character == "\n":
-                    output.append(character)
-                index += 1
+        if source.startswith("/*", index):
+            depth = 1
+            end = index + 2
+            while end < len(source) and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            output.append(masked(source[index:end]))
+            index = end
             continue
-        if in_string:
-            output.append(character)
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            index += 1
+
+        literal_end = raw_string_end(index)
+        marker = '""'
+        if literal_end is None:
+            literal_end = quoted_string_end(index)
+        if literal_end is None:
+            literal_end = char_literal_end(index)
+            marker = "''"
+        if literal_end is not None:
+            segment = source[index:literal_end]
+            output.append(masked(segment, marker) if strip_literals else segment)
+            index = literal_end
             continue
-        if pair == "//":
-            in_line_comment = True
-            index += 2
-        elif pair == "/*":
-            block_depth = 1
-            index += 2
-        else:
-            output.append(character)
-            if character == '"':
-                in_string = True
-            index += 1
+
+        output.append(source[index])
+        index += 1
     return "".join(output)
 
 
+def rust_without_comments(source: str) -> str:
+    return project_rust(source, strip_literals=False)
+
+
 def rust_code_only(source: str) -> str:
-    source = rust_without_comments(source)
-    source = re.sub(r'(?s)(?:br|r)(?P<hash>#{0,16})".*?"(?P=hash)', '""', source)
-    return re.sub(r'(?s)b?"(?:\\.|[^"\\])*"', '""', source)
+    return project_rust(source, strip_literals=True)
+
+
+def desktop_runtime_boundary_violations(projected_rust: str) -> set[str]:
+    allowed_environment_read = 'std::env::var_os("")'
+    projected_rust = projected_rust.replace(allowed_environment_read, "")
+    return set(re.findall(r"\b(?:Command|PATH|env)\b", projected_rust))
 
 
 class GuiBaselineContractTests(unittest.TestCase):
@@ -102,6 +167,38 @@ struct RealCode;
         projected = rust_code_only(source)
         self.assertIn("struct RealCode", projected)
         self.assertNotRegex(projected, r"\b(?:DesktopLaunchOptions|Command|env|PATH)\b")
+
+    def test_rust_code_projection_preserves_code_after_raw_literals(self) -> None:
+        raw_mutant = (
+            'const DECOY: &str = r#"inner " // raw"#; '
+            'std::process::Command::new("wine");'
+        )
+        raw_byte_mutant = (
+            'const DECOY: &[u8] = br##"inner " // raw byte"##; '
+            'use std::env as runtime_env;'
+        )
+        self.assertEqual(desktop_runtime_boundary_violations(rust_code_only(raw_mutant)), {"Command"})
+        self.assertIn("env", desktop_runtime_boundary_violations(rust_code_only(raw_byte_mutant)))
+
+        decoy_only = 'const A: &str = r#"Command env // raw"#; const B: &[u8] = br#"PATH"#;'
+        self.assertEqual(desktop_runtime_boundary_violations(rust_code_only(decoy_only)), set())
+
+    def test_rust_code_projection_handles_other_literals_and_nested_comments(self) -> None:
+        source = r'''
+const TEXT: &str = "Command // string";
+const BYTES: &[u8] = b"env /* bytes */";
+const SLASH: char = '/';
+const QUOTE: char = '\'';
+const BYTE: u8 = b'\n';
+const FACE: char = '\u{1F600}';
+/* outer Command /* nested env */ PATH */
+// Command env PATH
+struct RealCode;
+'''
+        projected = rust_code_only(source)
+        self.assertIn("struct RealCode", projected)
+        self.assertNotRegex(projected, r"\b(?:Command|env|PATH)\b")
+        self.assertIn('"Command // string"', rust_without_comments(source))
 
     def test_fixed_official_asset_matrix_is_closed(self) -> None:
         self.assertEqual(
@@ -177,9 +274,7 @@ struct RealCode;
 
         allowed_environment_read = 'std::env::var_os("")'
         self.assertEqual(rust.count(allowed_environment_read), 1)
-        rust_without_smoke = rust.replace(allowed_environment_read, "")
-        self.assertNotRegex(rust_without_smoke, r"\benv\b")
-        self.assertNotRegex(rust, r"\b(?:Command|PATH)\b")
+        self.assertEqual(desktop_runtime_boundary_violations(rust), set())
         self.assertEqual(
             rust_without_comments(rust_source).count('std::env::var_os("COMPATFORGE_DESKTOP_SMOKE")'),
             1,
