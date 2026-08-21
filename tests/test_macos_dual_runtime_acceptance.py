@@ -71,90 +71,488 @@ gui_assets = load_module("download_gui_assets_for_dual_runtime_docs", GUI_ASSET_
 desktop_smoke = load_module("desktop_smoke_for_dual_runtime_ci", DESKTOP_SMOKE)
 
 
+def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
+    def active_content(value: str) -> str:
+        quote = ""
+        escaped = False
+        for index, character in enumerate(value):
+            if quote == '"':
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+            elif quote == "'":
+                if character == quote:
+                    quote = ""
+            elif character in ("'", '"'):
+                quote = character
+            elif character == "#" and (index == 0 or value[index - 1].isspace()):
+                return value[:index].rstrip()
+        return value.rstrip()
+
+    lines: list[tuple[int, str]] = []
+    for raw_line in source.splitlines():
+        prefix = raw_line[: len(raw_line) - len(raw_line.lstrip())]
+        if "\t" in prefix:
+            raise AssertionError("workflow indentation must use spaces")
+        content = active_content(raw_line.lstrip(" "))
+        if content:
+            lines.append((len(prefix), content))
+    return lines
+
+
+def _workflow_pair(content: str) -> tuple[str, str]:
+    if ":" not in content:
+        raise AssertionError(f"workflow mapping entry is invalid: {content}")
+    key, value = content.split(":", 1)
+    key = key.strip()
+    if not key:
+        raise AssertionError("workflow mapping key is empty")
+    return key, value.strip()
+
+
+def _workflow_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _workflow_inline_list(value: str) -> tuple[str, ...]:
+    if not value.startswith("[") or not value.endswith("]"):
+        raise AssertionError(f"workflow value must be an inline list: {value}")
+    body = value[1:-1].strip()
+    if not body:
+        return ()
+    return tuple(_workflow_scalar(item.strip()) for item in body.split(","))
+
+
+def _workflow_headers(
+    lines: list[tuple[int, str]], indent: int
+) -> list[tuple[int, str, str]]:
+    headers: list[tuple[int, str, str]] = []
+    names: set[str] = set()
+    for index, (line_indent, content) in enumerate(lines):
+        if line_indent != indent or content.startswith("- "):
+            continue
+        key, value = _workflow_pair(content)
+        if key in names:
+            raise AssertionError(f"duplicate workflow mapping key: {key}")
+        names.add(key)
+        headers.append((index, key, value))
+    return headers
+
+
+def _workflow_step(lines: list[tuple[int, str]]) -> dict[str, object]:
+    if not lines or lines[0][0] != 6 or not lines[0][1].startswith("- "):
+        raise AssertionError("workflow step boundary is invalid")
+    fields: dict[str, str] = {}
+    with_fields: dict[str, str] = {}
+
+    def set_field(key: str, value: str) -> None:
+        if key in fields:
+            raise AssertionError(f"duplicate workflow step field: {key}")
+        fields[key] = _workflow_scalar(value)
+
+    first_key, first_value = _workflow_pair(lines[0][1][2:].strip())
+    set_field(first_key, first_value)
+    index = 1
+    while index < len(lines):
+        indent, content = lines[index]
+        if indent != 8 or content.startswith("- "):
+            index += 1
+            continue
+        key, value = _workflow_pair(content)
+        if key == "with":
+            if value:
+                raise AssertionError("workflow step with mapping must be expanded")
+            index += 1
+            while index < len(lines) and lines[index][0] > 8:
+                child_indent, child_content = lines[index]
+                if child_indent == 10 and not child_content.startswith("- "):
+                    child_key, child_value = _workflow_pair(child_content)
+                    if child_key in with_fields:
+                        raise AssertionError(
+                            f"duplicate workflow step input: {child_key}"
+                        )
+                    with_fields[child_key] = _workflow_scalar(child_value)
+                index += 1
+            continue
+        if key == "run" and value in ("|", ">", "|-", ">-"):
+            index += 1
+            command_lines: list[str] = []
+            while index < len(lines) and lines[index][0] > 8:
+                command_lines.append(lines[index][1])
+                index += 1
+            set_field(key, "\n".join(command_lines))
+            continue
+        set_field(key, value)
+        index += 1
+    return {"fields": fields, "with": with_fields}
+
+
+def _workflow_job(lines: list[tuple[int, str]]) -> dict[str, object]:
+    direct_fields: dict[str, str] = {}
+    for indent, content in lines:
+        if indent == 4 and not content.startswith("- "):
+            key, value = _workflow_pair(content)
+            if key in direct_fields:
+                raise AssertionError(f"duplicate workflow job field: {key}")
+            direct_fields[key] = _workflow_scalar(value)
+
+    matrix: dict[str, object] = {}
+    strategy_index = next(
+        (
+            index
+            for index, (indent, content) in enumerate(lines)
+            if indent == 4 and _workflow_pair(content)[0] == "strategy"
+        ),
+        None,
+    )
+    if strategy_index is not None:
+        strategy_end = next(
+            (
+                index
+                for index in range(strategy_index + 1, len(lines))
+                if lines[index][0] <= 4
+            ),
+            len(lines),
+        )
+        matrix_index = next(
+            (
+                index
+                for index in range(strategy_index + 1, strategy_end)
+                if lines[index][0] == 6
+                and _workflow_pair(lines[index][1])[0] == "matrix"
+            ),
+            None,
+        )
+        if matrix_index is not None:
+            matrix_end = next(
+                (
+                    index
+                    for index in range(matrix_index + 1, strategy_end)
+                    if lines[index][0] <= 6
+                ),
+                strategy_end,
+            )
+            for indent, content in lines[matrix_index + 1 : matrix_end]:
+                if indent == 8 and not content.startswith("- "):
+                    key, value = _workflow_pair(content)
+                    if key in matrix:
+                        raise AssertionError(f"duplicate workflow matrix field: {key}")
+                    matrix[key] = (
+                        _workflow_inline_list(value)
+                        if key == "os"
+                        else _workflow_scalar(value)
+                    )
+
+    steps: list[dict[str, object]] = []
+    steps_index = next(
+        (
+            index
+            for index, (indent, content) in enumerate(lines)
+            if indent == 4 and _workflow_pair(content)[0] == "steps"
+        ),
+        None,
+    )
+    if steps_index is not None:
+        steps_end = next(
+            (
+                index
+                for index in range(steps_index + 1, len(lines))
+                if lines[index][0] <= 4
+            ),
+            len(lines),
+        )
+        starts = [
+            index
+            for index in range(steps_index + 1, steps_end)
+            if lines[index][0] == 6 and lines[index][1].startswith("- ")
+        ]
+        for position, start in enumerate(starts):
+            end = starts[position + 1] if position + 1 < len(starts) else steps_end
+            steps.append(_workflow_step(lines[start:end]))
+    return {"fields": direct_fields, "matrix": matrix, "steps": steps}
+
+
+def _workflow_oracle(source: str) -> dict[str, object]:
+    lines = _workflow_comment_free_lines(source)
+    top_headers = _workflow_headers(lines, 0)
+    top = {key: (index, value) for index, key, value in top_headers}
+    if "on" not in top or "jobs" not in top:
+        raise AssertionError("workflow must define top-level on and jobs mappings")
+
+    def top_block(name: str) -> list[tuple[int, str]]:
+        start = top[name][0]
+        end = next(
+            (index for index, _key, _value in top_headers if index > start),
+            len(lines),
+        )
+        return lines[start + 1 : end]
+
+    trigger_lines = top_block("on")
+    trigger_headers = _workflow_headers(trigger_lines, 2)
+    triggers: dict[str, dict[str, object]] = {}
+    for position, (start, name, value) in enumerate(trigger_headers):
+        if value:
+            raise AssertionError(f"workflow trigger must be a mapping: {name}")
+        end = (
+            trigger_headers[position + 1][0]
+            if position + 1 < len(trigger_headers)
+            else len(trigger_lines)
+        )
+        fields: dict[str, object] = {}
+        for indent, content in trigger_lines[start + 1 : end]:
+            if indent == 4 and not content.startswith("- "):
+                key, field_value = _workflow_pair(content)
+                if key in fields:
+                    raise AssertionError(f"duplicate workflow trigger field: {key}")
+                fields[key] = (
+                    _workflow_inline_list(field_value)
+                    if key == "branches"
+                    else _workflow_scalar(field_value)
+                )
+        triggers[name] = fields
+
+    job_lines = top_block("jobs")
+    job_headers = _workflow_headers(job_lines, 2)
+    jobs: dict[str, dict[str, object]] = {}
+    for position, (start, name, value) in enumerate(job_headers):
+        if value:
+            raise AssertionError(f"workflow job must be a mapping: {name}")
+        end = (
+            job_headers[position + 1][0]
+            if position + 1 < len(job_headers)
+            else len(job_lines)
+        )
+        jobs[name] = _workflow_job(job_lines[start + 1 : end])
+    return {"triggers": triggers, "jobs": jobs, "lines": lines}
+
+
 class MacOsDualRuntimeCiContractTests(unittest.TestCase):
     @staticmethod
     def _workflow() -> str:
         return CI_WORKFLOW.read_text(encoding="utf-8")
 
-    @classmethod
-    def _job(cls, name: str) -> str:
-        workflow = cls._workflow()
-        marker = f"  {name}:\n"
-        start = workflow.find(marker)
-        if start < 0:
-            raise AssertionError(f"CI job is missing: {name}")
-        end = len(workflow)
-        for line in workflow[start + len(marker) :].splitlines(keepends=True):
-            if (
-                line.startswith("  ")
-                and not line.startswith("    ")
-                and line.rstrip().endswith(":")
-            ):
-                end = workflow.find(line, start + len(marker))
-                break
-        return workflow[start:end]
+    @staticmethod
+    def _comment_command(workflow: str, command: str) -> str:
+        active = f"        run: {command}"
+        commented = f"        # run: {command}"
+        if active not in workflow:
+            raise AssertionError(f"active workflow command is missing: {command}")
+        return workflow.replace(active, commented, 1)
 
-    def test_default_ci_runs_dual_runtime_contracts_on_windows_and_macos(self) -> None:
-        job = self._job("macos-dual-runtime-contracts")
-        self.assertIn("os: [windows-latest, macos-latest]", job)
-        self.assertIn("runs-on: ${{ matrix.os }}", job)
-        self.assertNotIn("if:", job)
-        self.assertIn("uses: actions/setup-python@", job)
-        self.assertIn('python-version: "3.12"', job)
+    @staticmethod
+    def _append_contract_step(workflow: str, field: str, value: str) -> str:
+        marker = "\n  macos-dual-runtime-contracts:\n"
+        if marker not in workflow:
+            raise AssertionError("dual-Runtime job marker is missing")
+        step = f"      - name: Mutant step\n        {field}: {value}\n"
+        return workflow.replace(marker, f"\n{step}{marker}", 1)
+
+    def _assert_workflow_contract(self, source: str) -> None:
+        document = _workflow_oracle(source)
+        triggers = document["triggers"]
+        jobs = document["jobs"]
+
+        def assert_gate(fields: dict[str, str], label: str) -> None:
+            self.assertNotIn("if", fields, label)
+            self.assertNotIn("continue-on-error", fields, label)
+
+        self.assertIn("push", triggers)
+        self.assertIn("pull_request", triggers)
+        self.assertEqual(triggers["push"].get("branches"), ("main",))
+
+        dual = jobs.get("macos-dual-runtime-contracts")
+        self.assertIsNotNone(dual)
+        self.assertEqual(dual["fields"].get("runs-on"), "${{ matrix.os }}")
+        assert_gate(dual["fields"], "dual-Runtime job")
         self.assertEqual(
-            job.count(
-                "python -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v"
-            ),
-            1,
+            dual["matrix"].get("os"), ("windows-latest", "macos-latest")
         )
+        self.assertNotIn("exclude", dual["matrix"])
 
-    def test_default_ci_keeps_the_repository_and_desktop_gates(self) -> None:
-        workflow = self._workflow()
+        dual_steps = dual["steps"]
+        python_steps = [
+            step
+            for step in dual_steps
+            if step["fields"].get("uses", "").startswith("actions/setup-python@")
+        ]
+        self.assertEqual(len(python_steps), 1)
+        self.assertEqual(python_steps[0]["with"].get("python-version"), "3.12")
+        assert_gate(python_steps[0]["fields"], "Python setup")
+
+        dual_command = (
+            "python -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v"
+        )
+        dual_runs = [
+            step
+            for step in dual_steps
+            if step["fields"].get("run") == dual_command
+        ]
+        self.assertEqual(len(dual_runs), 1)
+        assert_gate(dual_runs[0]["fields"], dual_command)
+
+        def command_occurrences(command: str) -> list[tuple[dict, dict]]:
+            return [
+                (job, step)
+                for job in jobs.values()
+                for step in job["steps"]
+                if step["fields"].get("run") == command
+            ]
+
         for command in (
             "python -B scripts/validate_repository.py",
             "python -S -B -m unittest tests.test_macos_headless_preview -v",
             "python -S -B -m unittest tests.test_gui_baseline_contracts -v",
+        ):
+            occurrences = command_occurrences(command)
+            self.assertEqual(len(occurrences), 1, command)
+            job, step = occurrences[0]
+            assert_gate(job["fields"], command)
+            assert_gate(step["fields"], command)
+
+        desktop = jobs.get("desktop")
+        self.assertIsNotNone(desktop)
+        self.assertEqual(desktop["fields"].get("runs-on"), "macos-latest")
+        assert_gate(desktop["fields"], "desktop job")
+        desktop_steps = desktop["steps"]
+        node_steps = [
+            step
+            for step in desktop_steps
+            if step["fields"].get("uses", "").startswith("actions/setup-node@")
+        ]
+        self.assertEqual(len(node_steps), 1)
+        self.assertEqual(node_steps[0]["with"].get("node-version"), "24")
+        assert_gate(node_steps[0]["fields"], "Node setup")
+
+        smoke_command = (
+            "python -B apps/desktop/tests/smoke.py "
+            "apps/desktop/src-tauri/target/release/bundle/macos/"
+            "CompatForge.app/Contents/MacOS/CompatForge"
+        )
+        desktop_commands = (
+            "npm ci --prefix apps/desktop",
+            "npm run build --prefix apps/desktop",
             "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked",
             "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
-            "npm run build --prefix apps/desktop",
-        ):
-            with self.subTest(command=command):
-                self.assertEqual(workflow.count(command), 1)
-
-        desktop = self._job("desktop")
-        self.assertIn("runs-on: macos-latest", desktop)
-        self.assertIn('node-version: "24"', desktop)
-        self.assertIn("npm ci --prefix apps/desktop", desktop)
+            "npm run tauri --prefix apps/desktop -- build --bundles app",
+            smoke_command,
+        )
+        for command in desktop_commands:
+            matching = [
+                step
+                for step in desktop_steps
+                if step["fields"].get("run") == command
+            ]
+            self.assertEqual(len(matching), 1, command)
+            assert_gate(matching[0]["fields"], command)
         self.assertEqual(
-            desktop.count(
-                "python -B apps/desktop/tests/smoke.py "
+            shlex.split(smoke_command),
+            [
+                "python",
+                "-B",
+                "apps/desktop/tests/smoke.py",
                 "apps/desktop/src-tauri/target/release/bundle/macos/"
-                "CompatForge.app/Contents/MacOS/CompatForge"
-            ),
-            1,
+                "CompatForge.app/Contents/MacOS/CompatForge",
+            ],
         )
 
-    def test_default_ci_has_no_interactive_or_commercial_runtime_path(self) -> None:
-        workflow = self._workflow().casefold()
-        for forbidden in (
+        active_surfaces = [
+            step["fields"][field]
+            for job in jobs.values()
+            for step in job["steps"]
+            for field in ("run", "uses")
+            if field in step["fields"]
+        ]
+        forbidden = (
+            "curl",
+            "wget",
+            "invoke-webrequest",
+            "urllib",
+            "download",
+            "download_gui_assets.py",
+            "run_gui_baseline.py",
             "--allow-network",
             "--accept-interactive",
             "crossover",
+            "codeweavers",
             "whisky",
-            "download_gui_assets.py",
-            "run_gui_baseline.py",
             "screenshot",
-            "msiexec",
-            ".msi",
+            "screencapture",
             "7z.exe",
             "sumatrapdf.exe",
             "notepad++.exe",
-            "self-hosted",
-            "${{ secrets.",
-            "secrets:",
-        ):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, workflow)
+            "msiexec",
+            "sudo ",
+            "installer",
+            ".pkg",
+            ".dmg",
+            "hdiutil",
+        )
+        for surface in active_surfaces:
+            folded = surface.casefold()
+            for token in forbidden:
+                self.assertNotIn(token, folded, surface)
+
+        active_lines = "\n".join(content for _indent, content in document["lines"])
+        folded_lines = active_lines.casefold()
+        for token in ("secrets.", "secrets[", "secrets:", "self-hosted"):
+            self.assertNotIn(token, folded_lines)
+
+    def _assert_smoke_main_contract(self, module: object) -> None:
+        source_environment = {
+            "PATH": "/usr/bin",
+            "HOME": "/tmp/home",
+            "COMPATFORGE_RUNTIME_ROOT": "/private/runtime",
+            "WINEPREFIX": "/private/bottle",
+            "CX_BOTTLE": "private-bottle",
+            "CROSSOVER_ROOT": "/private/crossover",
+            "WHISKY_BOTTLE": "/private/whisky",
+        }
+        expected_environment = module.smoke_environment(source_environment)
+        self.assertEqual(
+            expected_environment,
+            {
+                "PATH": "/usr/bin",
+                "HOME": "/tmp/home",
+                "COMPATFORGE_DESKTOP_SMOKE": "1",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "CompatForge"
+            executable.write_bytes(b"packaged-app")
+            completed = subprocess.CompletedProcess(
+                [str(executable)],
+                0,
+                "COMPATFORGE_TAURI_SMOKE_READY\n",
+                "",
+            )
+            with (
+                mock.patch.dict(module.os.environ, source_environment, clear=True),
+                mock.patch.object(
+                    module,
+                    "smoke_environment",
+                    return_value=expected_environment,
+                ) as build_environment,
+                mock.patch.object(
+                    module.subprocess, "run", return_value=completed
+                ) as run,
+                mock.patch.object(
+                    module.sys, "argv", ["smoke.py", str(executable)]
+                ),
+            ):
+                self.assertEqual(module.main(), 0)
+        build_environment.assert_called_once_with()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [str(executable)])
+        self.assertIs(run.call_args.kwargs["env"], expected_environment)
+        self.assertEqual(completed.stdout, "COMPATFORGE_TAURI_SMOKE_READY\n")
+
+    def test_default_ci_has_the_complete_active_contract(self) -> None:
+        self._assert_workflow_contract(self._workflow())
 
     def test_desktop_smoke_scrubs_runtime_environment(self) -> None:
         source = {
@@ -179,26 +577,104 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
         )
 
     def test_desktop_smoke_launches_only_the_packaged_executable(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            executable = Path(directory) / "CompatForge"
-            executable.write_bytes(b"packaged-app")
-            completed = subprocess.CompletedProcess(
-                [str(executable)],
-                0,
-                "COMPATFORGE_TAURI_SMOKE_READY\n",
-                "",
-            )
-            with (
-                mock.patch.object(
-                    desktop_smoke.sys, "argv", ["smoke.py", str(executable)]
+        self._assert_smoke_main_contract(desktop_smoke)
+
+    def test_structured_workflow_oracle_rejects_review_mutants(self) -> None:
+        workflow = self._workflow()
+        required_commands = (
+            "python -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v",
+            "python -B scripts/validate_repository.py",
+            "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
+            "python -B apps/desktop/tests/smoke.py apps/desktop/src-tauri/target/release/bundle/macos/CompatForge.app/Contents/MacOS/CompatForge",
+        )
+        mutants = {
+            f"comment-{index}": self._comment_command(workflow, command)
+            for index, command in enumerate(required_commands)
+        }
+        mutants.update(
+            {
+                "delete-pull-request": workflow.replace("  pull_request:\n", "", 1),
+                "exclude-windows": workflow.replace(
+                    "        os: [windows-latest, macos-latest]\n",
+                    "        os: [windows-latest, macos-latest]\n"
+                    "        exclude:\n"
+                    "          - os: windows-latest\n",
+                    1,
                 ),
-                mock.patch.object(
-                    desktop_smoke.subprocess, "run", return_value=completed
-                ) as run,
-            ):
-                self.assertEqual(desktop_smoke.main(), 0)
-        self.assertEqual(run.call_args.args[0], [str(executable)])
-        self.assertEqual(run.call_args.kwargs["env"]["COMPATFORGE_DESKTOP_SMOKE"], "1")
+                "rename-desktop-comment-shell": workflow.replace(
+                    "\n  desktop:\n", "\n  desktop-real:\n", 1
+                )
+                + "\n# jobs:\n#   desktop:\n#     runs-on: macos-latest\n",
+                "continue-on-error-dual": workflow.replace(
+                    "        run: python -S -B -m unittest "
+                    "tests.test_macos_dual_runtime_acceptance -v\n",
+                    "        run: python -S -B -m unittest "
+                    "tests.test_macos_dual_runtime_acceptance -v\n"
+                    "        continue-on-error: true\n",
+                    1,
+                ),
+            }
+        )
+        for label, mutant in mutants.items():
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                self._assert_workflow_contract(mutant)
+
+    def test_structured_workflow_oracle_rejects_active_forbidden_surfaces(self) -> None:
+        workflow = self._workflow()
+        commands = (
+            "curl https://example.invalid/runtime",
+            "wget https://example.invalid/runtime",
+            "Invoke-WebRequest https://example.invalid/runtime",
+            'python -c "import urllib.request"',
+            "python tools/download_gui_assets.py fetch 7zip --allow-network",
+            "python tools/download_commercial_runtime.py",
+            "python tools/run_macos_dual_runtime_acceptance.py --accept-interactive",
+            "crossover --version",
+            "whisky --version",
+            "python capture_screenshot.py",
+            "screencapture /tmp/runtime.png",
+            "sudo installer -pkg Runtime.pkg -target /",
+            "hdiutil attach Runtime.dmg",
+            "echo ${{ secrets.RUNTIME_TOKEN }}",
+        )
+        for command in commands:
+            mutant = self._append_contract_step(workflow, "run", command)
+            with self.subTest(command=command), self.assertRaises(AssertionError):
+                self._assert_workflow_contract(mutant)
+
+        prohibited_use = self._append_contract_step(
+            workflow, "uses", "crossover/download-runtime@v1"
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_workflow_contract(prohibited_use)
+
+        self_hosted = workflow.replace(
+            "    runs-on: ${{ matrix.os }}\n", "    runs-on: self-hosted\n", 1
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_workflow_contract(self_hosted)
+
+    def test_structured_workflow_oracle_ignores_comments(self) -> None:
+        workflow = self._workflow() + (
+            "\n# curl https://example.invalid/runtime\n"
+            "# sudo installer -pkg Runtime.pkg -target /\n"
+            "# uses: crossover/download-runtime@v1\n"
+            "# runs-on: self-hosted\n"
+            "# run: echo ${{ secrets.RUNTIME_TOKEN }}\n"
+        )
+        self._assert_workflow_contract(workflow)
+
+    def test_desktop_smoke_main_bypass_mutant_is_rejected(self) -> None:
+        source = DESKTOP_SMOKE.read_text(encoding="utf-8")
+        original = "    environment = smoke_environment()\n"
+        self.assertIn(original, source)
+        mutant = source.replace(original, "    environment = os.environ.copy()\n", 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "smoke_mutant.py"
+            path.write_text(mutant, encoding="utf-8")
+            module = load_module("desktop_smoke_bypass_mutant", path)
+            with self.assertRaises(AssertionError):
+                self._assert_smoke_main_contract(module)
 
 
 class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
