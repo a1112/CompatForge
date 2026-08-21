@@ -11,6 +11,8 @@ import re
 import stat
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Sequence
@@ -67,6 +69,11 @@ MAX_JSON_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 12
 MAX_JSON_NODES = 512
 MAX_TEXT_CHARS = 4096
+MAX_PROCESS_STREAM_BYTES = 64 * 1024
+MAX_PROCESS_OUTPUT_BYTES = 64 * 1024
+PROCESS_READ_CHUNK_BYTES = 8192
+PROCESS_POLL_SECONDS = 0.01
+PROCESS_STOP_TIMEOUT_SECONDS = 5
 DISCOVERY_TIMEOUT_SECONDS = 30
 CHILD_TIMEOUT_SECONDS = 20 * 60
 DESKTOP_TIMEOUT_SECONDS = 20 * 60
@@ -125,6 +132,23 @@ class UniqueFlagAction(argparse.Action):
 
 
 @dataclass(frozen=True)
+class NodeIdentity:
+    device: int
+    inode: int
+    kind: int
+
+
+@dataclass(frozen=True)
+class PathBinding:
+    path: Path
+    components: tuple[tuple[Path, NodeIdentity], ...]
+    absent_components: tuple[Path, ...]
+    target_existed: bool
+    target_size: int | None
+    target_mtime_ns: int | None
+
+
+@dataclass(frozen=True)
 class AcceptancePaths:
     compatforge_cli: Path
     desktop_app: Path
@@ -135,6 +159,7 @@ class AcceptancePaths:
     work_root: Path
     interaction_evidence_root: Path
     allow_network: bool
+    bindings: dict[str, PathBinding]
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -207,6 +232,94 @@ def _canonical(path: Path, field: str) -> Path:
         return path.resolve(strict=False)
     except (OSError, RuntimeError) as error:
         raise AcceptanceError(f"{field} could not be resolved") from error
+
+
+def _node_identity(metadata: os.stat_result) -> NodeIdentity:
+    return NodeIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        kind=stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _capture_binding(path: Path, field: str) -> PathBinding:
+    _reject_unsafe_components(path, field)
+    components: list[tuple[Path, NodeIdentity]] = []
+    absent_components: list[Path] = []
+    target_metadata: os.stat_result | None = None
+    for component in reversed((path, *path.parents)):
+        try:
+            metadata = component.lstat()
+        except FileNotFoundError:
+            absent_components.append(component)
+            continue
+        except OSError as error:
+            raise AcceptanceError(f"{field} identity could not be captured") from error
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+            raise AcceptanceError(f"{field} has an unsafe path component")
+        components.append((component, _node_identity(metadata)))
+        if component == path:
+            target_metadata = metadata
+    is_regular = target_metadata is not None and stat.S_ISREG(target_metadata.st_mode)
+    return PathBinding(
+        path=path,
+        components=tuple(components),
+        absent_components=tuple(absent_components),
+        target_existed=target_metadata is not None,
+        target_size=target_metadata.st_size if is_regular else None,
+        target_mtime_ns=target_metadata.st_mtime_ns if is_regular else None,
+    )
+
+
+def _revalidate_binding(binding: PathBinding, field: str) -> None:
+    for component, expected in binding.components:
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            raise AcceptanceError(f"{field} identity changed") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or _node_identity(metadata) != expected
+        ):
+            raise AcceptanceError(f"{field} identity changed")
+    for component in binding.absent_components:
+        try:
+            component.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AcceptanceError(f"{field} identity changed") from error
+        raise AcceptanceError(f"{field} identity changed")
+    try:
+        target_metadata = binding.path.lstat()
+    except FileNotFoundError:
+        target_metadata = None
+    except OSError as error:
+        raise AcceptanceError(f"{field} identity changed") from error
+    if (target_metadata is not None) != binding.target_existed:
+        raise AcceptanceError(f"{field} identity changed")
+    if target_metadata is not None and binding.target_size is not None:
+        if (
+            target_metadata.st_size != binding.target_size
+            or target_metadata.st_mtime_ns != binding.target_mtime_ns
+        ):
+            raise AcceptanceError(f"{field} identity changed")
+
+
+def _revalidate_bindings(paths: AcceptancePaths) -> None:
+    for field, binding in paths.bindings.items():
+        _revalidate_binding(binding, field)
+
+
+def _refresh_root_bindings(paths: AcceptancePaths) -> None:
+    for field, path in (
+        ("cache-root", paths.cache_root),
+        ("runtime-store-root", paths.runtime_store_root),
+        ("storage-root", paths.storage_root),
+        ("work-root", paths.work_root),
+    ):
+        paths.bindings[field] = _capture_binding(path, field)
 
 
 def _overlaps(left: Path, right: Path) -> bool:
@@ -326,9 +439,9 @@ def _validate_interaction_document(value: object) -> None:
         if (
             not isinstance(checks, dict)
             or set(checks) != set(required)
-            or any(not isinstance(checked, bool) for checked in checks.values())
+            or any(checked is not True for checked in checks.values())
         ):
-            raise AcceptanceError("interaction evidence checks are incomplete")
+            raise AcceptanceError("interaction evidence checks must all be true")
 
 
 def _bounded_entries(root: Path, limit: int, label: str) -> list[Path]:
@@ -421,7 +534,18 @@ def preflight(
     _empty_or_absent_directory(resolved["runtime-store-root"], "runtime-store-root")
     _empty_or_absent_directory(resolved["storage-root"], "storage-root")
     _empty_or_absent_directory(resolved["work-root"], "work-root")
+
+    bindings = {
+        field: _capture_binding(path, field) for field, path in resolved.items()
+    }
+    for round_id in ROUNDS:
+        for runtime_id in RUNTIME_IDS:
+            field = f"interaction-evidence:{round_id}:{runtime_id}"
+            path = resolved["interaction-evidence-root"] / round_id / f"{runtime_id}.json"
+            bindings[field] = _capture_binding(path, field)
     _validate_interaction_root(resolved["interaction-evidence-root"])
+    for field, binding in bindings.items():
+        _revalidate_binding(binding, field)
 
     return AcceptancePaths(
         compatforge_cli=resolved["compatforge-cli"],
@@ -433,11 +557,15 @@ def preflight(
         work_root=resolved["work-root"],
         interaction_evidence_root=resolved["interaction-evidence-root"],
         allow_network=arguments.allow_network is True,
+        bindings=bindings,
     )
 
 
 def _portable_entrypoint(value: object, field: str) -> PurePosixPath:
     if not isinstance(value, str) or not value or "\\" in value or ":" in value:
+        raise AcceptanceError(f"Runtime {field} is invalid")
+    raw_parts = value.split("/")
+    if any(part in ("", ".", "..") for part in raw_parts):
         raise AcceptanceError(f"Runtime {field} is invalid")
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
@@ -458,7 +586,17 @@ def _safe_text(value: object, field: str, *, max_chars: int = 128) -> str:
     return value
 
 
-def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[str, str]]:
+def _runtime_version(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 128
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+() -]*", value) is None
+    ):
+        raise AcceptanceError("Runtime version is invalid")
+    return value
+
+
+def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[str, object]]:
     value = parse_closed_json(text, "Runtime discovery")
     if not isinstance(value, dict) or set(value) != {"schemaVersion", "runtimes"}:
         raise AcceptanceError("Runtime discovery keys are invalid")
@@ -486,7 +624,7 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
             )
         ),
     ]
-    validated: list[dict[str, str]] = []
+    validated: list[dict[str, object]] = []
     runtime_roots: list[Path] = []
     for runtime_id, descriptor in zip(RUNTIME_IDS, runtimes):
         if not isinstance(descriptor, dict) or set(descriptor) != RUNTIME_DESCRIPTOR_KEYS:
@@ -504,15 +642,20 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
         }
         if source not in expected_sources[runtime_id]:
             raise AcceptanceError("Runtime descriptor source is invalid")
-        version = _safe_text(descriptor["version"], "Runtime version")
+        version = _runtime_version(descriptor["version"])
         root = _canonical(_absolute(descriptor["materializedRoot"], "Runtime root"), "Runtime root")
         if not root.is_dir() or any(_overlaps(root, protected_path) for protected_path in protected):
             raise AcceptanceError("Runtime root is invalid or overlaps protected input")
         if any(_overlaps(root, other) for other in runtime_roots):
             raise AcceptanceError("Runtime roots overlap")
         runtime_roots.append(root)
+        root_binding = _capture_binding(root, "Runtime root")
         wine = _portable_entrypoint(descriptor["wine"], "wine")
         wineserver = _portable_entrypoint(descriptor["wineserver"], "wineserver")
+        if wine == wineserver:
+            raise AcceptanceError("Runtime entrypoints must be distinct")
+        resolved_entrypoints: list[Path] = []
+        entrypoint_bindings: list[PathBinding] = []
         for entrypoint, field in ((wine, "wine"), (wineserver, "wineserver")):
             executable = root.joinpath(*entrypoint.parts)
             _reject_unsafe_components(executable, f"Runtime {field}")
@@ -522,7 +665,19 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
                 raise AcceptanceError(f"Runtime {field} is invalid") from error
             if root not in resolved_executable.parents:
                 raise AcceptanceError(f"Runtime {field} escapes its root")
+            entrypoint_bindings.append(
+                _capture_binding(resolved_executable, f"Runtime {field}")
+            )
             _regular_executable(resolved_executable, f"Runtime {field}")
+            resolved_entrypoints.append(resolved_executable)
+        try:
+            if resolved_entrypoints[0].samefile(resolved_entrypoints[1]):
+                raise AcceptanceError("Runtime entrypoints must be distinct")
+        except OSError as error:
+            raise AcceptanceError("Runtime entrypoint identity is invalid") from error
+        _revalidate_binding(root_binding, "Runtime root")
+        _revalidate_binding(entrypoint_bindings[0], "Runtime wine")
+        _revalidate_binding(entrypoint_bindings[1], "Runtime wineserver")
         validated.append(
             {
                 "runtimeId": runtime_id,
@@ -531,17 +686,203 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
                 "wine": wine.as_posix(),
                 "wineserver": wineserver.as_posix(),
                 "version": version,
+                "_bindings": {
+                    "Runtime root": root_binding,
+                    "Runtime wine": entrypoint_bindings[0],
+                    "Runtime wineserver": entrypoint_bindings[1],
+                },
             }
         )
     return validated
 
 
+def _revalidate_runtime(descriptor: dict[str, object]) -> None:
+    bindings = descriptor.get("_bindings")
+    if not isinstance(bindings, dict):
+        raise AcceptanceError("Runtime identity binding is missing")
+    for field, binding in bindings.items():
+        if not isinstance(field, str) or not isinstance(binding, PathBinding):
+            raise AcceptanceError("Runtime identity binding is invalid")
+        _revalidate_binding(binding, field)
+
+
+def _descriptor_text(descriptor: dict[str, object], field: str) -> str:
+    value = descriptor.get(field)
+    if not isinstance(value, str) or not value:
+        raise AcceptanceError("Runtime identity binding is invalid")
+    return value
+
+
+def _process_poll(process: object) -> int | None:
+    poll = getattr(process, "poll", None)
+    if not callable(poll):
+        return None
+    try:
+        value = poll()
+    except Exception:
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _stop_process(process: object) -> bool:
+    terminate = getattr(process, "terminate", None)
+    kill = getattr(process, "kill", None)
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return False
+    if _process_poll(process) is not None:
+        return True
+    if callable(terminate):
+        try:
+            terminate()
+        except Exception:
+            pass
+    try:
+        wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+    except Exception:
+        if callable(kill):
+            try:
+                kill()
+            except Exception:
+                pass
+        try:
+            wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        except Exception:
+            return False
+    if _process_poll(process) is not None:
+        return True
+    if callable(kill):
+        try:
+            kill()
+            wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        except Exception:
+            return False
+    return _process_poll(process) is not None
+
+
+def _close_process_streams(process: object) -> None:
+    for name in ("stdout", "stderr"):
+        stream = getattr(process, name, None)
+        close = getattr(stream, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0:
+        raise AcceptanceError("child process timeout is invalid")
+    try:
+        process = subprocess.Popen(
+            list(arguments),
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(CHILD_ENV),
+            shell=False,
+        )
+    except OSError as error:
+        raise AcceptanceError("child process could not be started") from error
+    if process.stdout is None or process.stderr is None:
+        if not _stop_process(process):
+            _close_process_streams(process)
+            raise AcceptanceError("child process cleanup failed")
+        _close_process_streams(process)
+        raise AcceptanceError("child process capture is unavailable")
+
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    total = 0
+    lock = threading.Lock()
+    overflow = threading.Event()
+    reader_failed = threading.Event()
+
+    def reader(name: str, stream: object) -> None:
+        nonlocal total
+        read = getattr(stream, "read", None)
+        if not callable(read):
+            reader_failed.set()
+            return
+        try:
+            while True:
+                chunk = read(PROCESS_READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                if not isinstance(chunk, bytes):
+                    reader_failed.set()
+                    return
+                with lock:
+                    stream_remaining = MAX_PROCESS_STREAM_BYTES - len(captured[name])
+                    total_remaining = MAX_PROCESS_OUTPUT_BYTES - total
+                    accepted = min(len(chunk), max(0, stream_remaining), max(0, total_remaining))
+                    if accepted:
+                        captured[name].extend(chunk[:accepted])
+                        total += accepted
+                    if accepted != len(chunk):
+                        overflow.set()
+                        return
+        except Exception:
+            reader_failed.set()
+
+    threads = [
+        threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while _process_poll(process) is None:
+        if overflow.is_set() or reader_failed.is_set():
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(PROCESS_POLL_SECONDS)
+    if timed_out or overflow.is_set() or reader_failed.is_set():
+        if not _stop_process(process):
+            _close_process_streams(process)
+            raise AcceptanceError("child process cleanup failed")
+    for thread in threads:
+        thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
+    if any(thread.is_alive() for thread in threads):
+        if not _stop_process(process):
+            _close_process_streams(process)
+            raise AcceptanceError("child process cleanup failed")
+        _close_process_streams(process)
+        for thread in threads:
+            thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
+        raise AcceptanceError("child process capture did not stop")
+    _close_process_streams(process)
+    if overflow.is_set():
+        raise AcceptanceError("child process exceeded output limit")
+    if timed_out:
+        raise AcceptanceError("child process timed out")
+    if reader_failed.is_set():
+        raise AcceptanceError("child process capture failed")
+    returncode = _process_poll(process)
+    if returncode is None:
+        if not _stop_process(process):
+            raise AcceptanceError("child process cleanup failed")
+        raise AcceptanceError("child process did not report an exit status")
+    try:
+        stdout = bytes(captured["stdout"]).decode("utf-8")
+        stderr = bytes(captured["stderr"]).decode("utf-8")
+    except UnicodeError as error:
+        raise AcceptanceError("child process output is invalid") from error
+    return subprocess.CompletedProcess(list(arguments), returncode, stdout, stderr)
+
+
 def _invoke(
     arguments: Sequence[str],
-    runner: Runner,
+    runner: Runner | None,
     *,
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
+    if runner is None:
+        return _bounded_run(arguments, timeout=timeout)
     try:
         result = runner(
             list(arguments),
@@ -568,7 +909,9 @@ def _invoke(
     return result
 
 
-def discover_runtimes(arguments: argparse.Namespace, runner: Runner) -> list[dict[str, str]]:
+def discover_runtimes(
+    arguments: argparse.Namespace, runner: Runner | None
+) -> list[dict[str, object]]:
     result = _invoke(
         [sys.executable, "-S", "-B", str(DISCOVERY_TOOL), "--all"],
         runner,
@@ -580,6 +923,7 @@ def discover_runtimes(arguments: argparse.Namespace, runner: Runner) -> list[dic
 
 
 def _prepare_layout(paths: AcceptancePaths) -> None:
+    _revalidate_bindings(paths)
     for root, field in (
         (paths.runtime_store_root, "runtime-store-root"),
         (paths.storage_root, "storage-root"),
@@ -599,6 +943,7 @@ def _prepare_layout(paths: AcceptancePaths) -> None:
                     (paths.storage_root / round_id / runtime_id / phase).mkdir(parents=True)
     except OSError as error:
         raise AcceptanceError("acceptance layout could not be created") from error
+    _refresh_root_bindings(paths)
 
 
 def _digest(value: object, field: str) -> str:
@@ -607,7 +952,7 @@ def _digest(value: object, field: str) -> str:
     return value
 
 
-def _project_console(value: object, descriptor: dict[str, str]) -> dict[str, object]:
+def _project_console(value: object, descriptor: dict[str, object]) -> dict[str, object]:
     required = {
         "schemaVersion",
         "packId",
@@ -625,11 +970,13 @@ def _project_console(value: object, descriptor: dict[str, str]) -> dict[str, obj
     }
     if not isinstance(value, dict) or set(value) != required:
         raise AcceptanceError("Console summary keys are invalid")
-    expected_pack = f"wine-macos-{descriptor['runtimeId']}-preview"
+    runtime_id = _descriptor_text(descriptor, "runtimeId")
+    version = _descriptor_text(descriptor, "version")
+    expected_pack = f"wine-macos-{runtime_id}-preview"
     if (
         value["schemaVersion"] != "1"
         or value["packId"] != expected_pack
-        or value["packVersion"] != descriptor["version"]
+        or value["packVersion"] != version
         or value["hostArchitecture"] != "arm64"
         or value["runtime"] != "wine"
         or value["runtimeSource"] != "explicit"
@@ -648,7 +995,7 @@ def _project_console(value: object, descriptor: dict[str, str]) -> dict[str, obj
         raise AcceptanceError("Console event kinds are invalid")
     return {
         "schemaVersion": "1",
-        "runtimeId": descriptor["runtimeId"],
+        "runtimeId": runtime_id,
         "appId": "console",
         "status": "accepted",
         "packDigest": _digest(value["packDigest"], "Console pack digest"),
@@ -687,9 +1034,43 @@ def _project_exit(value: object) -> dict[str, object]:
     return {"present": exit_value["present"], "code": code, "success": exit_value["success"]}
 
 
+def _successful_exit(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"present", "code", "success"}
+        and value["present"] is True
+        and value["code"] == 0
+        and not isinstance(value["code"], bool)
+        and value["success"] is True
+    )
+
+
+def _complete_accepted_gui(application: object) -> bool:
+    if not isinstance(application, dict) or application.get("status") != "accepted":
+        return False
+    application_id = application.get("appId")
+    if application_id not in REQUIRED_INTERACTIONS:
+        return False
+    asset_digest = application.get("assetSha256")
+    interactions = application.get("interactionChecks")
+    return (
+        isinstance(asset_digest, str)
+        and re.fullmatch(r"[0-9a-f]{64}", asset_digest) is not None
+        and application.get("cleanup") is True
+        and isinstance(interactions, dict)
+        and tuple(interactions) == REQUIRED_INTERACTIONS[application_id]
+        and all(checked is True for checked in interactions.values())
+        and _successful_exit(application.get("installerExit"))
+        and _successful_exit(application.get("exit"))
+        and application.get("windowAvailable") is True
+    )
+
+
 def _project_gui(
-    value: object, descriptor: dict[str, str]
+    value: object, descriptor: dict[str, object]
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
+    runtime_id = _descriptor_text(descriptor, "runtimeId")
+    runtime_version = _descriptor_text(descriptor, "version")
     summary = _exact_keys(value, {"schemaVersion", "receipt", "applications"}, set(), "GUI summary")
     if summary["schemaVersion"] != "1":
         raise AcceptanceError("GUI summary schema is invalid")
@@ -701,14 +1082,14 @@ def _project_gui(
     )
     if (
         receipt["schemaVersion"] != "1"
-        or receipt["runtimeId"] != descriptor["runtimeId"]
-        or receipt["version"] != descriptor["version"]
+        or receipt["runtimeId"] != runtime_id
+        or receipt["version"] != runtime_version
     ):
         raise AcceptanceError("GUI receipt identity is invalid")
     _safe_text(receipt["packId"], "GUI pack id")
     _safe_text(receipt["source"], "GUI Runtime source")
     receipt_projection: dict[str, object] = {
-        "runtimeVersion": descriptor["version"],
+        "runtimeVersion": runtime_version,
         "packDigest": _digest(receipt["packDigest"], "GUI pack digest"),
     }
     if "activated" in receipt and not isinstance(receipt["activated"], bool):
@@ -738,7 +1119,7 @@ def _project_gui(
         status_value = application["status"]
         if (
             application["schemaVersion"] != "1"
-            or application["runtimeId"] != descriptor["runtimeId"]
+            or application["runtimeId"] != runtime_id
             or application["appId"] != application_id
             or status_value not in STATUSES
             or not isinstance(application["cleanup"], bool)
@@ -746,7 +1127,7 @@ def _project_gui(
             raise AcceptanceError("GUI application identity is invalid")
         output = {
             "schemaVersion": "1",
-            "runtimeId": descriptor["runtimeId"],
+            "runtimeId": runtime_id,
             "appId": application_id,
             "status": status_value,
             "cleanup": application["cleanup"],
@@ -789,12 +1170,57 @@ def _project_gui(
                 if not isinstance(application[field], bool):
                     raise AcceptanceError("GUI observation flag is invalid")
                 output[field] = application[field]
+        if status_value == "accepted" and not _complete_accepted_gui(output):
+            raise AcceptanceError("accepted GUI application evidence is incomplete")
         projected.append(output)
     return receipt_projection, projected
 
 
-def _headless_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, str]) -> list[str]:
-    runtime_id = descriptor["runtimeId"]
+def aggregate_is_accepted(rounds: object) -> bool:
+    if not isinstance(rounds, list) or len(rounds) != len(ROUNDS):
+        return False
+    for round_id, round_entry in zip(ROUNDS, rounds):
+        if not isinstance(round_entry, dict) or round_entry.get("roundId") != round_id:
+            return False
+        runtimes = round_entry.get("runtimes")
+        if not isinstance(runtimes, list) or len(runtimes) != len(RUNTIME_IDS):
+            return False
+        for runtime_id, runtime in zip(RUNTIME_IDS, runtimes):
+            if not isinstance(runtime, dict) or runtime.get("runtimeId") != runtime_id:
+                return False
+            if not isinstance(runtime.get("runtimeVersion"), str):
+                return False
+            if not isinstance(runtime.get("packDigest"), str) or re.fullmatch(
+                r"sha256:[0-9a-f]{64}", runtime["packDigest"]
+            ) is None:
+                return False
+            desktop = runtime.get("desktop")
+            if not isinstance(desktop, dict) or desktop != {"status": "accepted", "exitCode": 0}:
+                return False
+            applications = runtime.get("applications")
+            if not isinstance(applications, list) or len(applications) != 4:
+                return False
+            if [value.get("appId") if isinstance(value, dict) else None for value in applications] != list(
+                RUNTIME_MATRIX[runtime_id]
+            ):
+                return False
+            console = applications[0]
+            if (
+                not isinstance(console, dict)
+                or console.get("status") != "accepted"
+                or console.get("exitCode") != 0
+                or not isinstance(console.get("eventKinds"), list)
+                or not isinstance(console.get("packDigest"), str)
+                or not isinstance(console.get("guestDigest"), str)
+            ):
+                return False
+            if any(not _complete_accepted_gui(application) for application in applications[1:]):
+                return False
+    return True
+
+
+def _headless_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, object]) -> list[str]:
+    runtime_id = _descriptor_text(descriptor, "runtimeId")
     return [
         sys.executable,
         "-S",
@@ -805,11 +1231,11 @@ def _headless_command(paths: AcceptancePaths, round_id: str, descriptor: dict[st
         "--cc",
         str(paths.cc),
         "--wine-root",
-        descriptor["materializedRoot"],
+        _descriptor_text(descriptor, "materializedRoot"),
         "--wine",
-        descriptor["wine"],
+        _descriptor_text(descriptor, "wine"),
         "--wineserver",
-        descriptor["wineserver"],
+        _descriptor_text(descriptor, "wineserver"),
         "--runtime-store",
         str(paths.runtime_store_root / round_id / runtime_id / "console"),
         "--storage-root",
@@ -819,12 +1245,12 @@ def _headless_command(paths: AcceptancePaths, round_id: str, descriptor: dict[st
         "--pack-id",
         f"wine-macos-{runtime_id}-preview",
         "--version",
-        descriptor["version"],
+        _descriptor_text(descriptor, "version"),
     ]
 
 
-def _gui_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, str]) -> list[str]:
-    runtime_id = descriptor["runtimeId"]
+def _gui_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, object]) -> list[str]:
+    runtime_id = _descriptor_text(descriptor, "runtimeId")
     command = [
         sys.executable,
         "-S",
@@ -843,13 +1269,13 @@ def _gui_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, st
         "--runtime-id",
         runtime_id,
         "--wine-root",
-        descriptor["materializedRoot"],
+        _descriptor_text(descriptor, "materializedRoot"),
         "--wine",
-        descriptor["wine"],
+        _descriptor_text(descriptor, "wine"),
         "--wineserver",
-        descriptor["wineserver"],
+        _descriptor_text(descriptor, "wineserver"),
         "--version",
-        descriptor["version"],
+        _descriptor_text(descriptor, "version"),
         "--accept-interactive",
         "--interaction-evidence",
         str(paths.interaction_evidence_root / round_id / f"{runtime_id}.json"),
@@ -859,20 +1285,20 @@ def _gui_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, st
     return command
 
 
-def _desktop_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, str]) -> list[str]:
-    runtime_id = descriptor["runtimeId"]
+def _desktop_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, object]) -> list[str]:
+    runtime_id = _descriptor_text(descriptor, "runtimeId")
     return [
         str(paths.desktop_app),
         "--acceptance-root",
         str(paths.work_root / round_id / runtime_id / "desktop"),
         "--wine-root",
-        descriptor["materializedRoot"],
+        _descriptor_text(descriptor, "materializedRoot"),
         "--wine",
-        descriptor["wine"],
+        _descriptor_text(descriptor, "wine"),
         "--wineserver",
-        descriptor["wineserver"],
+        _descriptor_text(descriptor, "wineserver"),
         "--version",
-        descriptor["version"],
+        _descriptor_text(descriptor, "version"),
     ]
 
 
@@ -888,7 +1314,7 @@ def _launch_desktop(
     launcher: Launcher,
     waiter: Waiter,
     printer: Printer,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], bool]:
     printer("compatforge-desktop-command: " + json.dumps(command, ensure_ascii=False, separators=(",", ":")))
     try:
         process = launcher(
@@ -900,26 +1326,78 @@ def _launch_desktop(
             stderr=subprocess.DEVNULL,
             shell=False,
         )
+    except Exception:
+        return (
+            {
+                "status": "failed",
+                "failureClass": "desktop",
+                "reasonCode": "desktop-launch-failed",
+            },
+            True,
+        )
+    try:
         returncode = waiter(process, DESKTOP_TIMEOUT_SECONDS)
-    except (OSError, subprocess.TimeoutExpired, AcceptanceError):
-        return {
-            "status": "failed",
-            "failureClass": "desktop",
-            "reasonCode": "desktop-launch-failed",
-        }
-    if not isinstance(returncode, int) or isinstance(returncode, bool) or returncode != 0:
-        return {
-            "status": "failed",
-            "failureClass": "desktop",
-            "reasonCode": "desktop-exit-failed",
-        }
-    return {"status": "accepted", "exitCode": 0}
+    except Exception as error:
+        stopped = _stop_process(process)
+        if not stopped:
+            return (
+                {
+                    "status": "failed",
+                    "failureClass": "cleanup",
+                    "reasonCode": "cleanup-termination-failed",
+                },
+                False,
+            )
+        reason = (
+            "desktop-timeout-failed"
+            if isinstance(error, subprocess.TimeoutExpired)
+            else "desktop-launch-failed"
+        )
+        return (
+            {"status": "failed", "failureClass": "desktop", "reasonCode": reason},
+            True,
+        )
+    polled = _process_poll(process)
+    if polled is None:
+        stopped = _stop_process(process)
+        if not stopped:
+            return (
+                {
+                    "status": "failed",
+                    "failureClass": "cleanup",
+                    "reasonCode": "cleanup-termination-failed",
+                },
+                False,
+            )
+        return (
+            {
+                "status": "failed",
+                "failureClass": "desktop",
+                "reasonCode": "desktop-exit-failed",
+            },
+            True,
+        )
+    if (
+        not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or returncode != polled
+        or returncode != 0
+    ):
+        return (
+            {
+                "status": "failed",
+                "failureClass": "desktop",
+                "reasonCode": "desktop-exit-failed",
+            },
+            True,
+        )
+    return {"status": "accepted", "exitCode": 0}, True
 
 
 def orchestrate(
     arguments: argparse.Namespace,
     *,
-    runner: Runner = subprocess.run,
+    runner: Runner | None = None,
     launcher: Launcher = subprocess.Popen,
     waiter: Waiter = _default_waiter,
     host_system: str | None = None,
@@ -931,16 +1409,20 @@ def orchestrate(
         host_system=platform.system() if host_system is None else host_system,
         host_machine=platform.machine() if host_machine is None else host_machine,
     )
+    _revalidate_bindings(paths)
     runtimes = discover_runtimes(arguments, runner)
     _prepare_layout(paths)
     rounds: list[dict[str, object]] = []
+    abort_remaining = False
     for round_id in ROUNDS:
         runtime_results: list[dict[str, object]] = []
         for descriptor in runtimes:
-            runtime_id = descriptor["runtimeId"]
+            runtime_id = _descriptor_text(descriptor, "runtimeId")
             applications: list[dict[str, object]] = []
             runtime_evidence: dict[str, object] = {}
             try:
+                _revalidate_bindings(paths)
+                _revalidate_runtime(descriptor)
                 console_result = _invoke(
                     _headless_command(paths, round_id, descriptor),
                     runner,
@@ -966,6 +1448,8 @@ def orchestrate(
                 }
             else:
                 try:
+                    _revalidate_bindings(paths)
+                    _revalidate_runtime(descriptor)
                     gui_result = _invoke(
                         _gui_command(paths, round_id, descriptor),
                         runner,
@@ -988,9 +1472,13 @@ def orchestrate(
                         for application_id in GUI_APPLICATIONS
                     ]
                 applications.extend(gui_applications)
-                desktop = _launch_desktop(
+                _revalidate_bindings(paths)
+                _revalidate_runtime(descriptor)
+                desktop, continue_safe = _launch_desktop(
                     _desktop_command(paths, round_id, descriptor), launcher, waiter, printer
                 )
+                if not continue_safe:
+                    abort_remaining = True
             runtime_results.append(
                 {
                     "runtimeId": runtime_id,
@@ -999,13 +1487,12 @@ def orchestrate(
                     "desktop": desktop,
                 }
             )
+            if abort_remaining:
+                break
         rounds.append({"roundId": round_id, "runtimes": runtime_results})
-    accepted = all(
-        runtime["desktop"]["status"] == "accepted"
-        and all(application["status"] == "accepted" for application in runtime["applications"])
-        for round_entry in rounds
-        for runtime in round_entry["runtimes"]
-    )
+        if abort_remaining:
+            break
+    accepted = aggregate_is_accepted(rounds)
     summary: dict[str, object] = {
         "schemaVersion": "1",
         "status": "accepted" if accepted else "failed",

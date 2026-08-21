@@ -24,6 +24,17 @@ EXPECTED_REVIEWED_PATHS = (
     "tests/test_macos_dual_runtime_acceptance.py",
     "tools/run_macos_dual_runtime_acceptance.py",
 )
+EXPECTED_REQUIRED_INTERACTIONS = {
+    "7zip": ("fileList", "menus"),
+    "sumatrapdf": ("mainWindow", "openDialog"),
+    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+}
+
+
+class FinishedDesktopProcess:
+    @staticmethod
+    def poll() -> int:
+        return 0
 
 
 def load_module(name: str, path: Path):
@@ -250,9 +261,11 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                     "schemaVersion": "1",
                     "runtimeId": runtime_id,
                     "appId": app_id,
+                    "assetSha256": "d" * 64,
                     "status": "accepted",
                     "cleanup": True,
                     "interactionChecks": checks[app_id],
+                    "installerExit": {"present": True, "code": 0, "success": True},
                     "exit": {"present": True, "code": 0, "success": True},
                     "windowAvailable": True,
                     "screenshotAvailable": True,
@@ -383,7 +396,7 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
 
         def launcher(argv: list[str], **kwargs: object) -> object:
             desktop_calls.append((list(argv), dict(kwargs)))
-            return object()
+            return FinishedDesktopProcess()
 
         def waiter(_process: object, timeout: int) -> int:
             desktop_timeouts.append(timeout)
@@ -529,7 +542,7 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         summary = acceptance.orchestrate(
             self._arguments(),
             runner=runner,
-            launcher=lambda *_args, **_kwargs: object(),
+            launcher=lambda *_args, **_kwargs: FinishedDesktopProcess(),
             waiter=lambda _process, _timeout: 0,
             host_system="Darwin",
             host_machine="arm64",
@@ -588,6 +601,407 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(acceptance.AcceptanceError, "application keys"):
             acceptance._project_gui(screenshot_path, descriptor)
+
+    def test_interaction_preflight_requires_every_literal_check_to_be_true(self) -> None:
+        target = self.interactions / "round-1" / "crossover.json"
+        original = json.loads(target.read_text(encoding="utf-8"))
+        cases: list[tuple[str, object]] = []
+
+        false_check = json.loads(json.dumps(original))
+        false_check["applications"]["7zip"]["menus"] = False
+        cases.append(("false", false_check))
+        integer_check = json.loads(json.dumps(original))
+        integer_check["applications"]["sumatrapdf"]["mainWindow"] = 0
+        cases.append(("integer", integer_check))
+        string_check = json.loads(json.dumps(original))
+        string_check["applications"]["notepad-plus-plus"]["edit"] = "true"
+        cases.append(("string", string_check))
+        missing_check = json.loads(json.dumps(original))
+        del missing_check["applications"]["7zip"]["fileList"]
+        cases.append(("missing", missing_check))
+        extra_check = json.loads(json.dumps(original))
+        extra_check["applications"]["sumatrapdf"]["extra"] = True
+        cases.append(("extra", extra_check))
+
+        self.assertEqual(
+            EXPECTED_REQUIRED_INTERACTIONS,
+            {
+                "7zip": ("fileList", "menus"),
+                "sumatrapdf": ("mainWindow", "openDialog"),
+                "notepad-plus-plus": (
+                    "open",
+                    "edit",
+                    "saveUtf8Chinese",
+                    "rereadMatches",
+                ),
+            },
+        )
+        for label, document in cases:
+            with self.subTest(label=label):
+                target.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    acceptance.AcceptanceError, "interaction evidence"
+                ):
+                    acceptance.preflight(
+                        self._arguments(), host_system="Darwin", host_machine="arm64"
+                    )
+                self.assertFalse(self.work.exists())
+        target.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_runtime_descriptor_rejects_option_versions_and_aliased_entrypoints(self) -> None:
+        for version in ("--allow-network", "--foo", "-1", "24.0\nsecret", "é"):
+            with self.subTest(version=version):
+                discovery = self._discovery()
+                discovery["runtimes"][0]["version"] = version
+                with self.assertRaisesRegex(
+                    acceptance.AcceptanceError, "Runtime (?:version|discovery)"
+                ):
+                    acceptance.parse_discovery(json.dumps(discovery), self._arguments())
+
+        same = self._discovery()
+        same["runtimes"][0]["wineserver"] = "bin/wine"
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "entrypoints.*distinct"):
+            acceptance.parse_discovery(json.dumps(same), self._arguments())
+
+        normalized = self._discovery()
+        normalized["runtimes"][0]["wineserver"] = "bin/./wine"
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "Runtime wineserver"):
+            acceptance.parse_discovery(json.dumps(normalized), self._arguments())
+
+    def test_root_identity_swaps_fail_before_layout_or_child_process(self) -> None:
+        for field in ("cache", "interactions"):
+            with self.subTest(field=field):
+                target = self.cache if field == "cache" else self.interactions
+                original = target.with_name(target.name + "-original")
+                calls = 0
+
+                def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                    nonlocal calls
+                    calls += 1
+                    if calls != 1:
+                        self.fail("a child started after an input-root identity swap")
+                    target.rename(original)
+                    target.mkdir()
+                    return subprocess.CompletedProcess(
+                        argv, 0, json.dumps(self._discovery()), ""
+                    )
+
+                if field == "cache":
+                    sentinel = target / "sentinel"
+                    sentinel.write_text("unchanged", encoding="utf-8")
+                    expected_source = b"unchanged"
+                else:
+                    sentinel = target / "round-1" / "crossover.json"
+                    expected_source = sentinel.read_bytes()
+                with self.assertRaisesRegex(acceptance.AcceptanceError, "identity changed"):
+                    acceptance.orchestrate(
+                        self._arguments(),
+                        runner=runner,
+                        host_system="Darwin",
+                        host_machine="arm64",
+                        printer=lambda _line: None,
+                    )
+                original_sentinel = (
+                    original / "sentinel"
+                    if field == "cache"
+                    else original / "round-1" / "crossover.json"
+                )
+                self.assertEqual(original_sentinel.read_bytes(), expected_source)
+                self.assertFalse(self.work.exists())
+                target.rmdir()
+                original.rename(target)
+
+        self.work = self.external / "work-parent" / "work"
+        self.work.parent.mkdir()
+        (self.work.parent / "sentinel").write_text("unchanged", encoding="utf-8")
+        original_parent = self.external / "work-parent-original"
+
+        def swap_parent(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.work.parent.rename(original_parent)
+            self.work.parent.mkdir()
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self._discovery()), "")
+
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "(?:identity changed|unsafe path component)"
+        ):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=swap_parent,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertFalse(self.work.exists())
+        self.assertEqual(
+            (original_parent / "sentinel").read_text(encoding="utf-8"), "unchanged"
+        )
+
+    def test_cache_symlink_swap_and_tool_mutation_fail_before_the_next_child(self) -> None:
+        original_cache = self.external / "cache-original"
+        victim = self.external / "cache-victim"
+        victim.mkdir()
+        (victim / "sentinel").write_text("unchanged", encoding="utf-8")
+
+        def symlink_swap(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            self.cache.rename(original_cache)
+            try:
+                os.symlink(victim, self.cache, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self._discovery()), "")
+
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "(?:identity changed|unsafe path component)"
+        ):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=symlink_swap,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual((victim / "sentinel").read_text(encoding="utf-8"), "unchanged")
+        self.assertFalse(self.work.exists())
+        if self.cache.is_symlink():
+            self.cache.unlink()
+        original_cache.rename(self.cache)
+
+        calls: list[str] = []
+
+        def mutate_tool(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(Path(argv[3]).name)
+            if argv[-1] == "--all":
+                payload = self._discovery()
+            elif Path(argv[3]).name == "run_macos_headless_preview.py":
+                pack_id = argv[argv.index("--pack-id") + 1]
+                runtime_id = "crossover" if "crossover" in pack_id else "whisky"
+                payload = self._console_summary(runtime_id)
+                self.cli.write_text("mutated", encoding="utf-8")
+            else:
+                self.fail("GUI child started after a tool identity mutation")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "identity changed"):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=mutate_tool,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual(calls, ["discover_macos_wine.py", "run_macos_headless_preview.py"])
+
+    def test_desktop_timeout_stops_process_before_another_launch(self) -> None:
+        class Process:
+            def __init__(self, terminate_timeout: bool = False) -> None:
+                self.actions: list[str] = []
+                self.running = True
+                self.terminate_timeout = terminate_timeout
+
+            def poll(self) -> int | None:
+                return None if self.running else -9
+
+            def terminate(self) -> None:
+                self.actions.append("terminate")
+
+            def kill(self) -> None:
+                self.actions.append("kill")
+
+            def wait(self, timeout: int) -> int:
+                self.actions.append(f"wait:{timeout}")
+                if self.terminate_timeout and "kill" not in self.actions:
+                    raise subprocess.TimeoutExpired("desktop", timeout)
+                self.running = False
+                return -9
+
+        first = Process()
+
+        def timed_out(_process: object, timeout: int) -> int:
+            raise subprocess.TimeoutExpired("desktop", timeout)
+
+        evidence, safe = acceptance._launch_desktop(
+            ["desktop"], lambda *_args, **_kwargs: first, timed_out, lambda _line: None
+        )
+        self.assertTrue(safe)
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(first.actions[0], "terminate")
+        self.assertIsNotNone(first.poll())
+
+        second = Process(terminate_timeout=True)
+        evidence, safe = acceptance._launch_desktop(
+            ["desktop"], lambda *_args, **_kwargs: second, timed_out, lambda _line: None
+        )
+        self.assertTrue(safe)
+        self.assertEqual(evidence["status"], "failed")
+        self.assertIn("kill", second.actions)
+        self.assertIsNotNone(second.poll())
+
+        launched: list[Process] = []
+
+        def next_launcher(*_args: object, **_kwargs: object) -> Process:
+            if launched:
+                self.assertIsNotNone(launched[-1].poll())
+            process = Process()
+            launched.append(process)
+            return process
+
+        acceptance._launch_desktop(
+            ["desktop"], next_launcher, timed_out, lambda _line: None
+        )
+
+        class Unstoppable(Process):
+            def terminate(self) -> None:
+                self.actions.append("terminate")
+                raise OSError("closed test failure")
+
+            def kill(self) -> None:
+                self.actions.append("kill")
+                raise OSError("closed test failure")
+
+            def wait(self, timeout: int) -> int:
+                self.actions.append(f"wait:{timeout}")
+                raise subprocess.TimeoutExpired("desktop", timeout)
+
+        unstoppable = Unstoppable()
+        evidence, safe = acceptance._launch_desktop(
+            ["desktop"], lambda *_args, **_kwargs: unstoppable, timed_out, lambda _line: None
+        )
+        self.assertFalse(safe)
+        self.assertEqual(
+            evidence,
+            {
+                "status": "failed",
+                "failureClass": "cleanup",
+                "reasonCode": "cleanup-termination-failed",
+            },
+        )
+        child_calls: list[str] = []
+        desktop_launches = 0
+
+        def successful_runner(
+            argv: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            child_calls.append(Path(argv[3]).name)
+            if argv[-1] == "--all":
+                payload = self._discovery()
+            elif Path(argv[3]).name == "run_macos_headless_preview.py":
+                pack_id = argv[argv.index("--pack-id") + 1]
+                runtime_id = "crossover" if "crossover" in pack_id else "whisky"
+                payload = self._console_summary(runtime_id)
+            else:
+                runtime_id = argv[argv.index("--runtime-id") + 1]
+                payload = self._gui_summary(runtime_id)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        def unstoppable_launcher(*_args: object, **_kwargs: object) -> Unstoppable:
+            nonlocal desktop_launches
+            desktop_launches += 1
+            return Unstoppable()
+
+        summary = acceptance.orchestrate(
+            self._arguments(),
+            runner=successful_runner,
+            launcher=unstoppable_launcher,
+            waiter=timed_out,
+            host_system="Darwin",
+            host_machine="arm64",
+            printer=lambda _line: None,
+        )
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(desktop_launches, 1)
+        self.assertEqual(
+            child_calls,
+            [
+                "discover_macos_wine.py",
+                "run_macos_headless_preview.py",
+                "run_gui_baseline.py",
+            ],
+        )
+        acceptance._launch_desktop(
+            ["desktop"], next_launcher, timed_out, lambda _line: None
+        )
+
+    def test_bounded_process_capture_terminates_overflow_and_timeout(self) -> None:
+        endless = (
+            "import sys\n"
+            "while True:\n"
+            " sys.stdout.buffer.write(b'x'*8192)\n"
+            " sys.stdout.buffer.flush()\n"
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "output limit"):
+            acceptance._bounded_run(
+                [sys.executable, "-S", "-B", "-c", endless], timeout=5
+            )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "timed out"):
+            acceptance._bounded_run(
+                [sys.executable, "-S", "-B", "-c", "import time; time.sleep(30)"],
+                timeout=0.1,
+            )
+
+    def test_accepted_gui_projection_is_complete_and_aggregate_checks_cleanup(self) -> None:
+        descriptor = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )[0]
+        receipt, applications = acceptance._project_gui(
+            self._gui_summary("crossover"), descriptor
+        )
+        self.assertEqual(receipt["runtimeVersion"], "24.0")
+        self.assertEqual([value["appId"] for value in applications], list(EXPECTED_REQUIRED_INTERACTIONS))
+
+        mutations: list[tuple[str, dict[str, object]]] = []
+        for label in (
+            "cleanup-false",
+            "missing-interactions",
+            "check-false",
+            "exit-nonzero",
+            "window-false",
+            "missing-asset",
+            "missing-installer-exit",
+        ):
+            mutant = self._gui_summary("crossover")
+            application = mutant["applications"][0]
+            if label == "cleanup-false":
+                application["cleanup"] = False
+            elif label == "missing-interactions":
+                del application["interactionChecks"]
+            elif label == "check-false":
+                application["interactionChecks"]["menus"] = False
+            elif label == "exit-nonzero":
+                application["exit"] = {"present": True, "code": 1, "success": False}
+            elif label == "window-false":
+                application["windowAvailable"] = False
+            elif label == "missing-asset":
+                del application["assetSha256"]
+            else:
+                del application["installerExit"]
+            mutations.append((label, mutant))
+        for label, mutant in mutations:
+            with self.subTest(label=label), self.assertRaisesRegex(
+                acceptance.AcceptanceError, "accepted GUI"
+            ):
+                acceptance._project_gui(mutant, descriptor)
+
+        incomplete_rounds = [
+            {
+                "roundId": "round-1",
+                "runtimes": [
+                    {
+                        "runtimeId": "crossover",
+                        "applications": [
+                            {
+                                "schemaVersion": "1",
+                                "runtimeId": "crossover",
+                                "appId": "7zip",
+                                "status": "accepted",
+                                "cleanup": False,
+                            }
+                        ],
+                        "desktop": {"status": "accepted", "exitCode": 0},
+                    }
+                ],
+            }
+        ]
+        self.assertFalse(acceptance.aggregate_is_accepted(incomplete_rounds))
 
 
 if __name__ == "__main__":
