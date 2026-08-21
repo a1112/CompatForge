@@ -455,6 +455,89 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             with mock.patch.object(validator, "ROOT", repository_root):
                 self.assertEqual(validator.validate_macos_acceptance_docs(), [])
 
+    def test_repository_validator_applies_symmetric_topic_claim_grammar(self) -> None:
+        self.assertEqual(
+            tuple(
+                topic
+                for topic, _patterns in getattr(
+                    validator, "MACOS_ACCEPTANCE_TOPIC_GRAMMAR", ()
+                )
+            ),
+            ("public", "signing", "dmg", "repositories"),
+        )
+        accepted = (
+            ("public-en-prefix", "This stage is not a public beta."),
+            ("public-zh-prefix", "本阶段绝非公测。"),
+            ("public-en-suffix", "Public release is forbidden."),
+            ("public-zh-suffix", "公开发布不会发生。"),
+            ("signing-en-prefix", "The application will not be signed."),
+            ("signing-zh-prefix", "应用不会签名。"),
+            ("signing-en-suffix", "Application signing is prohibited."),
+            ("signing-zh-suffix", "应用签名被禁止。"),
+            ("dmg-en-prefix", "This stage will not generate a DMG."),
+            ("dmg-zh-prefix", "本阶段不会生成 DMG。"),
+            ("dmg-en-suffix", "DMG generation will not happen."),
+            ("dmg-zh-suffix", "DMG 生成不会发生。"),
+            ("repositories-en-prefix", "This stage will not modify ForgeOS."),
+            ("repositories-zh-prefix", "本阶段不会修改 ForgeTools。"),
+            ("repositories-en-suffix", "Mac-Win modification is forbidden."),
+            ("repositories-zh-suffix", "ForgeOS 修改被禁止。"),
+            (
+                "unrelated-authorization-en",
+                "The operator is authorized to fetch the three fixed assets.",
+            ),
+            ("unrelated-authorization-zh", "操作者获授权获取三个固定资产。"),
+        )
+        rejected = (
+            ("public-en-positive", "This stage is a public beta."),
+            ("public-zh-positive", "本阶段进入公测。"),
+            ("signing-en-positive", "Application signing is complete."),
+            ("signing-zh-positive", "应用签名有效。"),
+            ("dmg-en-positive", "DMG generation is complete."),
+            ("dmg-zh-positive", "DMG 已生成。"),
+            (
+                "repositories-en-positive",
+                "ForgeOS modification is authorized.",
+            ),
+            ("repositories-zh-positive", "ForgeTools 修改已获授权。"),
+            (
+                "public-mixed",
+                "Public beta is forbidden, but this stage is a public release.",
+            ),
+            (
+                "signing-mixed",
+                "Application signing is prohibited, but the build is notarized.",
+            ),
+            (
+                "dmg-mixed",
+                "DMG generation is forbidden, but this stage generated a DMG.",
+            ),
+            (
+                "repositories-mixed",
+                "ForgeOS modification is forbidden, but ForgeTools changes are authorized.",
+            ),
+        )
+
+        for should_accept, cases in ((True, accepted), (False, rejected)):
+            for label, fragment in cases:
+                with self.subTest(label=label), tempfile.TemporaryDirectory(
+                    prefix=f"compatforge-macos-topic-grammar-{label}-"
+                ) as temporary:
+                    repository_root = Path(temporary) / "repository"
+                    self._copy_reviewed_surface(repository_root)
+                    guide = (
+                        repository_root
+                        / "docs/guides/macos-local-dual-runtime-acceptance.md"
+                    )
+                    source = guide.read_text(encoding="utf-8")
+                    guide.write_bytes(f"{source}\n{fragment}\n".encode("utf-8"))
+                    with mock.patch.object(validator, "ROOT", repository_root):
+                        errors = validator.validate_macos_acceptance_docs()
+                    if should_accept:
+                        self.assertEqual(errors, [])
+                    else:
+                        self.assertTrue(errors)
+
     def test_repository_validator_rejects_duplicate_example_keys(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="compatforge-macos-doc-duplicate-"
