@@ -30,7 +30,11 @@ npm --version
 df -h /absolute/external
 ```
 
-若 `arch -x86_64 /usr/bin/true` 失败，在了解许可与系统影响后由操作者单独执行 `softwareupdate --install-rosetta --agree-to-license`，然后重新检查；不要让验收脚本自行安装 Rosetta。
+若 `arch -x86_64 /usr/bin/true` 失败，在了解许可与系统影响后，由操作者单独执行以下系统命令，然后重新检查；不要让验收脚本自行安装 Rosetta：
+
+```text
+sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+```
 
 ## 2. 外部根与清理边界
 
@@ -88,7 +92,7 @@ python3 -S -B tools/download_gui_assets.py fetch sumatrapdf --cache-root /absolu
 python3 -S -B tools/download_gui_assets.py fetch notepad-plus-plus --cache-root /absolute/external/cache --allow-network
 ```
 
-除此显式资产阶段外不使用 `--allow-network`。准备好缓存后，下面的双轮编排保持离线。
+准备好缓存后，标准双轮编排保持离线。只有操作者明确把固定资产获取合并到本次编排时，才可使用第 7 节唯一列出的 opt-in 变体；不得在其他命令或阶段单独追加 `--allow-network`。
 
 ## 6. 独立准备交互确认
 
@@ -117,6 +121,21 @@ python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
   --storage-root /absolute/external/storage \
   --work-root /absolute/external/evidence \
   --interaction-evidence-root /absolute/external/interactions
+```
+
+如果且仅如果固定缓存尚未准备好、操作者明确批准本次编排同时获取固定资产，可改用下面唯一的联网变体；参数顺序和网络 flag 不得改写：
+
+```text
+python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
+  --compatforge-cli /absolute/external/build/compatforge-cli \
+  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \
+  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \
+  --cache-root /absolute/external/cache \
+  --runtime-store-root /absolute/external/runtime-store \
+  --storage-root /absolute/external/storage \
+  --work-root /absolute/external/evidence \
+  --interaction-evidence-root /absolute/external/interactions \
+  --allow-network
 ```
 
 编排器会再绑定所发现 Runtime 的 identity，依次运行每个 `round/runtime` 的 Console、GUI 和 Desktop，并打印精确 Tauri 命令。每个应用出现后立即完成本组合的人工确认；不要等到整轮结束后凭记忆补写。桌面壳必须人工正常关闭并确认进程树已清理，才允许继续下一个组合。
@@ -156,3 +175,12 @@ python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
 - 原始证据、Screenshots、安装器、Bottle、Runtime 和绝对路径留在仓库外，只将审核后的脱敏阶段报告用于交接。
 
 这仍然不是 public beta，也不是签名/notarize/DMG/发布门禁；它不证明其他 Windows 应用或其他主机可用，不授权修改 ForgeOS、ForgeTools 或 Mac-Win。
+
+## 10. 闭集非声明
+
+阶段报告必须保留以下四条原文，不得用更强的发布或跨仓声明替换：
+
+- `scope`: 本门禁仅为 local-only/developer-local；不是 public beta、public release 或发布门禁。
+- `distribution`: 本门禁不签名、不 notarize、不生成或分发 DMG。
+- `coverage`: 本门禁不证明所有 Windows 应用、主机或 Runtime 可用。
+- `repositories`: 本门禁不修改也不授权修改 ForgeOS、ForgeTools 或 Mac-Win。

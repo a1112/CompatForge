@@ -156,6 +156,16 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
         self.assertFalse(standard.negative_checks)
         self.assertEqual(standard.runtime_store_root, "/absolute/external/runtime-store")
 
+        network = acceptance.parse_arguments(
+            arguments(validator.MACOS_ACCEPTANCE_NETWORK_ORCHESTRATOR_COMMAND)
+        )
+        self.assertTrue(network.allow_network)
+        self.assertFalse(network.negative_checks)
+        self.assertEqual(
+            network.interaction_evidence_root,
+            "/absolute/external/interactions",
+        )
+
         negative = acceptance.parse_arguments(
             arguments(validator.MACOS_ACCEPTANCE_NEGATIVE_COMMAND)
         )
@@ -240,6 +250,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 ).encode("utf-8")
             )
 
+        def append_guide(text: str):
+            def mutation(root: Path) -> None:
+                path = root / "docs/guides/macos-local-dual-runtime-acceptance.md"
+                source = path.read_text(encoding="utf-8")
+                path.write_bytes((source + "\n" + text + "\n").encode("utf-8"))
+
+            return mutation
+
         cases = (
             ("missing-guide", delete("docs/guides/macos-local-dual-runtime-acceptance.md")),
             ("missing-example", delete("examples/macos-dual-runtime-interactions.json")),
@@ -267,6 +285,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                     "docs/guides/macos-local-dual-runtime-acceptance.md",
                     "--runtime-store-root /absolute/external/runtime-store",
                     "--runtime-store /absolute/external/runtime-store",
+                ),
+            ),
+            (
+                "command-flag-reordered",
+                replace(
+                    "docs/guides/macos-local-dual-runtime-acceptance.md",
+                    "  --cache-root /absolute/external/cache \\\n  --runtime-store-root /absolute/external/runtime-store \\",
+                    "  --runtime-store-root /absolute/external/runtime-store \\\n  --cache-root /absolute/external/cache \\",
                 ),
             ),
             (
@@ -302,6 +328,58 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 ),
             ),
             ("navigation-fence-spoof", navigation_fence_spoof),
+            (
+                "extra-bash-command",
+                append_guide(
+                    "```bash\npython3 -S -B tools/discover_macos_wine.py --all --verbose\n```"
+                ),
+            ),
+            (
+                "duplicate-text-command",
+                append_guide(
+                    "```text\npython3 -S -B tools/discover_macos_wine.py --all\n```"
+                ),
+            ),
+            (
+                "alternate-sh-network-command",
+                append_guide("```sh\ncurl https://example.invalid/runtime\n```"),
+            ),
+            (
+                "blank-language-command",
+                append_guide(
+                    "```\npython3 -S -B tools/discover_macos_wine.py --all --hidden\n```"
+                ),
+            ),
+            (
+                "standalone-network-flag",
+                append_guide("```console\n--allow-network\n```"),
+            ),
+            (
+                "indented-command",
+                append_guide(
+                    "    python3 -S -B tools/discover_macos_wine.py --all --hidden"
+                ),
+            ),
+            ("public-release-ready", append_guide("CompatForge is PUBLIC release-ready.")),
+            ("released-claim", append_guide("CompatForge has been released.")),
+            ("public-beta-ready", append_guide("This stage is public   beta ready!")),
+            ("signed-claim", append_guide("The application is signed.")),
+            ("notarized-claim", append_guide("The build is NOTARIZED.")),
+            ("dmg-claim", append_guide("A DMG is ready for distribution.")),
+            (
+                "cross-repository-authorization",
+                append_guide(
+                    "Authorized to modify ForgeOS, ForgeTools, and Mac-Win."
+                ),
+            ),
+            (
+                "reverse-cross-repository-authorization",
+                append_guide("Modifications to ForgeTools are authorized."),
+            ),
+            ("chinese-public-release", append_guide("本阶段进入公测并公开发布。")),
+            ("chinese-signed-notarized", append_guide("应用已签名并完成公证。")),
+            ("chinese-dmg", append_guide("下一步将生成 DMG。")),
+            ("chinese-cross-repository", append_guide("允许修改 ForgeOS。")),
         )
         for label, mutate in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory(
@@ -312,6 +390,26 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 mutate(repository_root)
                 with mock.patch.object(validator, "ROOT", repository_root):
                     self.assertTrue(validator.validate_macos_acceptance_docs())
+
+    def test_repository_validator_accepts_explicit_negative_nonclaims(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-macos-doc-negative-nonclaims-"
+        ) as temporary:
+            repository_root = Path(temporary) / "repository"
+            self._copy_reviewed_surface(repository_root)
+            guide = repository_root / "docs/guides/macos-local-dual-runtime-acceptance.md"
+            source = guide.read_text(encoding="utf-8")
+            source += (
+                "\n这不是公测、不公开发布，未签名、未完成公证、未 notarized，不生成 DMG，"
+                "也不授权修改 ForgeOS、ForgeTools 或 Mac-Win。\n"
+                "This is not public beta ready or public release ready; "
+                "the application is not signed or "
+                "notarized, does not create a DMG, and does not authorize modifications "
+                "to ForgeOS, ForgeTools, or Mac-Win.\n"
+            )
+            guide.write_bytes(source.encode("utf-8"))
+            with mock.patch.object(validator, "ROOT", repository_root):
+                self.assertEqual(validator.validate_macos_acceptance_docs(), [])
 
     def test_repository_validator_rejects_duplicate_example_keys(self) -> None:
         with tempfile.TemporaryDirectory(

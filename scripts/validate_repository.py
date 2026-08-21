@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import types
+import unicodedata
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -432,6 +433,30 @@ MACOS_ACCEPTANCE_INTERACTION_CHECKS = {
 MACOS_ACCEPTANCE_DISCOVERY_COMMAND = (
     "python3 -S -B tools/discover_macos_wine.py --all",
 )
+MACOS_ACCEPTANCE_PREFLIGHT_COMMANDS = (
+    "uname -m",
+    "python3 -S -B -c 'import platform,sys; print(sys.executable); print(sys.version); assert sys.version_info >= (3,11); assert platform.machine() == \"arm64\"'",
+    "arch -x86_64 /usr/bin/true",
+    "test -x /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc",
+    "rustc --version",
+    "rustup target list --installed",
+    "node --version",
+    "npm --version",
+    "df -h /absolute/external",
+)
+MACOS_ACCEPTANCE_ROSETTA_INSTALL_COMMAND = (
+    "sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license",
+)
+MACOS_ACCEPTANCE_BUILD_COMMANDS = (
+    "python3 -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v",
+    "python3 -S -B scripts/validate_repository.py",
+    "cargo fmt --all -- --check",
+    "cargo test --offline --workspace --all-targets --locked",
+    "npm ci --offline --prefix apps/desktop",
+    "npm run build --prefix apps/desktop",
+    "cargo build --offline --release --locked -p compatforge-cli",
+    "CARGO_NET_OFFLINE=true npm run tauri --prefix apps/desktop -- build --bundles app",
+)
 MACOS_ACCEPTANCE_ASSET_LIST_COMMAND = (
     "python3 -S -B tools/download_gui_assets.py list --cache-root /absolute/external/cache",
 )
@@ -451,6 +476,18 @@ MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND = (
     "  --work-root /absolute/external/evidence \\",
     "  --interaction-evidence-root /absolute/external/interactions",
 )
+MACOS_ACCEPTANCE_NETWORK_ORCHESTRATOR_COMMAND = (
+    "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
+    "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
+    "  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \\",
+    "  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \\",
+    "  --cache-root /absolute/external/cache \\",
+    "  --runtime-store-root /absolute/external/runtime-store \\",
+    "  --storage-root /absolute/external/storage \\",
+    "  --work-root /absolute/external/evidence \\",
+    "  --interaction-evidence-root /absolute/external/interactions \\",
+    "  --allow-network",
+)
 MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
     "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
     "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
@@ -464,6 +501,30 @@ MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
     "  --negative-checks \\",
     "  --console-guest /absolute/external/inputs/windows-console-smoke.exe \\",
     "  --negative-sentinel /absolute/external/inputs/negative-sentinel.txt",
+)
+MACOS_ACCEPTANCE_INTERACTION_PATHS = (
+    "/absolute/external/interactions/round-1/crossover.json",
+    "/absolute/external/interactions/round-1/whisky.json",
+    "/absolute/external/interactions/round-2/crossover.json",
+    "/absolute/external/interactions/round-2/whisky.json",
+)
+MACOS_ACCEPTANCE_GUIDE_BLOCKS = (
+    MACOS_ACCEPTANCE_PREFLIGHT_COMMANDS,
+    MACOS_ACCEPTANCE_ROSETTA_INSTALL_COMMAND,
+    MACOS_ACCEPTANCE_BUILD_COMMANDS,
+    MACOS_ACCEPTANCE_DISCOVERY_COMMAND,
+    MACOS_ACCEPTANCE_ASSET_LIST_COMMAND,
+    MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
+    MACOS_ACCEPTANCE_INTERACTION_PATHS,
+    MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND,
+    MACOS_ACCEPTANCE_NETWORK_ORCHESTRATOR_COMMAND,
+    MACOS_ACCEPTANCE_NEGATIVE_COMMAND,
+)
+MACOS_ACCEPTANCE_NONCLAIMS = (
+    "- `scope`: 本门禁仅为 local-only/developer-local；不是 public beta、public release 或发布门禁。",
+    "- `distribution`: 本门禁不签名、不 notarize、不生成或分发 DMG。",
+    "- `coverage`: 本门禁不证明所有 Windows 应用、主机或 Runtime 可用。",
+    "- `repositories`: 本门禁不修改也不授权修改 ForgeOS、ForgeTools 或 Mac-Win。",
 )
 
 
@@ -4183,14 +4244,117 @@ def _macos_acceptance_fences(source: str) -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(block.splitlines()) for block in blocks)
 
 
+def _macos_acceptance_guide_fences(
+    source: str,
+) -> tuple[tuple[tuple[str, ...], ...], str]:
+    allowed_languages = {"", "text", "bash", "sh", "zsh", "console"}
+    blocks: list[tuple[str, ...]] = []
+    prose: list[str] = []
+    body: list[str] | None = None
+    marker_size = 0
+    for line in source.splitlines():
+        if body is None:
+            opening = re.fullmatch(r"(?P<marker>`{3,})(?P<info>[^`]*)", line)
+            if opening is None:
+                if line.lstrip().startswith("```"):
+                    raise ValueError("macOS acceptance guide contains an invalid fence")
+                prose.append(line)
+                continue
+            language = opening.group("info").strip().casefold()
+            if language not in allowed_languages:
+                raise ValueError("macOS acceptance guide uses an unsupported fence language")
+            marker_size = len(opening.group("marker"))
+            body = []
+            continue
+        if re.fullmatch(rf"`{{{marker_size},}}[ \t]*", line):
+            blocks.append(tuple(body))
+            body = None
+            marker_size = 0
+        else:
+            body.append(line)
+    if body is not None:
+        raise ValueError("macOS acceptance guide contains an unclosed fence")
+    return tuple(blocks), "\n".join(prose)
+
+
 def _macos_acceptance_prose(source: str) -> str:
     return re.sub(r"(?ms)^```[^\n]*\n.*?^```[ \t]*$", "", source)
 
 
+def _macos_acceptance_semantic_text(prose: str) -> str:
+    normalized = unicodedata.normalize("NFKC", prose).casefold()
+    normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+    negated = (
+        r"\b(?:this|it|compatforge|stage|gate|build|application|app)?\s*"
+        r"(?:is|are|was|were)\s+not\s+(?:a\s+)?public\s+(?:beta|release)"
+        r"(?:\s+ready)?(?:\s+or\s+public\s+(?:beta|release)(?:\s+ready)?)*\b",
+        r"\bnot\s+(?:a\s+)?public\s+(?:beta|release)(?:\s+ready)?"
+        r"(?:\s+or\s+public\s+(?:beta|release)(?:\s+ready)?)*\b",
+        r"\b(?:application|app|build|artifact|binary|package|this|it)?\s*"
+        r"(?:is|are|was|were)\s+not\s+(?:signed|notarized)\b",
+        r"\bnot\s+(?:signed|notarized)\b",
+        r"\bdoes\s+not\s+(?:create|build|ship|publish|release|distribute|provide|deliver)"
+        r"\s+(?:a\s+)?dmg\b",
+        r"不\s*(?:是|进入|构成|属于)\s*(?:public\s+(?:beta|release)|公测|公开测试|公开发布)"
+        r"(?:\s+public\s+(?:beta|release))*",
+        r"(?:未|不)\s*(?:签名|notarize|notarized|(?:完成\s*)?公证)",
+        r"(?:未|不)\s*(?:公开\s*)?发布",
+        r"不\s*(?:生成|创建|构建|发布|分发|交付|提供)"
+        r"(?:\s*或\s*(?:生成|创建|构建|发布|分发|交付|提供))*\s*dmg",
+        r"不\s*(?:允许|授权|可以|会|将)?\s*修改\s*(?:forgeos|forgetools|mac\s+win)",
+    )
+    for pattern in negated:
+        normalized = re.sub(pattern, " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _validate_macos_acceptance_nonclaims(prose: str) -> None:
+    lines = prose.splitlines()
+    selected = tuple(
+        line
+        for line in lines
+        if line.startswith(("- `scope`:", "- `distribution`:", "- `coverage`:", "- `repositories`:"))
+    )
+    if selected != MACOS_ACCEPTANCE_NONCLAIMS:
+        raise ValueError("macOS acceptance closed non-claims drifted")
+
+    semantic = _macos_acceptance_semantic_text(prose)
+    forbidden = (
+        r"\bpublic\s+(?:beta|release)\b",
+        r"(?:公测|公开测试|公开发布)",
+        r"\bready\s+for\s+(?:a\s+)?public\s+(?:beta|release)\b",
+        r"\b(?:this|it|compatforge|stage|gate|build|application|app|artifact|package)"
+        r"\s+(?:is|are|was|were|will\s+be|has\s+been)\s+released\b",
+        r"\b(?:application|app|build|artifact|binary|package|this|it)"
+        r"\s+(?:is|are|was|were|will\s+be|has\s+been)\s+(?:signed|notarized)\b",
+        r"\b(?:a\s+)?dmg\s+(?:is\s+)?ready\b",
+        r"\b(?:create|creates|created|build|builds|built|ship|ships|publish|publishes|"
+        r"release|releases|distribute|distributes|provide|provides|deliver|delivers)"
+        r"\s+(?:a\s+)?dmg\b",
+        r"\bauthorized\s+to\s+modify\s+(?:forgeos|forgetools|mac\s+win)\b",
+        r"\b(?:modifications?\s+to\s+)?(?:forgeos|forgetools|mac\s+win)\s+"
+        r"modifications?\s+(?:are|is)\s+authorized\b",
+        r"\bmodifications?\s+to\s+(?:forgeos|forgetools|mac\s+win)\s+"
+        r"(?:are|is)\s+authorized\b",
+        r"\b(?:may|can|will|allowed\s+to|authorized\s+to)\s+modify\s+"
+        r"(?:forgeos|forgetools|mac\s+win)\b",
+        r"(?<!不)(?:是|进入|达到|构成|属于)\s*(?:public\s+(?:beta|release)|公测|公开测试|公开发布)",
+        r"公开\s*发布",
+        r"(?<!不)(?:已|已经|将|会|允许|可以|授权|完成)\s*(?:应用|构建|代码)?\s*"
+        r"(?:签名|notarize|notarized|公证)",
+        r"(?<!不)(?:生成|创建|构建|发布|分发|交付|提供|将\s*生成)\s*(?:一个)?\s*dmg",
+        r"(?<!不)(?:允许|授权|可以|将|会|需要)\s*(?:直接)?\s*修改\s*"
+        r"(?:forgeos|forgetools|mac\s+win)",
+    )
+    if any(re.search(pattern, semantic) for pattern in forbidden):
+        raise ValueError("macOS acceptance guide contains a contradictory claim")
+
+
 def _validate_macos_acceptance_guide(source: str) -> None:
+    fences, prose = _macos_acceptance_guide_fences(source)
     headings = tuple(
         line
-        for line in source.splitlines()
+        for line in prose.splitlines()
         if line.startswith("#")
     )
     required_headings = (
@@ -4204,6 +4368,7 @@ def _validate_macos_acceptance_guide(source: str) -> None:
         "## 7. 执行两轮矩阵",
         "## 8. 负向隔离检查",
         "## 9. 精确退出门禁",
+        "## 10. 闭集非声明",
     )
     if headings != required_headings:
         raise ValueError("macOS acceptance guide headings drifted")
@@ -4226,30 +4391,33 @@ def _validate_macos_acceptance_guide(source: str) -> None:
         "Screenshots、安装器、Bottle、Runtime 内容",
         "重新运行必须选择新的空",
     ):
-        if source.count(marker) < 1:
+        if prose.count(marker) < 1:
             raise ValueError(f"macOS acceptance guide marker drifted: {marker}")
-    if "它是 public beta" in source or "默认 CI 运行真实" in source:
-        raise ValueError("macOS acceptance guide makes an unsupported release or CI claim")
-    fences = _macos_acceptance_fences(source)
+    _validate_macos_acceptance_nonclaims(prose)
+    for line in prose.splitlines():
+        if re.match(
+            r"^\s*(?:python3|cargo|npm|node|rustc|rustup|uname|arch|"
+            r"test\s+-x|df\s+-h|curl|wget|sudo|softwareupdate|env|rm|cp|mv|bash|sh|zsh|"
+            r"CARGO_NET_OFFLINE=|--allow-network)\b",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            raise ValueError("macOS acceptance guide contains an unfenced command")
     if any(
         "curl" in line or "http://" in line or "https://" in line
         for block in fences
         for line in block
     ):
         raise ValueError("macOS acceptance guide permits an arbitrary download surface")
-    required_fences = (
-        MACOS_ACCEPTANCE_DISCOVERY_COMMAND,
-        MACOS_ACCEPTANCE_ASSET_LIST_COMMAND,
-        MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
-        MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND,
-        MACOS_ACCEPTANCE_NEGATIVE_COMMAND,
-    )
-    if any(block not in fences for block in required_fences):
+    if fences != MACOS_ACCEPTANCE_GUIDE_BLOCKS:
         raise ValueError("macOS acceptance guide command contract drifted")
     network_lines = tuple(
         line for block in fences for line in block if "--allow-network" in line
     )
-    if network_lines != MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS:
+    if network_lines != (
+        *MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
+        "  --allow-network",
+    ):
         raise ValueError("macOS acceptance network opt-in escaped the fixed asset stage")
 
 
