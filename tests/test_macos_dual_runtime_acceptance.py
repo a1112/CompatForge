@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ACCEPTANCE_TOOL = ROOT / "tools" / "run_macos_dual_runtime_acceptance.py"
+GUI_BASELINE_TOOL = ROOT / "tools" / "run_gui_baseline.py"
 VALIDATOR = ROOT / "scripts" / "validate_repository.py"
 
 EXPECTED_MATRIX = {
@@ -50,6 +51,7 @@ def load_module(name: str, path: Path):
 
 
 acceptance = load_module("run_macos_dual_runtime_acceptance", ACCEPTANCE_TOOL)
+gui_baseline = load_module("run_gui_baseline_for_dual_runtime", GUI_BASELINE_TOOL)
 validator = load_module("validate_repository_for_macos_acceptance", VALIDATOR)
 
 
@@ -257,7 +259,6 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 "version": "24.0" if runtime_id == "crossover" else "2.3",
                 "packDigest": "sha256:" + "c" * 64,
                 "source": "explicit-override",
-                "activated": True,
             },
             "applications": [
                 {
@@ -1182,11 +1183,51 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                     with self.assertRaises(acceptance.AcceptanceError):
                         acceptance._project_gui(mutant, descriptor)
 
-            missing = self._gui_summary(runtime_id)
-            del missing["receipt"]["activated"]
-            with self.subTest(runtime_id=runtime_id, case="activated-missing"):
-                with self.assertRaises(acceptance.AcceptanceError):
-                    acceptance._project_gui(missing, descriptor)
+            activated = self._gui_summary(runtime_id)
+            activated["receipt"]["activated"] = True
+            with self.subTest(runtime_id=runtime_id, case="activated-optional-true"):
+                acceptance._project_gui(activated, descriptor)
+
+    def test_real_provider_receipt_shape_projects_through_gui_compact_summary(self) -> None:
+        runtime_id = "crossover"
+        provider_receipt: dict[str, object] = {
+            "schemaVersion": "1",
+            "source": "explicit-override",
+            "version": "24.0",
+            "architecture": "x86_64",
+            "packId": "wine-macos-auto-preview",
+            "packDigest": "sha256:" + "c" * 64,
+            "capabilities": [
+                "guest-i386",
+                "guest-x86_64",
+                "new-wow64",
+                "windows-gui",
+            ],
+        }
+        full_applications = self._gui_summary(runtime_id)["applications"]
+        for application in full_applications:
+            application["windows"] = {
+                "available": application.pop("windowAvailable")
+            }
+            application["screenshot"] = {
+                "available": application.pop("screenshotAvailable")
+            }
+        gui_baseline.bind_runtime_identity(
+            runtime_id, provider_receipt, full_applications
+        )
+        compact = gui_baseline.compact_summary(provider_receipt, full_applications)
+        self.assertEqual(
+            set(compact["receipt"]),
+            {"schemaVersion", "runtimeId", "packId", "version", "packDigest", "source"},
+        )
+        descriptor = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )[0]
+        receipt, applications = acceptance._project_gui(compact, descriptor)
+        self.assertEqual(receipt["runtimeVersion"], "24.0")
+        self.assertTrue(
+            all(application["status"] == "accepted" for application in applications)
+        )
 
     def test_final_desktop_wait_work_root_swap_never_writes_the_victim(self) -> None:
         original_work = self.external / "work-original"

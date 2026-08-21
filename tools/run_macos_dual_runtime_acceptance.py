@@ -1293,9 +1293,8 @@ def _project_gui(
             "version",
             "packDigest",
             "source",
-            "activated",
         },
-        set(),
+        {"activated"},
         "GUI receipt",
     )
     if (
@@ -1304,7 +1303,7 @@ def _project_gui(
         or receipt["version"] != runtime_version
         or receipt["packId"] != GUI_PROVIDER_PACK_ID
         or receipt["source"] != GUI_EXPLICIT_SOURCE
-        or receipt["activated"] is not True
+        or ("activated" in receipt and receipt["activated"] is not True)
     ):
         raise AcceptanceError("GUI receipt identity is invalid")
     receipt_projection: dict[str, object] = {
