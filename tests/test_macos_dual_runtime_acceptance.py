@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import hashlib
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import json
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -336,8 +338,8 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         for runtime_id in ("crossover", "whisky"):
             runtime_root = self.external / f"{runtime_id}-runtime"
             (runtime_root / "bin").mkdir(parents=True)
-            self._tool_at(runtime_root / "bin" / "wine")
-            self._tool_at(runtime_root / "bin" / "wineserver")
+            self._macho_tool_at(runtime_root / "bin" / "wine")
+            self._macho_tool_at(runtime_root / "bin" / "wineserver")
             self.runtime_roots[runtime_id] = runtime_root
 
     def tearDown(self) -> None:
@@ -345,6 +347,13 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
 
     def _tool_at(self, path: Path) -> Path:
         path.write_text("fixture\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def _macho_tool_at(self, path: Path) -> Path:
+        path.write_bytes(
+            b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture\n"
+        )
         path.chmod(0o755)
         return path
 
@@ -396,6 +405,462 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
 
     def _arguments(self, *extra: str) -> argparse.Namespace:
         return acceptance.parse_arguments(self._argv(*extra))
+
+    def _negative_fixture(self):
+        guest = self.external / "console-guest.exe"
+        guest.write_bytes(b"MZ" + b"guest-fixture")
+        sentinel = self.external / "negative-sentinel"
+        sentinel.write_bytes(b"outside-sentinel")
+        installer_bytes = b"MZ" + b"installer-fixture"
+        asset = SimpleNamespace(
+            app_id="7zip",
+            filename="fixture-installer.exe",
+            sha256=hashlib.sha256(installer_bytes).hexdigest(),
+        )
+        (self.cache / asset.filename).write_bytes(installer_bytes)
+        return guest, sentinel, asset
+
+    def test_negative_checks_reject_four_isolated_mutants_without_touching_sources(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        originals = {
+            path: (path.stat(), path.read_bytes())
+            for path in (
+                guest,
+                sentinel,
+                self.cache / asset.filename,
+                *(root / "bin" / name for root in self.runtime_roots.values() for name in ("wine", "wineserver")),
+            )
+        }
+        validation_calls: list[Path] = []
+        inspection_calls: list[list[str]] = []
+        fetch_calls: list[tuple[Path, bool]] = []
+
+        def runtime_validator(path: Path) -> set[str]:
+            validation_calls.append(path)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+            return {"x86_64"} if path.read_bytes().startswith(b"\xcf\xfa\xed\xfe") else set()
+
+        def guest_runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            inspection_calls.append(list(argv))
+            inspected = Path(argv[-1])
+            self.assertEqual(list(inspected.parent.iterdir()), [inspected])
+            self.assertFalse(inspected.read_bytes().startswith(b"MZ"))
+            return subprocess.CompletedProcess(argv, 1, "", "invalid PE")
+
+        class AssetError(Exception):
+            pass
+
+        def asset_fetcher(_asset, cache_root: Path, allow_network: bool) -> Path:
+            fetch_calls.append((cache_root, allow_network))
+            candidate = cache_root / asset.filename
+            self.assertEqual(list(cache_root.iterdir()), [candidate])
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() != asset.sha256:
+                raise AssetError("cached 7zip digest mismatch")
+            return candidate
+
+        summary = acceptance.run_negative_checks(
+            paths,
+            descriptors,
+            console_guest=guest,
+            sentinel=sentinel,
+            runtime_validator=runtime_validator,
+            guest_runner=guest_runner,
+            asset=asset,
+            asset_fetcher=asset_fetcher,
+            asset_error=AssetError,
+        )
+
+        self.assertEqual(
+            summary,
+            {
+                "schemaVersion": "1",
+                "status": "accepted",
+                "cases": [
+                    {
+                        "runtimeId": runtime_id,
+                        "caseId": case_id,
+                        "status": "accepted",
+                        "failureClass": failure_class,
+                        "reasonCode": reason_code,
+                    }
+                    for runtime_id, case_id, failure_class, reason_code in (
+                        ("crossover", "wine-bytes-changed", "runtime", "runtime-architecture-invalid"),
+                        ("whisky", "wineserver-bytes-changed", "runtime", "runtime-architecture-invalid"),
+                        ("crossover", "console-guest-bytes-changed", "core", "core-inspection-refused"),
+                        ("whisky", "cached-installer-bytes-changed", "environment", "cached-asset-digest-mismatch"),
+                    )
+                ],
+            },
+        )
+        self.assertEqual(len(validation_calls), 2)
+        self.assertEqual(len(inspection_calls), 1)
+        self.assertEqual(inspection_calls[0][1], "inspect")
+        self.assertEqual(fetch_calls, [(self.work / "negative" / "whisky" / "cached-installer-bytes-changed", False)])
+        for path, (metadata, content) in originals.items():
+            current = path.stat()
+            self.assertEqual((current.st_dev, current.st_ino), (metadata.st_dev, metadata.st_ino))
+            self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(any(path.is_file() for path in (self.work / "negative").rglob("*")))
+        self.assertNotIn(str(self.external), json.dumps(summary))
+
+    def test_negative_mode_runs_only_discovery_and_guest_validation_processes(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        arguments = self._arguments(
+            "--negative-checks",
+            "--console-guest",
+            str(guest),
+            "--negative-sentinel",
+            str(sentinel),
+        )
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(list(argv))
+            if argv[-1] == "--all":
+                return subprocess.CompletedProcess(argv, 0, json.dumps(self._discovery()), "")
+            if len(argv) == 3 and argv[1] == "inspect":
+                return subprocess.CompletedProcess(argv, 1, "", "invalid PE")
+            raise AssertionError("negative mode attempted a non-validation process")
+
+        class AssetError(Exception):
+            pass
+
+        def fetcher(_asset, cache_root: Path, allow_network: bool) -> Path:
+            self.assertFalse(allow_network)
+            candidate = cache_root / asset.filename
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() != asset.sha256:
+                raise AssetError("cached 7zip digest mismatch")
+            return candidate
+
+        with (
+            mock.patch.object(
+                acceptance,
+                "_default_runtime_validator",
+                side_effect=lambda path: {"x86_64"}
+                if path.read_bytes().startswith(b"\xcf\xfa\xed\xfe")
+                else set(),
+            ),
+            mock.patch.object(
+                acceptance,
+                "_default_asset_boundary",
+                return_value=(asset, fetcher, AssetError),
+            ),
+        ):
+            summary = acceptance.orchestrate(
+                arguments,
+                runner=runner,
+                launcher=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("negative mode launched the desktop")
+                ),
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+
+        self.assertEqual(summary["status"], "accepted")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][-1], "--all")
+        self.assertEqual(calls[1][1], "inspect")
+        negative_summary = json.loads(
+            (self.work / "negative-summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(negative_summary, summary)
+
+    def test_negative_boundary_failures_are_closed_and_do_not_skip_later_cases(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        runtime_calls = 0
+        guest_calls = 0
+        asset_calls = 0
+
+        def runtime_accepts(_path: Path) -> set[str]:
+            nonlocal runtime_calls
+            runtime_calls += 1
+            return {"x86_64"}
+
+        def guest_accepts(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal guest_calls
+            guest_calls += 1
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        class AssetError(Exception):
+            pass
+
+        def asset_accepts(_asset, cache_root: Path, allow_network: bool) -> Path:
+            nonlocal asset_calls
+            asset_calls += 1
+            self.assertFalse(allow_network)
+            return cache_root / asset.filename
+
+        summary = acceptance.run_negative_checks(
+            paths,
+            descriptors,
+            console_guest=guest,
+            sentinel=sentinel,
+            runtime_validator=runtime_accepts,
+            guest_runner=guest_accepts,
+            asset=asset,
+            asset_fetcher=asset_accepts,
+            asset_error=AssetError,
+        )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual([case["status"] for case in summary["cases"]], ["failed"] * 4)
+        self.assertEqual(
+            {case["reasonCode"] for case in summary["cases"]},
+            {"negative-boundary-unexpectedly-accepted"},
+        )
+        self.assertEqual((runtime_calls, guest_calls, asset_calls), (2, 1, 1))
+
+    def test_default_runtime_negative_boundary_uses_the_discovery_header_validator(self) -> None:
+        candidate = self.external / "isolated-runtime-entrypoint"
+        self._macho_tool_at(candidate)
+        self.assertEqual(acceptance._default_runtime_validator(candidate), {"x86_64"})
+        mutated = bytearray(candidate.read_bytes())
+        mutated[0] ^= 0xFF
+        candidate.write_bytes(mutated)
+        self.assertEqual(acceptance._default_runtime_validator(candidate), set())
+
+    def test_wrong_negative_boundary_errors_are_closed_and_sequentially_isolated(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        runtime_calls = 0
+
+        def invalid_runtime_boundary(_path: Path):
+            nonlocal runtime_calls
+            runtime_calls += 1
+            if runtime_calls == 1:
+                raise ValueError("wrong Runtime error")
+            return ["not-a-closed-set"]
+
+        def invalid_guest_boundary(
+            _argv: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            raise OSError("wrong inspection error")
+
+        class AssetError(Exception):
+            pass
+
+        class WrongAssetError(AssetError):
+            pass
+
+        def invalid_asset_boundary(_asset, _root: Path, _allow_network: bool) -> Path:
+            raise WrongAssetError("cached 7zip digest mismatch")
+
+        summary = acceptance.run_negative_checks(
+            paths,
+            descriptors,
+            console_guest=guest,
+            sentinel=sentinel,
+            runtime_validator=invalid_runtime_boundary,
+            guest_runner=invalid_guest_boundary,
+            asset=asset,
+            asset_fetcher=invalid_asset_boundary,
+            asset_error=AssetError,
+        )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(len(summary["cases"]), 4)
+        self.assertEqual(
+            {case["reasonCode"] for case in summary["cases"]},
+            {"negative-boundary-error-invalid"},
+        )
+
+    def test_negative_sources_reject_symlinks_and_hardlinks_before_copying(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        guest_target = self.external / "guest-target.exe"
+        guest_target.write_bytes(guest.read_bytes())
+        guest.unlink()
+        try:
+            os.symlink(guest_target, guest)
+        except OSError as error:
+            self.skipTest(f"file symlinks are unavailable: {error}")
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "unsafe path component"):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertFalse(self.work.exists())
+        self.assertEqual(guest_target.read_bytes(), b"MZ" + b"guest-fixture")
+
+        guest.unlink()
+        guest.write_bytes(b"MZ" + b"guest-fixture")
+        hardlink = self.external / "guest-hardlink.exe"
+        try:
+            os.link(guest, hardlink)
+        except OSError as error:
+            self.skipTest(f"hardlinks are unavailable: {error}")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "private bounded"):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertEqual(hardlink.read_bytes(), b"MZ" + b"guest-fixture")
+
+    def test_negative_cleanup_refuses_case_directory_substitution(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        victim = self.external / "case-directory-victim"
+        victim.mkdir()
+        (victim / "sentinel").write_bytes(b"foreign-directory")
+
+        def substitute_case(path: Path) -> set[str]:
+            original_case = path.parent
+            original_case.rename(original_case.with_name(original_case.name + "-owned"))
+            try:
+                os.symlink(victim, original_case, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+            return set()
+
+        with self.assertRaisesRegex(acceptance.CleanupError, "case root identity changed"):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=substitute_case,
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertEqual((victim / "sentinel").read_bytes(), b"foreign-directory")
+        self.assertFalse((victim / "payload.bin").exists())
+
+    def test_negative_cleanup_refuses_hardlink_file_substitution(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        victim = self.external / "cleanup-hardlink-victim"
+        victim.write_bytes(b"foreign-file")
+
+        def substitute_copy(path: Path) -> set[str]:
+            path.unlink()
+            try:
+                os.link(victim, path)
+            except OSError as error:
+                self.skipTest(f"hardlinks are unavailable: {error}")
+            return set()
+
+        with self.assertRaisesRegex(acceptance.CleanupError, "copy identity changed"):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=substitute_copy,
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertEqual(victim.read_bytes(), b"foreign-file")
+
+    def test_negative_check_detects_original_source_swap_during_validation(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        replacement = self.external / "replacement-guest.exe"
+        replacement.write_bytes(guest.read_bytes())
+
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            guest.unlink()
+            replacement.rename(guest)
+            return subprocess.CompletedProcess(argv, 1, "", "invalid PE")
+
+        class AssetError(Exception):
+            pass
+
+        def fetcher(_asset, cache_root: Path, _allow_network: bool) -> Path:
+            candidate = cache_root / asset.filename
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() != asset.sha256:
+                raise AssetError("cached 7zip digest mismatch")
+            return candidate
+
+        with self.assertRaisesRegex(acceptance.IntegrityError, "identity or digest changed"):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=lambda _path: set(),
+                guest_runner=runner,
+                asset=asset,
+                asset_fetcher=fetcher,
+                asset_error=AssetError,
+            )
+
+    def test_negative_check_detects_external_sentinel_mutation(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+
+        def mutate_sentinel(_path: Path) -> set[str]:
+            sentinel.write_bytes(b"attacker-mutated-sentinel")
+            return set()
+
+        with self.assertRaisesRegex(acceptance.IntegrityError, "identity or digest changed"):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=mutate_sentinel,
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
 
     def _discovery(self) -> dict[str, object]:
         return {
@@ -525,6 +990,34 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
 
         parsed = self._arguments("--allow-network")
         self.assertTrue(parsed.allow_network)
+
+    def test_negative_mode_is_explicit_closed_and_always_offline(self) -> None:
+        guest, sentinel, _asset = self._negative_fixture()
+        negative = self._arguments(
+            "--negative-checks",
+            "--console-guest",
+            str(guest),
+            "--negative-sentinel",
+            str(sentinel),
+        )
+        self.assertTrue(negative.negative_checks)
+        self.assertEqual(negative.console_guest, str(guest))
+        self.assertEqual(negative.negative_sentinel, str(sentinel))
+        for extra in (
+            ("--negative-checks",),
+            ("--negative-checks", "--console-guest", str(guest)),
+            ("--console-guest", str(guest), "--negative-sentinel", str(sentinel)),
+            (
+                "--negative-checks",
+                "--console-guest",
+                str(guest),
+                "--negative-sentinel",
+                str(sentinel),
+                "--allow-network",
+            ),
+        ):
+            with self.subTest(extra=extra), self.assertRaises(acceptance.AcceptanceError):
+                self._arguments(*extra)
 
     def test_preflight_is_pure_and_rejects_unsafe_or_incomplete_inputs(self) -> None:
         paths = acceptance.preflight(

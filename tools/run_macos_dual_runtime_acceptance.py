@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DISCOVERY_TOOL = ROOT / "tools" / "discover_macos_wine.py"
 HEADLESS_TOOL = ROOT / "tools" / "run_macos_headless_preview.py"
 GUI_TOOL = ROOT / "tools" / "run_gui_baseline.py"
+GUI_ASSET_TOOL = ROOT / "tools" / "download_gui_assets.py"
 
 RUNTIME_MATRIX = {
     "crossover": ("console", "7zip", "sumatrapdf", "notepad-plus-plus"),
@@ -125,6 +128,16 @@ RUNTIME_DESCRIPTOR_KEYS = {
     "version",
     "architecture",
 }
+NEGATIVE_CASES = (
+    ("crossover", "wine-bytes-changed", "runtime", "runtime-architecture-invalid"),
+    ("whisky", "wineserver-bytes-changed", "runtime", "runtime-architecture-invalid"),
+    ("crossover", "console-guest-bytes-changed", "core", "core-inspection-refused"),
+    ("whisky", "cached-installer-bytes-changed", "environment", "cached-asset-digest-mismatch"),
+)
+MAX_NEGATIVE_FILE_BYTES = 128 * 1024 * 1024
+MAX_NEGATIVE_SENTINEL_BYTES = 1024 * 1024
+NEGATIVE_READ_CHUNK_BYTES = 64 * 1024
+NEGATIVE_READ_SECONDS = 30
 
 
 class AcceptanceError(Exception):
@@ -207,6 +220,21 @@ class AcceptancePaths:
     bindings: dict[str, PathBinding]
 
 
+@dataclass(frozen=True)
+class SourceBinding:
+    path: Path
+    identity: NodeIdentity
+    size: int
+    mtime_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class OwnedNode:
+    path: Path
+    identity: NodeIdentity
+
+
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 Launcher = Callable[..., object]
 Waiter = Callable[[object, int], int]
@@ -234,6 +262,9 @@ def parser() -> argparse.ArgumentParser:
     ):
         value.add_argument(f"--{flag}", required=True, action=UniqueValueAction)
     value.add_argument("--allow-network", action=UniqueFlagAction)
+    value.add_argument("--negative-checks", action=UniqueFlagAction)
+    value.add_argument("--console-guest", action=UniqueValueAction)
+    value.add_argument("--negative-sentinel", action=UniqueValueAction)
     return value
 
 
@@ -241,6 +272,15 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     require_python(sys.version_info[:3])
     parsed = parser().parse_args(list(arguments))
     parsed.allow_network = parsed.allow_network is True
+    parsed.negative_checks = parsed.negative_checks is True
+    negative_inputs = (parsed.console_guest, parsed.negative_sentinel)
+    if parsed.negative_checks:
+        if not all(isinstance(value, str) and value for value in negative_inputs):
+            raise AcceptanceError("negative checks require explicit guest and sentinel inputs")
+        if parsed.allow_network:
+            raise AcceptanceError("negative checks are always offline")
+    elif any(value is not None for value in negative_inputs):
+        raise AcceptanceError("negative inputs require --negative-checks")
     return parsed
 
 
@@ -1103,6 +1143,557 @@ def discover_runtimes(
     if result.returncode != 0:
         raise AcceptanceError("Runtime discovery failed")
     return parse_discovery(result.stdout, arguments)
+
+
+def _load_tool_module(name: str, path: Path) -> object:
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise AcceptanceError("negative validation boundary is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        sys.modules.pop(name, None)
+        raise AcceptanceError("negative validation boundary is unavailable") from error
+    return module
+
+
+def _read_bound_source(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int = MAX_NEGATIVE_FILE_BYTES,
+) -> tuple[SourceBinding, bytes]:
+    _reject_unsafe_components(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor: int | None = None
+    try:
+        entry = path.lstat()
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(entry.st_mode)
+            or _is_reparse(entry)
+            or entry.st_nlink != 1
+            or opened.st_nlink != 1
+            or _node_identity(entry) != _node_identity(opened)
+            or entry.st_size <= 0
+            or entry.st_size > max_bytes
+        ):
+            raise AcceptanceError(f"{label} must be a private bounded regular file")
+        deadline = time.monotonic() + NEGATIVE_READ_SECONDS
+        chunks: list[bytes] = []
+        total = 0
+        while total < opened.st_size:
+            if time.monotonic() >= deadline:
+                raise AcceptanceError(f"{label} read exceeded its time bound")
+            chunk = os.read(
+                descriptor,
+                min(NEGATIVE_READ_CHUNK_BYTES, opened.st_size - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        current = os.fstat(descriptor)
+        current_entry = path.lstat()
+        if (
+            total != opened.st_size
+            or current.st_size != opened.st_size
+            or current.st_mtime_ns != opened.st_mtime_ns
+            or current_entry.st_size != opened.st_size
+            or current_entry.st_mtime_ns != opened.st_mtime_ns
+            or _node_identity(current) != _node_identity(opened)
+            or _node_identity(current_entry) != _node_identity(opened)
+            or current.st_nlink != 1
+            or current_entry.st_nlink != 1
+        ):
+            raise IntegrityError(f"{label} identity changed")
+        payload = b"".join(chunks)
+        return (
+            SourceBinding(
+                path=path,
+                identity=_node_identity(opened),
+                size=opened.st_size,
+                mtime_ns=opened.st_mtime_ns,
+                sha256=hashlib.sha256(payload).hexdigest(),
+            ),
+            payload,
+        )
+    except (AcceptanceError, IntegrityError):
+        raise
+    except OSError as error:
+        raise AcceptanceError(f"{label} could not be read safely") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _revalidate_source(binding: SourceBinding, label: str) -> bytes:
+    current, payload = _read_bound_source(
+        binding.path,
+        label,
+        max_bytes=max(binding.size, MAX_NEGATIVE_SENTINEL_BYTES),
+    )
+    if current != binding:
+        raise IntegrityError(f"{label} identity or digest changed")
+    return payload
+
+
+def _owned_directory(
+    path: Path,
+    label: str,
+    *,
+    create: bool,
+    parent: OwnedNode | None = None,
+) -> OwnedNode:
+    if parent is not None:
+        if path.parent != parent.path:
+            raise AcceptanceError(f"{label} parent is invalid")
+        _verify_owned_directory(parent, f"{label} parent")
+    try:
+        if create:
+            os.mkdir(path, 0o700)
+        metadata = path.lstat()
+    except OSError as error:
+        raise AcceptanceError(f"{label} could not be created safely") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+        raise AcceptanceError(f"{label} is unsafe")
+    owned = OwnedNode(path, _node_identity(metadata))
+    if parent is not None:
+        _verify_owned_directory(parent, f"{label} parent")
+    return owned
+
+
+def _verify_owned_directory(owned: OwnedNode, label: str) -> None:
+    try:
+        metadata = owned.path.lstat()
+    except OSError as error:
+        raise CleanupError(f"{label} identity changed") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse(metadata)
+        or _node_identity(metadata) != owned.identity
+    ):
+        raise CleanupError(f"{label} identity changed")
+
+
+def _create_private_copy(
+    case_root: OwnedNode,
+    payload: bytes,
+    *,
+    filename: str = "payload.bin",
+) -> OwnedNode:
+    _verify_owned_directory(case_root, "negative case root")
+    if Path(filename).name != filename or not filename:
+        raise AcceptanceError("negative copy filename is invalid")
+    target = case_root.path / filename
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(target, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise OSError("negative copy is not private")
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        entry = target.lstat()
+        current = os.fstat(descriptor)
+        if (
+            _node_identity(opened) != _node_identity(entry)
+            or _node_identity(opened) != _node_identity(current)
+            or entry.st_nlink != 1
+            or current.st_nlink != 1
+            or entry.st_size != len(payload)
+            or current.st_size != len(payload)
+        ):
+            raise IntegrityError("negative copy identity changed")
+        return OwnedNode(target, _node_identity(opened))
+    except IntegrityError:
+        raise
+    except OSError as error:
+        raise AcceptanceError("negative copy could not be created safely") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _mutate_owned_copy(owned: OwnedNode) -> None:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(owned.path, flags)
+        opened = os.fstat(descriptor)
+        entry = owned.path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or entry.st_nlink != 1
+            or _node_identity(opened) != owned.identity
+            or _node_identity(entry) != owned.identity
+            or opened.st_size <= 0
+        ):
+            raise IntegrityError("negative copy identity changed")
+        original = os.read(descriptor, 1)
+        if len(original) != 1:
+            raise OSError("negative copy is empty")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.write(descriptor, bytes((original[0] ^ 0xFF,))) != 1:
+            raise OSError("negative mutation did not advance")
+        os.fsync(descriptor)
+        current = os.fstat(descriptor)
+        current_entry = owned.path.lstat()
+        if (
+            _node_identity(current) != owned.identity
+            or _node_identity(current_entry) != owned.identity
+            or current.st_nlink != 1
+            or current_entry.st_nlink != 1
+            or current.st_size != opened.st_size
+        ):
+            raise IntegrityError("negative copy identity changed")
+    except IntegrityError:
+        raise
+    except OSError as error:
+        raise AcceptanceError("negative copy mutation failed") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _cleanup_owned_case(case_root: OwnedNode, owned_file: OwnedNode) -> None:
+    _verify_owned_directory(case_root, "negative case root")
+    try:
+        entries = _bounded_entries(case_root.path, 1, "negative case root")
+        if entries != [owned_file.path]:
+            raise CleanupError("negative case contents changed")
+        metadata = owned_file.path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or metadata.st_nlink != 1
+            or _node_identity(metadata) != owned_file.identity
+        ):
+            raise CleanupError("negative copy identity changed")
+        owned_file.path.unlink()
+        _verify_owned_directory(case_root, "negative case root")
+        if _bounded_entries(case_root.path, 1, "negative case root"):
+            raise CleanupError("negative case cleanup is incomplete")
+        case_root.path.rmdir()
+    except CleanupError:
+        raise
+    except AcceptanceError as error:
+        raise CleanupError("negative case contents changed") from error
+    except OSError as error:
+        raise CleanupError("negative case cleanup failed") from error
+
+
+def _prepare_negative_layout(paths: AcceptancePaths) -> dict[str, OwnedNode]:
+    _revalidate_bindings(paths)
+    _empty_or_absent_directory(paths.work_root, "work-root")
+    try:
+        paths.work_root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise AcceptanceError("negative work root could not be created") from error
+    _refresh_root_bindings(paths)
+    work_metadata = paths.work_root.lstat()
+    work_root = OwnedNode(paths.work_root, _node_identity(work_metadata))
+    negative = _owned_directory(
+        paths.work_root / "negative",
+        "negative root",
+        create=True,
+        parent=work_root,
+    )
+    runtime_roots: dict[str, OwnedNode] = {}
+    for runtime_id in RUNTIME_IDS:
+        runtime_roots[runtime_id] = _owned_directory(
+            negative.path / runtime_id,
+            "negative Runtime root",
+            create=True,
+            parent=negative,
+        )
+    entries = _bounded_entries(negative.path, len(RUNTIME_IDS), "negative root")
+    if {entry.name for entry in entries} != set(RUNTIME_IDS):
+        raise IntegrityError("negative layout changed")
+    return runtime_roots
+
+
+def _default_runtime_validator(path: Path) -> object:
+    module = _load_tool_module("_compatforge_negative_discovery", DISCOVERY_TOOL)
+    validator = getattr(module, "macho_architectures", None)
+    if not callable(validator):
+        raise AcceptanceError("negative Runtime boundary is unavailable")
+    return validator(path)
+
+
+def _default_asset_boundary() -> tuple[object, Callable[..., Path], type[Exception]]:
+    module = _load_tool_module("_compatforge_negative_gui_assets", GUI_ASSET_TOOL)
+    asset_for = getattr(module, "asset_for", None)
+    fetch = getattr(module, "fetch", None)
+    asset_error = getattr(module, "AssetError", None)
+    if (
+        not callable(asset_for)
+        or not callable(fetch)
+        or not isinstance(asset_error, type)
+        or not issubclass(asset_error, Exception)
+    ):
+        raise AcceptanceError("negative asset boundary is unavailable")
+    return asset_for("7zip"), fetch, asset_error
+
+
+def _runtime_negative_boundary(path: Path, validator: Callable[[Path], object]) -> str | None:
+    try:
+        architectures = validator(path)
+    except Exception:
+        return "negative-boundary-error-invalid"
+    if not isinstance(architectures, set) or any(not isinstance(value, str) for value in architectures):
+        return "negative-boundary-error-invalid"
+    return None if architectures != {"x86_64"} else "negative-boundary-unexpectedly-accepted"
+
+
+def _guest_negative_boundary(
+    path: Path,
+    cli: Path,
+    runner: Runner | None,
+) -> str | None:
+    try:
+        result = _invoke(
+            [str(cli), "inspect", str(path)],
+            runner,
+            timeout=DISCOVERY_TIMEOUT_SECONDS,
+        )
+    except (AcceptanceError, CleanupError):
+        return "negative-boundary-error-invalid"
+    if not isinstance(result.returncode, int) or isinstance(result.returncode, bool):
+        return "negative-boundary-error-invalid"
+    if result.returncode == 0:
+        return "negative-boundary-unexpectedly-accepted"
+    if result.returncode != 1 or result.stdout != "" or not result.stderr.strip():
+        return "negative-boundary-error-invalid"
+    return None
+
+
+def _asset_negative_boundary(
+    case_root: Path,
+    asset: object,
+    fetcher: Callable[..., Path],
+    asset_error: type[Exception],
+) -> str | None:
+    try:
+        fetcher(asset, case_root, False)
+    except Exception as error:
+        if type(error) is asset_error and str(error) == "cached 7zip digest mismatch":
+            return None
+        return "negative-boundary-error-invalid"
+    return "negative-boundary-unexpectedly-accepted"
+
+
+def run_negative_checks(
+    paths: AcceptancePaths,
+    runtimes: list[dict[str, object]],
+    *,
+    console_guest: Path,
+    sentinel: Path,
+    runtime_validator: Callable[[Path], object] | None = None,
+    guest_runner: Runner | None = None,
+    asset: object | None = None,
+    asset_fetcher: Callable[..., Path] | None = None,
+    asset_error: type[Exception] | None = None,
+) -> dict[str, object]:
+    """Run four copy-bound negative checks without executing a mutant payload."""
+
+    if len(runtimes) != len(RUNTIME_IDS) or [
+        descriptor.get("runtimeId") for descriptor in runtimes
+    ] != list(RUNTIME_IDS):
+        raise AcceptanceError("negative Runtime descriptors are incomplete")
+    _revalidate_bindings(paths)
+    for descriptor in runtimes:
+        _revalidate_runtime(descriptor)
+    if runtime_validator is None:
+        runtime_validator = _default_runtime_validator
+
+    if asset is None or asset_fetcher is None or asset_error is None:
+        if any(value is not None for value in (asset, asset_fetcher, asset_error)):
+            raise AcceptanceError("negative asset boundary is incomplete")
+        asset, asset_fetcher, asset_error = _default_asset_boundary()
+    filename = getattr(asset, "filename", None)
+    expected_asset_digest = getattr(asset, "sha256", None)
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or Path(filename).name != filename
+        or not isinstance(expected_asset_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_asset_digest) is None
+        or not isinstance(asset_error, type)
+        or not issubclass(asset_error, Exception)
+    ):
+        raise AcceptanceError("negative asset contract is invalid")
+
+    guest_path = _canonical(_absolute(str(console_guest), "console guest"), "console guest")
+    sentinel_path = _canonical(_absolute(str(sentinel), "negative sentinel"), "negative sentinel")
+    installer_path = paths.cache_root / filename
+    protected = (
+        ROOT.resolve(strict=True),
+        paths.work_root,
+        paths.runtime_store_root,
+        paths.storage_root,
+        paths.interaction_evidence_root,
+        paths.compatforge_cli,
+        paths.desktop_app,
+        paths.cc,
+    )
+    if any(_overlaps(guest_path, value) for value in protected):
+        raise AcceptanceError("console guest overlaps a protected path")
+    if any(_overlaps(sentinel_path, value) for value in (*protected, paths.cache_root, guest_path)):
+        raise AcceptanceError("negative sentinel overlaps a protected path")
+
+    descriptor_by_id = {str(value["runtimeId"]): value for value in runtimes}
+    source_paths: dict[str, Path] = {}
+    for runtime_id, descriptor in descriptor_by_id.items():
+        root = Path(_descriptor_text(descriptor, "materializedRoot"))
+        for field in ("wine", "wineserver"):
+            relative = PurePosixPath(_descriptor_text(descriptor, field))
+            source_paths[f"{runtime_id}:{field}"] = root.joinpath(*relative.parts)
+    source_paths["console-guest"] = guest_path
+    source_paths["cached-installer"] = installer_path
+    source_paths["sentinel"] = sentinel_path
+    if len(set(source_paths.values())) != len(source_paths):
+        raise AcceptanceError("negative sources must be distinct")
+
+    bindings: dict[str, SourceBinding] = {}
+    guest_header = b""
+    for key, path in source_paths.items():
+        maximum = MAX_NEGATIVE_SENTINEL_BYTES if key == "sentinel" else MAX_NEGATIVE_FILE_BYTES
+        binding, payload = _read_bound_source(
+            path,
+            f"negative source {key}",
+            max_bytes=maximum,
+        )
+        bindings[key] = binding
+        if key == "console-guest":
+            guest_header = payload[:2]
+    if guest_header != b"MZ":
+        raise AcceptanceError("console guest is not a PE input")
+    if bindings["cached-installer"].sha256 != expected_asset_digest:
+        raise AcceptanceError("cached installer digest is invalid")
+
+    runtime_roots = _prepare_negative_layout(paths)
+    case_results: list[dict[str, object]] = []
+    for runtime_id, case_id, expected_class, expected_reason in NEGATIVE_CASES:
+        if case_id == "wine-bytes-changed":
+            source_key = f"{runtime_id}:wine"
+        elif case_id == "wineserver-bytes-changed":
+            source_key = f"{runtime_id}:wineserver"
+        elif case_id == "console-guest-bytes-changed":
+            source_key = "console-guest"
+        else:
+            source_key = "cached-installer"
+        source_payload = _revalidate_source(
+            bindings[source_key], f"negative source {source_key}"
+        )
+        _revalidate_source(bindings["sentinel"], "negative sentinel")
+        _verify_owned_directory(runtime_roots[runtime_id], "negative Runtime root")
+        if _bounded_entries(
+            runtime_roots[runtime_id].path,
+            1,
+            "negative Runtime root",
+        ):
+            raise IntegrityError("negative Runtime root contains an unexpected case")
+        case_root = _owned_directory(
+            runtime_roots[runtime_id].path / case_id,
+            "negative case root",
+            create=True,
+            parent=runtime_roots[runtime_id],
+        )
+        owned_file = _create_private_copy(
+            case_root,
+            source_payload,
+            filename=filename if case_id == "cached-installer-bytes-changed" else "payload.bin",
+        )
+        _mutate_owned_copy(owned_file)
+        _revalidate_source(bindings[source_key], f"negative source {source_key}")
+        _revalidate_source(bindings["sentinel"], "negative sentinel")
+
+        failure_reason: str | None = None
+        try:
+            if case_id in ("wine-bytes-changed", "wineserver-bytes-changed"):
+                failure_reason = _runtime_negative_boundary(owned_file.path, runtime_validator)
+            elif case_id == "console-guest-bytes-changed":
+                failure_reason = _guest_negative_boundary(
+                    owned_file.path,
+                    paths.compatforge_cli,
+                    guest_runner,
+                )
+            else:
+                failure_reason = _asset_negative_boundary(
+                    case_root.path,
+                    asset,
+                    asset_fetcher,
+                    asset_error,
+                )
+        finally:
+            _cleanup_owned_case(case_root, owned_file)
+        if _bounded_entries(
+            runtime_roots[runtime_id].path,
+            1,
+            "negative Runtime root",
+        ):
+            raise CleanupError("negative case cleanup is incomplete")
+        _revalidate_source(bindings[source_key], f"negative source {source_key}")
+        _revalidate_source(bindings["sentinel"], "negative sentinel")
+        case_results.append(
+            {
+                "runtimeId": runtime_id,
+                "caseId": case_id,
+                "status": "accepted" if failure_reason is None else "failed",
+                "failureClass": expected_class if failure_reason is None else "core",
+                "reasonCode": expected_reason if failure_reason is None else failure_reason,
+            }
+        )
+
+    _revalidate_bindings(paths)
+    for descriptor in runtimes:
+        _revalidate_runtime(descriptor)
+    for runtime_id in RUNTIME_IDS:
+        _verify_owned_directory(runtime_roots[runtime_id], "negative Runtime root")
+        if _bounded_entries(
+            runtime_roots[runtime_id].path,
+            1,
+            "negative Runtime root",
+        ):
+            raise CleanupError("negative case cleanup is incomplete")
+    for key, binding in bindings.items():
+        _revalidate_source(binding, f"negative source {key}")
+    accepted = all(value["status"] == "accepted" for value in case_results)
+    summary: dict[str, object] = {
+        "schemaVersion": "1",
+        "status": "accepted" if accepted else "failed",
+        "cases": case_results,
+    }
+    encoded = json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_JSON_BYTES:
+        raise AcceptanceError("negative summary exceeds its size bound")
+    return summary
 
 
 def _prepare_layout(paths: AcceptancePaths) -> None:
@@ -2346,6 +2937,27 @@ def orchestrate(
         runtimes = discover_runtimes(arguments, runner)
     finally:
         _revalidate_bindings(paths)
+    if arguments.negative_checks is True:
+        summary = run_negative_checks(
+            paths,
+            runtimes,
+            console_guest=Path(arguments.console_guest),
+            sentinel=Path(arguments.negative_sentinel),
+            guest_runner=runner,
+        )
+        encoded = json.dumps(
+            summary,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        _safe_create_output(
+            paths,
+            ("negative-summary.json",),
+            encoded,
+            "negative summary output",
+        )
+        return summary
     _prepare_layout(paths)
     rounds: list[dict[str, object]] = []
     abort_remaining = False

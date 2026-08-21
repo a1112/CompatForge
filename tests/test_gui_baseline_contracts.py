@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
 import http.client
 import importlib.util
 import io
@@ -974,6 +976,47 @@ struct RealCode;
                 with self.assertRaises(urllib.error.HTTPError) as deterministic_http:
                     self.assets.fetch_classified(asset, cache_root, True)
             self.assertNotIsInstance(deterministic_http.exception, self.assets.NetworkUnavailable)
+
+    def test_offline_downloader_rejects_an_isolated_mutated_cached_installer(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-mutated-cache-") as temporary:
+            root = Path(temporary)
+            original_cache = root / "original-cache"
+            negative_cache = root / "negative-cache"
+            original_cache.mkdir()
+            negative_cache.mkdir()
+            original = b"MZ" + b"fixed-installer-fixture"
+            digest = hashlib.sha256(original).hexdigest()
+            asset = dataclasses.replace(self.assets.ASSETS[0], sha256=digest)
+            source = original_cache / asset.filename
+            mutant = negative_cache / asset.filename
+            source.write_bytes(original)
+            mutant.write_bytes(original)
+            mutated = bytearray(mutant.read_bytes())
+            mutated[0] ^= 0xFF
+            mutant.write_bytes(mutated)
+            source_metadata = source.stat()
+
+            with mock.patch.object(
+                self.assets.urllib.request,
+                "build_opener",
+                side_effect=AssertionError("offline cache validation attempted network access"),
+            ):
+                self.assertEqual(
+                    self.assets.fetch(asset, original_cache, False),
+                    source,
+                )
+                with self.assertRaisesRegex(
+                    self.assets.AssetError,
+                    "^cached 7zip digest mismatch$",
+                ):
+                    self.assets.fetch(asset, negative_cache, False)
+
+            current = source.stat()
+            self.assertEqual(
+                (current.st_dev, current.st_ino),
+                (source_metadata.st_dev, source_metadata.st_ino),
+            )
+            self.assertEqual(source.read_bytes(), original)
 
     def test_protocol_body_failure_flows_through_fetch_asset_and_main_as_blocked(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-gui-protocol-body-") as temporary:
