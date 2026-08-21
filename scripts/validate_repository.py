@@ -589,6 +589,10 @@ MACOS_ACCEPTANCE_NEGATION_BEFORE = (
     r"\bneither\b(?:(?!__comma__).)*\bnor\b"
     r"(?:\s+(?!__comma__)\w+){0,4}\s*$",
 )
+MACOS_ACCEPTANCE_SCOPE_SUFFIX = (
+    r"(?:scope|this\s+scope|current\s+scope|the\s+scope|"
+    r"the\s+current\s+scope|the\s+present\s+scope)"
+)
 MACOS_ACCEPTANCE_NEGATION_AFTER = (
     r"(?:(?:generation|distribution|packaging|release)\s+)?"
     r"(?:(?:is|are|was|were|will\s+be|would\s+be|has\s+been|have\s+been|"
@@ -600,12 +604,12 @@ MACOS_ACCEPTANCE_NEGATION_AFTER = (
     r"(?:happen|occur|proceed|be\s+(?:allowed|authorized|generated|modified|changed))\b",
     r"(?:generation|distribution|packaging|release)\s+"
     r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
-    r"(?:out(?:side)?(?:\s+of)?\s+(?:(?:current|this|the)\s+)?scope|"
-    r"beyond\s+(?:(?:current|this|the)\s+)?scope|excluded)\b",
+    rf"(?:out(?:side)?(?:\s+of)?\s+{MACOS_ACCEPTANCE_SCOPE_SUFFIX}|"
+    rf"beyond\s+{MACOS_ACCEPTANCE_SCOPE_SUFFIX}|excluded)\b",
     r"(?:(?:is|remains?|stays?)\s+)?out(?:side)?(?:\s+of)?\s+"
-    r"(?:(?:current|this|the)\s+)?scope\b",
+    rf"{MACOS_ACCEPTANCE_SCOPE_SUFFIX}\b",
     r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
-    r"(?:beyond\s+(?:(?:current|this|the)\s+)?scope|excluded)\b",
+    rf"(?:beyond\s+{MACOS_ACCEPTANCE_SCOPE_SUFFIX}|excluded)\b",
     r"(?:生成|分发|发布|打包)?(?:不在(?:本阶段)?范围内|"
     r"超出(?:本阶段)?范围|(?:在)?范围外|(?:已)?排除|"
     r"(?:被)?(?:严禁|禁止)|不会发生)",

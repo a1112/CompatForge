@@ -623,6 +623,10 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "Public release stays outside the scope.",
             ),
             (
+                "public-en-outside-the-current-scope",
+                "Public release stays outside the current scope.",
+            ),
+            (
                 "signing-en-beyond-this-scope",
                 "Code signing remains beyond this scope.",
             ),
