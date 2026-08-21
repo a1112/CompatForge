@@ -8,6 +8,7 @@ import unittest
 import argparse
 import json
 import subprocess
+import threading
 import time
 from unittest import mock
 from pathlib import Path
@@ -252,10 +253,11 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             "receipt": {
                 "schemaVersion": "1",
                 "runtimeId": runtime_id,
-                "packId": f"local-{runtime_id}",
+                "packId": "wine-macos-auto-preview",
                 "version": "24.0" if runtime_id == "crossover" else "2.3",
                 "packDigest": "sha256:" + "c" * 64,
-                "source": f"{runtime_id}-app",
+                "source": "explicit-override",
+                "activated": True,
             },
             "applications": [
                 {
@@ -640,6 +642,32 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(acceptance.AcceptanceError, "application keys"):
             acceptance._project_gui(screenshot_path, descriptor)
 
+    def test_closed_json_rejects_large_integers_constants_and_invalid_text(self) -> None:
+        large_integer = "9" * 5000
+        for document in (
+            large_integer,
+            '{"nested":' + large_integer + "}",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            '{"nested":[NaN]}',
+        ):
+            with self.subTest(document=document[:16]):
+                with self.assertRaises(acceptance.AcceptanceError) as raised:
+                    acceptance.parse_closed_json(document, "child")
+                self.assertEqual(str(raised.exception), "child JSON is invalid")
+
+        for invalid_text in ('"\\ud800"', '"control\\u0001value"'):
+            with self.subTest(invalid_text=invalid_text):
+                with self.assertRaises(acceptance.AcceptanceError):
+                    acceptance.parse_closed_json(invalid_text, "child")
+
+        too_deep = "[" * (acceptance.MAX_JSON_DEPTH + 2) + "]" * (
+            acceptance.MAX_JSON_DEPTH + 2
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "structural bound"):
+            acceptance.parse_closed_json(too_deep, "child")
+
     def test_interaction_preflight_requires_every_literal_check_to_be_true(self) -> None:
         target = self.interactions / "round-1" / "crossover.json"
         original = json.loads(target.read_text(encoding="utf-8"))
@@ -972,6 +1000,91 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 timeout=0.1,
             )
 
+    def test_bounded_capture_cleanup_cannot_block_on_an_active_stream_reader(self) -> None:
+        class BlockingStream:
+            def __init__(self) -> None:
+                self.read_descriptor, self.write_descriptor = os.pipe()
+                self.lock = threading.Lock()
+                self.entered = threading.Event()
+                self.released = threading.Event()
+                self.finished = threading.Event()
+                self.closed = False
+
+            def read(self, _size: int) -> bytes:
+                with self.lock:
+                    self.entered.set()
+                    self.released.wait()
+                    self.finished.set()
+                    return b""
+
+            def fileno(self) -> int:
+                return self.read_descriptor
+
+            def close(self) -> None:
+                with self.lock:
+                    if not self.closed:
+                        os.close(self.read_descriptor)
+                        self.closed = True
+
+            def cleanup(self) -> None:
+                self.released.set()
+                if not self.closed:
+                    try:
+                        os.close(self.read_descriptor)
+                    except OSError:
+                        pass
+                    self.closed = True
+                try:
+                    os.close(self.write_descriptor)
+                except OSError:
+                    pass
+
+        class UnstoppableProcess:
+            def __init__(self) -> None:
+                self.stdout = BlockingStream()
+                self.stderr = BlockingStream()
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                raise OSError("closed terminate failure")
+
+            def kill(self) -> None:
+                raise OSError("closed kill failure")
+
+            def wait(self, timeout: int) -> int:
+                raise subprocess.TimeoutExpired("child", timeout)
+
+        process = UnstoppableProcess()
+        errors: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                acceptance._bounded_run(["child"], timeout=0.05)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=invoke)
+
+        try:
+            with (
+                mock.patch.object(acceptance.subprocess, "Popen", return_value=process),
+                mock.patch.object(acceptance, "_posix_process_group", return_value=None),
+            ):
+                worker.start()
+                worker.join(0.75)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], acceptance.CleanupError)
+            self.assertTrue(process.stdout.closed)
+            self.assertTrue(process.stderr.closed)
+            self.assertNotIn("daemon=True", ACCEPTANCE_TOOL.read_text(encoding="utf-8"))
+        finally:
+            process.stdout.cleanup()
+            process.stderr.cleanup()
+            worker.join(2)
+
     def test_accepted_gui_projection_is_complete_and_aggregate_checks_cleanup(self) -> None:
         descriptor = acceptance.parse_discovery(
             json.dumps(self._discovery()), self._arguments()
@@ -1036,6 +1149,44 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             }
         ]
         self.assertFalse(acceptance.aggregate_is_accepted(incomplete_rounds))
+
+    def test_gui_receipt_is_bound_to_the_explicit_provider_identity(self) -> None:
+        for runtime_id in ("crossover", "whisky"):
+            with self.subTest(runtime_id=runtime_id, case="valid"):
+                descriptor = acceptance.parse_discovery(
+                    json.dumps(self._discovery()), self._arguments()
+                )[0 if runtime_id == "crossover" else 1]
+                receipt, applications = acceptance._project_gui(
+                    self._gui_summary(runtime_id), descriptor
+                )
+                self.assertEqual(receipt["runtimeVersion"], descriptor["version"])
+                self.assertTrue(
+                    all(application["status"] == "accepted" for application in applications)
+                )
+
+            mutations: list[tuple[str, object]] = [
+                ("packId", f"local-{runtime_id}"),
+                ("packId-type", 1),
+                ("source", f"{runtime_id}-app"),
+                ("source-type", True),
+                ("activated-false", False),
+                ("activated-type", "true"),
+                ("runtimeId", "whisky" if runtime_id == "crossover" else "crossover"),
+                ("version", "0.0"),
+            ]
+            for label, value in mutations:
+                with self.subTest(runtime_id=runtime_id, case=label):
+                    mutant = self._gui_summary(runtime_id)
+                    field = label.split("-", 1)[0]
+                    mutant["receipt"][field] = value
+                    with self.assertRaises(acceptance.AcceptanceError):
+                        acceptance._project_gui(mutant, descriptor)
+
+            missing = self._gui_summary(runtime_id)
+            del missing["receipt"]["activated"]
+            with self.subTest(runtime_id=runtime_id, case="activated-missing"):
+                with self.assertRaises(acceptance.AcceptanceError):
+                    acceptance._project_gui(missing, descriptor)
 
     def test_final_desktop_wait_work_root_swap_never_writes_the_victim(self) -> None:
         original_work = self.external / "work-original"
@@ -1283,11 +1434,17 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
 
     def test_normal_child_and_desktop_returns_reap_a_residual_process_group(self) -> None:
         class EmptyStream:
-            def read(self, _size: int) -> bytes:
-                return b""
+            def __init__(self) -> None:
+                self.descriptor, writer = os.pipe()
+                os.close(writer)
 
             def close(self) -> None:
-                pass
+                if self.descriptor >= 0:
+                    os.close(self.descriptor)
+                    self.descriptor = -1
+
+            def fileno(self) -> int:
+                return self.descriptor
 
         class FinishedProcess:
             def __init__(self) -> None:
@@ -1327,11 +1484,17 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
 
     def test_normal_return_residual_cleanup_failure_is_fatal(self) -> None:
         class EmptyStream:
-            def read(self, _size: int) -> bytes:
-                return b""
+            def __init__(self) -> None:
+                self.descriptor, writer = os.pipe()
+                os.close(writer)
 
             def close(self) -> None:
-                pass
+                if self.descriptor >= 0:
+                    os.close(self.descriptor)
+                    self.descriptor = -1
+
+            def fileno(self) -> int:
+                return self.descriptor
 
         class FinishedProcess:
             def __init__(self) -> None:

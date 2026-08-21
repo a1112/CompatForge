@@ -12,7 +12,6 @@ import signal
 import stat
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -32,6 +31,8 @@ ROUNDS = ("round-1", "round-2")
 RUNTIME_IDS = tuple(RUNTIME_MATRIX)
 GUI_APPLICATIONS = ("7zip", "sumatrapdf", "notepad-plus-plus")
 PHASES = ("console", "gui", "desktop")
+GUI_PROVIDER_PACK_ID = "wine-macos-auto-preview"
+GUI_EXPLICIT_SOURCE = "explicit-override"
 
 REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
@@ -374,6 +375,10 @@ def _bounded_structure(value: object, label: str) -> None:
         elif isinstance(current, list):
             stack.extend((nested, depth + 1) for nested in current)
         elif isinstance(current, str):
+            try:
+                current.encode("utf-8")
+            except UnicodeError as error:
+                raise AcceptanceError(f"{label} contains invalid text") from error
             if len(current) > MAX_TEXT_CHARS or any(
                 ord(character) < 32 or ord(character) == 127 for character in current
             ):
@@ -391,6 +396,10 @@ def _closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
+def _reject_json_constant(_constant: str) -> object:
+    raise ValueError("non-standard JSON constant")
+
+
 def parse_closed_json(text: object, label: str) -> object:
     if not isinstance(text, str):
         raise AcceptanceError(f"{label} JSON is invalid")
@@ -401,10 +410,14 @@ def parse_closed_json(text: object, label: str) -> object:
     if size > MAX_JSON_BYTES:
         raise AcceptanceError(f"{label} JSON exceeds its size bound")
     try:
-        value = json.loads(text, object_pairs_hook=_closed_object)
+        value = json.loads(
+            text,
+            object_pairs_hook=_closed_object,
+            parse_constant=_reject_json_constant,
+        )
     except AcceptanceError:
         raise
-    except (json.JSONDecodeError, UnicodeError, RecursionError) as error:
+    except (ValueError, UnicodeError, RecursionError) as error:
         raise AcceptanceError(f"{label} JSON is invalid") from error
     _bounded_structure(value, label)
     return value
@@ -906,94 +919,108 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
             _close_process_streams(process)
         raise
     if process.stdout is None or process.stderr is None:
-        if not _stop_process(process, process_group=process_group):
+        try:
+            if not _stop_process(process, process_group=process_group):
+                raise CleanupError("child process cleanup failed")
+        finally:
             _close_process_streams(process)
-            raise CleanupError("child process cleanup failed")
-        _close_process_streams(process)
+        raise AcceptanceError("child process capture is unavailable")
+
+    try:
+        stream_descriptors: dict[str, int] = {}
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            fileno = getattr(stream, "fileno", None)
+            if not callable(fileno):
+                raise AcceptanceError("child process capture is unavailable")
+            descriptor = fileno()
+            if not isinstance(descriptor, int) or isinstance(descriptor, bool) or descriptor < 0:
+                raise AcceptanceError("child process capture is unavailable")
+            os.set_blocking(descriptor, False)
+            stream_descriptors[name] = descriptor
+    except (AcceptanceError, OSError, ValueError):
+        try:
+            _stop_process(process, process_group=process_group)
+        finally:
+            _close_process_streams(process)
         raise AcceptanceError("child process capture is unavailable")
 
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     total = 0
-    lock = threading.Lock()
-    overflow = threading.Event()
-    reader_failed = threading.Event()
+    overflow = False
+    reader_failed = False
 
-    def reader(name: str, stream: object) -> None:
-        nonlocal total
-        read = getattr(stream, "read", None)
-        if not callable(read):
-            reader_failed.set()
-            return
-        try:
-            while True:
-                chunk = read(PROCESS_READ_CHUNK_BYTES)
+    def drain_available() -> bool:
+        nonlocal total, overflow, reader_failed
+        progressed = False
+        for name, descriptor in tuple(stream_descriptors.items()):
+            while name in stream_descriptors:
+                try:
+                    chunk = os.read(descriptor, PROCESS_READ_CHUNK_BYTES)
+                except BlockingIOError:
+                    break
+                except OSError:
+                    reader_failed = True
+                    del stream_descriptors[name]
+                    break
                 if not chunk:
-                    return
-                if not isinstance(chunk, bytes):
-                    reader_failed.set()
-                    return
-                with lock:
-                    stream_remaining = MAX_PROCESS_STREAM_BYTES - len(captured[name])
-                    total_remaining = MAX_PROCESS_OUTPUT_BYTES - total
-                    accepted = min(len(chunk), max(0, stream_remaining), max(0, total_remaining))
-                    if accepted:
-                        captured[name].extend(chunk[:accepted])
-                        total += accepted
-                    if accepted != len(chunk):
-                        overflow.set()
-                        return
-        except Exception:
-            reader_failed.set()
+                    del stream_descriptors[name]
+                    break
+                progressed = True
+                stream_remaining = MAX_PROCESS_STREAM_BYTES - len(captured[name])
+                total_remaining = MAX_PROCESS_OUTPUT_BYTES - total
+                accepted = min(len(chunk), max(0, stream_remaining), max(0, total_remaining))
+                if accepted:
+                    captured[name].extend(chunk[:accepted])
+                    total += accepted
+                if accepted != len(chunk):
+                    overflow = True
+                    return progressed
+        return progressed
 
-    threads = [
-        threading.Thread(target=reader, args=("stdout", process.stdout), daemon=True),
-        threading.Thread(target=reader, args=("stderr", process.stderr), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-    deadline = time.monotonic() + timeout
-    timed_out = False
-    while _process_poll(process) is None:
-        if overflow.is_set() or reader_failed.is_set():
-            break
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(PROCESS_POLL_SECONDS)
-    if timed_out or overflow.is_set() or reader_failed.is_set():
-        if not _stop_process(process, process_group=process_group):
-            _close_process_streams(process)
-            raise CleanupError("child process cleanup failed")
-    for thread in threads:
-        thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
-    if any(thread.is_alive() for thread in threads):
-        if not _stop_process(process, process_group=process_group):
-            _close_process_streams(process)
-            raise CleanupError("child process cleanup failed")
-        _close_process_streams(process)
-        for thread in threads:
-            thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
-        raise AcceptanceError("child process capture did not stop")
-    _close_process_streams(process)
-    if overflow.is_set():
-        raise AcceptanceError("child process exceeded output limit")
-    if timed_out:
-        raise AcceptanceError("child process timed out")
-    if reader_failed.is_set():
-        raise AcceptanceError("child process capture failed")
-    returncode = _process_poll(process)
-    if returncode is None:
-        if not _stop_process(process, process_group=process_group):
-            raise CleanupError("child process cleanup failed")
-        raise AcceptanceError("child process did not report an exit status")
-    if not _reap_residual_process_group(process, process_group):
-        raise CleanupError("child process cleanup failed")
     try:
-        stdout = bytes(captured["stdout"]).decode("utf-8")
-        stderr = bytes(captured["stderr"]).decode("utf-8")
-    except UnicodeError as error:
-        raise AcceptanceError("child process output is invalid") from error
-    return subprocess.CompletedProcess(list(arguments), returncode, stdout, stderr)
+        deadline = time.monotonic() + timeout
+        timed_out = False
+        residual_checked = False
+        while True:
+            progressed = drain_available()
+            if overflow or reader_failed:
+                break
+            returncode = _process_poll(process)
+            if returncode is not None and not residual_checked:
+                _reap_residual_process_group(process, process_group)
+                residual_checked = True
+                progressed = drain_available() or progressed
+            if returncode is not None and not stream_descriptors:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            if not progressed:
+                time.sleep(PROCESS_POLL_SECONDS)
+        if timed_out or overflow or reader_failed:
+            if not _stop_process(process, process_group=process_group):
+                raise CleanupError("child process cleanup failed")
+        if overflow:
+            raise AcceptanceError("child process exceeded output limit")
+        if timed_out:
+            raise AcceptanceError("child process timed out")
+        if reader_failed:
+            raise AcceptanceError("child process capture failed")
+        returncode = _process_poll(process)
+        if returncode is None:
+            if not _stop_process(process, process_group=process_group):
+                raise CleanupError("child process cleanup failed")
+            raise AcceptanceError("child process did not report an exit status")
+        if not residual_checked and not _reap_residual_process_group(process, process_group):
+            raise CleanupError("child process cleanup failed")
+        try:
+            stdout = bytes(captured["stdout"]).decode("utf-8")
+            stderr = bytes(captured["stderr"]).decode("utf-8")
+        except UnicodeError as error:
+            raise AcceptanceError("child process output is invalid") from error
+        return subprocess.CompletedProcess(list(arguments), returncode, stdout, stderr)
+    finally:
+        _close_process_streams(process)
 
 
 def _invoke(
@@ -1259,24 +1286,31 @@ def _project_gui(
         raise AcceptanceError("GUI summary schema is invalid")
     receipt = _exact_keys(
         summary["receipt"],
-        {"schemaVersion", "runtimeId", "packId", "version", "packDigest", "source"},
-        {"activated"},
+        {
+            "schemaVersion",
+            "runtimeId",
+            "packId",
+            "version",
+            "packDigest",
+            "source",
+            "activated",
+        },
+        set(),
         "GUI receipt",
     )
     if (
         receipt["schemaVersion"] != "1"
         or receipt["runtimeId"] != runtime_id
         or receipt["version"] != runtime_version
+        or receipt["packId"] != GUI_PROVIDER_PACK_ID
+        or receipt["source"] != GUI_EXPLICIT_SOURCE
+        or receipt["activated"] is not True
     ):
         raise AcceptanceError("GUI receipt identity is invalid")
-    _safe_text(receipt["packId"], "GUI pack id")
-    _safe_text(receipt["source"], "GUI Runtime source")
     receipt_projection: dict[str, object] = {
         "runtimeVersion": runtime_version,
         "packDigest": _digest(receipt["packDigest"], "GUI pack digest"),
     }
-    if "activated" in receipt and not isinstance(receipt["activated"], bool):
-        raise AcceptanceError("GUI receipt activated flag is invalid")
 
     applications = summary["applications"]
     if not isinstance(applications, list) or len(applications) != len(GUI_APPLICATIONS):
