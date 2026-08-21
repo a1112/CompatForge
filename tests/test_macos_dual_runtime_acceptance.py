@@ -574,6 +574,7 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("public-zh-no-plans", "本阶段无计划公开发布。"),
             ("public-en-never", "This stage is never a public release."),
             ("public-zh-not-planned", "本阶段不计划对外发布。"),
+            ("irrelevant-released-file", "File handles are released after cleanup."),
             ("signing-en-prefix", "The application will not be signed."),
             ("signing-zh-prefix", "应用不会签名。"),
             ("signing-en-suffix", "Application signing is prohibited."),
@@ -583,6 +584,7 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("signing-zh-out-of-scope", "代码签名不在本阶段范围内。"),
             ("signing-en-beyond-scope", "Artifact signature is beyond scope."),
             ("signing-en-excluded", "Notarization is excluded."),
+            ("signing-en-remains-excluded", "Code signing remains excluded."),
             ("signing-zh-beyond-scope", "构建签署在范围外。"),
             ("dmg-en-prefix", "This stage will not generate a DMG."),
             ("dmg-zh-prefix", "本阶段不会生成 DMG。"),
@@ -601,6 +603,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("repositories-en-suffix", "Mac-Win modification is forbidden."),
             ("repositories-zh-suffix", "ForgeOS 修改被禁止。"),
             (
+                "public-en-stays-outside-scope",
+                "Public release stays outside scope.",
+            ),
+            (
+                "repositories-en-remains-forbidden",
+                "ForgeOS changes remain forbidden.",
+            ),
+            (
                 "unrelated-authorization-en",
                 "The operator is authorized to fetch the three fixed assets.",
             ),
@@ -609,10 +619,17 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "ordinary-markdown-link",
                 "See [network policy](https://example.invalid/policy).",
             ),
+            ("ordinary-markdown-autolink", "See <https://example.invalid/policy>."),
+            (
+                "ordinary-markdown-reference",
+                "See policy [p].\n\n[p]: https://example.invalid/policy",
+            ),
         )
         rejected = (
             ("public-en-positive", "This stage is a public beta."),
             ("public-zh-positive", "本阶段进入公测。"),
+            ("public-en-publicly-available", "The build is publicly available."),
+            ("public-zh-facing-public", "本阶段面向公众发布。"),
             ("signing-en-positive", "Application signing is complete."),
             ("signing-zh-positive", "应用签名有效。"),
             ("dmg-en-positive", "DMG generation is complete."),
@@ -621,7 +638,9 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "repositories-en-positive",
                 "ForgeOS modification is authorized.",
             ),
+            ("repositories-en-update", "Maintainers may update ForgeTools."),
             ("repositories-zh-positive", "ForgeTools 修改已获授权。"),
+            ("repositories-zh-edit", "允许编辑 Mac-Win。"),
             ("repositories-zh-ascii-comma", "ForgeOS, 已获授权。"),
             ("repositories-zh-fullwidth-comma", "ForgeOS，已获授权。"),
             (
@@ -657,6 +676,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             (
                 "negative-signing-sentence-generated-dmg",
                 "The application is not signed. Generated DMG is available.",
+            ),
+            (
+                "negative-signing-colon-public-release",
+                "Not signed: public release begins.",
+            ),
+            (
+                "negative-public-comma-positive-public-release",
+                "Not public beta, public release begins.",
             ),
             (
                 "dmg-mixed",

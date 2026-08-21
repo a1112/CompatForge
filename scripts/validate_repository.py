@@ -521,7 +521,7 @@ MACOS_ACCEPTANCE_REPOSITORY_SUBJECT = r"(?:forgeos|forgetools|mac\s+win)"
 MACOS_ACCEPTANCE_REPOSITORY_ACTION = (
     r"(?:changes?|changed|changing|modifications?|modify|modifies|modified|"
     r"alter|alters|altered|altering|edits?|edited|editing|adjusts?|adjusted|"
-    r"rewrit(?:e|es|ten|ing)|mutat(?:e|es|ed|ing|ion)|"
+    r"updat(?:e|es|ed|ing)|rewrit(?:e|es|ten|ing)|mutat(?:e|es|ed|ing|ion)|"
     r"authori[sz](?:e|es|ed|ation))"
 )
 MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
@@ -530,8 +530,10 @@ MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
         (
             r"\bpublic\s+(?:beta|release)\b",
             r"\bavailable\s+to\s+(?:the\s+)?public\b",
-            r"\breleased\b",
-            r"(?:公测|公开测试|公开发布|对外发布)",
+            r"\bpublicly\s+available\b",
+            r"\b(?:compatforge|stage|gate|build|application|app|artifact|package)\b"
+            r"(?:\s+\w+){0,3}\s+released\b",
+            r"(?:公测|公开测试|公开发布|对外发布|面向公众发布)",
         ),
     ),
     (
@@ -554,8 +556,8 @@ MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
             rf"\b{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b(?:\s+\w+){{0,5}}\s+"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b",
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}(?:\s+__comma__)?\s*"
-            r"(?:的)?\s*(?:修改|变更|改动|更改|调整|重写|授权|(?:已)?获授权)",
-            r"(?:修改|变更|改动|更改|调整|重写|授权(?:修改)?|获授权)\s*"
+            r"(?:的)?\s*(?:修改|变更|改动|更改|编辑|调整|重写|授权|(?:已)?获授权)",
+            r"(?:修改|变更|改动|更改|编辑|调整|重写|授权(?:修改)?|获授权)\s*"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}",
         ),
     ),
@@ -581,17 +583,20 @@ MACOS_ACCEPTANCE_NEGATION_BEFORE = (
 )
 MACOS_ACCEPTANCE_NEGATION_AFTER = (
     r"(?:(?:generation|distribution|packaging|release)\s+)?"
-    r"(?:(?:is|are|was|were|will\s+be|would\s+be|has\s+been|have\s+been)\s+)?"
+    r"(?:(?:is|are|was|were|will\s+be|would\s+be|has\s+been|have\s+been|"
+    r"remains?|stays?)\s+)?"
     r"(?:not\s+(?:ready|allowed|permitted|planned|scheduled|happening|occurring|"
     r"authorized|signed|notarized|generated|modified|changed)|forbidden|prohibited)\b",
     r"(?:(?:generation|distribution|packaging|release)\s+)?"
     r"(?:will|would|can|could|shall)\s+not\s+"
     r"(?:happen|occur|proceed|be\s+(?:allowed|authorized|generated|modified|changed))\b",
     r"(?:generation|distribution|packaging|release)\s+"
-    r"(?:(?:is|are|was|were)\s+)?(?:out(?:side)?\s+of\s+scope|"
+    r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
+    r"(?:out(?:side)?(?:\s+of)?\s+scope|"
     r"beyond\s+scope|excluded)\b",
-    r"(?:is\s+)?out(?:side)?\s+of\s+scope\b",
-    r"(?:(?:is|are|was|were)\s+)?(?:beyond\s+scope|excluded)\b",
+    r"(?:(?:is|remains?|stays?)\s+)?out(?:side)?(?:\s+of)?\s+scope\b",
+    r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
+    r"(?:beyond\s+scope|excluded)\b",
     r"(?:生成|分发|发布|打包)?(?:不在(?:本阶段)?范围内|"
     r"超出(?:本阶段)?范围|(?:在)?范围外|(?:已)?排除|"
     r"(?:被)?(?:严禁|禁止)|不会发生)",
@@ -4358,7 +4363,7 @@ def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", prose).casefold()
     clauses: list[str] = []
     for sentence in re.split(
-        r"[\n\r。！？!?；;]+|(?<!\d)\.(?!\d)", normalized
+        r"[\n\r。！？!?；;:：]+|(?<!\d)\.(?!\d)", normalized
     ):
         for clause in re.split(
             r"\b(?:although|while|but|however|whereas|yet|and)\b|"
@@ -4396,6 +4401,12 @@ def _macos_acceptance_claim_is_negated(
     connector = re.search(MACOS_ACCEPTANCE_NEGATION_COORDINATOR, prefix)
     if connector is None:
         return False
+    if connector.group().strip() == "__comma__":
+        current_item = re.split(
+            r"__comma__|\b(?:or|nor)\b|或", clause[match.end() :], maxsplit=1
+        )[0].strip()
+        if current_item:
+            return False
     previous = prefix[: connector.start()].rstrip()
     for pattern in topic_triggers:
         prior_matches = tuple(re.finditer(pattern, previous))
@@ -4446,6 +4457,18 @@ def _validate_macos_acceptance_markdown_surface(prose: str) -> None:
         r"\1",
         remaining,
         flags=re.IGNORECASE,
+    )
+    without_link_destinations = re.sub(
+        r"<https?://[^>\s]+>",
+        "",
+        without_link_destinations,
+        flags=re.IGNORECASE,
+    )
+    without_link_destinations = re.sub(
+        r"(?im)^([ \t]{0,3}\[[^\]\r\n]+\]:)[ \t]*<?https?://[^\s>]+>?"
+        r"[ \t]*(?:(?:\"[^\"]*\"|'[^']*'|\([^)]*\))[ \t]*)?$",
+        r"\1",
+        without_link_destinations,
     )
     normalized = unicodedata.normalize("NFKC", without_link_destinations).casefold()
     normalized = re.sub(r"\s+", " ", normalized)
