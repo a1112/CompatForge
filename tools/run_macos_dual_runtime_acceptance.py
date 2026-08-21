@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Sequence
 
 
@@ -66,6 +66,41 @@ GUI_FAILURE_RELATIONS = {
     "cleanup-termination-failed": ("failed", "cleanup"),
     "cleanup-delete-failed": ("failed", "cleanup"),
 }
+APPLICATION_FAILURE_RELATIONS = {
+    **GUI_FAILURE_RELATIONS,
+    "console-runner-failed": ("failed", "core"),
+    "console-precondition-failed": ("blocked", "core"),
+    "gui-summary-invalid": ("failed", "application"),
+}
+DESKTOP_FAILURE_RELATIONS = {
+    "console-precondition-failed": ("blocked", "core"),
+    "desktop-launch-failed": ("failed", "desktop"),
+    "desktop-timeout-failed": ("failed", "desktop"),
+    "desktop-exit-failed": ("failed", "desktop"),
+}
+
+ROUND_DYNAMIC_KEYS = {"requestId", "startedAt", "durationMs", "workRoot", "runtimeEvents"}
+RUNTIME_DYNAMIC_KEYS = {
+    "requestId",
+    "processIds",
+    "startedAt",
+    "durationMs",
+    "runtimeRoot",
+    "runtimeEvents",
+}
+APPLICATION_DYNAMIC_KEYS = {
+    "requestId",
+    "pid",
+    "startedAt",
+    "durationMs",
+    "workRoot",
+    "screenshotPath",
+    "runtimeEvents",
+}
+RUNTIME_EVENT_KEYS = {"kind", "requestId", "pid", "timestampNs", "durationNs", "root"}
+MAX_RUNTIME_EVENTS = 64
+MAX_PROCESS_IDS = 32
+MAX_DYNAMIC_INTEGER = (1 << 63) - 1
 
 MAX_JSON_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 12
@@ -1092,6 +1127,9 @@ def _prepare_layout(paths: AcceptancePaths) -> None:
     except OSError as error:
         raise AcceptanceError("acceptance layout could not be created") from error
     _refresh_root_bindings(paths)
+    for round_id in ROUNDS:
+        field = f"work-output:{round_id}"
+        paths.bindings[field] = _capture_binding(paths.work_root / round_id, field)
 
 
 def _write_all(file_descriptor: int, payload: bytes) -> None:
@@ -1103,27 +1141,50 @@ def _write_all(file_descriptor: int, payload: bytes) -> None:
         written += count
 
 
-def _safe_create_summary(paths: AcceptancePaths, encoded: str) -> None:
+def _safe_create_output(
+    paths: AcceptancePaths,
+    relative_parts: tuple[str, ...],
+    encoded: str,
+    label: str,
+) -> None:
+    if (
+        not relative_parts
+        or len(relative_parts) > 2
+        or any(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", part) is None for part in relative_parts)
+    ):
+        raise AcceptanceError("acceptance output target is invalid")
     _revalidate_bindings(paths)
     payload = (encoded + "\n").encode("utf-8")
+    if len(payload) > MAX_JSON_BYTES + 1:
+        raise AcceptanceError(f"{label} exceeds its size bound")
     create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     create_flags |= getattr(os, "O_CLOEXEC", 0)
     create_flags |= getattr(os, "O_NOFOLLOW", 0)
     file_descriptor: int | None = None
-    directory_descriptor: int | None = None
+    directory_descriptors: list[int] = []
     try:
         if os.name == "posix":
             directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             directory_flags |= getattr(os, "O_CLOEXEC", 0)
             directory_flags |= getattr(os, "O_NOFOLLOW", 0)
             directory_descriptor = os.open(paths.work_root, directory_flags)
+            directory_descriptors.append(directory_descriptor)
             binding = paths.bindings.get("work-root")
             if binding is None or _node_identity(os.fstat(directory_descriptor)) != dict(
                 binding.components
             ).get(paths.work_root):
                 raise IntegrityError("work-root identity changed")
+            for part in relative_parts[:-1]:
+                child_descriptor = os.open(part, directory_flags, dir_fd=directory_descriptor)
+                directory_descriptors.append(child_descriptor)
+                directory_descriptor = child_descriptor
+                child_binding = paths.bindings.get(f"work-output:{part}")
+                if child_binding is None or _node_identity(os.fstat(directory_descriptor)) != dict(
+                    child_binding.components
+                ).get(paths.work_root / part):
+                    raise IntegrityError("work output identity changed")
             file_descriptor = os.open(
-                "summary.json",
+                relative_parts[-1],
                 create_flags,
                 0o600,
                 dir_fd=directory_descriptor,
@@ -1131,29 +1192,42 @@ def _safe_create_summary(paths: AcceptancePaths, encoded: str) -> None:
         else:
             create_flags |= getattr(os, "O_BINARY", 0)
             create_flags |= getattr(os, "O_NOINHERIT", 0)
-            file_descriptor = os.open(paths.work_root / "summary.json", create_flags, 0o600)
+            parent = paths.work_root.joinpath(*relative_parts[:-1])
+            _reject_unsafe_components(parent, "acceptance output")
+            if len(relative_parts) == 2:
+                _revalidate_binding(
+                    paths.bindings[f"work-output:{relative_parts[0]}"],
+                    "work output",
+                )
+            file_descriptor = os.open(
+                paths.work_root.joinpath(*relative_parts), create_flags, 0o600
+            )
         metadata = os.fstat(file_descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise OSError("summary output is not a private regular file")
+            raise OSError("acceptance output is not a private regular file")
         _write_all(file_descriptor, payload)
         os.fsync(file_descriptor)
-        if directory_descriptor is not None:
-            os.fsync(directory_descriptor)
+        if directory_descriptors:
+            os.fsync(directory_descriptors[-1])
     except IntegrityError:
         raise
     except (OSError, ValueError) as error:
-        raise AcceptanceError("summary output is unsafe") from error
+        raise AcceptanceError(f"{label} is unsafe") from error
     finally:
         if file_descriptor is not None:
             try:
                 os.close(file_descriptor)
             except OSError:
                 pass
-        if directory_descriptor is not None:
+        for directory_descriptor in reversed(directory_descriptors):
             try:
                 os.close(directory_descriptor)
             except OSError:
                 pass
+
+
+def _safe_create_summary(paths: AcceptancePaths, encoded: str) -> None:
+    _safe_create_output(paths, ("summary.json",), encoded, "summary output")
 
 
 def _digest(value: object, field: str) -> str:
@@ -1239,7 +1313,11 @@ def _project_exit(value: object) -> dict[str, object]:
     if not isinstance(exit_value["present"], bool) or not isinstance(exit_value["success"], bool):
         raise AcceptanceError("GUI exit flags are invalid")
     code = exit_value["code"]
-    if code is not None and (not isinstance(code, int) or isinstance(code, bool)):
+    if code is not None and (
+        not isinstance(code, int)
+        or isinstance(code, bool)
+        or abs(code) > MAX_DYNAMIC_INTEGER
+    ):
         raise AcceptanceError("GUI exit code is invalid")
     return {"present": exit_value["present"], "code": code, "success": exit_value["success"]}
 
@@ -1252,6 +1330,22 @@ def _successful_exit(value: object) -> bool:
         and value["code"] == 0
         and not isinstance(value["code"], bool)
         and value["success"] is True
+    )
+
+
+def _closed_exit_relation(value: dict[str, object]) -> bool:
+    present = value["present"]
+    code = value["code"]
+    success = value["success"]
+    return (
+        present is False
+        and code is None
+        and success is False
+    ) or (
+        present is True
+        and isinstance(code, int)
+        and not isinstance(code, bool)
+        and success is (code == 0)
     )
 
 
@@ -1390,6 +1484,565 @@ def _project_gui(
             raise AcceptanceError("accepted GUI application evidence is incomplete")
         projected.append(output)
     return receipt_projection, projected
+
+
+def _projection_input_object(
+    value: object,
+    required: set[str],
+    dynamic: set[str],
+    label: str,
+) -> dict[str, object]:
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or not set(value).issubset(required | dynamic)
+    ):
+        raise AcceptanceError(f"{label} keys are invalid")
+    return value
+
+
+def _bounded_dynamic_integer(value: object, label: str, *, positive: bool = False) -> int:
+    minimum = 1 if positive else 0
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+        or value > MAX_DYNAMIC_INTEGER
+    ):
+        raise AcceptanceError(f"{label} is invalid")
+    return value
+
+
+def _dynamic_path(value: object, label: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_TEXT_CHARS
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or not (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute())
+    ):
+        raise AcceptanceError(f"{label} is invalid")
+
+
+def _validate_runtime_events(value: object) -> None:
+    if not isinstance(value, list) or len(value) > MAX_RUNTIME_EVENTS:
+        raise AcceptanceError("dynamic Runtime events are invalid")
+    for event in value:
+        if not isinstance(event, dict) or set(event) != RUNTIME_EVENT_KEYS:
+            raise AcceptanceError("dynamic Runtime event keys are invalid")
+        _safe_text(event["kind"], "dynamic Runtime event kind")
+        _safe_text(event["requestId"], "dynamic Runtime event request ID")
+        _bounded_dynamic_integer(event["pid"], "dynamic Runtime event PID", positive=True)
+        _bounded_dynamic_integer(event["timestampNs"], "dynamic Runtime event timestamp")
+        _bounded_dynamic_integer(event["durationNs"], "dynamic Runtime event duration")
+        _dynamic_path(event["root"], "dynamic Runtime event root")
+
+
+def _validate_dynamic_fields(value: dict[str, object], allowed: set[str]) -> None:
+    for key in set(value) & allowed:
+        nested = value[key]
+        if key == "requestId":
+            _safe_text(nested, "dynamic request ID")
+        elif key == "pid":
+            _bounded_dynamic_integer(nested, "dynamic PID", positive=True)
+        elif key == "processIds":
+            if not isinstance(nested, list) or len(nested) > MAX_PROCESS_IDS:
+                raise AcceptanceError("dynamic process IDs are invalid")
+            process_ids = [
+                _bounded_dynamic_integer(process_id, "dynamic process ID", positive=True)
+                for process_id in nested
+            ]
+            if len(process_ids) != len(set(process_ids)):
+                raise AcceptanceError("dynamic process IDs are invalid")
+        elif key == "startedAt":
+            _safe_text(nested, "dynamic timestamp")
+        elif key == "durationMs":
+            _bounded_dynamic_integer(nested, "dynamic duration")
+        elif key in {"workRoot", "runtimeRoot", "screenshotPath"}:
+            _dynamic_path(nested, f"dynamic {key}")
+        elif key == "runtimeEvents":
+            _validate_runtime_events(nested)
+        else:
+            raise AcceptanceError("dynamic evidence key is invalid")
+
+
+def _failure_projection(
+    application: dict[str, object], runtime_id: str, application_id: str
+) -> dict[str, object]:
+    status_value = application.get("status")
+    failure_class = application.get("failureClass")
+    reason_code = application.get("reasonCode")
+    if (
+        not isinstance(reason_code, str)
+        or failure_class not in FAILURE_CLASSES
+        or application.get("schemaVersion") != "1"
+        or application["runtimeId"] != runtime_id
+        or application["appId"] != application_id
+        or APPLICATION_FAILURE_RELATIONS.get(reason_code) != (status_value, failure_class)
+    ):
+        raise AcceptanceError("projected application failure is invalid")
+    return {
+        "appId": application_id,
+        "assetSha256": None,
+        "status": status_value,
+        "failureClass": failure_class,
+        "reasonCode": reason_code,
+        "interactionChecks": {},
+        "installerExitPresent": None,
+        "installerExitCode": None,
+        "exitPresent": None,
+        "exitCode": None,
+        "windowAvailable": None,
+        "cleanup": None,
+    }
+
+
+def _project_console_evidence(
+    application: object, runtime_id: str
+) -> dict[str, object]:
+    common = {"schemaVersion", "runtimeId", "appId", "status"}
+    if not isinstance(application, dict):
+        raise AcceptanceError("projected Console application is invalid")
+    status_value = application.get("status")
+    if status_value != "accepted":
+        failure = _projection_input_object(
+            application,
+            common | {"failureClass", "reasonCode"},
+            APPLICATION_DYNAMIC_KEYS,
+            "projected Console failure",
+        )
+        _validate_dynamic_fields(failure, APPLICATION_DYNAMIC_KEYS)
+        return _failure_projection(failure, runtime_id, "console")
+
+    accepted = _projection_input_object(
+        application,
+        common | {"packDigest", "guestDigest", "eventKinds", "exitCode"},
+        APPLICATION_DYNAMIC_KEYS,
+        "projected Console application",
+    )
+    _validate_dynamic_fields(accepted, APPLICATION_DYNAMIC_KEYS)
+    if (
+        accepted["schemaVersion"] != "1"
+        or accepted["runtimeId"] != runtime_id
+        or accepted["appId"] != "console"
+        or accepted["exitCode"] != 0
+        or isinstance(accepted["exitCode"], bool)
+    ):
+        raise AcceptanceError("projected Console application is invalid")
+    event_kinds = accepted["eventKinds"]
+    if (
+        not isinstance(event_kinds, list)
+        or not event_kinds
+        or len(event_kinds) > MAX_RUNTIME_EVENTS
+        or any(
+            not isinstance(kind, str)
+            or re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*", kind) is None
+            for kind in event_kinds
+        )
+    ):
+        raise AcceptanceError("projected Console event kinds are invalid")
+    guest_digest = _digest(accepted["guestDigest"], "projected Console guest digest")
+    return {
+        "appId": "console",
+        "assetSha256": guest_digest.removeprefix("sha256:"),
+        "packDigest": _digest(accepted["packDigest"], "projected Console pack digest"),
+        "status": "accepted",
+        "interactionChecks": {},
+        "eventKinds": list(event_kinds),
+        "installerExitPresent": None,
+        "installerExitCode": None,
+        "exitPresent": True,
+        "exitCode": 0,
+        "windowAvailable": False,
+        "cleanup": True,
+    }
+
+
+def _project_gui_evidence(
+    application: object, runtime_id: str, application_id: str
+) -> dict[str, object]:
+    common = {"schemaVersion", "runtimeId", "appId", "status"}
+    stable_optional = {
+        "assetSha256",
+        "failureClass",
+        "reasonCode",
+        "interactionChecks",
+        "installerExit",
+        "exit",
+        "windowAvailable",
+        "screenshotAvailable",
+        "cleanup",
+    }
+    if not isinstance(application, dict):
+        raise AcceptanceError("projected GUI application is invalid")
+    value = _projection_input_object(
+        application,
+        common,
+        stable_optional | APPLICATION_DYNAMIC_KEYS,
+        "projected GUI application",
+    )
+    _validate_dynamic_fields(value, APPLICATION_DYNAMIC_KEYS)
+    if (
+        value["schemaVersion"] != "1"
+        or value["runtimeId"] != runtime_id
+        or value["appId"] != application_id
+        or value["status"] not in STATUSES
+    ):
+        raise AcceptanceError("projected GUI application identity is invalid")
+
+    if value["status"] != "accepted":
+        failure = _failure_projection(value, runtime_id, application_id)
+        asset_digest = value.get("assetSha256")
+        if asset_digest is not None:
+            if not isinstance(asset_digest, str) or re.fullmatch(r"[0-9a-f]{64}", asset_digest) is None:
+                raise AcceptanceError("projected GUI asset digest is invalid")
+            failure["assetSha256"] = asset_digest
+        interactions = value.get("interactionChecks")
+        if interactions is not None:
+            required = REQUIRED_INTERACTIONS[application_id]
+            if (
+                not isinstance(interactions, dict)
+                or tuple(interactions) != required
+                or any(not isinstance(checked, bool) for checked in interactions.values())
+            ):
+                raise AcceptanceError("projected GUI interaction checks are invalid")
+            failure["interactionChecks"] = {name: interactions[name] for name in required}
+        if "installerExit" in value:
+            installer_exit = _project_exit(value["installerExit"])
+            if not _closed_exit_relation(installer_exit):
+                raise AcceptanceError("projected GUI installer exit relation is invalid")
+            failure["installerExitPresent"] = installer_exit["present"]
+            failure["installerExitCode"] = installer_exit["code"]
+        if "exit" in value:
+            exit_value = _project_exit(value["exit"])
+            if not _closed_exit_relation(exit_value):
+                raise AcceptanceError("projected GUI exit relation is invalid")
+            failure["exitPresent"] = exit_value["present"]
+            failure["exitCode"] = exit_value["code"]
+        if "windowAvailable" in value:
+            if not isinstance(value["windowAvailable"], bool):
+                raise AcceptanceError("projected GUI window flag is invalid")
+            failure["windowAvailable"] = value["windowAvailable"]
+        if "cleanup" in value:
+            if not isinstance(value["cleanup"], bool):
+                raise AcceptanceError("projected GUI cleanup is invalid")
+            failure["cleanup"] = value["cleanup"]
+        if "screenshotAvailable" in value and not isinstance(value["screenshotAvailable"], bool):
+            raise AcceptanceError("projected GUI screenshot flag is invalid")
+        return failure
+
+    stable = {key: nested for key, nested in value.items() if key not in APPLICATION_DYNAMIC_KEYS}
+    if "failureClass" in stable or "reasonCode" in stable or not _complete_accepted_gui(stable):
+        raise AcceptanceError("projected accepted GUI evidence is incomplete")
+    if "screenshotAvailable" in stable and not isinstance(stable["screenshotAvailable"], bool):
+        raise AcceptanceError("projected GUI screenshot flag is invalid")
+    installer_exit = _project_exit(stable["installerExit"])
+    exit_value = _project_exit(stable["exit"])
+    return {
+        "appId": application_id,
+        "assetSha256": stable["assetSha256"],
+        "status": "accepted",
+        "interactionChecks": {
+            name: stable["interactionChecks"][name]
+            for name in REQUIRED_INTERACTIONS[application_id]
+        },
+        "installerExitPresent": installer_exit["present"],
+        "installerExitCode": installer_exit["code"],
+        "exitPresent": exit_value["present"],
+        "exitCode": exit_value["code"],
+        "windowAvailable": stable["windowAvailable"],
+        "cleanup": stable["cleanup"],
+    }
+
+
+def _project_desktop_evidence(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise AcceptanceError("projected desktop evidence is invalid")
+    if value.get("status") == "accepted":
+        if set(value) != {"status", "exitCode"} or value["exitCode"] != 0 or isinstance(
+            value["exitCode"], bool
+        ):
+            raise AcceptanceError("projected desktop evidence is invalid")
+        return {"status": "accepted", "exitCode": 0}
+    reason_code = value.get("reasonCode")
+    failure_class = value.get("failureClass")
+    if (
+        set(value) != {"status", "failureClass", "reasonCode"}
+        or not isinstance(reason_code, str)
+        or failure_class not in FAILURE_CLASSES
+        or DESKTOP_FAILURE_RELATIONS.get(reason_code)
+        != (value.get("status"), failure_class)
+    ):
+        raise AcceptanceError("projected desktop failure is invalid")
+    return {
+        "status": value["status"],
+        "failureClass": value["failureClass"],
+        "reasonCode": value["reasonCode"],
+    }
+
+
+def project_round_evidence(value: object) -> dict[str, object]:
+    """Build the deterministic redacted projection from one closed aggregate round."""
+
+    _bounded_structure(value, "round evidence")
+    round_value = _projection_input_object(
+        value,
+        {"roundId", "runtimes"},
+        ROUND_DYNAMIC_KEYS,
+        "round evidence",
+    )
+    _validate_dynamic_fields(round_value, ROUND_DYNAMIC_KEYS)
+    if round_value["roundId"] not in ROUNDS:
+        raise AcceptanceError("round evidence identity is invalid")
+    runtimes = round_value["runtimes"]
+    if not isinstance(runtimes, list) or len(runtimes) != len(RUNTIME_IDS):
+        raise AcceptanceError("round evidence Runtime records are incomplete")
+
+    runtime_records: dict[str, dict[str, object]] = {}
+    for raw_runtime in runtimes:
+        runtime = _projection_input_object(
+            raw_runtime,
+            {"runtimeId", "runtimeVersion", "packDigest", "applications", "desktop"},
+            RUNTIME_DYNAMIC_KEYS,
+            "round Runtime evidence",
+        )
+        _validate_dynamic_fields(runtime, RUNTIME_DYNAMIC_KEYS)
+        runtime_id = runtime["runtimeId"]
+        if runtime_id not in RUNTIME_IDS or runtime_id in runtime_records:
+            raise AcceptanceError("round Runtime identities are invalid")
+        runtime_version = _runtime_version(runtime["runtimeVersion"])
+        pack_digest = _digest(runtime["packDigest"], "round Runtime pack digest")
+        applications = runtime["applications"]
+        if not isinstance(applications, list) or len(applications) != len(
+            RUNTIME_MATRIX[runtime_id]
+        ):
+            raise AcceptanceError("round application records are incomplete")
+        by_application: dict[str, object] = {}
+        for application in applications:
+            if not isinstance(application, dict):
+                raise AcceptanceError("round application evidence is invalid")
+            application_id = application.get("appId")
+            if application_id not in RUNTIME_MATRIX[runtime_id] or application_id in by_application:
+                raise AcceptanceError("round application identities are invalid")
+            by_application[application_id] = application
+        projected_applications: list[dict[str, object]] = []
+        for application_id in RUNTIME_MATRIX[runtime_id]:
+            application = by_application.get(application_id)
+            if application_id == "console":
+                projected = _project_console_evidence(application, runtime_id)
+            else:
+                projected = _project_gui_evidence(application, runtime_id, application_id)
+            projected_applications.append(projected)
+        runtime_records[runtime_id] = {
+            "runtimeId": runtime_id,
+            "runtimeVersion": runtime_version,
+            "packDigest": pack_digest,
+            "applications": projected_applications,
+            "desktop": _project_desktop_evidence(runtime["desktop"]),
+        }
+    if set(runtime_records) != set(RUNTIME_IDS):
+        raise AcceptanceError("round Runtime records are incomplete")
+    return {
+        "schemaVersion": "1",
+        "runtimes": [runtime_records[runtime_id] for runtime_id in RUNTIME_IDS],
+    }
+
+
+def _validate_canonical_application(
+    application: object, runtime_id: str, application_id: str
+) -> None:
+    accepted_keys = {
+        "appId",
+        "assetSha256",
+        "status",
+        "interactionChecks",
+        "installerExitPresent",
+        "installerExitCode",
+        "exitPresent",
+        "exitCode",
+        "windowAvailable",
+        "cleanup",
+    }
+    failure_keys = accepted_keys | {"failureClass", "reasonCode"}
+    console_keys = accepted_keys | {"packDigest", "eventKinds"}
+    if not isinstance(application, dict) or application.get("appId") != application_id:
+        raise AcceptanceError("round projection application identity is invalid")
+    status_value = application.get("status")
+    expected_keys = (
+        console_keys
+        if application_id == "console" and status_value == "accepted"
+        else accepted_keys
+        if status_value == "accepted"
+        else failure_keys
+    )
+    if set(application) != expected_keys:
+        raise AcceptanceError("round projection application schema is invalid")
+
+    asset_digest = application["assetSha256"]
+    if asset_digest is not None and (
+        not isinstance(asset_digest, str) or re.fullmatch(r"[0-9a-f]{64}", asset_digest) is None
+    ):
+        raise AcceptanceError("round projection asset digest is invalid")
+    interactions = application["interactionChecks"]
+    required_interactions = () if application_id == "console" else REQUIRED_INTERACTIONS[application_id]
+    if (
+        not isinstance(interactions, dict)
+        or tuple(interactions) not in ((), required_interactions)
+        or any(not isinstance(checked, bool) for checked in interactions.values())
+    ):
+        raise AcceptanceError("round projection interaction checks are invalid")
+    for field in ("installerExitCode", "exitCode"):
+        code = application[field]
+        if code is not None and (
+            not isinstance(code, int)
+            or isinstance(code, bool)
+            or abs(code) > MAX_DYNAMIC_INTEGER
+        ):
+            raise AcceptanceError("round projection exit code is invalid")
+    for field in ("installerExitPresent", "exitPresent"):
+        present = application[field]
+        if present is not None and not isinstance(present, bool):
+            raise AcceptanceError("round projection exit presence is invalid")
+    for prefix in ("installerExit", "exit"):
+        present = application[f"{prefix}Present"]
+        code = application[f"{prefix}Code"]
+        if not (
+            (present is None and code is None)
+            or (present is False and code is None)
+            or (present is True and isinstance(code, int) and not isinstance(code, bool))
+        ):
+            raise AcceptanceError("round projection exit relation is invalid")
+    for field in ("windowAvailable", "cleanup"):
+        flag = application[field]
+        if flag is not None and not isinstance(flag, bool):
+            raise AcceptanceError("round projection observation flag is invalid")
+
+    if status_value == "accepted":
+        if application_id == "console":
+            event_kinds = application["eventKinds"]
+            if (
+                application["assetSha256"] is None
+                or _digest(application["packDigest"], "round projection Console pack digest")
+                != application["packDigest"]
+                or not isinstance(event_kinds, list)
+                or not event_kinds
+                or len(event_kinds) > MAX_RUNTIME_EVENTS
+                or any(
+                    not isinstance(kind, str)
+                    or re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*", kind) is None
+                    for kind in event_kinds
+                )
+                or application["installerExitCode"] is not None
+                or application["installerExitPresent"] is not None
+                or application["exitPresent"] is not True
+                or application["exitCode"] != 0
+                or application["windowAvailable"] is not False
+                or application["cleanup"] is not True
+                or interactions
+            ):
+                raise AcceptanceError("round projection Console result is invalid")
+        elif (
+            application["assetSha256"] is None
+            or tuple(interactions) != required_interactions
+            or any(checked is not True for checked in interactions.values())
+            or application["installerExitCode"] != 0
+            or application["installerExitPresent"] is not True
+            or application["exitPresent"] is not True
+            or application["exitCode"] != 0
+            or application["windowAvailable"] is not True
+            or application["cleanup"] is not True
+        ):
+            raise AcceptanceError("round projection GUI result is invalid")
+        return
+
+    failure_class = application.get("failureClass")
+    reason_code = application.get("reasonCode")
+    if (
+        not isinstance(reason_code, str)
+        or failure_class not in FAILURE_CLASSES
+        or APPLICATION_FAILURE_RELATIONS.get(reason_code) != (status_value, failure_class)
+    ):
+        raise AcceptanceError("round projection application failure is invalid")
+
+
+def _validate_canonical_projection(projection: object) -> None:
+    if (
+        not isinstance(projection, dict)
+        or set(projection) != {"schemaVersion", "runtimes"}
+        or projection.get("schemaVersion") != "1"
+    ):
+        raise AcceptanceError("round projection schema is invalid")
+    runtimes = projection["runtimes"]
+    if not isinstance(runtimes, list) or len(runtimes) != len(RUNTIME_IDS):
+        raise AcceptanceError("round projection Runtime records are incomplete")
+    for runtime_id, runtime in zip(RUNTIME_IDS, runtimes):
+        if (
+            not isinstance(runtime, dict)
+            or set(runtime)
+            != {"runtimeId", "runtimeVersion", "packDigest", "applications", "desktop"}
+            or runtime.get("runtimeId") != runtime_id
+        ):
+            raise AcceptanceError("round projection Runtime identity is invalid")
+        _runtime_version(runtime["runtimeVersion"])
+        _digest(runtime["packDigest"], "round projection Runtime pack digest")
+        applications = runtime["applications"]
+        if not isinstance(applications, list) or len(applications) != len(
+            RUNTIME_MATRIX[runtime_id]
+        ):
+            raise AcceptanceError("round projection applications are incomplete")
+        for application_id, application in zip(RUNTIME_MATRIX[runtime_id], applications):
+            _validate_canonical_application(application, runtime_id, application_id)
+        _project_desktop_evidence(runtime["desktop"])
+
+
+def canonical_projection_bytes(projection: object) -> bytes:
+    """Encode one internally produced projection with a bounded canonical JSON form."""
+
+    _bounded_structure(projection, "round projection")
+    _validate_canonical_projection(projection)
+    encoded = json.dumps(projection, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if len(encoded) > MAX_JSON_BYTES:
+        raise AcceptanceError("round projection exceeds its size bound")
+    return encoded
+
+
+def compare_round_evidence(first: object, second: object) -> bool:
+    """Fail closed unless both rounds have byte-identical allowlist projections."""
+
+    try:
+        first_projection = project_round_evidence(first)
+        second_projection = project_round_evidence(second)
+        return canonical_projection_bytes(first_projection) == canonical_projection_bytes(
+            second_projection
+        )
+    except (AcceptanceError, RecursionError, UnicodeError, ValueError, TypeError):
+        return False
+
+
+def build_round_comparison(
+    rounds: object,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Project two fixed rounds and report whether the stable evidence is identical."""
+
+    if not isinstance(rounds, list) or len(rounds) != len(ROUNDS):
+        raise AcceptanceError("round comparison evidence is incomplete")
+    if any(
+        not isinstance(round_value, dict) or round_value.get("roundId") != round_id
+        for round_id, round_value in zip(ROUNDS, rounds)
+    ):
+        raise AcceptanceError("round comparison identities are invalid")
+    projections = [project_round_evidence(round_value) for round_value in rounds]
+    rounds_equal = canonical_projection_bytes(projections[0]) == canonical_projection_bytes(
+        projections[1]
+    )
+    accepted = rounds_equal and aggregate_is_accepted(rounds)
+    return projections, {
+        "schemaVersion": "1",
+        "roundsEqual": rounds_equal,
+        "status": "accepted" if accepted else "failed",
+    }
 
 
 def aggregate_is_accepted(rounds: object) -> bool:
@@ -1729,7 +2382,15 @@ def orchestrate(
     _revalidate_bindings(paths)
     for descriptor in runtimes:
         _revalidate_runtime(descriptor)
-    accepted = aggregate_is_accepted(rounds)
+    matrix_accepted = aggregate_is_accepted(rounds)
+    projections: list[dict[str, object]] | None = None
+    comparison: dict[str, object] | None = None
+    try:
+        projections, comparison = build_round_comparison(rounds)
+    except AcceptanceError:
+        if matrix_accepted:
+            raise
+    accepted = comparison is not None and comparison["status"] == "accepted"
     summary: dict[str, object] = {
         "schemaVersion": "1",
         "status": "accepted" if accepted else "failed",
@@ -1741,6 +2402,23 @@ def orchestrate(
     _revalidate_bindings(paths)
     for descriptor in runtimes:
         _revalidate_runtime(descriptor)
+    if projections is not None and comparison is not None:
+        for round_id, projection in zip(ROUNDS, projections):
+            _safe_create_output(
+                paths,
+                (round_id, "round-projection.json"),
+                canonical_projection_bytes(projection).decode("utf-8"),
+                "round projection output",
+            )
+        comparison_encoded = json.dumps(
+            comparison, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        _safe_create_output(
+            paths,
+            ("comparison.json",),
+            comparison_encoded,
+            "comparison output",
+        )
     _safe_create_summary(paths, encoded)
     return summary
 

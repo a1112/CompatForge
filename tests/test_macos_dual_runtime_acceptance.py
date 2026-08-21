@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import os
 import sys
 import tempfile
@@ -117,6 +118,200 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertIn("tools/run_macos_dual_runtime_acceptance.py", errors[0])
             self.assertIn("unsafe path component", errors[0])
+
+
+class MacOsDualRuntimeProjectionTests(unittest.TestCase):
+    @staticmethod
+    def _round_fixture(round_id: str, dynamic_marker: str) -> dict[str, object]:
+        checks = {
+            "7zip": {"fileList": True, "menus": True},
+            "sumatrapdf": {"mainWindow": True, "openDialog": True},
+            "notepad-plus-plus": {
+                "open": True,
+                "edit": True,
+                "saveUtf8Chinese": True,
+                "rereadMatches": True,
+            },
+        }
+        runtimes: list[dict[str, object]] = []
+        for runtime_id, runtime_version in (("crossover", "24.0"), ("whisky", "2.3")):
+            applications: list[dict[str, object]] = [
+                {
+                    "schemaVersion": "1",
+                    "runtimeId": runtime_id,
+                    "appId": "console",
+                    "status": "accepted",
+                    "packDigest": "sha256:" + "a" * 64,
+                    "guestDigest": "sha256:" + "b" * 64,
+                    "eventKinds": ["started", "stdout", "exited"],
+                    "exitCode": 0,
+                    "requestId": f"console-request-{dynamic_marker}",
+                    "pid": 1100 if dynamic_marker == "one" else 2200,
+                    "startedAt": f"2026-08-21T00:00:0{1 if dynamic_marker == 'one' else 2}Z",
+                    "durationMs": 11 if dynamic_marker == "one" else 29,
+                    "workRoot": f"/Users/{dynamic_marker}/console",
+                    "runtimeEvents": [
+                        {
+                            "kind": "started",
+                            "requestId": f"event-request-{dynamic_marker}",
+                            "pid": 3100 if dynamic_marker == "one" else 4200,
+                            "timestampNs": 101 if dynamic_marker == "one" else 909,
+                            "durationNs": 7 if dynamic_marker == "one" else 13,
+                            "root": f"/Users/{dynamic_marker}/events",
+                        }
+                    ],
+                }
+            ]
+            for app_id in ("7zip", "sumatrapdf", "notepad-plus-plus"):
+                applications.append(
+                    {
+                        "schemaVersion": "1",
+                        "runtimeId": runtime_id,
+                        "appId": app_id,
+                        "assetSha256": "d" * 64,
+                        "status": "accepted",
+                        "cleanup": True,
+                        "interactionChecks": checks[app_id],
+                        "installerExit": {"present": True, "code": 0, "success": True},
+                        "exit": {"present": True, "code": 0, "success": True},
+                        "windowAvailable": True,
+                        "screenshotAvailable": True,
+                        "requestId": f"{app_id}-request-{dynamic_marker}",
+                        "pid": 5100 if dynamic_marker == "one" else 6200,
+                        "startedAt": f"2026-08-21T00:01:0{1 if dynamic_marker == 'one' else 2}Z",
+                        "durationMs": 17 if dynamic_marker == "one" else 31,
+                        "workRoot": f"/Users/{dynamic_marker}/{app_id}",
+                        "screenshotPath": f"/Users/{dynamic_marker}/{app_id}.png",
+                        "runtimeEvents": [],
+                    }
+                )
+            runtimes.append(
+                {
+                    "runtimeId": runtime_id,
+                    "runtimeVersion": runtime_version,
+                    "packDigest": "sha256:" + "c" * 64,
+                    "applications": applications,
+                    "desktop": {"status": "accepted", "exitCode": 0},
+                    "requestId": f"runtime-request-{dynamic_marker}",
+                    "processIds": [7100] if dynamic_marker == "one" else [8200],
+                    "startedAt": f"2026-08-21T00:02:0{1 if dynamic_marker == 'one' else 2}Z",
+                    "durationMs": 23 if dynamic_marker == "one" else 37,
+                    "runtimeRoot": f"/Applications/{dynamic_marker}/{runtime_id}",
+                    "runtimeEvents": [],
+                }
+            )
+        return {
+            "roundId": round_id,
+            "runtimes": runtimes,
+            "requestId": f"round-request-{dynamic_marker}",
+            "startedAt": f"2026-08-21T00:03:0{1 if dynamic_marker == 'one' else 2}Z",
+            "durationMs": 41 if dynamic_marker == "one" else 53,
+            "workRoot": f"/Users/{dynamic_marker}/round",
+            "runtimeEvents": [],
+        }
+
+    def test_dynamic_only_evidence_has_byte_equal_allowlist_projection(self) -> None:
+        first = self._round_fixture("round-1", "one")
+        second = self._round_fixture("round-2", "two")
+
+        first_projection = acceptance.project_round_evidence(first)
+        second_projection = acceptance.project_round_evidence(second)
+
+        self.assertEqual(first_projection, second_projection)
+        self.assertEqual(
+            acceptance.canonical_projection_bytes(first_projection),
+            acceptance.canonical_projection_bytes(second_projection),
+        )
+        self.assertTrue(acceptance.compare_round_evidence(first, second))
+        encoded = acceptance.canonical_projection_bytes(first_projection).decode("utf-8")
+        for secret in ("request", "/Users/", "/Applications/", ".png", "timestampNs", "pid"):
+            self.assertNotIn(secret, encoded)
+        self.assertEqual(
+            [runtime["runtimeId"] for runtime in first_projection["runtimes"]],
+            ["crossover", "whisky"],
+        )
+        self.assertEqual(
+            [app["appId"] for app in first_projection["runtimes"][0]["applications"]],
+            ["console", "7zip", "sumatrapdf", "notepad-plus-plus"],
+        )
+
+    def test_stable_security_and_behavior_mutations_never_compare_equal(self) -> None:
+        baseline = self._round_fixture("round-1", "one")
+        cases: list[tuple[str, callable]] = [
+            ("runtime-id", lambda value: value["runtimes"][0].update(runtimeId="whisky")),
+            ("runtime-version", lambda value: value["runtimes"][0].update(runtimeVersion="25.0")),
+            ("pack-digest", lambda value: value["runtimes"][0].update(packDigest="sha256:" + "e" * 64)),
+            ("missing-app", lambda value: value["runtimes"][0]["applications"].pop()),
+            ("extra-app", lambda value: value["runtimes"][0]["applications"].append(copy.deepcopy(value["runtimes"][0]["applications"][1]))),
+            ("app-identity", lambda value: value["runtimes"][0]["applications"][1].update(appId="sumatrapdf")),
+            ("asset-digest", lambda value: value["runtimes"][0]["applications"][1].update(assetSha256="e" * 64)),
+            ("status", lambda value: value["runtimes"][0]["applications"][1].update(status="failed")),
+            ("interaction", lambda value: value["runtimes"][0]["applications"][1]["interactionChecks"].update(menus=False)),
+            ("exit", lambda value: value["runtimes"][0]["applications"][1]["exit"].update(code=9, success=False)),
+            ("window", lambda value: value["runtimes"][0]["applications"][1].update(windowAvailable=False)),
+            ("cleanup", lambda value: value["runtimes"][0]["applications"][1].update(cleanup=False)),
+        ]
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                mutant = copy.deepcopy(baseline)
+                mutate(mutant)
+                self.assertFalse(acceptance.compare_round_evidence(baseline, mutant))
+
+        failure_one = copy.deepcopy(baseline)
+        failure_two = copy.deepcopy(baseline)
+        for fixture, reason in (
+            (failure_one, "application-install-failed"),
+            (failure_two, "application-content-verification-failed"),
+        ):
+            fixture["runtimes"][0]["applications"][1] = {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "appId": "7zip",
+                "status": "failed",
+                "failureClass": "application",
+                "reasonCode": reason,
+            }
+        self.assertFalse(acceptance.compare_round_evidence(failure_one, failure_two))
+
+    def test_projection_sorts_fixed_identities_but_rejects_unknown_duplicate_and_bounds(self) -> None:
+        unordered = self._round_fixture("round-1", "one")
+        unordered["runtimes"].reverse()
+        for runtime in unordered["runtimes"]:
+            runtime["applications"].reverse()
+        projection = acceptance.project_round_evidence(unordered)
+        self.assertEqual(
+            [runtime["runtimeId"] for runtime in projection["runtimes"]],
+            ["crossover", "whisky"],
+        )
+        self.assertEqual(
+            [app["appId"] for app in projection["runtimes"][0]["applications"]],
+            ["console", "7zip", "sumatrapdf", "notepad-plus-plus"],
+        )
+
+        invalid_documents: list[dict[str, object]] = []
+        unknown = self._round_fixture("round-1", "one")
+        unknown["absoluteSecret"] = "/Users/private"
+        invalid_documents.append(unknown)
+        duplicate = self._round_fixture("round-1", "one")
+        duplicate["runtimes"][1]["runtimeId"] = "crossover"
+        invalid_documents.append(duplicate)
+        malformed_dynamic = self._round_fixture("round-1", "one")
+        malformed_dynamic["runtimes"][0]["processIds"] = [True]
+        invalid_documents.append(malformed_dynamic)
+        too_long = self._round_fixture("round-1", "one")
+        too_long["requestId"] = "x" * (acceptance.MAX_TEXT_CHARS + 1)
+        invalid_documents.append(too_long)
+        too_deep = self._round_fixture("round-1", "one")
+        too_deep["runtimeEvents"] = [[[[[[[[[[[[[["closed"]]]]]]]]]]]]]]
+        invalid_documents.append(too_deep)
+        for document in invalid_documents:
+            with self.assertRaises(acceptance.AcceptanceError):
+                acceptance.project_round_evidence(document)
+
+        polluted_projection = copy.deepcopy(projection)
+        polluted_projection["absoluteSecret"] = "/Users/private"
+        with self.assertRaises(acceptance.AcceptanceError):
+            acceptance.canonical_projection_bytes(polluted_projection)
 
 
 class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
@@ -538,10 +733,130 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 for runtime in round_entry["runtimes"]
             )
         )
+        projections = [
+            json.loads(
+                (self.work / round_id / "round-projection.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for round_id in ("round-1", "round-2")
+        ]
+        self.assertEqual(projections[0], projections[1])
+        self.assertEqual(
+            json.loads((self.work / "comparison.json").read_text(encoding="utf-8")),
+            {"schemaVersion": "1", "roundsEqual": True, "status": "accepted"},
+        )
+        self.assertEqual(summary["status"], "accepted")
+        for artifact in (
+            self.work / "round-1" / "round-projection.json",
+            self.work / "round-2" / "round-projection.json",
+            self.work / "comparison.json",
+        ):
+            encoded_artifact = artifact.read_text(encoding="utf-8")
+            self.assertNotIn(str(self.external), encoded_artifact)
+            self.assertNotIn("requestId", encoded_artifact)
         self.assertEqual(
             source_snapshots,
             {path: path.read_bytes() for path in source_snapshots},
         )
+
+    def test_round_mismatch_is_stage_failed_and_writes_unequal_closed_projections(self) -> None:
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if argv[-1] == "--all":
+                payload = self._discovery()
+            elif Path(argv[3]).name == "run_macos_headless_preview.py":
+                pack_id = argv[argv.index("--pack-id") + 1]
+                runtime_id = "crossover" if "crossover" in pack_id else "whisky"
+                payload = self._console_summary(runtime_id)
+            else:
+                runtime_id = argv[argv.index("--runtime-id") + 1]
+                payload = self._gui_summary(runtime_id)
+                work_root = argv[argv.index("--work-root") + 1]
+                if "round-2" in work_root and runtime_id == "whisky":
+                    payload["applications"][2]["assetSha256"] = "e" * 64
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        summary = acceptance.orchestrate(
+            self._arguments(),
+            runner=runner,
+            launcher=lambda *_args, **_kwargs: FinishedDesktopProcess(),
+            waiter=lambda _process, _timeout: 0,
+            host_system="Darwin",
+            host_machine="arm64",
+            printer=lambda _line: None,
+        )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(acceptance.aggregate_is_accepted(summary["rounds"]))
+        self.assertEqual(
+            json.loads((self.work / "comparison.json").read_text(encoding="utf-8")),
+            {"schemaVersion": "1", "roundsEqual": False, "status": "failed"},
+        )
+        self.assertNotEqual(
+            (self.work / "round-1" / "round-projection.json").read_bytes(),
+            (self.work / "round-2" / "round-projection.json").read_bytes(),
+        )
+
+    def test_projection_and_comparison_outputs_reject_existing_links_without_overwrite(self) -> None:
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        acceptance._prepare_layout(paths)
+        victim_one = self.external / "projection-link-victim"
+        victim_two = self.external / "projection-hardlink-victim"
+        victim_one.write_text("unchanged-one", encoding="utf-8")
+        victim_two.write_text("unchanged-two", encoding="utf-8")
+        try:
+            os.symlink(victim_one, self.work / "round-1" / "round-projection.json")
+        except OSError as error:
+            self.skipTest(f"file symlinks are unavailable: {error}")
+        try:
+            os.link(victim_two, self.work / "round-2" / "round-projection.json")
+        except OSError as error:
+            self.skipTest(f"hardlinks are unavailable: {error}")
+        (self.work / "comparison.json").write_text("foreign", encoding="utf-8")
+
+        for target in (
+            ("round-1", "round-projection.json"),
+            ("round-2", "round-projection.json"),
+            ("comparison.json",),
+        ):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                acceptance.AcceptanceError, "unsafe"
+            ):
+                acceptance._safe_create_output(paths, target, "{}", "closed output")
+        self.assertEqual(victim_one.read_text(encoding="utf-8"), "unchanged-one")
+        self.assertEqual(victim_two.read_text(encoding="utf-8"), "unchanged-two")
+        self.assertEqual(
+            (self.work / "comparison.json").read_text(encoding="utf-8"), "foreign"
+        )
+
+    def test_round_projection_revalidates_its_bound_directory_before_writing(self) -> None:
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        acceptance._prepare_layout(paths)
+        original = self.work / "round-1-original"
+        victim = self.external / "round-projection-directory-victim"
+        victim.mkdir()
+        (victim / "sentinel").write_text("unchanged", encoding="utf-8")
+        (self.work / "round-1").rename(original)
+        try:
+            os.symlink(victim, self.work / "round-1", target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"directory symlinks are unavailable: {error}")
+
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "(?:identity changed|unsafe)"
+        ):
+            acceptance._safe_create_output(
+                paths,
+                ("round-1", "round-projection.json"),
+                "{}",
+                "round projection output",
+            )
+        self.assertEqual((victim / "sentinel").read_text(encoding="utf-8"), "unchanged")
+        self.assertFalse((victim / "round-projection.json").exists())
 
     def test_allow_network_is_forwarded_only_to_the_gui_runner(self) -> None:
         paths = acceptance.preflight(
