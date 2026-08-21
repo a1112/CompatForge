@@ -362,6 +362,37 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                     "    python3 -S -B tools/discover_macos_wine.py --all --hidden"
                 ),
             ),
+            (
+                "inline-curl-command",
+                append_guide("Run `curl https://example.invalid/runtime`."),
+            ),
+            (
+                "long-inline-curl-command",
+                append_guide("Run ``curl https://example.invalid/runtime`` now."),
+            ),
+            (
+                "blockquote-curl-command",
+                append_guide("> curl https://example.invalid/runtime"),
+            ),
+            (
+                "list-wget-command",
+                append_guide("- wget https://example.invalid/runtime"),
+            ),
+            (
+                "numbered-python-fetch-command",
+                append_guide(
+                    "1. python3 -S -B tools/download_gui_assets.py fetch 7zip "
+                    "--cache-root /tmp/cache --allow-network"
+                ),
+            ),
+            (
+                "inline-network-flag",
+                append_guide("Add `--allow-network` to continue."),
+            ),
+            (
+                "inline-network-url",
+                append_guide("Run `https://example.invalid/runtime` now."),
+            ),
             ("public-release-ready", append_guide("CompatForge is PUBLIC release-ready.")),
             ("released-claim", append_guide("CompatForge has been released.")),
             ("public-beta-ready", append_guide("This stage is public   beta ready!")),
@@ -373,6 +404,8 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ),
             ("notarized-claim", append_guide("The build is NOTARIZED.")),
             ("notarized-suffix-claim", append_guide("Build notarized successfully.")),
+            ("valid-code-signature", append_guide("A valid code signature is present.")),
+            ("notarization-succeeded", append_guide("Notarization succeeded.")),
             (
                 "notarized-after-comma",
                 append_guide("The build, now notarized, passed validation."),
@@ -406,6 +439,7 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 append_guide("Modifications to ForgeTools are authorized."),
             ),
             ("repository-authorized", append_guide("ForgeOS authorized.")),
+            ("repository-may-alter", append_guide("Maintainers may alter ForgeOS.")),
             ("chinese-public-release", append_guide("本阶段进入公测并公开发布。")),
             ("chinese-signed-notarized", append_guide("应用已签名并完成公证。")),
             ("chinese-signature-valid", append_guide("应用签名有效。")),
@@ -416,6 +450,8 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("chinese-dmg-generated", append_guide("DMG 已生成。")),
             ("chinese-dmg-after-comma", append_guide("DMG，已生成。")),
             ("chinese-cross-repository", append_guide("允许修改 ForgeOS。")),
+            ("chinese-repository-change", append_guide("可以改动 ForgeTools。")),
+            ("chinese-repository-edit", append_guide("允许更改 Mac-Win。")),
             ("chinese-repository-authorized", append_guide("ForgeOS 获授权。")),
         )
         for label, mutate in cases:
@@ -478,14 +514,31 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "public-en-neither-family",
                 "This stage is neither a PUBLIC beta nor a public release.",
             ),
+            (
+                "public-en-not-intended",
+                "This stage is not intended as a public beta.",
+            ),
+            (
+                "public-en-no-plans",
+                "There are no plans for a public release.",
+            ),
+            ("public-en-no-plans-exact", "No plans public release."),
+            ("public-zh-not-intended", "本阶段不打算进入公测。"),
+            ("public-zh-no-plans", "本阶段无计划公开发布。"),
             ("signing-en-prefix", "The application will not be signed."),
             ("signing-zh-prefix", "应用不会签名。"),
             ("signing-en-suffix", "Application signing is prohibited."),
             ("signing-zh-suffix", "应用签名被禁止。"),
+            ("signing-en-out-of-scope", "Code signing is out of scope."),
+            ("signing-en-out-of-scope-exact", "Signing out of scope."),
+            ("signing-zh-out-of-scope", "代码签名不在本阶段范围内。"),
             ("dmg-en-prefix", "This stage will not generate a DMG."),
             ("dmg-zh-prefix", "本阶段不会生成 DMG。"),
             ("dmg-en-suffix", "DMG generation will not happen."),
             ("dmg-zh-suffix", "DMG 生成不会发生。"),
+            ("dmg-en-out-of-scope", "DMG generation is out of scope."),
+            ("dmg-en-out-of-scope-exact", "DMG generation out of scope."),
+            ("dmg-zh-out-of-scope", "DMG 生成不在范围内。"),
             ("repositories-en-prefix", "This stage will not modify ForgeOS."),
             ("repositories-zh-prefix", "本阶段不会修改 ForgeTools。"),
             ("repositories-en-suffix", "Mac-Win modification is forbidden."),
@@ -495,6 +548,10 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "The operator is authorized to fetch the three fixed assets.",
             ),
             ("unrelated-authorization-zh", "操作者获授权获取三个固定资产。"),
+            (
+                "ordinary-markdown-link",
+                "See [network policy](https://example.invalid/policy).",
+            ),
         )
         rejected = (
             ("public-en-positive", "This stage is a public beta."),
@@ -525,8 +582,16 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "while the build is notarized.",
             ),
             (
+                "public-no-plans-mixed",
+                "There are no plans for public release, but maintainers may alter ForgeOS.",
+            ),
+            (
                 "signing-mixed",
                 "Application signing is prohibited, but the build is notarized.",
+            ),
+            (
+                "signing-out-of-scope-mixed",
+                "Signing is out of scope, but notarization succeeded.",
             ),
             (
                 "dmg-mixed",

@@ -516,7 +516,7 @@ MACOS_ACCEPTANCE_NONCLAIMS = (
 MACOS_ACCEPTANCE_REPOSITORY_SUBJECT = r"(?:forgeos|forgetools|mac\s+win)"
 MACOS_ACCEPTANCE_REPOSITORY_ACTION = (
     r"(?:changes?|modifications?|modify|modifies|modified|changed|"
-    r"authorize|authorizes|authorized|authorization)"
+    r"alter|alters|altered|authorize|authorizes|authorized|authorization)"
 )
 MACOS_ACCEPTANCE_TOPIC_GRAMMAR = (
     (
@@ -541,6 +541,9 @@ MACOS_ACCEPTANCE_TOPIC_GRAMMAR = (
             r"(?:signing|notarization)\b",
             r"\b(?:signing|notarization)\s+(?:of\s+)?(?:an?\s+|the\s+)?"
             r"(?:application|app|build|artifact|binary|package)\b",
+            r"\b(?:valid\s+)?code\s+signatures?\b",
+            r"\b(?:code\s+)?signing\b",
+            r"\bnotarization\b(?:\s+(?:succeeded|successful|completed?))?",
             r"(?:应用|构建|代码|产物)?\s*(?:已|已经|将|会|不会|未)?\s*"
             r"(?:签名|公证)\s*(?:有效|成功|完成)?",
         ),
@@ -569,8 +572,8 @@ MACOS_ACCEPTANCE_TOPIC_GRAMMAR = (
             rf"\b{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b(?:\s+\w+){{0,5}}\s+"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b",
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}(?:\s+__comma__)?\s*"
-            r"(?:的)?\s*(?:修改|变更|授权|(?:已)?获授权)",
-            r"(?:修改|变更|授权(?:修改)?|获授权)\s*"
+            r"(?:的)?\s*(?:修改|变更|改动|更改|授权|(?:已)?获授权)",
+            r"(?:修改|变更|改动|更改|授权(?:修改)?|获授权)\s*"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}",
         ),
     ),
@@ -584,6 +587,9 @@ MACOS_ACCEPTANCE_NEGATION_BEFORE = (
     r"绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不是|不属于|不包含|"
     r"不允许|不授权|不|未(?:完成)?|无)\s*$",
     r"\bnot\s+ready\s+for\s*$",
+    r"\bnot\s+intended\s+(?:as|to\s+be)\s+(?:(?:a|an|the)\s*)?$",
+    r"\bno\s+plans?(?:\s+for)?\s*(?:(?:a|an|the)\s*)?$",
+    r"(?:不打算(?:进入|作为)?|无计划(?:进入|进行)?)\s*$",
     r"\bneither(?:\s+(?:a|an|the))?\s*$",
     r"\bneither\b.*\bnor(?:\s+(?:a|an|the))?\s*$",
 )
@@ -593,6 +599,8 @@ MACOS_ACCEPTANCE_NEGATION_AFTER = (
     r"authorized|signed|notarized|generated|modified|changed)|forbidden|prohibited)\b",
     r"(?:will|would|can|could|shall)\s+not\s+"
     r"(?:happen|occur|proceed|be\s+(?:allowed|authorized|generated|modified|changed))\b",
+    r"(?:is\s+)?out(?:side)?\s+of\s+scope\b",
+    r"不在(?:本阶段)?范围内|超出(?:本阶段)?范围",
     r"(?:被)?(?:严禁|禁止)|(?:绝不(?:会)?|不会|不得|不可|不)"
     r"(?:允许|发生|进行|开始|进入|开放|构成|成立|是)",
 )
@@ -4428,6 +4436,97 @@ def _validate_macos_acceptance_nonclaims(prose: str) -> None:
                     )
 
 
+def _macos_acceptance_inline_code_spans(
+    line: str,
+) -> tuple[tuple[int, int, str], ...]:
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    while cursor < len(line):
+        opening = line.find("`", cursor)
+        if opening < 0:
+            break
+        opening_end = opening
+        while opening_end < len(line) and line[opening_end] == "`":
+            opening_end += 1
+        marker_size = opening_end - opening
+        search = opening_end
+        while search < len(line):
+            closing = line.find("`", search)
+            if closing < 0:
+                search = len(line)
+                break
+            closing_end = closing
+            while closing_end < len(line) and line[closing_end] == "`":
+                closing_end += 1
+            if closing_end - closing == marker_size:
+                spans.append((opening, closing_end, line[opening_end:closing]))
+                search = closing_end
+                break
+            search = closing_end
+        cursor = search
+    return tuple(spans)
+
+
+def _macos_acceptance_markdown_container_content(line: str) -> str:
+    candidate = line
+    while True:
+        candidate = candidate.lstrip()
+        stripped = re.sub(
+            r"^(?:>\s*|(?:[-+*]|\d+[.)])\s+)", "", candidate, count=1
+        )
+        if stripped == candidate:
+            return candidate
+        candidate = stripped
+
+
+def _validate_macos_acceptance_markdown_surface(prose: str) -> None:
+    command_start = (
+        r"(?:(?:python(?:3(?:\.\d+)*)?|cargo|npm|node|rustc|rustup|uname|arch|"
+        r"test\s+-x|df\s+-h|curl|wget|sudo|softwareupdate|env|rm|cp|mv|bash|"
+        r"sh|zsh|--allow-network)(?=\s|$)|CARGO_NET_OFFLINE=)"
+    )
+    network_token = (
+        r"(?:curl|wget)\b|python(?:3(?:\.\d+)*)?\b.*\bfetch\b|"
+        r"https?://|--allow-network\b"
+    )
+    activation = r"(?:run|execute|invoke|use|add|append|运行|执行|调用|使用|添加|追加)\s*$"
+    negation = r"(?:do\s+not|must\s+not|never|forbid|prohibit|不要|不得|禁止|严禁|不可|不允许)"
+
+    for line in prose.splitlines():
+        candidate = _macos_acceptance_markdown_container_content(line)
+        if re.match(rf"^(?:{command_start}|https?://)", candidate, re.IGNORECASE):
+            raise ValueError("macOS acceptance guide contains an unfenced command")
+        if re.match(
+            rf"^(?:run|execute|invoke|use|add|append|运行|执行|调用|使用|添加|追加)\s+"
+            rf"(?:{network_token})",
+            candidate,
+            re.IGNORECASE,
+        ):
+            raise ValueError("macOS acceptance guide contains an unfenced network command")
+
+        for start, _end, content in _macos_acceptance_inline_code_spans(line):
+            compact = re.sub(r"\s+", " ", content).strip()
+            if not re.match(rf"^(?:{network_token})", compact, re.IGNORECASE):
+                continue
+            complete_network_command = bool(
+                re.match(r"^(?:curl|wget)\b\s+\S", compact, re.IGNORECASE)
+                or re.match(
+                    r"^python(?:3(?:\.\d+)*)?\b.*\bfetch\b",
+                    compact,
+                    re.IGNORECASE,
+                )
+            )
+            context = line[:start]
+            context_is_activation = re.search(activation, context, re.IGNORECASE)
+            context_is_negated = re.search(negation, context, re.IGNORECASE)
+            if complete_network_command or (
+                context_is_activation and not context_is_negated
+            ):
+                raise ValueError(
+                    "macOS acceptance guide contains an inline network command"
+                )
+
+
 def _validate_macos_acceptance_guide(source: str) -> None:
     fences, prose = _macos_acceptance_guide_fences(source)
     headings = tuple(
@@ -4472,15 +4571,7 @@ def _validate_macos_acceptance_guide(source: str) -> None:
         if prose.count(marker) < 1:
             raise ValueError(f"macOS acceptance guide marker drifted: {marker}")
     _validate_macos_acceptance_nonclaims(prose)
-    for line in prose.splitlines():
-        if re.match(
-            r"^\s*(?:python3|cargo|npm|node|rustc|rustup|uname|arch|"
-            r"test\s+-x|df\s+-h|curl|wget|sudo|softwareupdate|env|rm|cp|mv|bash|sh|zsh|"
-            r"CARGO_NET_OFFLINE=|--allow-network)\b",
-            line,
-            flags=re.IGNORECASE,
-        ):
-            raise ValueError("macOS acceptance guide contains an unfenced command")
+    _validate_macos_acceptance_markdown_surface(prose)
     if any(
         "curl" in line or "http://" in line or "https://" in line
         for block in fences
