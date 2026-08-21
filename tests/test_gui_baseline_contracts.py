@@ -426,6 +426,43 @@ struct RealCode;
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.failure_class("C:\\private\\arbitrary failure")
 
+        expected_status = {
+            "platform-unsupported": "blocked",
+            "tool-unavailable": "blocked",
+            "network-unavailable": "blocked",
+            "rosetta-unavailable": "blocked",
+            "asset-fetch-failed": "failed",
+            "runtime-descriptor-invalid": "blocked",
+            "runtime-start-failed": "failed",
+            "runtime-version-invalid": "failed",
+            "core-snapshot-failed": "failed",
+            "core-plan-failed": "failed",
+            "core-import-failed": "failed",
+            "core-inspection-failed": "failed",
+            "core-launch-failed": "failed",
+            "core-verification-failed": "failed",
+            "core-rollback-failed": "failed",
+            "desktop-launch-failed": "failed",
+            "desktop-window-unobserved": "failed",
+            "application-install-failed": "failed",
+            "application-interaction-unverified": "unverified",
+            "application-content-verification-failed": "failed",
+            "cleanup-residual-processes": "failed",
+            "cleanup-termination-failed": "failed",
+            "cleanup-delete-failed": "failed",
+        }
+        self.assertEqual(
+            {reason: self.baseline.failure_status(reason) for reason in expected_status},
+            expected_status,
+        )
+        self.assertEqual(set(self.baseline.STATUS_BY_REASON_CODE), set(expected_status))
+        self.assertEqual(
+            set(self.baseline.STATUS_BY_REASON_CODE),
+            set(self.baseline.FAILURE_CLASS_BY_REASON_CODE),
+        )
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.failure_status("arbitrary-status-reason")
+
     def test_execution_stage_mapping_is_independent_and_closed(self) -> None:
         expected = {
             "asset-fetch": "asset-fetch-failed",
@@ -443,18 +480,41 @@ struct RealCode;
             self.baseline.failure_reason("C:\\private\\unknown-stage")
 
     def test_application_outcomes_have_closed_status_and_failure_class(self) -> None:
-        for status in ("failed", "unverified", "blocked"):
-            with self.subTest(status=status):
+        valid = (
+            ("failed", "core-plan-failed", "core"),
+            ("unverified", "application-interaction-unverified", "application"),
+            ("blocked", "network-unavailable", "environment"),
+        )
+        for status, reason_code, expected_class in valid:
+            with self.subTest(status=status, reason_code=reason_code):
                 evidence: dict[str, object] = {"failureClass": "runtime", "reason": "local detail"}
                 self.baseline.set_application_outcome(
                     evidence,
                     status,
-                    "application-interaction-unverified",
+                    reason_code,
                     diagnostic="C:\\Users\\developer\\secret.txt",
                 )
                 self.assertEqual(evidence["status"], status)
-                self.assertEqual(evidence["failureClass"], "application")
-                self.assertEqual(evidence["reasonCode"], "application-interaction-unverified")
+                self.assertEqual(evidence["failureClass"], expected_class)
+                self.assertEqual(evidence["reasonCode"], reason_code)
+
+        mismatches = (
+            ("blocked", "core-plan-failed"),
+            ("unverified", "cleanup-delete-failed"),
+            ("failed", "network-unavailable"),
+        )
+        for status, reason_code in mismatches:
+            evidence = {"sentinel": "unchanged"}
+            with self.subTest(status=status, reason_code=reason_code), self.assertRaises(
+                self.baseline.AcceptanceError
+            ):
+                self.baseline.set_application_outcome(
+                    evidence,
+                    status,
+                    reason_code,
+                    diagnostic="must not append",
+                )
+            self.assertEqual(evidence, {"sentinel": "unchanged"})
 
         accepted: dict[str, object] = {
             "failureClass": "cleanup",
@@ -463,6 +523,8 @@ struct RealCode;
         }
         self.baseline.set_application_outcome(accepted, "accepted")
         self.assertEqual(accepted, {"status": "accepted"})
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.set_application_outcome({}, "accepted", "core-plan-failed")
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.set_application_outcome({}, "unknown")
 
@@ -543,6 +605,23 @@ struct RealCode;
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.apply_stage_outcome(
                 invalid_history,
+                "cleanup-delete",
+                diagnostic="cleanup failed",
+            )
+        mismatched_history = {
+            "diagnostics": [
+                {
+                    "sequence": 1,
+                    "status": "blocked",
+                    "failureClass": "core",
+                    "reasonCode": "core-plan-failed",
+                    "detail": "closed values with the wrong relation",
+                }
+            ]
+        }
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.apply_stage_outcome(
+                mismatched_history,
                 "cleanup-delete",
                 diagnostic="cleanup failed",
             )
@@ -1130,7 +1209,7 @@ struct RealCode;
                 "schemaVersion": "1",
                 "runtimeId": "crossover",
                 "appId": "7zip",
-                "status": "unverified",
+                "status": "failed",
                 "failureClass": "desktop",
                 "reasonCode": "desktop-window-unobserved",
                 "reason": "window tool failed under C:\\Users\\developer\\acceptance",
@@ -1161,7 +1240,7 @@ struct RealCode;
                     "schemaVersion": "1",
                     "runtimeId": "crossover",
                     "appId": "7zip",
-                    "status": "unverified",
+                    "status": "failed",
                     "failureClass": "desktop",
                     "reasonCode": "desktop-window-unobserved",
                     "cleanup": True,
@@ -1206,6 +1285,44 @@ struct RealCode;
         nested_application_id[0]["appId"] = {"nested": "7zip"}
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.compact_summary(receipt, nested_application_id)
+
+        status_reason_mismatches = (
+            ("blocked", "core", "core-plan-failed"),
+            ("unverified", "cleanup", "cleanup-delete-failed"),
+            ("failed", "environment", "network-unavailable"),
+        )
+        for status, failure_class, reason_code in status_reason_mismatches:
+            with self.subTest(boundary="full", status=status, reason_code=reason_code):
+                full_mutant = json.loads(json.dumps(applications))
+                full_mutant[0].update(
+                    status=status,
+                    failureClass=failure_class,
+                    reasonCode=reason_code,
+                )
+                with self.assertRaises(self.baseline.AcceptanceError):
+                    self.baseline.compact_summary(receipt, full_mutant)
+            with self.subTest(boundary="compact", status=status, reason_code=reason_code):
+                compact_mutant = json.loads(json.dumps(expected))
+                compact_mutant["applications"][0].update(
+                    status=status,
+                    failureClass=failure_class,
+                    reasonCode=reason_code,
+                )
+                with self.assertRaises(self.baseline.AcceptanceError):
+                    self.baseline.validate_compact_summary(compact_mutant)
+
+        polluted_history = json.loads(json.dumps(applications))
+        polluted_history[0]["diagnostics"] = [
+            {
+                "sequence": 1,
+                "status": "blocked",
+                "failureClass": "core",
+                "reasonCode": "core-plan-failed",
+                "detail": "closed values with the wrong relation",
+            }
+        ]
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.compact_summary(receipt, polluted_history)
 
         compact_mutants = []
         nested_key = json.loads(json.dumps(expected))

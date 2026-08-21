@@ -63,6 +63,31 @@ FAILURE_CLASS_BY_REASON_CODE = {
     "cleanup-termination-failed": "cleanup",
     "cleanup-delete-failed": "cleanup",
 }
+STATUS_BY_REASON_CODE = {
+    "platform-unsupported": "blocked",
+    "tool-unavailable": "blocked",
+    "network-unavailable": "blocked",
+    "rosetta-unavailable": "blocked",
+    "asset-fetch-failed": "failed",
+    "runtime-descriptor-invalid": "blocked",
+    "runtime-start-failed": "failed",
+    "runtime-version-invalid": "failed",
+    "core-snapshot-failed": "failed",
+    "core-plan-failed": "failed",
+    "core-import-failed": "failed",
+    "core-inspection-failed": "failed",
+    "core-launch-failed": "failed",
+    "core-verification-failed": "failed",
+    "core-rollback-failed": "failed",
+    "desktop-launch-failed": "failed",
+    "desktop-window-unobserved": "failed",
+    "application-install-failed": "failed",
+    "application-interaction-unverified": "unverified",
+    "application-content-verification-failed": "failed",
+    "cleanup-residual-processes": "failed",
+    "cleanup-termination-failed": "failed",
+    "cleanup-delete-failed": "failed",
+}
 FAILURE_REASON_BY_STAGE = {
     "preflight-platform": "platform-unsupported",
     "preflight-tool": "tool-unavailable",
@@ -96,8 +121,6 @@ BLOCKED_STAGES = {
     "runtime-descriptor",
 }
 UNVERIFIED_STAGES = {"application-interaction"}
-BLOCKED_REASON_CODES = frozenset(FAILURE_REASON_BY_STAGE[stage] for stage in BLOCKED_STAGES)
-UNVERIFIED_REASON_CODES = frozenset(FAILURE_REASON_BY_STAGE[stage] for stage in UNVERIFIED_STAGES)
 
 
 class AcceptanceError(Exception):
@@ -191,6 +214,13 @@ def failure_class(reason_code: str) -> str:
         raise AcceptanceError("failure reason code is not recognized") from error
 
 
+def failure_status(reason_code: str) -> str:
+    try:
+        return STATUS_BY_REASON_CODE[reason_code]
+    except KeyError as error:
+        raise AcceptanceError("failure reason status is not recognized") from error
+
+
 def failure_reason(stage: str) -> str:
     try:
         return FAILURE_REASON_BY_STAGE[stage]
@@ -207,8 +237,10 @@ def set_application_outcome(
 ) -> None:
     if status_value not in STATUSES:
         raise AcceptanceError("application status is not recognized")
-    evidence["status"] = status_value
     if status_value == "accepted":
+        if reason_code is not None:
+            raise AcceptanceError("accepted application must not include a reason code")
+        evidence["status"] = status_value
         evidence.pop("failureClass", None)
         evidence.pop("reasonCode", None)
         evidence.pop("reason", None)
@@ -216,8 +248,14 @@ def set_application_outcome(
         return
     if reason_code is None:
         raise AcceptanceError("non-accepted application status requires a reason code")
+    expected_status = failure_status(reason_code)
+    if status_value != expected_status:
+        raise AcceptanceError("application status and reason code do not match")
+    class_value = failure_class(reason_code)
+    _validate_diagnostic_history(evidence)
+    evidence["status"] = status_value
     evidence["reasonCode"] = reason_code
-    evidence["failureClass"] = failure_class(reason_code)
+    evidence["failureClass"] = class_value
     if diagnostic is not None:
         _append_diagnostic(evidence, status_value, reason_code, diagnostic)
         evidence["reason"] = diagnostic[:MAX_DIAGNOSTIC_CHARS]
@@ -231,7 +269,30 @@ def _append_diagnostic(
 ) -> None:
     if not isinstance(diagnostic, str):
         raise AcceptanceError("diagnostic detail must be text")
-    existing = evidence.setdefault("diagnostics", [])
+    if status_value != failure_status(reason_code):
+        raise AcceptanceError("diagnostic status and reason code do not match")
+    class_value = failure_class(reason_code)
+    existing = _validate_diagnostic_history(evidence)
+    if "diagnostics" not in evidence:
+        evidence["diagnostics"] = existing
+    sequence = existing[-1]["sequence"] + 1 if existing else 1
+    if len(existing) >= MAX_DIAGNOSTICS:
+        del existing[1 if len(existing) > 1 else 0]
+    existing.append(
+        {
+            "sequence": sequence,
+            "status": status_value,
+            "failureClass": class_value,
+            "reasonCode": reason_code,
+            "detail": diagnostic[:MAX_DIAGNOSTIC_CHARS],
+        }
+    )
+
+
+def _validate_diagnostic_history(evidence: dict[str, object]) -> list[dict[str, object]]:
+    if "diagnostics" not in evidence:
+        return []
+    existing = evidence["diagnostics"]
     if not isinstance(existing, list):
         raise AcceptanceError("diagnostic history must be an array")
     if len(existing) > MAX_DIAGNOSTICS:
@@ -259,28 +320,10 @@ def _append_diagnostic(
             or len(item["detail"]) > MAX_DIAGNOSTIC_CHARS
         ):
             raise AcceptanceError("diagnostic history entry is invalid")
-        expected_status = (
-            "blocked"
-            if item["reasonCode"] in BLOCKED_REASON_CODES
-            else "unverified"
-            if item["reasonCode"] in UNVERIFIED_REASON_CODES
-            else "failed"
-        )
-        if item["status"] != expected_status:
+        if item["status"] != failure_status(item["reasonCode"]):
             raise AcceptanceError("diagnostic history entry is invalid")
         previous_sequence = item["sequence"]
-    sequence = existing[-1]["sequence"] + 1 if existing else 1
-    if len(existing) >= MAX_DIAGNOSTICS:
-        del existing[1 if len(existing) > 1 else 0]
-    existing.append(
-        {
-            "sequence": sequence,
-            "status": status_value,
-            "failureClass": failure_class(reason_code),
-            "reasonCode": reason_code,
-            "detail": diagnostic[:MAX_DIAGNOSTIC_CHARS],
-        }
-    )
+    return existing
 
 
 def apply_stage_outcome(
@@ -453,7 +496,11 @@ def validate_compact_summary(value: object) -> None:
         else:
             reason_code = application.get("reasonCode")
             class_value = application.get("failureClass")
-            if not isinstance(reason_code, str) or class_value != failure_class(reason_code):
+            if (
+                not isinstance(reason_code, str)
+                or class_value != failure_class(reason_code)
+                or status_value != failure_status(reason_code)
+            ):
                 raise AcceptanceError("compact application failure metadata is invalid")
         asset_sha256 = application.get("assetSha256")
         if asset_sha256 is not None and (
@@ -506,13 +553,27 @@ def compact_summary(
             if key in application
         }
         if status_value == "accepted":
-            if "failureClass" in application or "reasonCode" in application:
+            if any(
+                key in application
+                for key in ("failureClass", "reasonCode", "reason", "diagnostics")
+            ):
                 raise AcceptanceError("accepted application includes failure metadata")
         else:
             reason_code = application.get("reasonCode")
             class_value = application.get("failureClass")
-            if not isinstance(reason_code, str) or class_value != failure_class(reason_code):
+            if (
+                not isinstance(reason_code, str)
+                or class_value != failure_class(reason_code)
+                or status_value != failure_status(reason_code)
+            ):
                 raise AcceptanceError("application failure metadata is invalid")
+            history = _validate_diagnostic_history(application)
+            if history and (
+                history[-1]["status"] != status_value
+                or history[-1]["failureClass"] != class_value
+                or history[-1]["reasonCode"] != reason_code
+            ):
+                raise AcceptanceError("application diagnostic history does not match final outcome")
             projected["failureClass"] = class_value
             projected["reasonCode"] = reason_code
         interactions = application.get("interactionChecks")
@@ -564,7 +625,11 @@ def compact_preflight(evidence: dict[str, object]) -> dict[str, object]:
     if runtime_id is not None and runtime_id not in RUNTIME_IDS:
         raise AcceptanceError("compact preflight Runtime identity is invalid")
     reason_code = projected["reasonCode"]
-    if not isinstance(reason_code, str) or projected["failureClass"] != failure_class(reason_code):
+    if (
+        not isinstance(reason_code, str)
+        or projected["failureClass"] != failure_class(reason_code)
+        or failure_status(reason_code) != "blocked"
+    ):
         raise AcceptanceError("compact preflight failure metadata is invalid")
     return projected
 
