@@ -99,6 +99,10 @@ class IntegrityError(AcceptanceError):
     """Report that a preflight-bound input changed during orchestration."""
 
 
+class CleanupError(AcceptanceError):
+    """Report that a managed child or process group could not be reaped."""
+
+
 class ClosedArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         raise AcceptanceError("invalid command-line arguments")
@@ -751,7 +755,7 @@ def _posix_process_group(process: object, options: dict[str, object]) -> int | N
         or process_id <= 1
         or process_id == os.getpgrp()
     ):
-        raise AcceptanceError("managed process group is invalid")
+        raise CleanupError("managed process group is invalid")
     return process_id
 
 
@@ -780,24 +784,31 @@ def _signal_process_group(process_group: int, requested_signal: int) -> bool:
 def _stop_posix_process_group(process: object, process_group: int) -> bool:
     wait = getattr(process, "wait", None)
     if not callable(wait):
-        return False
+        raise CleanupError("managed process group cleanup failed")
+    cleanup_failed = False
     if not _signal_process_group(process_group, signal.SIGTERM):
-        return False
+        cleanup_failed = True
     try:
         wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
-    except Exception:
+    except subprocess.TimeoutExpired:
         pass
+    except Exception:
+        cleanup_failed = True
     if _process_group_exists(process_group):
         if not _signal_process_group(process_group, signal.SIGKILL):
-            return False
+            cleanup_failed = True
         try:
             wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
         except Exception:
-            pass
+            cleanup_failed = True
     deadline = time.monotonic() + PROCESS_STOP_TIMEOUT_SECONDS
     while _process_group_exists(process_group) and time.monotonic() < deadline:
         time.sleep(PROCESS_POLL_SECONDS)
-    return _process_poll(process) is not None and not _process_group_exists(process_group)
+    if _process_poll(process) is None or _process_group_exists(process_group):
+        cleanup_failed = True
+    if cleanup_failed:
+        raise CleanupError("managed process group cleanup failed")
+    return True
 
 
 def _stop_process(process: object, *, process_group: int | None = None) -> bool:
@@ -807,41 +818,55 @@ def _stop_process(process: object, *, process_group: int | None = None) -> bool:
     kill = getattr(process, "kill", None)
     wait = getattr(process, "wait", None)
     if not callable(wait):
-        return False
+        raise CleanupError("child process cleanup failed")
     if _process_poll(process) is not None:
         return True
+    cleanup_failed = False
     if callable(terminate):
         try:
             terminate()
         except Exception:
-            pass
+            cleanup_failed = True
+    else:
+        cleanup_failed = True
     try:
         wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
-    except Exception:
+    except subprocess.TimeoutExpired:
         if callable(kill):
             try:
                 kill()
             except Exception:
-                pass
+                cleanup_failed = True
+        else:
+            cleanup_failed = True
         try:
             wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
         except Exception:
-            return False
-    if _process_poll(process) is not None:
-        return True
-    if callable(kill):
-        try:
-            kill()
-            wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
-        except Exception:
-            return False
-    return _process_poll(process) is not None
+            cleanup_failed = True
+    except Exception:
+        cleanup_failed = True
+    if _process_poll(process) is None:
+        if callable(kill):
+            try:
+                kill()
+                wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+            except Exception:
+                cleanup_failed = True
+        else:
+            cleanup_failed = True
+    if _process_poll(process) is None:
+        cleanup_failed = True
+    if cleanup_failed:
+        raise CleanupError("child process cleanup failed")
+    return True
 
 
 def _reap_residual_process_group(process: object, process_group: int | None) -> bool:
     if process_group is None or not _process_group_exists(process_group):
         return True
-    return _stop_process(process, process_group=process_group)
+    if not _stop_process(process, process_group=process_group):
+        raise CleanupError("managed process group cleanup failed")
+    return True
 
 
 def _close_process_streams(process: object) -> None:
@@ -872,11 +897,18 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
         )
     except OSError as error:
         raise AcceptanceError("child process could not be started") from error
-    process_group = _posix_process_group(process, group_options)
+    try:
+        process_group = _posix_process_group(process, group_options)
+    except CleanupError:
+        try:
+            _stop_process(process)
+        finally:
+            _close_process_streams(process)
+        raise
     if process.stdout is None or process.stderr is None:
         if not _stop_process(process, process_group=process_group):
             _close_process_streams(process)
-            raise AcceptanceError("child process cleanup failed")
+            raise CleanupError("child process cleanup failed")
         _close_process_streams(process)
         raise AcceptanceError("child process capture is unavailable")
 
@@ -931,13 +963,13 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
     if timed_out or overflow.is_set() or reader_failed.is_set():
         if not _stop_process(process, process_group=process_group):
             _close_process_streams(process)
-            raise AcceptanceError("child process cleanup failed")
+            raise CleanupError("child process cleanup failed")
     for thread in threads:
         thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
     if any(thread.is_alive() for thread in threads):
         if not _stop_process(process, process_group=process_group):
             _close_process_streams(process)
-            raise AcceptanceError("child process cleanup failed")
+            raise CleanupError("child process cleanup failed")
         _close_process_streams(process)
         for thread in threads:
             thread.join(PROCESS_STOP_TIMEOUT_SECONDS)
@@ -952,10 +984,10 @@ def _bounded_run(arguments: Sequence[str], *, timeout: float) -> subprocess.Comp
     returncode = _process_poll(process)
     if returncode is None:
         if not _stop_process(process, process_group=process_group):
-            raise AcceptanceError("child process cleanup failed")
+            raise CleanupError("child process cleanup failed")
         raise AcceptanceError("child process did not report an exit status")
     if not _reap_residual_process_group(process, process_group):
-        raise AcceptanceError("child process cleanup failed")
+        raise CleanupError("child process cleanup failed")
     try:
         stdout = bytes(captured["stdout"]).decode("utf-8")
         stderr = bytes(captured["stderr"]).decode("utf-8")
@@ -1490,58 +1522,27 @@ def _launch_desktop(
         )
     try:
         process_group = _posix_process_group(process, group_options)
-    except AcceptanceError:
-        if not _stop_process(process):
-            return (
-                {
-                    "status": "failed",
-                    "failureClass": "cleanup",
-                    "reasonCode": "cleanup-termination-failed",
-                },
-                False,
-            )
+    except CleanupError:
+        _stop_process(process)
+        raise
+    try:
+        returncode = waiter(process, DESKTOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _stop_process(process, process_group=process_group)
         return (
             {
                 "status": "failed",
                 "failureClass": "desktop",
-                "reasonCode": "desktop-launch-failed",
+                "reasonCode": "desktop-timeout-failed",
             },
             True,
         )
-    try:
-        returncode = waiter(process, DESKTOP_TIMEOUT_SECONDS)
     except Exception as error:
-        stopped = _stop_process(process, process_group=process_group)
-        if not stopped:
-            return (
-                {
-                    "status": "failed",
-                    "failureClass": "cleanup",
-                    "reasonCode": "cleanup-termination-failed",
-                },
-                False,
-            )
-        reason = (
-            "desktop-timeout-failed"
-            if isinstance(error, subprocess.TimeoutExpired)
-            else "desktop-launch-failed"
-        )
-        return (
-            {"status": "failed", "failureClass": "desktop", "reasonCode": reason},
-            True,
-        )
+        _stop_process(process, process_group=process_group)
+        raise CleanupError("desktop process wait failed") from error
     polled = _process_poll(process)
     if polled is None:
-        stopped = _stop_process(process, process_group=process_group)
-        if not stopped:
-            return (
-                {
-                    "status": "failed",
-                    "failureClass": "cleanup",
-                    "reasonCode": "cleanup-termination-failed",
-                },
-                False,
-            )
+        _stop_process(process, process_group=process_group)
         return (
             {
                 "status": "failed",
@@ -1550,15 +1551,7 @@ def _launch_desktop(
             },
             True,
         )
-    if not _reap_residual_process_group(process, process_group):
-        return (
-            {
-                "status": "failed",
-                "failureClass": "cleanup",
-                "reasonCode": "cleanup-termination-failed",
-            },
-            False,
-        )
+    _reap_residual_process_group(process, process_group)
     if (
         not isinstance(returncode, int)
         or isinstance(returncode, bool)
@@ -1622,7 +1615,7 @@ def orchestrate(
                 console = _project_console(
                     parse_closed_json(console_result.stdout, "Console summary"), descriptor
                 )
-            except IntegrityError:
+            except (IntegrityError, CleanupError):
                 raise
             except AcceptanceError:
                 console = _failure("console", runtime_id, "core", "console-runner-failed")
@@ -1663,7 +1656,7 @@ def orchestrate(
                         application["status"] == "accepted" for application in gui_applications
                     ):
                         raise AcceptanceError("GUI exit status disagrees with its summary")
-                except IntegrityError:
+                except (IntegrityError, CleanupError):
                     raise
                 except AcceptanceError:
                     gui_applications = [

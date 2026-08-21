@@ -901,18 +901,13 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired("desktop", timeout)
 
         unstoppable = Unstoppable()
-        evidence, safe = acceptance._launch_desktop(
-            ["desktop"], lambda *_args, **_kwargs: unstoppable, timed_out, lambda _line: None
-        )
-        self.assertFalse(safe)
-        self.assertEqual(
-            evidence,
-            {
-                "status": "failed",
-                "failureClass": "cleanup",
-                "reasonCode": "cleanup-termination-failed",
-            },
-        )
+        with self.assertRaises(acceptance.CleanupError):
+            acceptance._launch_desktop(
+                ["desktop"],
+                lambda *_args, **_kwargs: unstoppable,
+                timed_out,
+                lambda _line: None,
+            )
         child_calls: list[str] = []
         desktop_launches = 0
 
@@ -936,16 +931,16 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             desktop_launches += 1
             return Unstoppable()
 
-        summary = acceptance.orchestrate(
-            self._arguments(),
-            runner=successful_runner,
-            launcher=unstoppable_launcher,
-            waiter=timed_out,
-            host_system="Darwin",
-            host_machine="arm64",
-            printer=lambda _line: None,
-        )
-        self.assertEqual(summary["status"], "failed")
+        with self.assertRaises(acceptance.CleanupError):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=successful_runner,
+                launcher=unstoppable_launcher,
+                waiter=timed_out,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
         self.assertEqual(desktop_launches, 1)
         self.assertEqual(
             child_calls,
@@ -955,6 +950,7 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 "run_gui_baseline.py",
             ],
         )
+        self.assertFalse((self.work / "summary.json").exists())
         acceptance._launch_desktop(
             ["desktop"], next_launcher, timed_out, lambda _line: None
         )
@@ -1121,6 +1117,130 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         self.assertFalse((victim / "summary.json").exists())
         self.assertFalse((original_work / "summary.json").exists())
 
+    def test_console_cleanup_failure_is_fatal_and_starts_no_later_path(self) -> None:
+        child_calls: list[str] = []
+        desktop_calls = 0
+
+        def bounded(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+            del timeout
+            if argv[-1] == "--all":
+                return self._successful_runner(argv)
+            child_calls.append(Path(argv[3]).name)
+            raise acceptance.CleanupError("child process cleanup failed")
+
+        def launcher(*_args: object, **_kwargs: object) -> object:
+            nonlocal desktop_calls
+            desktop_calls += 1
+            return FinishedDesktopProcess()
+
+        with (
+            mock.patch.object(acceptance, "_bounded_run", side_effect=bounded),
+            self.assertRaises(acceptance.CleanupError),
+        ):
+            acceptance.orchestrate(
+                self._arguments(),
+                launcher=launcher,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual(child_calls, ["run_macos_headless_preview.py"])
+        self.assertEqual(desktop_calls, 0)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_gui_cleanup_failure_is_fatal_and_skips_desktop_and_later_paths(self) -> None:
+        child_calls: list[str] = []
+        desktop_calls = 0
+
+        def bounded(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+            del timeout
+            if argv[-1] == "--all":
+                return self._successful_runner(argv)
+            child_calls.append(Path(argv[3]).name)
+            if Path(argv[3]).name == "run_macos_headless_preview.py":
+                return self._successful_runner(argv)
+            raise acceptance.CleanupError("child process cleanup failed")
+
+        def launcher(*_args: object, **_kwargs: object) -> object:
+            nonlocal desktop_calls
+            desktop_calls += 1
+            return FinishedDesktopProcess()
+
+        with (
+            mock.patch.object(acceptance, "_bounded_run", side_effect=bounded),
+            self.assertRaises(acceptance.CleanupError),
+        ):
+            acceptance.orchestrate(
+                self._arguments(),
+                launcher=launcher,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual(
+            child_calls,
+            ["run_macos_headless_preview.py", "run_gui_baseline.py"],
+        )
+        self.assertEqual(desktop_calls, 0)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_desktop_wait_failure_is_cleanup_fatal_after_reaping_the_process(self) -> None:
+        child_calls: list[str] = []
+        desktop_calls = 0
+
+        class Process:
+            def __init__(self) -> None:
+                self.running = True
+
+            def poll(self) -> int | None:
+                return None if self.running else -15
+
+            def terminate(self) -> None:
+                self.running = False
+
+            def kill(self) -> None:
+                self.running = False
+
+            def wait(self, _timeout: int | None = None, **_kwargs: object) -> int:
+                self.running = False
+                return -15
+
+        process = Process()
+
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            child_calls.append(Path(argv[3]).name)
+            return self._successful_runner(argv)
+
+        def launcher(*_args: object, **_kwargs: object) -> object:
+            nonlocal desktop_calls
+            desktop_calls += 1
+            return process
+
+        def waiter(_process: object, _timeout: int) -> int:
+            raise OSError("closed wait failure")
+
+        with self.assertRaises(acceptance.CleanupError):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=runner,
+                launcher=launcher,
+                waiter=waiter,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual(
+            child_calls,
+            [
+                "discover_macos_wine.py",
+                "run_macos_headless_preview.py",
+                "run_gui_baseline.py",
+            ],
+        )
+        self.assertEqual(desktop_calls, 1)
+        self.assertIsNotNone(process.poll())
+        self.assertFalse((self.work / "summary.json").exists())
+
     def test_summary_output_rejects_symlink_without_touching_victim(self) -> None:
         victim = self.external / "summary-victim"
         victim.write_text("unchanged", encoding="utf-8")
@@ -1230,25 +1350,32 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 with (
                     mock.patch.object(acceptance, "_posix_process_group", return_value=4242),
                     mock.patch.object(acceptance, "_process_group_exists", return_value=True),
-                    mock.patch.object(acceptance, "_stop_process", return_value=False),
+                    mock.patch.object(
+                        acceptance,
+                        "_stop_process",
+                        side_effect=acceptance.CleanupError("cleanup failed"),
+                    ),
                 ):
                     if mode == "child":
                         with mock.patch.object(
                             acceptance.subprocess, "Popen", return_value=process
                         ):
-                            with self.assertRaisesRegex(
-                                acceptance.AcceptanceError, "cleanup failed"
-                            ):
+                            with self.assertRaises(acceptance.CleanupError):
                                 acceptance._bounded_run(["child"], timeout=1)
                     else:
-                        evidence, safe = acceptance._launch_desktop(
-                            ["desktop"],
-                            lambda *_args, **_kwargs: process,
-                            lambda _process, _timeout: 0,
-                            lambda _line: None,
-                        )
-                        self.assertFalse(safe)
-                        self.assertEqual(evidence["failureClass"], "cleanup")
+                        with self.assertRaises(acceptance.CleanupError):
+                            acceptance._launch_desktop(
+                                ["desktop"],
+                                lambda *_args, **_kwargs: process,
+                                lambda _process, _timeout: 0,
+                                lambda _line: None,
+                            )
+        with (
+            mock.patch.object(acceptance, "_process_group_exists", return_value=True),
+            mock.patch.object(acceptance, "_stop_process", return_value=False),
+            self.assertRaises(acceptance.CleanupError),
+        ):
+            acceptance._reap_residual_process_group(object(), 4242)
 
     @unittest.skipUnless(os.name == "posix", "real process-group probe requires POSIX")
     def test_timeout_reaps_grandchildren_for_child_and_desktop(self) -> None:
