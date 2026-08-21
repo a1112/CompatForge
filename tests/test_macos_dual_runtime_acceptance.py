@@ -393,6 +393,37 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "inline-network-url",
                 append_guide("Run `https://example.invalid/runtime` now."),
             ),
+            (
+                "task-list-absolute-curl",
+                append_guide(
+                    "- [ ] /usr/bin/curl https://example.invalid/runtime"
+                ),
+            ),
+            (
+                "multiline-code-span-curl",
+                append_guide(
+                    "Please run ``\n/usr/bin/curl https://example.invalid/runtime\n`` now."
+                ),
+            ),
+            (
+                "html-code-curl",
+                append_guide(
+                    "Please run <code>/usr/bin/curl "
+                    "https://example.invalid/runtime</code>."
+                ),
+            ),
+            (
+                "please-run-absolute-wget",
+                append_guide(
+                    "Please run /usr/local/bin/wget https://example.invalid/runtime."
+                ),
+            ),
+            (
+                "html-asset-downloader",
+                append_guide(
+                    "Use <code>tools/download_gui_assets.py fetch 7zip</code>."
+                ),
+            ),
             ("public-release-ready", append_guide("CompatForge is PUBLIC release-ready.")),
             ("released-claim", append_guide("CompatForge has been released.")),
             ("public-beta-ready", append_guide("This stage is public   beta ready!")),
@@ -407,10 +438,17 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("valid-code-signature", append_guide("A valid code signature is present.")),
             ("notarization-succeeded", append_guide("Notarization succeeded.")),
             (
+                "signature-verification-passed",
+                append_guide("The artifact signature passed verification."),
+            ),
+            ("generic-signing-complete", append_guide("Release signing completed.")),
+            ("notarizing-succeeded", append_guide("Notarizing succeeded.")),
+            (
                 "notarized-after-comma",
                 append_guide("The build, now notarized, passed validation."),
             ),
             ("dmg-claim", append_guide("A DMG is ready for distribution.")),
+            ("dmg-any-mention", append_guide("DMG packaging support is present.")),
             ("generated-dmg-claim", append_guide("Generated DMG for distribution.")),
             (
                 "dmg-generated-after-comma",
@@ -440,18 +478,27 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ),
             ("repository-authorized", append_guide("ForgeOS authorized.")),
             ("repository-may-alter", append_guide("Maintainers may alter ForgeOS.")),
+            ("repository-may-rewrite", append_guide("Maintainers may rewrite ForgeOS.")),
+            (
+                "available-to-public",
+                append_guide("The build is available to the public."),
+            ),
             ("chinese-public-release", append_guide("本阶段进入公测并公开发布。")),
+            ("chinese-external-release", append_guide("本阶段已经对外发布。")),
             ("chinese-signed-notarized", append_guide("应用已签名并完成公证。")),
             ("chinese-signature-valid", append_guide("应用签名有效。")),
             ("chinese-notarization-valid", append_guide("构建公证有效。")),
+            ("chinese-signing-complete", append_guide("构建签署完成。")),
             ("chinese-signature-after-comma", append_guide("应用，现已签名。")),
             ("chinese-notarization-after-comma", append_guide("构建，现已公证。")),
             ("chinese-dmg", append_guide("下一步将生成 DMG。")),
+            ("chinese-dmg-any-mention", append_guide("本阶段包含 DMG。")),
             ("chinese-dmg-generated", append_guide("DMG 已生成。")),
             ("chinese-dmg-after-comma", append_guide("DMG，已生成。")),
             ("chinese-cross-repository", append_guide("允许修改 ForgeOS。")),
             ("chinese-repository-change", append_guide("可以改动 ForgeTools。")),
             ("chinese-repository-edit", append_guide("允许更改 Mac-Win。")),
+            ("chinese-repository-adjust", append_guide("允许调整 ForgeTools。")),
             ("chinese-repository-authorized", append_guide("ForgeOS 获授权。")),
         )
         for label, mutate in cases:
@@ -496,7 +543,7 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             tuple(
                 topic
                 for topic, _patterns in getattr(
-                    validator, "MACOS_ACCEPTANCE_TOPIC_GRAMMAR", ()
+                    validator, "MACOS_ACCEPTANCE_TOPIC_TRIGGERS", ()
                 )
             ),
             ("public", "signing", "dmg", "repositories"),
@@ -525,6 +572,8 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("public-en-no-plans-exact", "No plans public release."),
             ("public-zh-not-intended", "本阶段不打算进入公测。"),
             ("public-zh-no-plans", "本阶段无计划公开发布。"),
+            ("public-en-never", "This stage is never a public release."),
+            ("public-zh-not-planned", "本阶段不计划对外发布。"),
             ("signing-en-prefix", "The application will not be signed."),
             ("signing-zh-prefix", "应用不会签名。"),
             ("signing-en-suffix", "Application signing is prohibited."),
@@ -532,13 +581,21 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("signing-en-out-of-scope", "Code signing is out of scope."),
             ("signing-en-out-of-scope-exact", "Signing out of scope."),
             ("signing-zh-out-of-scope", "代码签名不在本阶段范围内。"),
+            ("signing-en-beyond-scope", "Artifact signature is beyond scope."),
+            ("signing-en-excluded", "Notarization is excluded."),
+            ("signing-zh-beyond-scope", "构建签署在范围外。"),
             ("dmg-en-prefix", "This stage will not generate a DMG."),
             ("dmg-zh-prefix", "本阶段不会生成 DMG。"),
             ("dmg-en-suffix", "DMG generation will not happen."),
             ("dmg-zh-suffix", "DMG 生成不会发生。"),
+            ("dmg-en-forbidden", "DMG generation is forbidden."),
+            ("dmg-zh-forbidden", "DMG 生成被禁止。"),
             ("dmg-en-out-of-scope", "DMG generation is out of scope."),
             ("dmg-en-out-of-scope-exact", "DMG generation out of scope."),
             ("dmg-zh-out-of-scope", "DMG 生成不在范围内。"),
+            ("dmg-en-beyond-scope", "DMG is beyond scope."),
+            ("dmg-en-excluded", "DMG is excluded."),
+            ("dmg-zh-excluded", "DMG 已排除。"),
             ("repositories-en-prefix", "This stage will not modify ForgeOS."),
             ("repositories-zh-prefix", "本阶段不会修改 ForgeTools。"),
             ("repositories-en-suffix", "Mac-Win modification is forbidden."),
@@ -592,6 +649,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             (
                 "signing-out-of-scope-mixed",
                 "Signing is out of scope, but notarization succeeded.",
+            ),
+            (
+                "negative-signing-comma-generated-dmg",
+                "The application is not signed, generated DMG is available.",
+            ),
+            (
+                "negative-signing-sentence-generated-dmg",
+                "The application is not signed. Generated DMG is available.",
             ),
             (
                 "dmg-mixed",

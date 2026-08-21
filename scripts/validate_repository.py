@@ -513,56 +513,38 @@ MACOS_ACCEPTANCE_NONCLAIMS = (
     "- `coverage`: 本门禁不证明所有 Windows 应用、主机或 Runtime 可用。",
     "- `repositories`: 本门禁不修改也不授权修改 ForgeOS、ForgeTools 或 Mac-Win。",
 )
+MACOS_ACCEPTANCE_SAFE_NETWORK_PROSE = (
+    "只有操作者明确批准本阶段联网时，才逐个执行以下固定 app id。下载器内部固定 URL、大小上限和 SHA-256；不要用 `curl`、浏览器或任意 URL 替代：",
+    "三个固定资产获取完成后必须关闭网络。双轮编排及其余所有阶段都不得使用或追加 `--allow-network`。",
+)
 MACOS_ACCEPTANCE_REPOSITORY_SUBJECT = r"(?:forgeos|forgetools|mac\s+win)"
 MACOS_ACCEPTANCE_REPOSITORY_ACTION = (
-    r"(?:changes?|modifications?|modify|modifies|modified|changed|"
-    r"alter|alters|altered|authorize|authorizes|authorized|authorization)"
+    r"(?:changes?|changed|changing|modifications?|modify|modifies|modified|"
+    r"alter|alters|altered|altering|edits?|edited|editing|adjusts?|adjusted|"
+    r"rewrit(?:e|es|ten|ing)|mutat(?:e|es|ed|ing|ion)|"
+    r"authori[sz](?:e|es|ed|ation))"
 )
-MACOS_ACCEPTANCE_TOPIC_GRAMMAR = (
+MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
     (
         "public",
         (
             r"\bpublic\s+(?:beta|release)\b",
-            r"(?:公测|公开测试|公开发布)",
-            r"\b(?:this|it|compatforge|stage|gate|build|application|app|artifact|package)"
-            r"\s+(?:is|are|was|were|will\s+be|has\s+been)\s+released\b",
+            r"\bavailable\s+to\s+(?:the\s+)?public\b",
+            r"\breleased\b",
+            r"(?:公测|公开测试|公开发布|对外发布)",
         ),
     ),
     (
         "signing",
         (
-            r"\bsigned\s+(?:application|app|build|artifact|binary|package)\b",
-            r"\b(?:application|app|build|artifact|binary|package|this|it)"
-            r"(?:\s+\w+){0,4}\s+signed\b",
-            r"\bnotarized\s+(?:application|app|build|artifact|binary|package)\b",
-            r"\b(?:application|app|build|artifact|binary|package|this|it)"
-            r"(?:\s+\w+){0,4}\s+notarized\b",
-            r"\b(?:application|app|build|artifact|binary|package)\s+"
-            r"(?:signing|notarization)\b",
-            r"\b(?:signing|notarization)\s+(?:of\s+)?(?:an?\s+|the\s+)?"
-            r"(?:application|app|build|artifact|binary|package)\b",
-            r"\b(?:valid\s+)?code\s+signatures?\b",
-            r"\b(?:code\s+)?signing\b",
-            r"\bnotarization\b(?:\s+(?:succeeded|successful|completed?))?",
-            r"(?:应用|构建|代码|产物)?\s*(?:已|已经|将|会|不会|未)?\s*"
-            r"(?:签名|公证)\s*(?:有效|成功|完成)?",
+            r"\bsign(?:ature|atures|ed|ing)?\b",
+            r"\bnotari[sz](?:e|ed|ing|ation|ations)\b",
+            r"(?:签名|签署|公证)",
         ),
     ),
     (
         "dmg",
-        (
-            r"\b(?:a\s+)?dmg\s+(?:is\s+)?ready\b",
-            r"\bgenerated\s+dmg\b",
-            r"\bdmg(?:\s+\w+){0,4}\s+generated\b",
-            r"\b(?:generate|generates|generated|create|creates|created|build|builds|"
-            r"built|ship|ships|publish|publishes|release|releases|distribute|"
-            r"distributes|provide|provides|deliver|delivers)\s+(?:a\s+)?dmg\b",
-            r"\bdmg\s+(?:generation|distribution|release)\b",
-            r"\b(?:generation|distribution|release)\s+of\s+(?:a\s+)?dmg\b",
-            r"(?:不会|未|不)?\s*(?:生成|创建|构建|分发|发布|交付)\s*dmg",
-            r"dmg(?:\s+__comma__\s*(?:已|已经|将|会|不会|未)\s*|"
-            r"\s*(?:已|已经|将|会|不会|未)?\s*)(?:生成|分发|发布)",
-        ),
+        (r"\bdmg\b",),
     ),
     (
         "repositories",
@@ -572,8 +554,8 @@ MACOS_ACCEPTANCE_TOPIC_GRAMMAR = (
             rf"\b{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b(?:\s+\w+){{0,5}}\s+"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b",
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}(?:\s+__comma__)?\s*"
-            r"(?:的)?\s*(?:修改|变更|改动|更改|授权|(?:已)?获授权)",
-            r"(?:修改|变更|改动|更改|授权(?:修改)?|获授权)\s*"
+            r"(?:的)?\s*(?:修改|变更|改动|更改|调整|重写|授权|(?:已)?获授权)",
+            r"(?:修改|变更|改动|更改|调整|重写|授权(?:修改)?|获授权)\s*"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}",
         ),
     ),
@@ -590,17 +572,29 @@ MACOS_ACCEPTANCE_NEGATION_BEFORE = (
     r"\bnot\s+intended\s+(?:as|to\s+be)\s+(?:(?:a|an|the)\s*)?$",
     r"\bno\s+plans?(?:\s+for)?\s*(?:(?:a|an|the)\s*)?$",
     r"(?:不打算(?:进入|作为)?|无计划(?:进入|进行)?)\s*$",
+    r"\b(?:not|never|no|without|will\s+not|would\s+not|(?:do|does|did)\s+not)\b"
+    r"(?:\s+(?!__comma__)\w+){0,4}\s*$",
+    r"(?:不计划|不打算|不会|不|无|未|禁止|严禁)[^\s_]{0,8}\s*$",
     r"\bneither(?:\s+(?:a|an|the))?\s*$",
-    r"\bneither\b.*\bnor(?:\s+(?:a|an|the))?\s*$",
+    r"\bneither\b(?:(?!__comma__).)*\bnor\b"
+    r"(?:\s+(?!__comma__)\w+){0,4}\s*$",
 )
 MACOS_ACCEPTANCE_NEGATION_AFTER = (
+    r"(?:(?:generation|distribution|packaging|release)\s+)?"
     r"(?:(?:is|are|was|were|will\s+be|would\s+be|has\s+been|have\s+been)\s+)?"
     r"(?:not\s+(?:ready|allowed|permitted|planned|scheduled|happening|occurring|"
     r"authorized|signed|notarized|generated|modified|changed)|forbidden|prohibited)\b",
+    r"(?:(?:generation|distribution|packaging|release)\s+)?"
     r"(?:will|would|can|could|shall)\s+not\s+"
     r"(?:happen|occur|proceed|be\s+(?:allowed|authorized|generated|modified|changed))\b",
+    r"(?:generation|distribution|packaging|release)\s+"
+    r"(?:(?:is|are|was|were)\s+)?(?:out(?:side)?\s+of\s+scope|"
+    r"beyond\s+scope|excluded)\b",
     r"(?:is\s+)?out(?:side)?\s+of\s+scope\b",
-    r"不在(?:本阶段)?范围内|超出(?:本阶段)?范围",
+    r"(?:(?:is|are|was|were)\s+)?(?:beyond\s+scope|excluded)\b",
+    r"(?:生成|分发|发布|打包)?(?:不在(?:本阶段)?范围内|"
+    r"超出(?:本阶段)?范围|(?:在)?范围外|(?:已)?排除|"
+    r"(?:被)?(?:严禁|禁止)|不会发生)",
     r"(?:被)?(?:严禁|禁止)|(?:绝不(?:会)?|不会|不得|不可|不)"
     r"(?:允许|发生|进行|开始|进入|开放|构成|成立|是)",
 )
@@ -4363,7 +4357,9 @@ def _macos_acceptance_prose(source: str) -> str:
 def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", prose).casefold()
     clauses: list[str] = []
-    for sentence in re.split(r"[\n\r。！？!?；;]+", normalized):
+    for sentence in re.split(
+        r"[\n\r。！？!?；;]+|(?<!\d)\.(?!\d)", normalized
+    ):
         for clause in re.split(
             r"\b(?:although|while|but|however|whereas|yet|and)\b|"
             r"但是|然而|不过|可是|并且|但|而|却",
@@ -4391,7 +4387,7 @@ def _macos_acceptance_claim_is_directly_negated(
 
 
 def _macos_acceptance_claim_is_negated(
-    clause: str, match: re.Match[str], topic_patterns: tuple[str, ...]
+    clause: str, match: re.Match[str], topic_triggers: tuple[str, ...]
 ) -> bool:
     if _macos_acceptance_claim_is_directly_negated(clause, match):
         return True
@@ -4401,12 +4397,14 @@ def _macos_acceptance_claim_is_negated(
     if connector is None:
         return False
     previous = prefix[: connector.start()].rstrip()
-    for pattern in topic_patterns:
+    for pattern in topic_triggers:
         prior_matches = tuple(re.finditer(pattern, previous))
         if prior_matches and _macos_acceptance_claim_is_directly_negated(
             previous, prior_matches[-1]
         ):
             return True
+    if re.search(r"(?:不包含|不是|不属于).*", previous):
+        return True
     return False
 
 
@@ -4424,11 +4422,11 @@ def _validate_macos_acceptance_nonclaims(prose: str) -> None:
         line for line in lines if line not in MACOS_ACCEPTANCE_NONCLAIMS
     )
     for clause in _macos_acceptance_semantic_clauses(semantic_prose):
-        for _topic, topic_patterns in MACOS_ACCEPTANCE_TOPIC_GRAMMAR:
-            for pattern in topic_patterns:
+        for _topic, topic_triggers in MACOS_ACCEPTANCE_TOPIC_TRIGGERS:
+            for pattern in topic_triggers:
                 for match in re.finditer(pattern, clause):
                     if _macos_acceptance_claim_is_negated(
-                        clause, match, topic_patterns
+                        clause, match, topic_triggers
                     ):
                         continue
                     raise ValueError(
@@ -4436,95 +4434,30 @@ def _validate_macos_acceptance_nonclaims(prose: str) -> None:
                     )
 
 
-def _macos_acceptance_inline_code_spans(
-    line: str,
-) -> tuple[tuple[int, int, str], ...]:
-    spans: list[tuple[int, int, str]] = []
-    cursor = 0
-    while cursor < len(line):
-        opening = line.find("`", cursor)
-        if opening < 0:
-            break
-        opening_end = opening
-        while opening_end < len(line) and line[opening_end] == "`":
-            opening_end += 1
-        marker_size = opening_end - opening
-        search = opening_end
-        while search < len(line):
-            closing = line.find("`", search)
-            if closing < 0:
-                search = len(line)
-                break
-            closing_end = closing
-            while closing_end < len(line) and line[closing_end] == "`":
-                closing_end += 1
-            if closing_end - closing == marker_size:
-                spans.append((opening, closing_end, line[opening_end:closing]))
-                search = closing_end
-                break
-            search = closing_end
-        cursor = search
-    return tuple(spans)
-
-
-def _macos_acceptance_markdown_container_content(line: str) -> str:
-    candidate = line
-    while True:
-        candidate = candidate.lstrip()
-        stripped = re.sub(
-            r"^(?:>\s*|(?:[-+*]|\d+[.)])\s+)", "", candidate, count=1
-        )
-        if stripped == candidate:
-            return candidate
-        candidate = stripped
-
-
 def _validate_macos_acceptance_markdown_surface(prose: str) -> None:
-    command_start = (
-        r"(?:(?:python(?:3(?:\.\d+)*)?|cargo|npm|node|rustc|rustup|uname|arch|"
-        r"test\s+-x|df\s+-h|curl|wget|sudo|softwareupdate|env|rm|cp|mv|bash|"
-        r"sh|zsh|--allow-network)(?=\s|$)|CARGO_NET_OFFLINE=)"
+    lines = prose.splitlines()
+    if any(lines.count(safe_line) != 1 for safe_line in MACOS_ACCEPTANCE_SAFE_NETWORK_PROSE):
+        raise ValueError("macOS acceptance guide safe network prose drifted")
+    remaining = "\n".join(
+        line for line in lines if line not in MACOS_ACCEPTANCE_SAFE_NETWORK_PROSE
     )
-    network_token = (
-        r"(?:curl|wget)\b|python(?:3(?:\.\d+)*)?\b.*\bfetch\b|"
-        r"https?://|--allow-network\b"
+    without_link_destinations = re.sub(
+        r"\[([^\]\r\n]*)\]\(\s*https?://[^)\s]+(?:\s+['\"][^)]*['\"])?\s*\)",
+        r"\1",
+        remaining,
+        flags=re.IGNORECASE,
     )
-    activation = r"(?:run|execute|invoke|use|add|append|运行|执行|调用|使用|添加|追加)\s*$"
-    negation = r"(?:do\s+not|must\s+not|never|forbid|prohibit|不要|不得|禁止|严禁|不可|不允许)"
-
-    for line in prose.splitlines():
-        candidate = _macos_acceptance_markdown_container_content(line)
-        if re.match(rf"^(?:{command_start}|https?://)", candidate, re.IGNORECASE):
-            raise ValueError("macOS acceptance guide contains an unfenced command")
-        if re.match(
-            rf"^(?:run|execute|invoke|use|add|append|运行|执行|调用|使用|添加|追加)\s+"
-            rf"(?:{network_token})",
-            candidate,
-            re.IGNORECASE,
-        ):
-            raise ValueError("macOS acceptance guide contains an unfenced network command")
-
-        for start, _end, content in _macos_acceptance_inline_code_spans(line):
-            compact = re.sub(r"\s+", " ", content).strip()
-            if not re.match(rf"^(?:{network_token})", compact, re.IGNORECASE):
-                continue
-            complete_network_command = bool(
-                re.match(r"^(?:curl|wget)\b\s+\S", compact, re.IGNORECASE)
-                or re.match(
-                    r"^python(?:3(?:\.\d+)*)?\b.*\bfetch\b",
-                    compact,
-                    re.IGNORECASE,
-                )
-            )
-            context = line[:start]
-            context_is_activation = re.search(activation, context, re.IGNORECASE)
-            context_is_negated = re.search(negation, context, re.IGNORECASE)
-            if complete_network_command or (
-                context_is_activation and not context_is_negated
-            ):
-                raise ValueError(
-                    "macOS acceptance guide contains an inline network command"
-                )
+    normalized = unicodedata.normalize("NFKC", without_link_destinations).casefold()
+    normalized = re.sub(r"\s+", " ", normalized)
+    forbidden = (
+        r"(?<![\w-])(?:curl|wget)(?![\w-])",
+        r"(?<![\w-])--allow-network(?![\w-])",
+        r"(?<![\w.-])(?:tools[\\/])?download_gui_assets\.py(?![\w.-])",
+        r"(?<![\w.-])python(?:3(?:\.\d+)*)?(?:\s+-[sb])*\s+tools[\\/]",
+        r"https?://",
+    )
+    if any(re.search(pattern, normalized) for pattern in forbidden):
+        raise ValueError("macOS acceptance guide contains a forbidden network surface")
 
 
 def _validate_macos_acceptance_guide(source: str) -> None:
