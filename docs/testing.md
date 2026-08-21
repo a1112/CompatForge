@@ -156,3 +156,15 @@ python3 -S -B tools/run_macos_headless_preview.py \
 `--version`，不接受部分覆盖。发现器不使用 `PATH`、网络或 shell。
 
 完整限制、证据和清理方式见[本地预览指南](guides/macos-headless-preview.md)。
+
+## Apple Silicon 双 Runtime developer-local 门禁
+
+CrossOver 与 Whisky 的双轮本地验收仍是显式 developer-local 门禁，不进入默认 CI，不构成 public beta、签名、notarize、DMG 或发布结论。先运行离线契约：
+
+```text
+python3 -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v
+python3 -S -B scripts/validate_repository.py
+python3 -S -B tools/discover_macos_wine.py --all
+```
+
+真实 Mac 的固定资产 opt-in、四份独立人工交互记录、精确双轮命令、仓库外根、负向隔离检查与 `16 accepted + projections equal + zero cleanup failure` 退出条件见[双 Runtime 本地验收指南](guides/macos-local-dual-runtime-acceptance.md)。默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。

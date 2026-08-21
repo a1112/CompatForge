@@ -1,0 +1,105 @@
+{
+  "records": [
+    {
+      "confirmationId": "round-1-crossover-operator-confirmation",
+      "document": {
+        "applications": {
+          "7zip": {
+            "fileList": true,
+            "menus": true
+          },
+          "notepad-plus-plus": {
+            "edit": true,
+            "open": true,
+            "rereadMatches": true,
+            "saveUtf8Chinese": true
+          },
+          "sumatrapdf": {
+            "mainWindow": true,
+            "openDialog": true
+          }
+        },
+        "schemaVersion": "1"
+      },
+      "evidencePath": "round-1/crossover.json",
+      "roundId": "round-1",
+      "runtimeId": "crossover"
+    },
+    {
+      "confirmationId": "round-1-whisky-operator-confirmation",
+      "document": {
+        "applications": {
+          "7zip": {
+            "fileList": true,
+            "menus": true
+          },
+          "notepad-plus-plus": {
+            "edit": true,
+            "open": true,
+            "rereadMatches": true,
+            "saveUtf8Chinese": true
+          },
+          "sumatrapdf": {
+            "mainWindow": true,
+            "openDialog": true
+          }
+        },
+        "schemaVersion": "1"
+      },
+      "evidencePath": "round-1/whisky.json",
+      "roundId": "round-1",
+      "runtimeId": "whisky"
+    },
+    {
+      "confirmationId": "round-2-crossover-operator-confirmation",
+      "document": {
+        "applications": {
+          "7zip": {
+            "fileList": true,
+            "menus": true
+          },
+          "notepad-plus-plus": {
+            "edit": true,
+            "open": true,
+            "rereadMatches": true,
+            "saveUtf8Chinese": true
+          },
+          "sumatrapdf": {
+            "mainWindow": true,
+            "openDialog": true
+          }
+        },
+        "schemaVersion": "1"
+      },
+      "evidencePath": "round-2/crossover.json",
+      "roundId": "round-2",
+      "runtimeId": "crossover"
+    },
+    {
+      "confirmationId": "round-2-whisky-operator-confirmation",
+      "document": {
+        "applications": {
+          "7zip": {
+            "fileList": true,
+            "menus": true
+          },
+          "notepad-plus-plus": {
+            "edit": true,
+            "open": true,
+            "rereadMatches": true,
+            "saveUtf8Chinese": true
+          },
+          "sumatrapdf": {
+            "mainWindow": true,
+            "openDialog": true
+          }
+        },
+        "schemaVersion": "1"
+      },
+      "evidencePath": "round-2/whisky.json",
+      "roundId": "round-2",
+      "runtimeId": "whisky"
+    }
+  ],
+  "schemaVersion": "1"
+}

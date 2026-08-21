@@ -4,6 +4,7 @@ import importlib.util
 import copy
 import hashlib
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -22,12 +23,19 @@ ROOT = Path(__file__).resolve().parents[1]
 ACCEPTANCE_TOOL = ROOT / "tools" / "run_macos_dual_runtime_acceptance.py"
 GUI_BASELINE_TOOL = ROOT / "tools" / "run_gui_baseline.py"
 VALIDATOR = ROOT / "scripts" / "validate_repository.py"
+GUI_ASSET_TOOL = ROOT / "tools" / "download_gui_assets.py"
+ACCEPTANCE_GUIDE = ROOT / "docs" / "guides" / "macos-local-dual-runtime-acceptance.md"
+ACCEPTANCE_INTERACTIONS = ROOT / "examples" / "macos-dual-runtime-interactions.json"
 
 EXPECTED_MATRIX = {
     "crossover": ("console", "7zip", "sumatrapdf", "notepad-plus-plus"),
     "whisky": ("console", "7zip", "sumatrapdf", "notepad-plus-plus"),
 }
 EXPECTED_REVIEWED_PATHS = (
+    "README.md",
+    "docs/testing.md",
+    "docs/guides/macos-local-dual-runtime-acceptance.md",
+    "examples/macos-dual-runtime-interactions.json",
     "tests/test_macos_dual_runtime_acceptance.py",
     "tools/run_macos_dual_runtime_acceptance.py",
 )
@@ -57,9 +65,117 @@ def load_module(name: str, path: Path):
 acceptance = load_module("run_macos_dual_runtime_acceptance", ACCEPTANCE_TOOL)
 gui_baseline = load_module("run_gui_baseline_for_dual_runtime", GUI_BASELINE_TOOL)
 validator = load_module("validate_repository_for_macos_acceptance", VALIDATOR)
+gui_assets = load_module("download_gui_assets_for_dual_runtime_docs", GUI_ASSET_TOOL)
 
 
 class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
+    @staticmethod
+    def _copy_reviewed_surface(repository_root: Path) -> None:
+        for relative in EXPECTED_REVIEWED_PATHS:
+            target = repository_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
+
+    @staticmethod
+    def _rewrite_json(path: Path, mutate: callable) -> None:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        mutate(document)
+        path.write_bytes(
+            (
+                json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2)
+                + "\n"
+            ).encode("utf-8")
+        )
+
+    def test_operator_guide_exists_and_binds_the_exact_local_flow(self) -> None:
+        self.assertTrue(ACCEPTANCE_GUIDE.is_file())
+        guide = ACCEPTANCE_GUIDE.read_text(encoding="utf-8")
+        for required in (
+            "Python 3.11+",
+            "Apple Silicon",
+            "Rosetta",
+            "CrossOver",
+            "Whisky",
+            "x86_64-w64-mingw32-gcc",
+            "Rust",
+            "Node.js",
+            "16",
+            "developer-local",
+            "python3 -S -B tools/discover_macos_wine.py --all",
+            "python3 -S -B tools/run_macos_dual_runtime_acceptance.py",
+        ):
+            self.assertIn(required, guide)
+
+    def test_interaction_template_exists_and_has_four_independent_records(self) -> None:
+        self.assertTrue(ACCEPTANCE_INTERACTIONS.is_file())
+        document = json.loads(ACCEPTANCE_INTERACTIONS.read_text(encoding="utf-8"))
+        self.assertEqual(set(document), {"schemaVersion", "records"})
+        self.assertEqual(document["schemaVersion"], "1")
+        self.assertEqual(
+            [(record["roundId"], record["runtimeId"]) for record in document["records"]],
+            [
+                ("round-1", "crossover"),
+                ("round-1", "whisky"),
+                ("round-2", "crossover"),
+                ("round-2", "whisky"),
+            ],
+        )
+        for record in document["records"]:
+            evidence = record["document"]
+            self.assertEqual(evidence["schemaVersion"], "1")
+            self.assertEqual(
+                {name: set(checks) for name, checks in evidence["applications"].items()},
+                {
+                    name: set(checks)
+                    for name, checks in EXPECTED_REQUIRED_INTERACTIONS.items()
+                },
+            )
+            self.assertTrue(
+                all(
+                    checked is True
+                    for checks in evidence["applications"].values()
+                    for checked in checks.values()
+                )
+            )
+
+    def test_documented_command_literals_match_the_current_closed_parsers(self) -> None:
+        def arguments(lines: tuple[str, ...]) -> list[str]:
+            command = " ".join(
+                line[:-2] if line.endswith(" \\") else line for line in lines
+            )
+            return shlex.split(command)[4:]
+
+        self.assertEqual(
+            validator.MACOS_ACCEPTANCE_DISCOVERY_COMMAND,
+            ("python3 -S -B tools/discover_macos_wine.py --all",),
+        )
+        standard = acceptance.parse_arguments(
+            arguments(validator.MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND)
+        )
+        self.assertFalse(standard.allow_network)
+        self.assertFalse(standard.negative_checks)
+        self.assertEqual(standard.runtime_store_root, "/absolute/external/runtime-store")
+
+        negative = acceptance.parse_arguments(
+            arguments(validator.MACOS_ACCEPTANCE_NEGATIVE_COMMAND)
+        )
+        self.assertTrue(negative.negative_checks)
+        self.assertFalse(negative.allow_network)
+        self.assertEqual(
+            negative.console_guest,
+            "/absolute/external/inputs/windows-console-smoke.exe",
+        )
+
+        for command, app_id in zip(
+            validator.MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
+            ("7zip", "sumatrapdf", "notepad-plus-plus"),
+        ):
+            parsed = gui_assets.parser().parse_args(shlex.split(command)[4:])
+            self.assertEqual(parsed.command, "fetch")
+            self.assertEqual(parsed.app, app_id)
+            self.assertEqual(parsed.cache_root, "/absolute/external/cache")
+            self.assertTrue(parsed.allow_network)
+
     def test_acceptance_matrix_is_exact_and_has_two_rounds(self) -> None:
         self.assertEqual(acceptance.RUNTIME_MATRIX, EXPECTED_MATRIX)
         self.assertEqual(acceptance.ROUNDS, ("round-1", "round-2"))
@@ -89,6 +205,129 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             EXPECTED_REVIEWED_PATHS,
         )
         self.assertEqual(validator.validate_macos_acceptance_surface(), [])
+        self.assertEqual(validator.validate_macos_acceptance_docs(), [])
+
+    def test_repository_validator_rejects_independent_document_mutants(self) -> None:
+        def delete(relative: str):
+            return lambda root: (root / relative).unlink()
+
+        def mutate_example(change: callable):
+            return lambda root: self._rewrite_json(
+                root / "examples/macos-dual-runtime-interactions.json", change
+            )
+
+        def replace(relative: str, old: str, new: str):
+            def mutation(root: Path) -> None:
+                path = root / relative
+                source = path.read_text(encoding="utf-8")
+                self.assertIn(old, source)
+                path.write_bytes(source.replace(old, new, 1).encode("utf-8"))
+
+            return mutation
+
+        def navigation_fence_spoof(root: Path) -> None:
+            path = root / "README.md"
+            marker = (
+                "[Apple Silicon 双 Runtime 本地验收指南]"
+                "(docs/guides/macos-local-dual-runtime-acceptance.md)"
+            )
+            source = path.read_text(encoding="utf-8")
+            self.assertIn(marker, source)
+            path.write_bytes(
+                (
+                    source.replace(marker, "[已移除的导航](docs/platform-support.md)", 1)
+                    + f"\n```text\n{marker}\n```\n"
+                ).encode("utf-8")
+            )
+
+        cases = (
+            ("missing-guide", delete("docs/guides/macos-local-dual-runtime-acceptance.md")),
+            ("missing-example", delete("examples/macos-dual-runtime-interactions.json")),
+            ("schema-drift", mutate_example(lambda value: value.update(schemaVersion="2"))),
+            (
+                "application-drift",
+                mutate_example(
+                    lambda value: value["records"][0]["document"]["applications"].pop("7zip")
+                ),
+            ),
+            ("round-drift", mutate_example(lambda value: value["records"][0].update(roundId="round-0"))),
+            ("runtime-drift", mutate_example(lambda value: value["records"][0].update(runtimeId="other"))),
+            (
+                "path-leak",
+                mutate_example(
+                    lambda value: value["records"][0].update(
+                        evidencePath="/Users/operator/private.json"
+                    )
+                ),
+            ),
+            ("extra-key", mutate_example(lambda value: value.update(comment="looks valid"))),
+            (
+                "command-flag-drift",
+                replace(
+                    "docs/guides/macos-local-dual-runtime-acceptance.md",
+                    "--runtime-store-root /absolute/external/runtime-store",
+                    "--runtime-store /absolute/external/runtime-store",
+                ),
+            ),
+            (
+                "public-beta-claim",
+                replace(
+                    "docs/guides/macos-local-dual-runtime-acceptance.md",
+                    "它不是 public beta",
+                    "它是 public beta",
+                ),
+            ),
+            (
+                "ci-real-runtime-claim",
+                replace(
+                    "docs/testing.md",
+                    "默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。",
+                    "默认 CI 下载并运行 CrossOver、Whisky、安装器和真实 Windows 应用。",
+                ),
+            ),
+            (
+                "comment-spoof",
+                replace(
+                    "docs/guides/macos-local-dual-runtime-acceptance.md",
+                    "python3 -S -B tools/discover_macos_wine.py --all",
+                    "<!-- python3 -S -B tools/discover_macos_wine.py --all -->",
+                ),
+            ),
+            (
+                "readme-marker",
+                replace(
+                    "README.md",
+                    "[Apple Silicon 双 Runtime 本地验收指南]",
+                    "[已移除的双 Runtime 文档]",
+                ),
+            ),
+            ("navigation-fence-spoof", navigation_fence_spoof),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(
+                prefix=f"compatforge-macos-doc-mutant-{label}-"
+            ) as temporary:
+                repository_root = Path(temporary) / "repository"
+                self._copy_reviewed_surface(repository_root)
+                mutate(repository_root)
+                with mock.patch.object(validator, "ROOT", repository_root):
+                    self.assertTrue(validator.validate_macos_acceptance_docs())
+
+    def test_repository_validator_rejects_duplicate_example_keys(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-macos-doc-duplicate-"
+        ) as temporary:
+            repository_root = Path(temporary) / "repository"
+            self._copy_reviewed_surface(repository_root)
+            example = repository_root / "examples/macos-dual-runtime-interactions.json"
+            source = example.read_text(encoding="utf-8")
+            example.write_bytes(
+                source.replace(
+                    '{\n  "records":', '{\n  "schemaVersion": "1",\n  "records":', 1
+                ).encode("utf-8")
+            )
+            with mock.patch.object(validator, "ROOT", repository_root):
+                self.assertTrue(validator.validate_macos_acceptance_docs())
 
     def test_repository_validator_rejects_an_ancestor_link(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -96,13 +335,11 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
         ) as temporary:
             temporary_root = Path(temporary)
             repository_root = temporary_root / "repository"
-            tests_root = repository_root / "tests"
             external_tools = temporary_root / "external-tools"
-            tests_root.mkdir(parents=True)
+            self._copy_reviewed_surface(repository_root)
             external_tools.mkdir()
-            (tests_root / "test_macos_dual_runtime_acceptance.py").write_text(
-                "# test fixture\n", encoding="utf-8"
-            )
+            (repository_root / "tools" / "run_macos_dual_runtime_acceptance.py").unlink()
+            (repository_root / "tools").rmdir()
             (external_tools / "run_macos_dual_runtime_acceptance.py").write_text(
                 "# external fixture\n", encoding="utf-8"
             )

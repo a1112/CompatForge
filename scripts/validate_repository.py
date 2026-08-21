@@ -405,8 +405,65 @@ MAX_ORDINARY_SCAN_ENTRIES = 100_000
 MAX_ORDINARY_SCAN_TOTAL_BYTES = 1024 * 1024 * 1024
 DEVELOPER_PATH_VALIDATION_ERROR = "Repository developer-path validation failed"
 MACOS_ACCEPTANCE_REVIEWED_PATHS = (
+    "README.md",
+    "docs/testing.md",
+    "docs/guides/macos-local-dual-runtime-acceptance.md",
+    "examples/macos-dual-runtime-interactions.json",
     "tests/test_macos_dual_runtime_acceptance.py",
     "tools/run_macos_dual_runtime_acceptance.py",
+)
+MACOS_ACCEPTANCE_GUIDE = "docs/guides/macos-local-dual-runtime-acceptance.md"
+MACOS_ACCEPTANCE_INTERACTIONS = "examples/macos-dual-runtime-interactions.json"
+MACOS_ACCEPTANCE_MAX_MARKDOWN_BYTES = 96 * 1024
+MACOS_ACCEPTANCE_MAX_JSON_BYTES = 32 * 1024
+MACOS_ACCEPTANCE_RECORDS = (
+    ("round-1", "crossover"),
+    ("round-1", "whisky"),
+    ("round-2", "crossover"),
+    ("round-2", "whisky"),
+)
+MACOS_ACCEPTANCE_INTERACTION_CHECKS = {
+    "7zip": frozenset({"fileList", "menus"}),
+    "sumatrapdf": frozenset({"mainWindow", "openDialog"}),
+    "notepad-plus-plus": frozenset(
+        {"open", "edit", "saveUtf8Chinese", "rereadMatches"}
+    ),
+}
+MACOS_ACCEPTANCE_DISCOVERY_COMMAND = (
+    "python3 -S -B tools/discover_macos_wine.py --all",
+)
+MACOS_ACCEPTANCE_ASSET_LIST_COMMAND = (
+    "python3 -S -B tools/download_gui_assets.py list --cache-root /absolute/external/cache",
+)
+MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS = (
+    "python3 -S -B tools/download_gui_assets.py fetch 7zip --cache-root /absolute/external/cache --allow-network",
+    "python3 -S -B tools/download_gui_assets.py fetch sumatrapdf --cache-root /absolute/external/cache --allow-network",
+    "python3 -S -B tools/download_gui_assets.py fetch notepad-plus-plus --cache-root /absolute/external/cache --allow-network",
+)
+MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND = (
+    "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
+    "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
+    "  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \\",
+    "  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \\",
+    "  --cache-root /absolute/external/cache \\",
+    "  --runtime-store-root /absolute/external/runtime-store \\",
+    "  --storage-root /absolute/external/storage \\",
+    "  --work-root /absolute/external/evidence \\",
+    "  --interaction-evidence-root /absolute/external/interactions",
+)
+MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
+    "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
+    "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
+    "  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \\",
+    "  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \\",
+    "  --cache-root /absolute/external/cache \\",
+    "  --runtime-store-root /absolute/external/negative/runtime-store \\",
+    "  --storage-root /absolute/external/negative/storage \\",
+    "  --work-root /absolute/external/negative/evidence \\",
+    "  --interaction-evidence-root /absolute/external/interactions \\",
+    "  --negative-checks \\",
+    "  --console-guest /absolute/external/inputs/windows-console-smoke.exe \\",
+    "  --negative-sentinel /absolute/external/inputs/negative-sentinel.txt",
 )
 
 
@@ -4064,6 +4121,239 @@ def validate_macos_preview_binary_hygiene() -> list[str]:
     return errors
 
 
+def _macos_acceptance_closed_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, nested in pairs:
+        if not isinstance(key, str) or not key or key in value:
+            raise ValueError("macOS acceptance JSON contains an invalid or duplicate key")
+        value[key] = nested
+    return value
+
+
+def _macos_acceptance_reject_constant(_constant: str) -> object:
+    raise ValueError("macOS acceptance JSON contains a non-finite value")
+
+
+def _macos_acceptance_bounded_json(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > 256 or depth > 8:
+            raise ValueError("macOS acceptance JSON exceeds its structural bound")
+        if isinstance(current, dict):
+            stack.extend((nested, depth + 1) for nested in current.values())
+        elif isinstance(current, list):
+            stack.extend((nested, depth + 1) for nested in current)
+        elif isinstance(current, str):
+            if (
+                not current
+                or len(current) > 256
+                or any(ord(character) < 32 or ord(character) == 127 for character in current)
+            ):
+                raise ValueError("macOS acceptance JSON contains invalid text")
+        elif current is not True and current is not False:
+            raise ValueError("macOS acceptance JSON contains an unsupported scalar")
+
+
+def _macos_acceptance_text(relative: str, maximum: int) -> str:
+    raw, _identity = _read_bound_regular_file(ROOT / relative, maximum)
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError(f"{relative} is not UTF-8") from error
+    if "\r" in source or "\x00" in source:
+        raise ValueError(f"{relative} contains non-canonical text")
+    return source
+
+
+def _macos_acceptance_markdown(relative: str) -> str:
+    source = _macos_acceptance_text(relative, MACOS_ACCEPTANCE_MAX_MARKDOWN_BYTES)
+    visible = re.sub(r"(?s)<!--.*?-->", "", source)
+    if "<!--" in visible:
+        raise ValueError(f"{relative} contains an unclosed Markdown comment")
+    return visible
+
+
+def _macos_acceptance_fences(source: str) -> tuple[tuple[str, ...], ...]:
+    blocks = re.findall(r"(?ms)^```text\n(.*?)\n```[ \t]*$", source)
+    return tuple(tuple(block.splitlines()) for block in blocks)
+
+
+def _macos_acceptance_prose(source: str) -> str:
+    return re.sub(r"(?ms)^```[^\n]*\n.*?^```[ \t]*$", "", source)
+
+
+def _validate_macos_acceptance_guide(source: str) -> None:
+    headings = tuple(
+        line
+        for line in source.splitlines()
+        if line.startswith("#")
+    )
+    required_headings = (
+        "# Apple Silicon 双 Runtime 本地验收",
+        "## 1. 前置检查",
+        "## 2. 外部根与清理边界",
+        "## 3. 先构建与运行离线门禁",
+        "## 4. 发现一次双 Runtime",
+        "## 5. 显式 opt-in 获取固定资产",
+        "## 6. 独立准备交互确认",
+        "## 7. 执行两轮矩阵",
+        "## 8. 负向隔离检查",
+        "## 9. 精确退出门禁",
+    )
+    if headings != required_headings:
+        raise ValueError("macOS acceptance guide headings drifted")
+
+    for marker in (
+        "Python 3.11+",
+        "Apple Silicon `arm64`",
+        "Rosetta",
+        "CrossOver",
+        "Whisky",
+        "x86_64-w64-mingw32-gcc",
+        "Rust stable",
+        "Node.js 24",
+        "足够空间",
+        "默认禁用网络",
+        "16 paths",
+        "zero cleanup failure",
+        "它不是 public beta",
+        "不修改 ForgeOS、ForgeTools 或 Mac-Win",
+        "Screenshots、安装器、Bottle、Runtime 内容",
+        "重新运行必须选择新的空",
+    ):
+        if source.count(marker) < 1:
+            raise ValueError(f"macOS acceptance guide marker drifted: {marker}")
+    if "它是 public beta" in source or "默认 CI 运行真实" in source:
+        raise ValueError("macOS acceptance guide makes an unsupported release or CI claim")
+    fences = _macos_acceptance_fences(source)
+    if any(
+        "curl" in line or "http://" in line or "https://" in line
+        for block in fences
+        for line in block
+    ):
+        raise ValueError("macOS acceptance guide permits an arbitrary download surface")
+    required_fences = (
+        MACOS_ACCEPTANCE_DISCOVERY_COMMAND,
+        MACOS_ACCEPTANCE_ASSET_LIST_COMMAND,
+        MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
+        MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND,
+        MACOS_ACCEPTANCE_NEGATIVE_COMMAND,
+    )
+    if any(block not in fences for block in required_fences):
+        raise ValueError("macOS acceptance guide command contract drifted")
+    network_lines = tuple(
+        line for block in fences for line in block if "--allow-network" in line
+    )
+    if network_lines != MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS:
+        raise ValueError("macOS acceptance network opt-in escaped the fixed asset stage")
+
+
+def _validate_macos_acceptance_example(source: str) -> None:
+    try:
+        document = json.loads(
+            source,
+            object_pairs_hook=_macos_acceptance_closed_object,
+            parse_constant=_macos_acceptance_reject_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, UnicodeError) as error:
+        raise ValueError("macOS acceptance interaction example is invalid JSON") from error
+    _macos_acceptance_bounded_json(document)
+    if not isinstance(document, dict) or set(document) != {"schemaVersion", "records"}:
+        raise ValueError("macOS acceptance interaction example is not closed")
+    if document["schemaVersion"] != "1" or not isinstance(document["records"], list):
+        raise ValueError("macOS acceptance interaction example schema drifted")
+    records = document["records"]
+    if len(records) != len(MACOS_ACCEPTANCE_RECORDS):
+        raise ValueError("macOS acceptance interaction records are incomplete")
+    for record, (round_id, runtime_id) in zip(records, MACOS_ACCEPTANCE_RECORDS):
+        if not isinstance(record, dict) or set(record) != {
+            "confirmationId",
+            "document",
+            "evidencePath",
+            "roundId",
+            "runtimeId",
+        }:
+            raise ValueError("macOS acceptance interaction record is not closed")
+        if record["roundId"] != round_id or record["runtimeId"] != runtime_id:
+            raise ValueError("macOS acceptance interaction identity drifted")
+        if record["confirmationId"] != f"{round_id}-{runtime_id}-operator-confirmation":
+            raise ValueError("macOS acceptance confirmation identity drifted")
+        if record["evidencePath"] != f"{round_id}/{runtime_id}.json":
+            raise ValueError("macOS acceptance interaction path is not fixed and relative")
+        evidence = record["document"]
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != {"schemaVersion", "applications"}
+            or evidence["schemaVersion"] != "1"
+            or not isinstance(evidence["applications"], dict)
+            or set(evidence["applications"]) != set(MACOS_ACCEPTANCE_INTERACTION_CHECKS)
+        ):
+            raise ValueError("macOS acceptance runner document is not closed")
+        for application_id, expected_checks in MACOS_ACCEPTANCE_INTERACTION_CHECKS.items():
+            checks = evidence["applications"][application_id]
+            if (
+                not isinstance(checks, dict)
+                or set(checks) != expected_checks
+                or any(value is not True for value in checks.values())
+            ):
+                raise ValueError("macOS acceptance interaction checks drifted")
+    canonical = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, indent=2
+    ) + "\n"
+    if source != canonical:
+        raise ValueError("macOS acceptance interaction example is not canonical")
+
+
+def validate_macos_acceptance_docs() -> list[str]:
+    """Validate the closed local-only guide, navigation and interaction template."""
+
+    try:
+        guide = _macos_acceptance_markdown(MACOS_ACCEPTANCE_GUIDE)
+        readme = _macos_acceptance_markdown("README.md")
+        testing = _macos_acceptance_markdown("docs/testing.md")
+        example = _macos_acceptance_text(
+            MACOS_ACCEPTANCE_INTERACTIONS, MACOS_ACCEPTANCE_MAX_JSON_BYTES
+        )
+        _validate_macos_acceptance_guide(guide)
+        _validate_macos_acceptance_example(example)
+        readme_marker = (
+            "[Apple Silicon 双 Runtime 本地验收指南]"
+            "(docs/guides/macos-local-dual-runtime-acceptance.md)"
+        )
+        testing_marker = (
+            "[双 Runtime 本地验收指南]"
+            "(guides/macos-local-dual-runtime-acceptance.md)"
+        )
+        readme_prose = _macos_acceptance_prose(readme)
+        testing_prose = _macos_acceptance_prose(testing)
+        testing_fences = _macos_acceptance_fences(testing)
+        if (
+            readme_prose.count(readme_marker) != 1
+            or testing_prose.count(testing_marker) != 1
+        ):
+            raise ValueError("macOS acceptance navigation marker drifted")
+        if (
+            "## Apple Silicon 双 Runtime developer-local 门禁" not in testing_prose
+            or not any(
+                "python3 -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v"
+                in block
+                for block in testing_fences
+            )
+            or "默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。"
+            not in testing_prose
+            or "默认 CI 下载并运行" in testing_prose
+        ):
+            raise ValueError("macOS acceptance testing marker drifted")
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        return [f"macOS acceptance documentation validation failed: {error}"]
+    return []
+
+
 def validate_macos_acceptance_surface() -> list[str]:
     """Require every explicitly reviewed local acceptance entry to be regular."""
 
@@ -4094,7 +4384,7 @@ def validate_macos_acceptance_surface() -> list[str]:
                 f"macOS acceptance surface {relative}: unsafe path component"
             )
             continue
-        if not stat.S_ISREG(metadata.st_mode):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             errors.append(
                 f"macOS acceptance surface {relative}: expected a regular no-follow file"
             )
@@ -4112,6 +4402,7 @@ def main() -> int:
         + validate_pe_inspection_fixture()
         + validate_macos_preview_binary_hygiene()
         + validate_macos_acceptance_surface()
+        + validate_macos_acceptance_docs()
     )
     if errors:
         print("repository validation failed:", file=sys.stderr)
