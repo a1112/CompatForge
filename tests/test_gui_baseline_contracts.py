@@ -394,6 +394,11 @@ struct RealCode;
             with self.subTest(argv=argv), self.assertRaises(self.baseline.AcceptanceError):
                 self.baseline.validate_runtime_selection(self.baseline.parser().parse_args(argv))
 
+        for flag in ("--wine-root", "--wine", "--wineserver", "--version"):
+            with self.subTest(empty_flag=flag), self.assertRaises(self.baseline.AcceptanceError):
+                arguments = self.baseline.parser().parse_args([*common, flag, ""])
+                self.baseline.validate_runtime_selection(arguments)
+
         parser_failures = (
             [*common, "--runtime-id", "other", *quartet],
             [*common, "--runtime-id", "crossover", "--runtime-id", "whisky", *quartet],
@@ -460,6 +465,318 @@ struct RealCode;
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.set_application_outcome({}, "unknown")
 
+    def test_actual_stage_outcomes_cover_all_failure_classes(self) -> None:
+        expected = {
+            "preflight-tool": ("blocked", "environment", "tool-unavailable"),
+            "runtime-start": ("failed", "runtime", "runtime-start-failed"),
+            "core-plan": ("failed", "core", "core-plan-failed"),
+            "desktop-launch": ("failed", "desktop", "desktop-launch-failed"),
+            "installer-launch": ("failed", "application", "application-install-failed"),
+            "cleanup-delete": ("failed", "cleanup", "cleanup-delete-failed"),
+        }
+        for stage, outcome in expected.items():
+            with self.subTest(stage=stage):
+                evidence: dict[str, object] = {}
+                self.baseline.apply_stage_outcome(evidence, stage, diagnostic="local full detail")
+                self.assertEqual(
+                    (evidence["status"], evidence["failureClass"], evidence["reasonCode"]),
+                    outcome,
+                )
+
+    def test_actual_application_observation_branches_are_classified(self) -> None:
+        accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
+        nonzero_events = [{"kind": "exited", "exit": {"code": 7, "success": False}}]
+        termination_failed_events = [
+            {"kind": "terminate-requested"},
+            {"kind": "exited", "exit": {"code": 7, "success": False}},
+        ]
+        complete_checks = {"fileList": True, "menus": True}
+        cases = (
+            (
+                "accepted",
+                accepted_events,
+                {"available": True},
+                {"available": True},
+                [],
+                complete_checks,
+                ("accepted", None, None),
+            ),
+            (
+                "manual-unverified",
+                accepted_events,
+                {"available": True},
+                {"available": True},
+                [],
+                {},
+                ("unverified", "application", "application-interaction-unverified"),
+            ),
+            (
+                "nonzero-failed",
+                nonzero_events,
+                {"available": True},
+                {"available": True},
+                [],
+                complete_checks,
+                ("failed", "application", "application-content-verification-failed"),
+            ),
+            (
+                "termination-failed",
+                termination_failed_events,
+                {"available": True},
+                {"available": True},
+                [],
+                complete_checks,
+                ("failed", "cleanup", "cleanup-termination-failed"),
+            ),
+            (
+                "window-failed",
+                accepted_events,
+                {"available": False},
+                {"available": True},
+                [],
+                complete_checks,
+                ("failed", "desktop", "desktop-window-unobserved"),
+            ),
+            (
+                "residual-failed",
+                accepted_events,
+                {"available": True},
+                {"available": True},
+                ["residual process"],
+                complete_checks,
+                ("failed", "cleanup", "cleanup-residual-processes"),
+            ),
+        )
+        for name, events, windows, shot, residual, checks, expected in cases:
+            with self.subTest(name=name):
+                evidence: dict[str, object] = {}
+                self.baseline.evaluate_application_outcome(
+                    evidence,
+                    "7zip",
+                    events,
+                    windows,
+                    shot,
+                    residual,
+                    checks,
+                )
+                self.assertEqual(
+                    (
+                        evidence["status"],
+                        evidence.get("failureClass"),
+                        evidence.get("reasonCode"),
+                    ),
+                    expected,
+                )
+        self.assertEqual(self.baseline.status(nonzero_events), "failed")
+
+    def test_actual_installer_branches_fail_for_nonzero_or_missing_executable(self) -> None:
+        accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
+        nonzero_events = [{"kind": "exited", "exit": {"code": 5, "success": False}}]
+        termination_failed_events = [
+            {"kind": "terminate-requested"},
+            {"kind": "exited", "exit": {"code": 5, "success": False}},
+        ]
+        with tempfile.TemporaryDirectory(prefix="compatforge-installer-outcome-") as temporary:
+            installed = Path(temporary) / "installed.exe"
+            cases = (
+                ("nonzero", nonzero_events, installed, "application", "application-install-failed"),
+                ("missing", accepted_events, installed, "application", "application-install-failed"),
+                (
+                    "termination",
+                    termination_failed_events,
+                    installed,
+                    "cleanup",
+                    "cleanup-termination-failed",
+                ),
+            )
+            for name, events, executable, failure_class, reason_code in cases:
+                with self.subTest(name=name):
+                    evidence: dict[str, object] = {}
+                    self.assertFalse(
+                        self.baseline.installer_succeeded(evidence, events, executable)
+                    )
+                    self.assertEqual(evidence["status"], "failed")
+                    self.assertEqual(evidence["failureClass"], failure_class)
+                    self.assertEqual(evidence["reasonCode"], reason_code)
+
+            installed.write_bytes(b"MZ")
+            evidence = {}
+            self.assertTrue(self.baseline.installer_succeeded(evidence, accepted_events, installed))
+            self.assertEqual(evidence, {})
+
+    def test_asset_preflight_blocks_only_missing_offline_asset(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-asset-preflight-") as temporary:
+            cache_entry = Path(temporary) / "asset.exe"
+            evidence: dict[str, object] = {}
+            self.assertFalse(self.baseline.asset_preflight(evidence, cache_entry, False))
+            self.assertEqual(evidence["status"], "blocked")
+            self.assertEqual(evidence["failureClass"], "environment")
+            self.assertEqual(evidence["reasonCode"], "network-unavailable")
+
+            cache_entry.write_bytes(b"cached")
+            evidence = {}
+            self.assertTrue(self.baseline.asset_preflight(evidence, cache_entry, False))
+            self.assertEqual(evidence, {})
+
+            cache_entry.unlink()
+            evidence = {}
+            self.assertTrue(self.baseline.asset_preflight(evidence, cache_entry, True))
+            self.assertEqual(evidence, {})
+
+    def test_main_writes_blocked_preflight_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-preflight-") as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(root / "missing-compatforge"),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(root / "storage"),
+                "--work-root",
+                str(work),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.baseline.platform, "system", return_value="Linux"),
+                mock.patch.object(self.baseline.platform, "machine", return_value="x86_64"),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.baseline.main()
+            self.assertEqual(result, 1)
+            full = json.loads((work / "preflight-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(full["status"], "blocked")
+            self.assertEqual(full["failureClass"], "environment")
+            self.assertEqual(full["reasonCode"], "platform-unsupported")
+            self.assertIn("requires Darwin/arm64", full["reason"])
+            compact = json.loads(stdout.getvalue())
+            self.assertEqual(
+                compact,
+                {
+                    "schemaVersion": "1",
+                    "runtimeId": None,
+                    "status": "blocked",
+                    "failureClass": "environment",
+                    "reasonCode": "platform-unsupported",
+                },
+            )
+            self.assertEqual(
+                compact,
+                json.loads((work / "summary.json").read_text(encoding="utf-8")),
+            )
+            self.assertEqual(stderr.getvalue(), "")
+
+    def test_main_writes_blocked_runtime_descriptor_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-runtime-blocked-") as temporary:
+            root = Path(temporary)
+            cli = root / "compatforge"
+            cli.write_bytes(b"placeholder")
+            work = root / "work"
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(root / "storage"),
+                "--work-root",
+                str(work),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                mock.patch.object(self.baseline.os, "access", return_value=True),
+                mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                mock.patch.object(
+                    self.baseline,
+                    "invoke",
+                    side_effect=self.baseline.AcceptanceError(
+                        "Runtime descriptor unavailable under /Users/developer/runtime"
+                    ),
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.baseline.main()
+            self.assertEqual(result, 1)
+            full = json.loads((work / "preflight-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(full["status"], "blocked")
+            self.assertEqual(full["failureClass"], "runtime")
+            self.assertEqual(full["reasonCode"], "runtime-descriptor-invalid")
+            self.assertIn("/Users/developer/runtime", full["reason"])
+            compact = json.loads(stdout.getvalue())
+            self.assertEqual(compact["status"], "blocked")
+            self.assertEqual(compact["failureClass"], "runtime")
+            self.assertEqual(compact["reasonCode"], "runtime-descriptor-invalid")
+            self.assertNotIn("/Users/", stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
+
+    def test_main_writes_blocked_tool_and_rosetta_preflight_evidence(self) -> None:
+        cases = (
+            ("tool", False, True, "tool-unavailable"),
+            ("rosetta", True, False, "rosetta-unavailable"),
+        )
+        for name, create_cli, rosetta, reason_code in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                prefix=f"compatforge-gui-{name}-blocked-"
+            ) as temporary:
+                root = Path(temporary)
+                cli = root / "compatforge"
+                if create_cli:
+                    cli.write_bytes(b"placeholder")
+                work = root / "work"
+                argv = [
+                    str(BASELINE_TOOL),
+                    "--compatforge-cli",
+                    str(cli),
+                    "--cache-root",
+                    str(root / "cache"),
+                    "--runtime-store",
+                    str(root / "runtime-store"),
+                    "--storage-root",
+                    str(root / "storage"),
+                    "--work-root",
+                    str(work),
+                ]
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                    mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                    mock.patch.object(self.baseline.os, "access", return_value=True),
+                    mock.patch.object(self.baseline, "rosetta_available", return_value=rosetta),
+                    mock.patch.object(
+                        self.baseline,
+                        "invoke",
+                        side_effect=self.baseline.AcceptanceError("must not bootstrap"),
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = self.baseline.main()
+                self.assertEqual(result, 1)
+                full = json.loads((work / "preflight-evidence.json").read_text(encoding="utf-8"))
+                self.assertEqual(full["status"], "blocked")
+                self.assertEqual(full["failureClass"], "environment")
+                self.assertEqual(full["reasonCode"], reason_code)
+                compact = json.loads(stdout.getvalue())
+                self.assertEqual(compact["reasonCode"], reason_code)
+                self.assertEqual(stderr.getvalue(), "")
+
     def test_receipt_and_application_evidence_share_runtime_identity(self) -> None:
         for runtime_id in ("crossover", "whisky"):
             with self.subTest(runtime_id=runtime_id):
@@ -502,7 +819,6 @@ struct RealCode;
                 "interactionChecks": {
                     "fileList": True,
                     "menus": False,
-                    "/Users/developer/secret": True,
                 },
                 "exit": {"present": True, "code": 0, "success": True, "path": "/private/tmp/log"},
                 "windows": {"available": False, "reason": "/Users/developer denied access"},
@@ -549,6 +865,44 @@ struct RealCode;
         poisoned_receipt = {**receipt, "source": "/Users/developer/runtime"}
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.compact_summary(poisoned_receipt, applications)
+
+        unsafe_receipt_values = (
+            {"source": "file:///Users/developer/runtime"},
+            {"source": "failure under /Users/developer/runtime"},
+            {"source": "failure under C:\\Users\\developer\\runtime"},
+            {"source": "crossover-app\nsecret"},
+            {"source": {"nested": "crossover-app"}},
+            {"activated": {"nested": True}},
+        )
+        for mutation in unsafe_receipt_values:
+            with self.subTest(mutation=mutation), self.assertRaises(self.baseline.AcceptanceError):
+                self.baseline.compact_summary({**receipt, **mutation}, applications)
+
+        unsafe_application = json.loads(json.dumps(applications))
+        unsafe_application[0]["interactionChecks"]["/Users/developer/secret"] = True
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.compact_summary(receipt, unsafe_application)
+        nested_application_id = json.loads(json.dumps(applications))
+        nested_application_id[0]["appId"] = {"nested": "7zip"}
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.compact_summary(receipt, nested_application_id)
+
+        compact_mutants = []
+        nested_key = json.loads(json.dumps(expected))
+        nested_key["applications"][0]["interactionChecks"]["/Users/developer/secret"] = True
+        compact_mutants.append(nested_key)
+        unknown_nested = json.loads(json.dumps(expected))
+        unknown_nested["receipt"]["activated"] = {"/Users/developer/secret": True}
+        compact_mutants.append(unknown_nested)
+        embedded_windows = json.loads(json.dumps(expected))
+        embedded_windows["receipt"]["source"] = "failed under C:/Users/developer/runtime"
+        compact_mutants.append(embedded_windows)
+        control_value = json.loads(json.dumps(expected))
+        control_value["receipt"]["version"] = "24.0\u0001secret"
+        compact_mutants.append(control_value)
+        for mutant in compact_mutants:
+            with self.subTest(mutant=mutant), self.assertRaises(self.baseline.AcceptanceError):
+                self.baseline.compact_json(mutant)
 
     def test_each_application_evidence_is_appended_once(self) -> None:
         source = BASELINE_TOOL.read_text(encoding="utf-8")

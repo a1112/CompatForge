@@ -13,13 +13,14 @@ import argparse
 import json
 import os
 import platform
+import re
 import selectors
 import shutil
 import subprocess
 import sys
 import time
 import uuid
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOWNLOAD = ROOT / "tools" / "download_gui_assets.py"
@@ -40,6 +41,7 @@ FAILURE_CLASS_BY_REASON_CODE = {
     "platform-unsupported": "environment",
     "tool-unavailable": "environment",
     "network-unavailable": "environment",
+    "rosetta-unavailable": "environment",
     "asset-fetch-failed": "environment",
     "runtime-descriptor-invalid": "runtime",
     "runtime-start-failed": "runtime",
@@ -55,14 +57,16 @@ FAILURE_CLASS_BY_REASON_CODE = {
     "desktop-window-unobserved": "desktop",
     "application-install-failed": "application",
     "application-interaction-unverified": "application",
-    "application-content-unverified": "application",
+    "application-content-verification-failed": "application",
     "cleanup-residual-processes": "cleanup",
+    "cleanup-termination-failed": "cleanup",
     "cleanup-delete-failed": "cleanup",
 }
 FAILURE_REASON_BY_STAGE = {
     "preflight-platform": "platform-unsupported",
     "preflight-tool": "tool-unavailable",
     "preflight-network": "network-unavailable",
+    "preflight-rosetta": "rosetta-unavailable",
     "asset-fetch": "asset-fetch-failed",
     "runtime-descriptor": "runtime-descriptor-invalid",
     "runtime-start": "runtime-start-failed",
@@ -78,10 +82,19 @@ FAILURE_REASON_BY_STAGE = {
     "desktop-window": "desktop-window-unobserved",
     "installer-launch": "application-install-failed",
     "application-interaction": "application-interaction-unverified",
-    "application-content": "application-content-unverified",
+    "application-content": "application-content-verification-failed",
     "cleanup-residual": "cleanup-residual-processes",
+    "cleanup-termination": "cleanup-termination-failed",
     "cleanup-delete": "cleanup-delete-failed",
 }
+BLOCKED_STAGES = {
+    "preflight-platform",
+    "preflight-tool",
+    "preflight-network",
+    "preflight-rosetta",
+    "runtime-descriptor",
+}
+UNVERIFIED_STAGES = {"application-interaction"}
 
 
 class AcceptanceError(Exception):
@@ -139,12 +152,15 @@ def parser() -> argparse.ArgumentParser:
 
 def validate_runtime_selection(arguments: argparse.Namespace) -> str | None:
     explicit = [arguments.wine_root, arguments.wine, arguments.wineserver, arguments.version]
-    if any(explicit) and not all(explicit):
+    provided = [value is not None for value in explicit]
+    if any(provided) and not all(provided):
         raise AcceptanceError("wine-root, wine, wineserver and version must be provided together")
-    if all(explicit) and arguments.runtime_id is None:
+    if any(provided) and arguments.runtime_id is None:
         raise AcceptanceError("--runtime-id is required with an explicit Runtime quartet")
-    if arguments.runtime_id is not None and not all(explicit):
+    if arguments.runtime_id is not None and not all(provided):
         raise AcceptanceError("--runtime-id requires an explicit Runtime quartet")
+    if all(provided) and any(not isinstance(value, str) or not value for value in explicit):
+        raise AcceptanceError("explicit Runtime quartet values must be non-empty")
     return arguments.runtime_id
 
 
@@ -185,6 +201,22 @@ def set_application_outcome(
         evidence["reason"] = diagnostic
 
 
+def apply_stage_outcome(
+    evidence: dict[str, object],
+    stage: str,
+    *,
+    diagnostic: str,
+) -> None:
+    reason_code = failure_reason(stage)
+    if stage in BLOCKED_STAGES:
+        status_value = "blocked"
+    elif stage in UNVERIFIED_STAGES:
+        status_value = "unverified"
+    else:
+        status_value = "failed"
+    set_application_outcome(evidence, status_value, reason_code, diagnostic=diagnostic)
+
+
 def bind_runtime_identity(
     runtime_id: str | None,
     receipt: dict[str, object],
@@ -200,41 +232,187 @@ def bind_runtime_identity(
 def _compact_exit(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
+    present = value.get("present")
+    code = value.get("code")
+    success = value.get("success")
+    if present is not None and not isinstance(present, bool):
+        raise AcceptanceError("compact exit present flag is invalid")
+    if code is not None and (not isinstance(code, int) or isinstance(code, bool)):
+        raise AcceptanceError("compact exit code is invalid")
+    if success is not None and not isinstance(success, bool):
+        raise AcceptanceError("compact exit success flag is invalid")
     return {
-        "present": value.get("present") is True,
-        "code": value.get("code") if isinstance(value.get("code"), int) else None,
-        "success": value.get("success") is True,
+        "present": present is True,
+        "code": code,
+        "success": success is True,
     }
 
 
-def _reject_absolute_paths(value: object) -> None:
-    if isinstance(value, str):
-        if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
-            raise AcceptanceError("compact summary contains an absolute path")
-        return
+def _validate_compact_tree(value: object) -> None:
     if isinstance(value, dict):
-        for nested in value.values():
-            _reject_absolute_paths(nested)
+        for key, nested in value.items():
+            _validate_compact_text(key)
+            _validate_compact_tree(nested)
         return
     if isinstance(value, list):
         for nested in value:
-            _reject_absolute_paths(nested)
+            _validate_compact_tree(nested)
+        return
+    if isinstance(value, str):
+        _validate_compact_text(value)
+        return
+    if value is None or isinstance(value, (bool, int)):
+        return
+    raise AcceptanceError("compact summary contains an unsupported value type")
+
+
+def _validate_compact_text(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise AcceptanceError("compact summary text is invalid")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise AcceptanceError("compact summary text contains control characters")
+    if "/" in value or "\\" in value or "file:" in value.casefold():
+        raise AcceptanceError("compact summary text contains path material")
+    return value
+
+
+def _require_exact_keys(
+    value: dict[str, object],
+    required: set[str],
+    optional: set[str],
+    label: str,
+) -> None:
+    keys = set(value)
+    if not required.issubset(keys) or not keys.issubset(required | optional):
+        raise AcceptanceError(f"{label} keys are invalid")
+
+
+def _require_bool(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise AcceptanceError(f"{label} must be a boolean")
+    return value
+
+
+def _validate_exit_projection(value: object, label: str) -> None:
+    if not isinstance(value, dict):
+        raise AcceptanceError(f"{label} must be an object")
+    _require_exact_keys(value, {"present", "code", "success"}, set(), label)
+    _require_bool(value["present"], f"{label}.present")
+    code = value["code"]
+    if code is not None and (not isinstance(code, int) or isinstance(code, bool)):
+        raise AcceptanceError(f"{label}.code must be an integer or null")
+    _require_bool(value["success"], f"{label}.success")
+
+
+def validate_compact_summary(value: object) -> None:
+    _validate_compact_tree(value)
+    if not isinstance(value, dict):
+        raise AcceptanceError("compact summary must be an object")
+    _require_exact_keys(value, {"schemaVersion", "receipt", "applications"}, set(), "compact summary")
+    if value["schemaVersion"] != "1":
+        raise AcceptanceError("compact summary schemaVersion must be 1")
+    receipt = value["receipt"]
+    if not isinstance(receipt, dict):
+        raise AcceptanceError("compact receipt must be an object")
+    _require_exact_keys(
+        receipt,
+        {"schemaVersion", "runtimeId", "packId", "version", "packDigest", "source"},
+        {"activated"},
+        "compact receipt",
+    )
+    if receipt["schemaVersion"] != "1":
+        raise AcceptanceError("compact receipt schemaVersion must be 1")
+    runtime_id = receipt["runtimeId"]
+    if runtime_id is not None and runtime_id not in RUNTIME_IDS:
+        raise AcceptanceError("compact receipt Runtime identity is invalid")
+    for field in ("packId", "version", "source"):
+        _validate_compact_text(receipt[field])
+    digest = receipt["packDigest"]
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise AcceptanceError("compact receipt packDigest is invalid")
+    if "activated" in receipt:
+        _require_bool(receipt["activated"], "compact receipt activated")
+
+    applications = value["applications"]
+    if not isinstance(applications, list):
+        raise AcceptanceError("compact applications must be an array")
+    seen: set[str] = set()
+    for application in applications:
+        if not isinstance(application, dict):
+            raise AcceptanceError("compact application must be an object")
+        _require_exact_keys(
+            application,
+            {"schemaVersion", "runtimeId", "appId", "status", "cleanup"},
+            {
+                "assetSha256",
+                "failureClass",
+                "reasonCode",
+                "interactionChecks",
+                "installerExit",
+                "exit",
+                "windowAvailable",
+                "screenshotAvailable",
+            },
+            "compact application",
+        )
+        if application["schemaVersion"] != "1" or application["runtimeId"] != runtime_id:
+            raise AcceptanceError("compact application identity is invalid")
+        app_id = application["appId"]
+        if not isinstance(app_id, str) or app_id not in REQUIRED_INTERACTIONS or app_id in seen:
+            raise AcceptanceError("compact application id is invalid")
+        seen.add(app_id)
+        status_value = application["status"]
+        if status_value not in STATUSES:
+            raise AcceptanceError("compact application status is invalid")
+        _require_bool(application["cleanup"], "compact application cleanup")
+        if status_value == "accepted":
+            if "failureClass" in application or "reasonCode" in application:
+                raise AcceptanceError("accepted compact application includes failure metadata")
+        else:
+            reason_code = application.get("reasonCode")
+            class_value = application.get("failureClass")
+            if not isinstance(reason_code, str) or class_value != failure_class(reason_code):
+                raise AcceptanceError("compact application failure metadata is invalid")
+        asset_sha256 = application.get("assetSha256")
+        if asset_sha256 is not None and (
+            not isinstance(asset_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", asset_sha256) is None
+        ):
+            raise AcceptanceError("compact application assetSha256 is invalid")
+        interactions = application.get("interactionChecks")
+        if interactions is not None:
+            if not isinstance(interactions, dict):
+                raise AcceptanceError("compact interaction checks must be an object")
+            required = set(REQUIRED_INTERACTIONS[app_id])
+            _require_exact_keys(interactions, required, set(), "compact interaction checks")
+            for checked in interactions.values():
+                _require_bool(checked, "compact interaction check")
+        for field in ("installerExit", "exit"):
+            if field in application:
+                _validate_exit_projection(application[field], f"compact application {field}")
+        for field in ("windowAvailable", "screenshotAvailable"):
+            if field in application:
+                _require_bool(application[field], f"compact application {field}")
 
 
 def compact_summary(
     receipt: dict[str, object],
     applications: list[dict[str, object]],
 ) -> dict[str, object]:
+    if not isinstance(receipt, dict) or not isinstance(applications, list):
+        raise AcceptanceError("full summary inputs are invalid")
     runtime_id = receipt.get("runtimeId")
     if runtime_id is not None and runtime_id not in RUNTIME_IDS:
         raise AcceptanceError("receipt Runtime identity is not recognized")
-    compact_receipt = {
-        key: receipt[key]
-        for key in ("schemaVersion", "runtimeId", "packId", "version", "packDigest", "source", "activated")
-        if key in receipt
-    }
+    required_receipt = ("schemaVersion", "runtimeId", "packId", "version", "packDigest", "source")
+    if any(key not in receipt for key in required_receipt):
+        raise AcceptanceError("bootstrap receipt omitted compact identity")
+    compact_receipt = {key: receipt[key] for key in required_receipt}
+    if "activated" in receipt:
+        compact_receipt["activated"] = receipt["activated"]
     compact_applications: list[dict[str, object]] = []
     for application in applications:
+        if not isinstance(application, dict) or not isinstance(application.get("appId"), str):
+            raise AcceptanceError("application evidence identity is invalid")
         if application.get("runtimeId") != runtime_id:
             raise AcceptanceError("receipt and application Runtime identities differ")
         status_value = application.get("status")
@@ -258,6 +436,9 @@ def compact_summary(
         interactions = application.get("interactionChecks")
         required_interactions = REQUIRED_INTERACTIONS.get(application.get("appId"))
         if isinstance(interactions, dict) and required_interactions is not None:
+            unknown = set(interactions).difference(required_interactions)
+            if unknown or any(not isinstance(checked, bool) for checked in interactions.values()):
+                raise AcceptanceError("application interaction checks are invalid")
             projected["interactionChecks"] = {
                 name: interactions.get(name) is True for name in required_interactions
             }
@@ -273,12 +454,70 @@ def compact_summary(
             projected["screenshotAvailable"] = screenshot_value.get("available") is True
         compact_applications.append(projected)
     summary = {"schemaVersion": "1", "receipt": compact_receipt, "applications": compact_applications}
-    _reject_absolute_paths(summary)
+    validate_compact_summary(summary)
     return summary
 
 
 def compact_json(value: object) -> str:
+    validate_compact_summary(value)
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def compact_preflight(evidence: dict[str, object]) -> dict[str, object]:
+    projected = {
+        key: evidence[key]
+        for key in ("schemaVersion", "runtimeId", "status", "failureClass", "reasonCode")
+        if key in evidence
+    }
+    _validate_compact_tree(projected)
+    _require_exact_keys(
+        projected,
+        {"schemaVersion", "runtimeId", "status", "failureClass", "reasonCode"},
+        set(),
+        "compact preflight",
+    )
+    if projected["schemaVersion"] != "1" or projected["status"] != "blocked":
+        raise AcceptanceError("compact preflight identity is invalid")
+    runtime_id = projected["runtimeId"]
+    if runtime_id is not None and runtime_id not in RUNTIME_IDS:
+        raise AcceptanceError("compact preflight Runtime identity is invalid")
+    reason_code = projected["reasonCode"]
+    if not isinstance(reason_code, str) or projected["failureClass"] != failure_class(reason_code):
+        raise AcceptanceError("compact preflight failure metadata is invalid")
+    return projected
+
+
+def emit_blocked_preflight(
+    work_root: Path,
+    runtime_id: str | None,
+    stage: str,
+    diagnostic: str,
+) -> int:
+    evidence: dict[str, object] = {"schemaVersion": "1", "runtimeId": runtime_id}
+    apply_stage_outcome(evidence, stage, diagnostic=diagnostic)
+    if evidence["status"] != "blocked":
+        raise AcceptanceError("preflight outcome must be blocked")
+    summary = compact_preflight(evidence)
+    write_json(work_root / "preflight-evidence.json", evidence)
+    write_json(work_root / "summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return 1
+
+
+def rosetta_available() -> bool:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+            cwd=ROOT,
+            env={},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def invoke(argv: list[str], *, timeout: int = MAX_COMMAND_SECONDS) -> subprocess.CompletedProcess[str]:
@@ -480,15 +719,107 @@ def observed_launch(
 def status(events: list[dict[str, object]]) -> str:
     exit_event = next((event for event in reversed(events) if event.get("kind") == "exited"), None)
     if exit_event is None:
-        return "failed"
+        return "accepted" if any(event.get("kind") == "terminate-requested" for event in events) else "failed"
     exit_value = exit_event.get("exit")
     if isinstance(exit_value, dict) and exit_value.get("success") is True:
         return "accepted"
-    if any(event.get("kind") == "terminate-requested" for event in events):
-        return "accepted"
-    if not isinstance(exit_value, dict):
-        return "failed"
     return "failed"
+
+
+def evaluate_application_outcome(
+    evidence: dict[str, object],
+    app_id: str,
+    events: list[dict[str, object]],
+    windows: dict[str, object],
+    shot: dict[str, object],
+    residual: list[str],
+    checks: dict[str, bool],
+) -> None:
+    if residual:
+        apply_stage_outcome(
+            evidence,
+            "cleanup-residual",
+            diagnostic="launch left residual processes",
+        )
+        return
+    if status(events) != "accepted":
+        stage = (
+            "cleanup-termination"
+            if any(event.get("kind") == "terminate-requested" for event in events)
+            else "application-content"
+        )
+        apply_stage_outcome(
+            evidence,
+            stage,
+            diagnostic=(
+                "requested application termination was not successful"
+                if stage == "cleanup-termination"
+                else "application exit evidence is not successful"
+            ),
+        )
+        return
+    if windows.get("available") is not True or shot.get("available") is not True:
+        apply_stage_outcome(
+            evidence,
+            "desktop-window",
+            diagnostic="target window or screenshot evidence is incomplete",
+        )
+        return
+    interactions_complete = all(checks.get(name) is True for name in REQUIRED_INTERACTIONS[app_id])
+    if not interactions_complete:
+        apply_stage_outcome(
+            evidence,
+            "application-interaction",
+            diagnostic="required per-application interaction evidence was not supplied",
+        )
+        return
+    set_application_outcome(evidence, "accepted")
+
+
+def installer_succeeded(
+    evidence: dict[str, object],
+    events: list[dict[str, object]],
+    installed: Path,
+) -> bool:
+    if status(events) != "accepted":
+        stage = (
+            "cleanup-termination"
+            if any(event.get("kind") == "terminate-requested" for event in events)
+            else "installer-launch"
+        )
+        apply_stage_outcome(
+            evidence,
+            stage,
+            diagnostic=(
+                "requested installer termination was not successful"
+                if stage == "cleanup-termination"
+                else "installer exit evidence is not successful"
+            ),
+        )
+        return False
+    if not installed.is_file() or installed.is_symlink():
+        apply_stage_outcome(
+            evidence,
+            "installer-launch",
+            diagnostic="installer exited but expected GUI executable was not found",
+        )
+        return False
+    return True
+
+
+def asset_preflight(
+    evidence: dict[str, object],
+    cache_entry: Path,
+    allow_network: bool,
+) -> bool:
+    if not allow_network and not cache_entry.exists():
+        apply_stage_outcome(
+            evidence,
+            "preflight-network",
+            diagnostic="asset is not cached and network access was not enabled",
+        )
+        return False
+    return True
 
 
 def observer(process_group_id: int, title_tokens: tuple[str, ...]) -> dict[str, object]:
@@ -672,8 +1003,6 @@ def fetch_asset(arguments: argparse.Namespace, app_id: str) -> Path:
 def main() -> int:
     try:
         arguments = parser().parse_args()
-        if platform.system() != "Darwin" or platform.machine() != "arm64":
-            raise AcceptanceError("GUI baseline requires Darwin/arm64")
         runtime_id = validate_runtime_selection(arguments)
         arguments.compatforge_cli = absolute(arguments.compatforge_cli, "compatforge-cli")
         arguments.cache_root = absolute(arguments.cache_root, "cache-root", external=True)
@@ -683,6 +1012,31 @@ def main() -> int:
         arguments.work_root.mkdir(parents=True, exist_ok=True)
         if any(arguments.work_root.iterdir()):
             raise AcceptanceError("work-root must be empty")
+        if platform.system() != "Darwin" or platform.machine() != "arm64":
+            return emit_blocked_preflight(
+                arguments.work_root,
+                runtime_id,
+                "preflight-platform",
+                "GUI baseline requires Darwin/arm64",
+            )
+        if (
+            not arguments.compatforge_cli.is_file()
+            or arguments.compatforge_cli.is_symlink()
+            or not os.access(arguments.compatforge_cli, os.X_OK)
+        ):
+            return emit_blocked_preflight(
+                arguments.work_root,
+                runtime_id,
+                "preflight-tool",
+                "CompatForge CLI is unavailable or not executable",
+            )
+        if not rosetta_available():
+            return emit_blocked_preflight(
+                arguments.work_root,
+                runtime_id,
+                "preflight-rosetta",
+                "Rosetta x86_64 execution is unavailable",
+            )
         explicit = [arguments.wine_root, arguments.wine, arguments.wineserver, arguments.version]
         evidence_path = (
             absolute(arguments.interaction_evidence, "interaction-evidence", external=True)
@@ -696,7 +1050,7 @@ def main() -> int:
             "runtimeStoreRoot": str(arguments.runtime_store),
             "storageRoot": str(arguments.storage_root),
         }
-        if all(explicit):
+        if all(value is not None for value in explicit):
             request.update(
                 {
                     "materializedRoot": str(absolute(arguments.wine_root, "wine-root")),
@@ -708,10 +1062,20 @@ def main() -> int:
         request_path = arguments.work_root / "bootstrap-request.json"
         context_path = arguments.work_root / "context.json"
         write_json(request_path, request)
-        receipt = json_object(
-            invoke([str(arguments.compatforge_cli), "local", "macos", "context", str(request_path), str(context_path)]),
-            "bootstrap receipt",
-        )
+        try:
+            receipt = json_object(
+                invoke(
+                    [str(arguments.compatforge_cli), "local", "macos", "context", str(request_path), str(context_path)]
+                ),
+                "bootstrap receipt",
+            )
+        except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
+            return emit_blocked_preflight(
+                arguments.work_root,
+                runtime_id,
+                "runtime-descriptor",
+                str(error),
+            )
         bind_runtime_identity(runtime_id, receipt, [])
         context = json.loads(context_path.read_text(encoding="utf-8"))
         if not isinstance(context, dict):
@@ -743,16 +1107,18 @@ def main() -> int:
                 "bottleId": bottle_id,
                 "cleanup": False,
             }
-            set_application_outcome(
+            apply_stage_outcome(
                 evidence,
-                "unverified",
-                failure_reason("application-interaction"),
+                "application-interaction",
                 diagnostic="application acceptance was not completed",
             )
-            failure_reason_code = failure_reason("asset-fetch")
+            failure_stage = "asset-fetch"
             try:
+                cache_entry = arguments.cache_root / asset.filename
+                if not asset_preflight(evidence, cache_entry, arguments.allow_network):
+                    continue
                 installer = fetch_asset(arguments, asset.app_id)
-                failure_reason_code = failure_reason("core-inspection")
+                failure_stage = "core-inspection"
                 installer_inspection = json_object(
                     invoke([str(arguments.compatforge_cli), "inspect", str(installer)]),
                     f"{asset.app_id} installer inspection",
@@ -779,7 +1145,7 @@ def main() -> int:
                 }
                 installer_request_path = arguments.work_root / f"{asset.app_id}-installer-request.json"
                 write_json(installer_request_path, inspection_request)
-                failure_reason_code = failure_reason("core-plan")
+                failure_stage = "core-plan"
                 plan = json_object(
                     invoke(
                         [
@@ -793,7 +1159,7 @@ def main() -> int:
                     f"{asset.app_id} installer plan",
                 )
                 evidence["installerPlan"] = plan
-                failure_reason_code = failure_reason("installer-launch")
+                failure_stage = "installer-launch"
                 installer_events = run_events(
                     invoke(
                         [
@@ -810,13 +1176,7 @@ def main() -> int:
                 evidence["installerEvents"] = installer_events
                 evidence["installerExit"] = exit_observation(installer_events)
                 installed = installed_executable(asset, bottle_root)
-                if not installed.is_file() or installed.is_symlink():
-                    set_application_outcome(
-                        evidence,
-                        "unverified",
-                        failure_reason("installer-launch"),
-                        diagnostic="installer exited but expected GUI executable was not found",
-                    )
+                if not installer_succeeded(evidence, installer_events, installed):
                     continue
                 launch_request = {
                     "schemaVersion": "1",
@@ -834,7 +1194,7 @@ def main() -> int:
                     },
                 }
                 launch_request_path = arguments.work_root / f"{asset.app_id}-launch-request.json"
-                failure_reason_code = failure_reason("core-inspection")
+                failure_stage = "core-inspection"
                 gui_inspection = json_object(
                     invoke([str(arguments.compatforge_cli), "inspect", str(installed)]),
                     f"{asset.app_id} GUI inspection",
@@ -845,7 +1205,7 @@ def main() -> int:
                 launch_request["executable"]["architecture"] = request_architecture(gui_architecture)  # type: ignore[index]
                 write_json(launch_request_path, launch_request)
                 evidence["inspection"] = gui_inspection
-                failure_reason_code = failure_reason("core-plan")
+                failure_stage = "core-plan"
                 evidence["plan"] = json_object(
                     invoke(
                         [
@@ -858,7 +1218,7 @@ def main() -> int:
                     ),
                     f"{asset.app_id} GUI plan",
                 )
-                failure_reason_code = failure_reason("desktop-launch")
+                failure_stage = "desktop-launch"
                 events, windows, shot, process_group_id = observed_launch(
                     [
                         str(arguments.compatforge_cli),
@@ -877,51 +1237,19 @@ def main() -> int:
                 evidence["screenshot"] = shot
                 evidence["interactionChecks"] = manual_checks.get(asset.app_id, {})
                 evidence["residualProcesses"] = process_snapshot(str(bottle_root), process_group_id)
-                basic = status(events) == "accepted" and evidence["windows"].get("available") is True and evidence[
-                    "screenshot"
-                ].get("available") is True and not evidence["residualProcesses"]
-                interactions_complete = all(
-                    evidence["interactionChecks"].get(name) is True
-                    for name in REQUIRED_INTERACTIONS[asset.app_id]
-                )
-                if basic and interactions_complete:
-                    set_application_outcome(evidence, "accepted")
-                elif evidence["residualProcesses"]:
-                    set_application_outcome(
-                        evidence,
-                        "unverified",
-                        failure_reason("cleanup-residual"),
-                        diagnostic="launch left residual processes",
-                    )
-                elif (
-                    evidence["windows"].get("available") is not True
-                    or evidence["screenshot"].get("available") is not True
-                ):
-                    set_application_outcome(
-                        evidence,
-                        "unverified",
-                        failure_reason("desktop-window"),
-                        diagnostic="target window or screenshot evidence is incomplete",
-                    )
-                elif status(events) != "accepted":
-                    set_application_outcome(
-                        evidence,
-                        "unverified",
-                        failure_reason("application-content"),
-                        diagnostic="application exit evidence is incomplete",
-                    )
-                elif not interactions_complete:
-                    set_application_outcome(
-                        evidence,
-                        "unverified",
-                        failure_reason("application-interaction"),
-                        diagnostic="required per-application interaction evidence was not supplied",
-                    )
-            except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
-                set_application_outcome(
+                evaluate_application_outcome(
                     evidence,
-                    "failed",
-                    failure_reason_code,
+                    asset.app_id,
+                    events,
+                    windows,
+                    shot,
+                    evidence["residualProcesses"],
+                    evidence["interactionChecks"],
+                )
+            except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
+                apply_stage_outcome(
+                    evidence,
+                    failure_stage,
                     diagnostic=str(error),
                 )
             finally:
@@ -935,10 +1263,9 @@ def main() -> int:
                     evidence["cleanup"] = False
                     evidence["cleanupError"] = str(error)
                 if evidence["cleanup"] is not True:
-                    set_application_outcome(
+                    apply_stage_outcome(
                         evidence,
-                        "failed",
-                        failure_reason("cleanup-delete"),
+                        "cleanup-delete",
                         diagnostic="Bottle cleanup failed",
                     )
                 write_json(arguments.work_root / f"{asset.app_id}-evidence.json", evidence)
