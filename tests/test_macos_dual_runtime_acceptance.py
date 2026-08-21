@@ -392,6 +392,7 @@ def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
 
     lines: list[tuple[int, str]] = []
     block_parent_indent: int | None = None
+    pending_block_blanks = 0
     for raw_line in source.splitlines():
         prefix = raw_line[: len(raw_line) - len(raw_line.lstrip())]
         if "\t" in prefix:
@@ -399,11 +400,18 @@ def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
         indent = len(prefix)
         stripped = raw_line.lstrip(" ")
         if block_parent_indent is not None:
+            if not stripped:
+                pending_block_blanks += 1
+                continue
             if indent > block_parent_indent:
+                lines.extend(
+                    (block_parent_indent + 1, "")
+                    for _index in range(pending_block_blanks)
+                )
+                pending_block_blanks = 0
                 lines.append((indent, stripped))
                 continue
-            if not stripped:
-                continue
+            pending_block_blanks = 0
             block_parent_indent = None
         content = active_content(stripped)
         if content:
@@ -413,6 +421,11 @@ def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
                 key, value = _workflow_pair(candidate)
                 if key == "run" and _workflow_block_scalar_style(value):
                     block_parent_indent = indent
+    if block_parent_indent is not None:
+        lines.extend(
+            (block_parent_indent + 1, "")
+            for _index in range(pending_block_blanks)
+        )
     return lines
 
 
@@ -1182,10 +1195,39 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._assert_workflow_contract(mutant)
 
+    def test_closed_workflow_oracle_rejects_unindented_blank_in_run_block(
+        self,
+    ) -> None:
+        workflow = self._workflow()
+        mutant = workflow.replace(
+            "          cc -std=c11 -Wall -Wextra -Werror \\\n"
+            "            -I crates/compatforge-ffi/include \\\n",
+            "          cc -std=c11 -Wall -Wextra -Werror \\\n"
+            "\n"
+            "            -I crates/compatforge-ffi/include \\\n",
+            1,
+        )
+        with self.assertRaises(AssertionError):
+            self._assert_workflow_contract(mutant)
+
     def test_closed_workflow_oracle_accepts_existing_blocks_and_crlf(self) -> None:
         workflow = self._workflow()
         self._assert_workflow_contract(workflow)
         self._assert_workflow_contract(workflow.replace("\n", "\r\n"))
+
+    def test_closed_workflow_oracle_ignores_blanks_after_run_block(self) -> None:
+        workflow = self._workflow()
+        adjacent = workflow.replace(
+            "            examples/context-config.linux-arm64.json\n"
+            "\n"
+            "      - name: Run ForgeOS PE inspection C ABI fixture\n",
+            "            examples/context-config.linux-arm64.json\n"
+            "\n"
+            "\n"
+            "      - name: Run ForgeOS PE inspection C ABI fixture\n",
+            1,
+        )
+        self._assert_workflow_contract(adjacent)
 
     def test_structured_workflow_oracle_rejects_active_forbidden_surfaces(self) -> None:
         workflow = self._workflow()
