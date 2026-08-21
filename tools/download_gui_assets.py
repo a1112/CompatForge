@@ -13,8 +13,10 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import sys
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -82,6 +84,12 @@ ALLOWED_HOSTS = {
 
 class AssetError(Exception):
     pass
+
+
+class NetworkUnavailable(AssetError):
+    def __init__(self, diagnostic: str) -> None:
+        self.diagnostic = diagnostic
+        super().__init__("network unavailable")
 
 
 def asset_for(app_id: str) -> GuiAsset:
@@ -169,6 +177,17 @@ def fetch(asset: GuiAsset, cache_root: Path, allow_network: bool) -> Path:
             temporary.unlink()
 
 
+def fetch_classified(asset: GuiAsset, cache_root: Path, allow_network: bool) -> Path:
+    try:
+        return fetch(asset, cache_root, allow_network)
+    except urllib.error.HTTPError:
+        # An HTTP response proves the network path is available. Treat a
+        # deterministic server/content failure as an asset failure instead.
+        raise
+    except (urllib.error.URLError, TimeoutError, ConnectionError, socket.gaierror) as error:
+        raise NetworkUnavailable(str(error)) from error
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("command", choices=("list", "fetch"))
@@ -200,7 +219,7 @@ def main() -> int:
             return 0
         if arguments.app is None:
             raise AssetError("fetch requires an app id")
-        path = fetch(asset_for(arguments.app), cache_root, arguments.allow_network)
+        path = fetch_classified(asset_for(arguments.app), cache_root, arguments.allow_network)
         print(json.dumps({"appId": arguments.app, "path": str(path)}, ensure_ascii=False, sort_keys=True))
         return 0
     except (AssetError, OSError, urllib.error.URLError, ValueError) as error:

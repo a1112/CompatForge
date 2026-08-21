@@ -10,6 +10,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import urllib.error
 from unittest import mock
 from pathlib import Path
 
@@ -465,6 +466,158 @@ struct RealCode;
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.set_application_outcome({}, "unknown")
 
+    def test_full_evidence_preserves_bounded_ordered_diagnostics_but_compact_excludes_them(self) -> None:
+        evidence: dict[str, object] = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "appId": "7zip",
+            "cleanup": False,
+        }
+        primary = "core plan failed under /Users/developer/primary"
+        cleanup = "cleanup failed under C:\\Users\\developer\\cleanup"
+        self.baseline.apply_stage_outcome(evidence, "core-plan", diagnostic=primary)
+        self.baseline.apply_stage_outcome(evidence, "cleanup-delete", diagnostic=cleanup)
+        self.assertEqual(
+            evidence["diagnostics"],
+            [
+                {
+                    "sequence": 1,
+                    "status": "failed",
+                    "failureClass": "core",
+                    "reasonCode": "core-plan-failed",
+                    "detail": primary,
+                },
+                {
+                    "sequence": 2,
+                    "status": "failed",
+                    "failureClass": "cleanup",
+                    "reasonCode": "cleanup-delete-failed",
+                    "detail": cleanup,
+                },
+            ],
+        )
+        self.assertEqual(evidence["failureClass"], "cleanup")
+        self.assertEqual(evidence["reasonCode"], "cleanup-delete-failed")
+
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "wine-macos-auto-preview",
+            "version": "24.0",
+            "packDigest": "sha256:" + "a" * 64,
+            "source": "explicit-override",
+        }
+        compact = self.baseline.compact_summary(receipt, [evidence])
+        encoded = self.baseline.compact_json(compact)
+        self.assertNotIn("diagnostics", encoded)
+        self.assertNotIn("/Users/", encoded)
+        self.assertNotIn("C:\\\\", encoded)
+        self.assertEqual(compact["applications"][0]["failureClass"], "cleanup")
+        self.assertEqual(compact["applications"][0]["reasonCode"], "cleanup-delete-failed")
+
+        bounded: dict[str, object] = {}
+        for index in range(20):
+            self.baseline.apply_stage_outcome(
+                bounded,
+                "core-plan",
+                diagnostic=f"bounded diagnostic {index + 1}",
+            )
+        self.assertEqual(len(bounded["diagnostics"]), 16)
+        self.assertEqual(bounded["diagnostics"][0]["sequence"], 1)
+        self.assertEqual(bounded["diagnostics"][-1]["sequence"], 20)
+
+        self.baseline.set_application_outcome(bounded, "accepted")
+        self.assertEqual(bounded, {"status": "accepted"})
+
+        invalid_history = {
+            "diagnostics": [
+                {
+                    "sequence": 1,
+                    "status": "failed",
+                    "failureClass": "core",
+                    "reasonCode": "arbitrary-reason",
+                    "detail": "not a closed diagnostic",
+                }
+            ]
+        }
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.apply_stage_outcome(
+                invalid_history,
+                "cleanup-delete",
+                diagnostic="cleanup failed",
+            )
+
+    def test_main_preserves_primary_and_cleanup_diagnostics_only_in_full_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-diagnostic-history-") as temporary:
+            root = Path(temporary)
+            cli = root / "compatforge"
+            cli.write_bytes(b"placeholder")
+            storage = root / "storage"
+            work = root / "work"
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(storage),
+                "--work-root",
+                str(work),
+                "--allow-network",
+            ]
+            primary = "core plan failed under /Users/developer/primary"
+            cleanup = "cleanup failed under C:\\Users\\developer\\cleanup"
+
+            def fake_invoke(command, *, timeout=self.baseline.MAX_COMMAND_SECONDS):
+                del timeout
+                if command[1:4] == ["local", "macos", "context"]:
+                    Path(command[-1]).write_text(
+                        json.dumps({"schemaVersion": "1", "storageRoot": str(storage)}),
+                        encoding="utf-8",
+                    )
+                    receipt = {
+                        "schemaVersion": "1",
+                        "source": "auto",
+                        "version": "24.0",
+                        "packId": "wine-macos-auto-preview",
+                        "packDigest": "sha256:" + "a" * 64,
+                    }
+                    return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
+                if command[1] == "inspect":
+                    return subprocess.CompletedProcess(command, 0, '{"architecture":"x86_64"}', "")
+                if command[1] == "prepared-plan":
+                    raise self.baseline.AcceptanceError(primary)
+                raise AssertionError(f"unexpected command: {command}")
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                mock.patch.object(self.baseline.os, "access", return_value=True),
+                mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                mock.patch.object(self.baseline, "fetch_asset", return_value=root / "installer.exe"),
+                mock.patch.object(self.baseline.shutil, "rmtree", side_effect=OSError(cleanup)),
+                contextlib.redirect_stdout(stdout),
+            ):
+                result = self.baseline.main()
+
+            self.assertEqual(result, 1)
+            full = json.loads((work / "7zip-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                [(item["reasonCode"], item["detail"]) for item in full["diagnostics"]],
+                [("core-plan-failed", primary), ("cleanup-delete-failed", cleanup)],
+            )
+            compact = json.loads(stdout.getvalue())
+            self.assertEqual(compact["applications"][0]["reasonCode"], "cleanup-delete-failed")
+            self.assertNotIn("diagnostics", stdout.getvalue())
+            self.assertNotIn("/Users/", stdout.getvalue())
+            self.assertNotIn("C:\\\\", stdout.getvalue())
+
     def test_actual_stage_outcomes_cover_all_failure_classes(self) -> None:
         expected = {
             "preflight-tool": ("blocked", "environment", "tool-unavailable"),
@@ -622,6 +775,173 @@ struct RealCode;
             evidence = {}
             self.assertTrue(self.baseline.asset_preflight(evidence, cache_entry, True))
             self.assertEqual(evidence, {})
+
+    def test_invoke_and_fetch_asset_preserve_closed_failure_kinds(self) -> None:
+        command_result = subprocess.CompletedProcess(
+            ["compatforge", "inspect"],
+            9,
+            "",
+            "failure under /Users/developer/runtime",
+        )
+        with mock.patch.object(self.baseline.subprocess, "run", return_value=command_result):
+            with self.assertRaises(self.baseline.InvocationError) as caught:
+                self.baseline.invoke(["/external/compatforge", "inspect"])
+        self.assertEqual(caught.exception.closed_code, "command-failed")
+        self.assertEqual(caught.exception.returncode, 9)
+        self.assertIn("/Users/developer/runtime", caught.exception.diagnostic)
+
+        arguments = mock.Mock()
+        arguments.cache_root = Path("/external/cache")
+        arguments.allow_network = True
+        with mock.patch.object(
+            self.baseline,
+            "invoke",
+            side_effect=AssertionError("fetch_asset must use typed downloader failures"),
+        ):
+            with mock.patch.object(
+                self.assets,
+                "fetch",
+                side_effect=urllib.error.URLError("DNS unavailable"),
+            ):
+                with self.assertRaises(self.baseline.NetworkUnavailableError):
+                    self.baseline.fetch_asset(arguments, "7zip")
+            with mock.patch.object(
+                self.assets,
+                "fetch",
+                side_effect=self.assets.AssetError("cached 7zip digest mismatch"),
+            ):
+                with self.assertRaises(self.baseline.AssetFetchError):
+                    self.baseline.fetch_asset(arguments, "7zip")
+
+    def test_downloader_typed_network_boundary_preserves_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-downloader-") as temporary:
+            cache_root = Path(temporary)
+            asset = self.assets.ASSETS[0]
+            with mock.patch.object(
+                self.assets,
+                "fetch",
+                side_effect=urllib.error.URLError("DNS unavailable for acceptance host"),
+            ):
+                with self.assertRaises(self.assets.NetworkUnavailable) as caught:
+                    self.assets.fetch_classified(asset, cache_root, True)
+            self.assertIn("DNS unavailable", caught.exception.diagnostic)
+            self.assertEqual(str(caught.exception), "network unavailable")
+
+            for detail in (
+                "cached asset digest mismatch",
+                "download redirect leaves official host allowlist",
+            ):
+                with self.subTest(detail=detail), mock.patch.object(
+                    self.assets,
+                    "fetch",
+                    side_effect=self.assets.AssetError(detail),
+                ):
+                    with self.assertRaises(self.assets.AssetError) as deterministic:
+                        self.assets.fetch_classified(asset, cache_root, True)
+                self.assertNotIsInstance(deterministic.exception, self.assets.NetworkUnavailable)
+                self.assertEqual(str(deterministic.exception), detail)
+
+            http_error = urllib.error.HTTPError(
+                asset.url,
+                404,
+                "installer content not found",
+                None,
+                None,
+            )
+            with mock.patch.object(self.assets, "fetch", side_effect=http_error):
+                with self.assertRaises(urllib.error.HTTPError) as deterministic_http:
+                    self.assets.fetch_classified(asset, cache_root, True)
+            self.assertNotIsInstance(deterministic_http.exception, self.assets.NetworkUnavailable)
+
+    def test_allow_network_main_blocks_network_failure_but_fails_deterministic_asset_error(self) -> None:
+        cases = (
+            (
+                "network",
+                self.baseline.NetworkUnavailableError("network unavailable under /Users/developer/network"),
+                "blocked",
+                "network-unavailable",
+            ),
+            (
+                "digest",
+                self.baseline.AssetFetchError("digest mismatch under C:\\Users\\developer\\asset"),
+                "failed",
+                "asset-fetch-failed",
+            ),
+        )
+        for name, fetch_error, expected_status, expected_reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                prefix=f"compatforge-gui-{name}-asset-"
+            ) as temporary:
+                root = Path(temporary)
+                cli = root / "compatforge"
+                cli.write_bytes(b"placeholder")
+                storage = root / "storage"
+                work = root / "work"
+                argv = [
+                    str(BASELINE_TOOL),
+                    "--compatforge-cli",
+                    str(cli),
+                    "--cache-root",
+                    str(root / "cache"),
+                    "--runtime-store",
+                    str(root / "runtime-store"),
+                    "--storage-root",
+                    str(storage),
+                    "--work-root",
+                    str(work),
+                    "--allow-network",
+                ]
+
+                def fake_invoke(command, *, timeout=self.baseline.MAX_COMMAND_SECONDS):
+                    del timeout
+                    if command[1:4] != ["local", "macos", "context"]:
+                        raise AssertionError(f"unexpected command: {command}")
+                    context_path = Path(command[-1])
+                    context_path.write_text(
+                        json.dumps({"schemaVersion": "1", "storageRoot": str(storage)}),
+                        encoding="utf-8",
+                    )
+                    receipt = {
+                        "schemaVersion": "1",
+                        "source": "crossover-app",
+                        "version": "24.0",
+                        "packId": "wine-macos-auto-preview",
+                        "packDigest": "sha256:" + "a" * 64,
+                    }
+                    return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                    mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                    mock.patch.object(self.baseline.os, "access", return_value=True),
+                    mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                    mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                    mock.patch.object(self.baseline, "fetch_asset", side_effect=fetch_error),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = self.baseline.main()
+                self.assertEqual(result, 1)
+                compact = json.loads(stdout.getvalue())
+                self.assertEqual(
+                    [application["status"] for application in compact["applications"]],
+                    [expected_status, expected_status, expected_status],
+                )
+                self.assertEqual(
+                    [application["reasonCode"] for application in compact["applications"]],
+                    [expected_reason, expected_reason, expected_reason],
+                )
+                self.assertNotIn("diagnostics", stdout.getvalue())
+                self.assertNotIn("/Users/", stdout.getvalue())
+                self.assertNotIn("C:\\\\", stdout.getvalue())
+                full = json.loads((work / "7zip-evidence.json").read_text(encoding="utf-8"))
+                self.assertEqual(full["status"], expected_status)
+                self.assertEqual(full["reasonCode"], expected_reason)
+                self.assertEqual(len(full["diagnostics"]), 1)
+                self.assertEqual(stderr.getvalue(), "")
 
     def test_main_writes_blocked_preflight_evidence(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-gui-preflight-") as temporary:

@@ -23,10 +23,11 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DOWNLOAD = ROOT / "tools" / "download_gui_assets.py"
 MAX_COMMAND_SECONDS = 180
 WINDOW_APPEARANCE_SECONDS = 30
 INTERACTIVE_RUNTIME_MILLISECONDS = 60_000
+MAX_DIAGNOSTICS = 16
+MAX_DIAGNOSTIC_CHARS = 4096
 
 REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
@@ -95,9 +96,28 @@ BLOCKED_STAGES = {
     "runtime-descriptor",
 }
 UNVERIFIED_STAGES = {"application-interaction"}
+BLOCKED_REASON_CODES = frozenset(FAILURE_REASON_BY_STAGE[stage] for stage in BLOCKED_STAGES)
+UNVERIFIED_REASON_CODES = frozenset(FAILURE_REASON_BY_STAGE[stage] for stage in UNVERIFIED_STAGES)
 
 
 class AcceptanceError(Exception):
+    pass
+
+
+class InvocationError(AcceptanceError):
+    closed_code = "command-failed"
+
+    def __init__(self, returncode: int, diagnostic: str) -> None:
+        self.returncode = returncode
+        self.diagnostic = diagnostic[:MAX_DIAGNOSTIC_CHARS]
+        super().__init__(f"command returned {returncode}: {self.diagnostic}")
+
+
+class NetworkUnavailableError(AcceptanceError):
+    pass
+
+
+class AssetFetchError(AcceptanceError):
     pass
 
 
@@ -192,13 +212,75 @@ def set_application_outcome(
         evidence.pop("failureClass", None)
         evidence.pop("reasonCode", None)
         evidence.pop("reason", None)
+        evidence.pop("diagnostics", None)
         return
     if reason_code is None:
         raise AcceptanceError("non-accepted application status requires a reason code")
     evidence["reasonCode"] = reason_code
     evidence["failureClass"] = failure_class(reason_code)
     if diagnostic is not None:
-        evidence["reason"] = diagnostic
+        _append_diagnostic(evidence, status_value, reason_code, diagnostic)
+        evidence["reason"] = diagnostic[:MAX_DIAGNOSTIC_CHARS]
+
+
+def _append_diagnostic(
+    evidence: dict[str, object],
+    status_value: str,
+    reason_code: str,
+    diagnostic: str,
+) -> None:
+    if not isinstance(diagnostic, str):
+        raise AcceptanceError("diagnostic detail must be text")
+    existing = evidence.setdefault("diagnostics", [])
+    if not isinstance(existing, list):
+        raise AcceptanceError("diagnostic history must be an array")
+    if len(existing) > MAX_DIAGNOSTICS:
+        raise AcceptanceError("diagnostic history exceeds its bound")
+    previous_sequence = 0
+    for item in existing:
+        if not isinstance(item, dict) or set(item) != {
+            "sequence",
+            "status",
+            "failureClass",
+            "reasonCode",
+            "detail",
+        }:
+            raise AcceptanceError("diagnostic history entry is invalid")
+        if (
+            not isinstance(item["sequence"], int)
+            or isinstance(item["sequence"], bool)
+            or item["sequence"] <= previous_sequence
+            or item["status"] not in STATUSES[1:]
+            or item["failureClass"] not in FAILURE_CLASSES
+            or not isinstance(item["reasonCode"], str)
+            or item["reasonCode"] not in FAILURE_CLASS_BY_REASON_CODE
+            or item["failureClass"] != FAILURE_CLASS_BY_REASON_CODE[item["reasonCode"]]
+            or not isinstance(item["detail"], str)
+            or len(item["detail"]) > MAX_DIAGNOSTIC_CHARS
+        ):
+            raise AcceptanceError("diagnostic history entry is invalid")
+        expected_status = (
+            "blocked"
+            if item["reasonCode"] in BLOCKED_REASON_CODES
+            else "unverified"
+            if item["reasonCode"] in UNVERIFIED_REASON_CODES
+            else "failed"
+        )
+        if item["status"] != expected_status:
+            raise AcceptanceError("diagnostic history entry is invalid")
+        previous_sequence = item["sequence"]
+    sequence = existing[-1]["sequence"] + 1 if existing else 1
+    if len(existing) >= MAX_DIAGNOSTICS:
+        del existing[1 if len(existing) > 1 else 0]
+    existing.append(
+        {
+            "sequence": sequence,
+            "status": status_value,
+            "failureClass": failure_class(reason_code),
+            "reasonCode": reason_code,
+            "detail": diagnostic[:MAX_DIAGNOSTIC_CHARS],
+        }
+    )
 
 
 def apply_stage_outcome(
@@ -531,7 +613,8 @@ def invoke(argv: list[str], *, timeout: int = MAX_COMMAND_SECONDS) -> subprocess
         timeout=timeout,
     )
     if result.returncode != 0:
-        raise AcceptanceError(f"command failed: {Path(argv[0]).name} {' '.join(argv[1:3])}")
+        diagnostic = result.stderr.strip() or f"{Path(argv[0]).name} returned no diagnostic"
+        raise InvocationError(result.returncode, diagnostic)
     return result
 
 
@@ -979,25 +1062,20 @@ def request_architecture(value: str) -> str:
 
 
 def fetch_asset(arguments: argparse.Namespace, app_id: str) -> Path:
-    result = invoke(
-        [
-            sys.executable,
-            "-S",
-            "-B",
-            str(DOWNLOAD),
-            "fetch",
-            app_id,
-            "--cache-root",
-            str(arguments.cache_root),
-            *(["--allow-network"] if arguments.allow_network else []),
-        ],
-        timeout=240,
+    from download_gui_assets import (  # type: ignore[import-not-found]
+        AssetError,
+        NetworkUnavailable,
+        asset_for,
+        fetch_classified,
     )
-    value = json_object(result, f"{app_id} asset fetch")
-    path = value.get("path")
-    if not isinstance(path, str):
-        raise AcceptanceError(f"{app_id} asset fetch omitted path")
-    return absolute(path, f"{app_id} asset")
+
+    try:
+        path = fetch_classified(asset_for(app_id), arguments.cache_root, arguments.allow_network)
+    except NetworkUnavailable as error:
+        raise NetworkUnavailableError(error.diagnostic) from error
+    except (AssetError, OSError) as error:
+        raise AssetFetchError(str(error)) from error
+    return absolute(str(path), f"{app_id} asset")
 
 
 def main() -> int:
@@ -1107,11 +1185,6 @@ def main() -> int:
                 "bottleId": bottle_id,
                 "cleanup": False,
             }
-            apply_stage_outcome(
-                evidence,
-                "application-interaction",
-                diagnostic="application acceptance was not completed",
-            )
             failure_stage = "asset-fetch"
             try:
                 cache_entry = arguments.cache_root / asset.filename
@@ -1246,6 +1319,18 @@ def main() -> int:
                     evidence["residualProcesses"],
                     evidence["interactionChecks"],
                 )
+            except NetworkUnavailableError as error:
+                apply_stage_outcome(
+                    evidence,
+                    "preflight-network",
+                    diagnostic=str(error),
+                )
+            except AssetFetchError as error:
+                apply_stage_outcome(
+                    evidence,
+                    "asset-fetch",
+                    diagnostic=str(error),
+                )
             except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
                 apply_stage_outcome(
                     evidence,
@@ -1253,6 +1338,7 @@ def main() -> int:
                     diagnostic=str(error),
                 )
             finally:
+                cleanup_diagnostic = "Bottle cleanup failed"
                 try:
                     if bottle_root.exists() or bottle_root.is_symlink():
                         if bottle_root.is_symlink():
@@ -1262,11 +1348,12 @@ def main() -> int:
                 except (OSError, AcceptanceError) as error:
                     evidence["cleanup"] = False
                     evidence["cleanupError"] = str(error)
+                    cleanup_diagnostic = str(error)
                 if evidence["cleanup"] is not True:
                     apply_stage_outcome(
                         evidence,
                         "cleanup-delete",
-                        diagnostic="Bottle cleanup failed",
+                        diagnostic=cleanup_diagnostic,
                     )
                 write_json(arguments.work_root / f"{asset.app_id}-evidence.json", evidence)
                 results.append(evidence)
