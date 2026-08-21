@@ -86,6 +86,27 @@ class GuiBaselineContractTests(unittest.TestCase):
         for symbol in ("PreparedLaunch::prepare", "ProcessSupervisor::start", "ExecutableMode::BottleInPlace", "NetworkPolicy::Deny"):
             self.assertIn(symbol, service)
 
+    def test_desktop_acceptance_runtime_is_argument_only_and_closed(self) -> None:
+        rust = (TAURI / "src" / "lib.rs").read_text(encoding="utf-8")
+        main = (TAURI / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("struct DesktopLaunchOptions", rust)
+        self.assertIn("MacOsLocalContextRequest", rust)
+        for flag in (
+            "--acceptance-root",
+            "--wine-root",
+            "--wine",
+            "--wineserver",
+            "--version",
+        ):
+            self.assertIn(flag, rust)
+        self.assertIn("compatforge_desktop::run(std::env::args_os())", main)
+        self.assertNotIn("std::process::Command", rust)
+        self.assertNotIn('var_os("PATH")', rust)
+        self.assertNotIn('var("PATH")', rust)
+        self.assertNotRegex(rust, r'var(?:_os)?\("COMPATFORGE_(?!DESKTOP_SMOKE)')
+        self.assertNotIn("runtimeId", rust)
+        self.assertNotIn("failureClass", rust)
+
     def test_application_grid_and_function_switches_are_stable(self) -> None:
         frontend = (DESKTOP / "src" / "main.ts").read_text(encoding="utf-8")
         for label in (
