@@ -32,6 +32,14 @@ class Candidate:
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def runtime_id(candidate: Candidate) -> str | None:
+    if candidate.source == "crossover-app":
+        return "crossover"
+    if candidate.source in ("whisky-app", "whisky-library"):
+        return "whisky"
+    return None
+
+
 def known_candidates(home: Path | None = None) -> list[Candidate]:
     home = home or Path.home()
     candidates: list[Candidate] = []
@@ -210,9 +218,36 @@ def discover(candidates: Iterable[Candidate] | None = None, runner: Runner = sub
     raise DiscoveryError("no executable-verified x86_64 Wine candidate was found")
 
 
+def discover_all(
+    candidates: Iterable[Candidate] | None = None, runner: Runner = subprocess.run
+) -> list[dict[str, str]]:
+    selected_candidates = known_candidates() if candidates is None else candidates
+    selected: dict[str, dict[str, str]] = {}
+    for candidate in selected_candidates:
+        identifier = runtime_id(candidate)
+        if identifier is None or identifier in selected:
+            continue
+        verified = verify_candidate(candidate, runner)
+        if verified is not None:
+            selected[identifier] = {**verified, "runtimeId": identifier}
+    if set(selected) != {"crossover", "whisky"}:
+        raise DiscoveryError("required Runtime is unavailable")
+    return [selected[identifier] for identifier in ("crossover", "whisky")]
+
+
 def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments not in ([], ["--all"]):
+        print("compatforge-wine-discovery: invalid command-line arguments", file=sys.stderr)
+        return 2
     try:
-        result = discover()
+        if arguments == ["--all"]:
+            result: dict[str, object] = {
+                "runtimes": discover_all(),
+                "schemaVersion": "1",
+            }
+        else:
+            result = discover()
     except DiscoveryError as error:
         print(f"compatforge-wine-discovery: {error}", file=sys.stderr)
         return 1
