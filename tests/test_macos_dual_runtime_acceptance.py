@@ -575,6 +575,18 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("public-en-never", "This stage is never a public release."),
             ("public-zh-not-planned", "本阶段不计划对外发布。"),
             ("irrelevant-released-file", "File handles are released after cleanup."),
+            (
+                "irrelevant-released-build-resource",
+                "Build resources are released after cleanup.",
+            ),
+            (
+                "public-en-publicly-released-negative",
+                "The build was not publicly released.",
+            ),
+            (
+                "public-en-available-publicly-negative",
+                "The stage is not available publicly.",
+            ),
             ("signing-en-prefix", "The application will not be signed."),
             ("signing-zh-prefix", "应用不会签名。"),
             ("signing-en-suffix", "Application signing is prohibited."),
@@ -607,6 +619,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "Public release stays outside scope.",
             ),
             (
+                "public-en-outside-the-scope",
+                "Public release stays outside the scope.",
+            ),
+            (
+                "signing-en-beyond-this-scope",
+                "Code signing remains beyond this scope.",
+            ),
+            (
                 "repositories-en-remains-forbidden",
                 "ForgeOS changes remain forbidden.",
             ),
@@ -615,6 +635,11 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "The operator is authorized to fetch the three fixed assets.",
             ),
             ("unrelated-authorization-zh", "操作者获授权获取三个固定资产。"),
+            ("unrelated-edit-complete-zh", "该文件已编辑了。"),
+            (
+                "public-comma-colon-negative-state",
+                "Not public beta, public release: forbidden.",
+            ),
             (
                 "ordinary-markdown-link",
                 "See [network policy](https://example.invalid/policy).",
@@ -629,6 +654,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("public-en-positive", "This stage is a public beta."),
             ("public-zh-positive", "本阶段进入公测。"),
             ("public-en-publicly-available", "The build is publicly available."),
+            (
+                "public-en-publicly-released-object",
+                "Maintainers publicly released the build.",
+            ),
+            (
+                "public-en-available-publicly",
+                "The app is available publicly.",
+            ),
             ("public-zh-facing-public", "本阶段面向公众发布。"),
             ("signing-en-positive", "Application signing is complete."),
             ("signing-zh-positive", "应用签名有效。"),
@@ -641,6 +674,7 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("repositories-en-update", "Maintainers may update ForgeTools."),
             ("repositories-zh-positive", "ForgeTools 修改已获授权。"),
             ("repositories-zh-edit", "允许编辑 Mac-Win。"),
+            ("repositories-zh-edit-complete", "已编辑了 Mac-Win。"),
             ("repositories-zh-ascii-comma", "ForgeOS, 已获授权。"),
             ("repositories-zh-fullwidth-comma", "ForgeOS，已获授权。"),
             (
@@ -684,6 +718,10 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             (
                 "negative-public-comma-positive-public-release",
                 "Not public beta, public release begins.",
+            ),
+            (
+                "negative-public-comma-colon-positive-state",
+                "Not public beta, public release: ready.",
             ),
             (
                 "dmg-mixed",

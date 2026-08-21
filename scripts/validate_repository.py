@@ -532,7 +532,13 @@ MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
             r"\bavailable\s+to\s+(?:the\s+)?public\b",
             r"\bpublicly\s+available\b",
             r"\b(?:compatforge|stage|gate|build|application|app|artifact|package)\b"
-            r"(?:\s+\w+){0,3}\s+released\b",
+            r"\s+(?:is|are|was|were|has\s+been|have\s+been|will\s+be)\s+"
+            r"(?:not\s+)?(?:publicly\s+)?released\b",
+            r"\bpublicly\s+released\s+(?:the\s+)?"
+            r"(?:compatforge|stage|gate|build|application|app|artifact|package)\b",
+            r"\b(?:compatforge|stage|gate|build|application|app|artifact|package)\b"
+            r"\s+(?:(?:is|are|was|were|will\s+be)\s+)?(?:not\s+)?"
+            r"available\s+publicly\b",
             r"(?:公测|公开测试|公开发布|对外发布|面向公众发布)",
         ),
     ),
@@ -556,8 +562,10 @@ MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
             rf"\b{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b(?:\s+\w+){{0,5}}\s+"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b",
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}(?:\s+__comma__)?\s*"
-            r"(?:的)?\s*(?:修改|变更|改动|更改|编辑|调整|重写|授权|(?:已)?获授权)",
-            r"(?:修改|变更|改动|更改|编辑|调整|重写|授权(?:修改)?|获授权)\s*"
+            r"(?:的)?\s*(?:修改|变更|改动|更改|(?:已)?编辑(?:了)?|"
+            r"调整|重写|授权|(?:已)?获授权)",
+            r"(?:修改|变更|改动|更改|(?:已)?编辑(?:了)?|"
+            r"调整|重写|授权(?:修改)?|获授权)\s*"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}",
         ),
     ),
@@ -592,11 +600,12 @@ MACOS_ACCEPTANCE_NEGATION_AFTER = (
     r"(?:happen|occur|proceed|be\s+(?:allowed|authorized|generated|modified|changed))\b",
     r"(?:generation|distribution|packaging|release)\s+"
     r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
-    r"(?:out(?:side)?(?:\s+of)?\s+scope|"
-    r"beyond\s+scope|excluded)\b",
-    r"(?:(?:is|remains?|stays?)\s+)?out(?:side)?(?:\s+of)?\s+scope\b",
+    r"(?:out(?:side)?(?:\s+of)?\s+(?:(?:current|this|the)\s+)?scope|"
+    r"beyond\s+(?:(?:current|this|the)\s+)?scope|excluded)\b",
+    r"(?:(?:is|remains?|stays?)\s+)?out(?:side)?(?:\s+of)?\s+"
+    r"(?:(?:current|this|the)\s+)?scope\b",
     r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
-    r"(?:beyond\s+scope|excluded)\b",
+    r"(?:beyond\s+(?:(?:current|this|the)\s+)?scope|excluded)\b",
     r"(?:生成|分发|发布|打包)?(?:不在(?:本阶段)?范围内|"
     r"超出(?:本阶段)?范围|(?:在)?范围外|(?:已)?排除|"
     r"(?:被)?(?:严禁|禁止)|不会发生)",
@@ -4361,6 +4370,11 @@ def _macos_acceptance_prose(source: str) -> str:
 
 def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", prose).casefold()
+    normalized = re.sub(
+        r"[:：]\s*(?=(?:ready|begins?|available|publicly\s+available)\b)",
+        " ",
+        normalized,
+    )
     clauses: list[str] = []
     for sentence in re.split(
         r"[\n\r。！？!?；;:：]+|(?<!\d)\.(?!\d)", normalized
