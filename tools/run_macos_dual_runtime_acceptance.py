@@ -1178,25 +1178,32 @@ def _read_bound_source(
 ) -> tuple[SourceBinding, bytes]:
     _reject_unsafe_components(path, label)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor: int | None = None
     try:
         entry = path.lstat()
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(entry.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
             or stat.S_ISLNK(entry.st_mode)
             or _is_reparse(entry)
             or entry.st_nlink != 1
-            or opened.st_nlink != 1
-            or _node_identity(entry) != _node_identity(opened)
             or entry.st_size <= 0
             or entry.st_size > max_bytes
         ):
             raise AcceptanceError(f"{label} must be a private bounded regular file")
         deadline = time.monotonic() + NEGATIVE_READ_SECONDS
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _node_identity(entry) != _node_identity(opened)
+            or opened.st_size != entry.st_size
+            or opened.st_mtime_ns != entry.st_mtime_ns
+        ):
+            raise AcceptanceError(f"{label} must be a private bounded regular file")
+        if time.monotonic() >= deadline:
+            raise AcceptanceError(f"{label} read exceeded its time bound")
         chunks: list[bytes] = []
         total = 0
         while total < opened.st_size:
@@ -1357,37 +1364,48 @@ def _create_private_copy(
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
     descriptor: int | None = None
+    trusted_identity: NodeIdentity | None = None
+    owned: OwnedNode | None = None
+    failure: BaseException | None = None
     try:
         descriptor = os.open(target, flags, 0o600)
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise OSError("negative copy is not private")
+        trusted_identity = _node_identity(opened)
         _write_all(descriptor, payload)
         os.fsync(descriptor)
         entry = target.lstat()
         current = os.fstat(descriptor)
         if (
-            _node_identity(opened) != _node_identity(entry)
-            or _node_identity(opened) != _node_identity(current)
+            trusted_identity != _node_identity(entry)
+            or trusted_identity != _node_identity(current)
             or entry.st_nlink != 1
             or current.st_nlink != 1
             or entry.st_size != len(payload)
             or current.st_size != len(payload)
         ):
             raise IntegrityError("negative copy identity changed")
-        owned = OwnedNode(target, _node_identity(opened), case_root.directory_chain)
+        owned = OwnedNode(target, trusted_identity, case_root.directory_chain)
         _verify_owned_file(owned, IntegrityError)
-        return owned
-    except IntegrityError:
-        raise
+    except IntegrityError as error:
+        failure = error
     except OSError as error:
-        raise AcceptanceError("negative copy could not be created safely") from error
+        failure = AcceptanceError("negative copy could not be created safely")
+        failure.__cause__ = error
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+    if failure is not None:
+        if trusted_identity is not None:
+            _cleanup_partial_private_copy(case_root, target, trusted_identity)
+        raise failure
+    if owned is None:
+        raise AcceptanceError("negative copy could not be created safely")
+    return owned
 
 
 def _mutate_owned_copy(owned: OwnedNode) -> None:
@@ -1439,6 +1457,67 @@ def _mutate_owned_copy(owned: OwnedNode) -> None:
                 pass
 
 
+def _verify_cleaned_case_parent(case_root: OwnedNode) -> None:
+    parent_chain = OwnedNode(
+        case_root.path.parent,
+        case_root.directory_chain[-2].identity,
+        case_root.directory_chain[:-1],
+    )
+    _verify_owned_directory(parent_chain)
+
+
+def _cleanup_partial_private_copy(
+    case_root: OwnedNode,
+    target: Path,
+    trusted_identity: NodeIdentity,
+) -> None:
+    """Remove only a partially written file whose opened identity we own."""
+
+    try:
+        _verify_owned_directory(case_root)
+        entries = _bounded_entries(case_root.path, 1, "negative case root")
+        if not entries:
+            return
+        if entries != [target]:
+            raise CleanupError("negative case contents changed")
+        metadata = target.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or metadata.st_nlink != 1
+            or _node_identity(metadata) != trusted_identity
+        ):
+            raise CleanupError("negative copy identity changed")
+        target.unlink()
+        _verify_owned_directory(case_root)
+        if _bounded_entries(case_root.path, 1, "negative case root"):
+            raise CleanupError("negative case cleanup is incomplete")
+    except CleanupError:
+        raise
+    except AcceptanceError as error:
+        raise CleanupError("negative case contents changed") from error
+    except OSError as error:
+        raise CleanupError("negative case cleanup failed") from error
+
+
+def _cleanup_empty_owned_case(case_root: OwnedNode) -> None:
+    """Remove an owned case directory only when it is still bound and empty."""
+
+    try:
+        _verify_owned_directory(case_root)
+        if _bounded_entries(case_root.path, 1, "negative case root"):
+            raise CleanupError("negative case contents changed")
+        case_root.path.rmdir()
+        _verify_cleaned_case_parent(case_root)
+    except CleanupError:
+        raise
+    except AcceptanceError as error:
+        raise CleanupError("negative case contents changed") from error
+    except OSError as error:
+        raise CleanupError("negative case cleanup failed") from error
+
+
 def _cleanup_owned_case(case_root: OwnedNode, owned_file: OwnedNode) -> None:
     _verify_owned_directory(case_root)
     try:
@@ -1451,12 +1530,7 @@ def _cleanup_owned_case(case_root: OwnedNode, owned_file: OwnedNode) -> None:
         if _bounded_entries(case_root.path, 1, "negative case root"):
             raise CleanupError("negative case cleanup is incomplete")
         case_root.path.rmdir()
-        parent_chain = OwnedNode(
-            case_root.path.parent,
-            case_root.directory_chain[-2].identity,
-            case_root.directory_chain[:-1],
-        )
-        _verify_owned_directory(parent_chain)
+        _verify_cleaned_case_parent(case_root)
     except CleanupError:
         raise
     except AcceptanceError as error:
@@ -1690,24 +1764,30 @@ def run_negative_checks(
             "negative Runtime root",
         ):
             raise IntegrityError("negative Runtime root contains an unexpected case")
-        case_root = _owned_directory(
-            runtime_roots[runtime_id].path / case_id,
-            "negative case root",
-            create=True,
-            parent=runtime_roots[runtime_id],
-        )
-        owned_file = _create_private_copy(
-            case_root,
-            source_payload,
-            filename=filename if case_id == "cached-installer-bytes-changed" else "payload.bin",
-        )
-        _mutate_owned_copy(owned_file)
-        _verify_owned_file(owned_file, IntegrityError)
-        _revalidate_source(bindings[source_key], f"negative source {source_key}")
-        _revalidate_source(bindings["sentinel"], "negative sentinel")
-
+        case_root: OwnedNode | None = None
+        owned_file: OwnedNode | None = None
         failure_reason: str | None = None
+        case_result: dict[str, object] | None = None
         try:
+            case_root = _owned_directory(
+                runtime_roots[runtime_id].path / case_id,
+                "negative case root",
+                create=True,
+                parent=runtime_roots[runtime_id],
+            )
+            owned_file = _create_private_copy(
+                case_root,
+                source_payload,
+                filename=(
+                    filename
+                    if case_id == "cached-installer-bytes-changed"
+                    else "payload.bin"
+                ),
+            )
+            _mutate_owned_copy(owned_file)
+            _verify_owned_file(owned_file, IntegrityError)
+            _revalidate_source(bindings[source_key], f"negative source {source_key}")
+            _revalidate_source(bindings["sentinel"], "negative sentinel")
             _verify_owned_file(owned_file, IntegrityError)
             if case_id in ("wine-bytes-changed", "wineserver-bytes-changed"):
                 failure_reason = _runtime_negative_boundary(owned_file.path, runtime_validator)
@@ -1725,25 +1805,51 @@ def run_negative_checks(
                     asset_error,
                 )
             _verify_owned_file(owned_file, IntegrityError)
-        finally:
-            _cleanup_owned_case(case_root, owned_file)
-        if _bounded_entries(
-            runtime_roots[runtime_id].path,
-            1,
-            "negative Runtime root",
-        ):
-            raise CleanupError("negative case cleanup is incomplete")
-        _revalidate_source(bindings[source_key], f"negative source {source_key}")
-        _revalidate_source(bindings["sentinel"], "negative sentinel")
-        case_results.append(
-            {
+            case_result = {
                 "runtimeId": runtime_id,
                 "caseId": case_id,
                 "status": "accepted" if failure_reason is None else "failed",
                 "failureClass": expected_class if failure_reason is None else "core",
                 "reasonCode": expected_reason if failure_reason is None else failure_reason,
             }
-        )
+        finally:
+            cleanup_failure: AcceptanceError | None = None
+            if case_root is not None:
+                try:
+                    if owned_file is None:
+                        _cleanup_empty_owned_case(case_root)
+                    else:
+                        _cleanup_owned_case(case_root, owned_file)
+                except AcceptanceError as error:
+                    cleanup_failure = error
+            post_cleanup_failure: AcceptanceError | None = None
+            try:
+                _verify_owned_directory(runtime_roots[runtime_id], CleanupError)
+                if _bounded_entries(
+                    runtime_roots[runtime_id].path,
+                    1,
+                    "negative Runtime root",
+                ):
+                    raise CleanupError("negative case cleanup is incomplete")
+            except AcceptanceError as error:
+                post_cleanup_failure = error
+            try:
+                _revalidate_source(bindings[source_key], f"negative source {source_key}")
+            except AcceptanceError as error:
+                if post_cleanup_failure is None:
+                    post_cleanup_failure = error
+            try:
+                _revalidate_source(bindings["sentinel"], "negative sentinel")
+            except AcceptanceError as error:
+                if post_cleanup_failure is None:
+                    post_cleanup_failure = error
+            if cleanup_failure is not None:
+                raise cleanup_failure
+            if post_cleanup_failure is not None:
+                raise post_cleanup_failure
+        if case_result is None:
+            raise AcceptanceError("negative case evidence is incomplete")
+        case_results.append(case_result)
 
     _revalidate_bindings(paths)
     for descriptor in runtimes:

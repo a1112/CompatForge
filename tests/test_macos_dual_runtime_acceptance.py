@@ -1094,6 +1094,223 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 asset_error=RuntimeError,
             )
 
+    def test_negative_case_cleanup_covers_mutation_and_preboundary_revalidation_failures(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        original_mutate = acceptance._mutate_owned_copy
+
+        def mutate_then_fail(owned) -> None:
+            original_mutate(owned)
+            raise acceptance.AcceptanceError("injected mutation failure")
+
+        with (
+            mock.patch.object(
+                acceptance, "_mutate_owned_copy", side_effect=mutate_then_fail
+            ),
+            self.assertRaisesRegex(
+                acceptance.AcceptanceError, "injected mutation failure"
+            ),
+        ):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=lambda _path: set(),
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        failed_case = (
+            self.work / "negative" / "crossover" / "wine-bytes-changed"
+        )
+        self.assertFalse(failed_case.exists())
+        self.assertFalse(any(path.is_file() for path in self.work.rglob("*")))
+
+    def test_negative_case_cleanup_covers_source_change_before_boundary(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        source = self.runtime_roots["crossover"] / "bin" / "wine"
+        original_mutate = acceptance._mutate_owned_copy
+
+        def mutate_then_change_source(owned) -> None:
+            original_mutate(owned)
+            changed = bytearray(source.read_bytes())
+            changed[-1] ^= 0xFF
+            source.write_bytes(changed)
+
+        with (
+            mock.patch.object(
+                acceptance,
+                "_mutate_owned_copy",
+                side_effect=mutate_then_change_source,
+            ),
+            self.assertRaisesRegex(
+                acceptance.IntegrityError, "identity or digest changed"
+            ),
+        ):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=lambda _path: set(),
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertFalse(
+            (
+                self.work
+                / "negative"
+                / "crossover"
+                / "wine-bytes-changed"
+            ).exists()
+        )
+        self.assertFalse(any(path.is_file() for path in self.work.rglob("*")))
+
+    def test_partial_private_copy_failure_cleans_only_its_trusted_residue(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+
+        def partial_write_then_fail(descriptor: int, payload: bytes) -> None:
+            self.assertGreater(len(payload), 0)
+            os.write(descriptor, payload[:1])
+            raise OSError("injected partial copy failure")
+
+        with (
+            mock.patch.object(
+                acceptance, "_write_all", side_effect=partial_write_then_fail
+            ),
+            self.assertRaisesRegex(
+                acceptance.AcceptanceError,
+                "negative copy could not be created safely",
+            ),
+        ):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=lambda _path: set(),
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        failed_case = (
+            self.work / "negative" / "crossover" / "wine-bytes-changed"
+        )
+        self.assertFalse(failed_case.exists())
+        self.assertFalse(any(path.is_file() for path in self.work.rglob("*")))
+
+    @unittest.skipUnless(os.name == "posix", "open-file replacement requires POSIX")
+    def test_partial_private_copy_failure_does_not_delete_a_foreign_replacement(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        payload_path = (
+            self.work
+            / "negative"
+            / "crossover"
+            / "wine-bytes-changed"
+            / "payload.bin"
+        )
+        foreign_bytes = b"foreign replacement must survive"
+
+        def replace_partial_copy_then_fail(descriptor: int, _payload: bytes) -> None:
+            os.write(descriptor, b"x")
+            payload_path.unlink()
+            payload_path.write_bytes(foreign_bytes)
+            raise OSError("injected replacement failure")
+
+        with (
+            mock.patch.object(
+                acceptance,
+                "_write_all",
+                side_effect=replace_partial_copy_then_fail,
+            ),
+            self.assertRaises(acceptance.CleanupError),
+        ):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=lambda _path: set(),
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertEqual(payload_path.read_bytes(), foreign_bytes)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "mkfifo"),
+        "FIFO open-bound regression requires POSIX",
+    )
+    def test_bounded_source_rejects_fifo_without_waiting_for_a_writer(self) -> None:
+        fifo = self.external / "source-fifo"
+        os.mkfifo(fifo)
+        probe = """
+import importlib.util
+import pathlib
+import sys
+spec = importlib.util.spec_from_file_location("fifo_acceptance", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+try:
+    module._read_bound_source(pathlib.Path(sys.argv[2]), "FIFO source")
+except module.AcceptanceError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+        result = subprocess.run(
+            [sys.executable, "-S", "-B", "-c", probe, str(ACCEPTANCE_TOOL), str(fifo)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=2,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_bounded_source_rejects_nonregular_entry_before_open(self) -> None:
+        directory = self.external / "source-directory"
+        directory.mkdir()
+        with mock.patch.object(
+            acceptance.os,
+            "open",
+            side_effect=AssertionError("nonregular source reached open"),
+        ):
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError, "private bounded regular file"
+            ):
+                acceptance._read_bound_source(directory, "directory source")
+
     def _discovery(self) -> dict[str, object]:
         return {
             "schemaVersion": "1",
