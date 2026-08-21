@@ -439,10 +439,35 @@ def _workflow_pair(content: str) -> tuple[str, str]:
     return key, value.strip()
 
 
-def _workflow_scalar(value: str) -> str:
+class _WorkflowScalar(str):
+    kind: str
+    quote: str
+
+    def __new__(
+        cls, value: str, *, kind: str, quote: str = ""
+    ) -> _WorkflowScalar:
+        scalar = super().__new__(cls, value)
+        scalar.kind = kind
+        scalar.quote = quote
+        return scalar
+
+
+def _workflow_scalar(value: str) -> _WorkflowScalar:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        return value[1:-1]
-    return value
+        return _WorkflowScalar(value[1:-1], kind="string", quote=value[0])
+    lowered = value.lower()
+    if not value or lowered == "null" or value == "~":
+        kind = "null"
+    elif lowered in ("true", "false"):
+        kind = "bool"
+    elif re.fullmatch(
+        r"[+-]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?",
+        value,
+    ):
+        kind = "number"
+    else:
+        kind = "string"
+    return _WorkflowScalar(value, kind=kind)
 
 
 def _normalize_workflow_surface(value: str, *, preserve_edges: bool = False) -> str:
@@ -478,7 +503,7 @@ def _workflow_step_signature(
     )
 
 
-def _workflow_inline_list(value: str) -> tuple[str, ...]:
+def _workflow_inline_list(value: str) -> tuple[_WorkflowScalar, ...]:
     if not value.startswith("[") or not value.endswith("]"):
         raise AssertionError(f"workflow value must be an inline list: {value}")
     body = value[1:-1].strip()
@@ -770,15 +795,34 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
         triggers = document["triggers"]
         jobs = document["jobs"]
 
-        def assert_gate(fields: dict[str, str], label: str) -> None:
+        def assert_gate(fields: dict[str, _WorkflowScalar], label: str) -> None:
             self.assertNotIn("if", fields, label)
             self.assertNotIn("continue-on-error", fields, label)
 
+        def assert_scalar(
+            value: object,
+            kind: str,
+            label: str,
+            *,
+            quotes: tuple[str, ...] | None = None,
+        ) -> None:
+            self.assertIsInstance(value, _WorkflowScalar, label)
+            self.assertEqual(value.kind, kind, label)
+            if kind != "string":
+                self.assertEqual(value.quote, "", label)
+            if quotes is not None:
+                self.assertIn(value.quote, quotes, label)
+
         self.assertEqual(document["top"], EXPECTED_CI_TOP_LEVEL)
         self.assertEqual(document["permissions"], {"contents": "read"})
+        for key, scalar in document["top"].items():
+            assert_scalar(scalar, "string" if key == "name" else "null", key)
+        assert_scalar(document["permissions"]["contents"], "string", "permissions")
         self.assertEqual(set(triggers), {"push", "pull_request"})
         self.assertEqual(triggers["push"], {"branches": ("main",)})
         self.assertEqual(triggers["pull_request"], {})
+        for branch in triggers["push"]["branches"]:
+            assert_scalar(branch, "string", "push branch")
         self.assertEqual(tuple(jobs), tuple(EXPECTED_CI_JOBS))
         for job_name, (runner, matrix) in EXPECTED_CI_JOBS.items():
             job = jobs[job_name]
@@ -790,6 +834,18 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             self.assertEqual(job["fields"], expected_fields, job_name)
             self.assertEqual(job["strategy"], expected_strategy, job_name)
             self.assertEqual(job["matrix"], matrix, job_name)
+            assert_scalar(job["fields"]["runs-on"], "string", job_name)
+            assert_scalar(job["fields"]["steps"], "null", job_name)
+            if matrix:
+                assert_scalar(job["fields"]["strategy"], "null", job_name)
+                assert_scalar(
+                    job["strategy"]["fail-fast"], "bool", f"{job_name} fail-fast"
+                )
+                assert_scalar(
+                    job["strategy"]["matrix"], "null", f"{job_name} matrix"
+                )
+                for runner_name in job["matrix"]["os"]:
+                    assert_scalar(runner_name, "string", f"{job_name} matrix os")
             for control in ("needs", "if", "continue-on-error"):
                 self.assertNotIn(control, job["fields"], job_name)
             actual_steps = tuple(
@@ -824,6 +880,17 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
                 if shell:
                     expected_keys.add("shell")
                 self.assertEqual(step["keys"], tuple(sorted(expected_keys)), name)
+                for field_name, scalar in step["fields"].items():
+                    assert_scalar(scalar, "string", f"{job_name} {field_name}")
+                for input_name, scalar in step["with"].items():
+                    assert_scalar(scalar, "string", f"{job_name} {input_name}")
+                    if input_name in ("python-version", "node-version"):
+                        assert_scalar(
+                            scalar,
+                            "string",
+                            f"{job_name} {input_name}",
+                            quotes=("'", '"'),
+                        )
                 for control in ("working-directory", "env", "continue-on-error"):
                     self.assertNotIn(control, step["fields"], job_name)
 
@@ -1181,6 +1248,46 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             .replace("contents: read", 'contents: "read"')
         )
         self._assert_workflow_contract(quoted)
+
+    def test_closed_workflow_oracle_rejects_quoted_strategy_boole(self) -> None:
+        workflow = self._workflow()
+        for quote in ('"', "'"):
+            mutant = workflow.replace(
+                "      fail-fast: false\n",
+                f"      fail-fast: {quote}false{quote}\n",
+                1,
+            )
+            with self.subTest(quote=quote), self.assertRaises(AssertionError):
+                self._assert_workflow_contract(mutant)
+
+    def test_closed_workflow_oracle_accepts_bool_and_quoted_versions(self) -> None:
+        workflow = self._workflow().replace(
+            '          python-version: "3.12"\n',
+            "          python-version: '3.12'\n",
+            1,
+        )
+        self._assert_workflow_contract(workflow)
+
+    def test_closed_workflow_oracle_rejects_typed_scalar_mutants(self) -> None:
+        workflow = self._workflow()
+        mutants = {
+            "numeric-python-version": workflow.replace(
+                '          python-version: "3.12"\n',
+                "          python-version: 3.12\n",
+                1,
+            ),
+            "numeric-node-version": workflow.replace(
+                '          node-version: "24"\n',
+                "          node-version: 24\n",
+                1,
+            ),
+            "quoted-null-steps": workflow.replace(
+                "    steps:\n", '    steps: ""\n', 1
+            ),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                self._assert_workflow_contract(mutant)
 
     def test_closed_workflow_oracle_rejects_indented_blank_in_run_block(
         self,
