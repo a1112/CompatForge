@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import re
 import subprocess
@@ -350,6 +352,207 @@ struct RealCode;
         self.assertIn('"unverified"', source)
         self.assertIn("WINDOW_APPEARANCE_SECONDS = 30", source)
         self.assertIn("process_group_ids", source)
+
+    def test_explicit_runtime_identity_is_closed_and_quartet_bound(self) -> None:
+        common = [
+            "--compatforge-cli",
+            "C:\\tools\\compatforge.exe",
+            "--cache-root",
+            "C:\\acceptance\\cache",
+            "--runtime-store",
+            "C:\\acceptance\\runtime-store",
+            "--storage-root",
+            "C:\\acceptance\\storage",
+            "--work-root",
+            "C:\\acceptance\\work",
+        ]
+        quartet = [
+            "--wine-root",
+            "C:\\Runtimes\\selected",
+            "--wine",
+            "bin/wine",
+            "--wineserver",
+            "bin/wineserver",
+            "--version",
+            "24.0",
+        ]
+
+        automatic = self.baseline.parser().parse_args(common)
+        self.assertIsNone(self.baseline.validate_runtime_selection(automatic))
+        for runtime_id in ("crossover", "whisky"):
+            arguments = self.baseline.parser().parse_args(
+                [*common, "--runtime-id", runtime_id, *quartet]
+            )
+            self.assertEqual(self.baseline.validate_runtime_selection(arguments), runtime_id)
+
+        invalid_argv = (
+            [*common, "--runtime-id", "crossover"],
+            [*common, *quartet],
+            [*common, "--runtime-id", "whisky", *quartet[:-2]],
+        )
+        for argv in invalid_argv:
+            with self.subTest(argv=argv), self.assertRaises(self.baseline.AcceptanceError):
+                self.baseline.validate_runtime_selection(self.baseline.parser().parse_args(argv))
+
+        parser_failures = (
+            [*common, "--runtime-id", "other", *quartet],
+            [*common, "--runtime-id", "crossover", "--runtime-id", "whisky", *quartet],
+            [*common, "--runtime-id", "crossover", *quartet, "--wine", "other/wine"],
+        )
+        for argv in parser_failures:
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.baseline.parser().parse_args(argv)
+
+    def test_failure_reason_mapping_is_closed_and_table_driven(self) -> None:
+        expected = {
+            "platform-unsupported": "environment",
+            "runtime-descriptor-invalid": "runtime",
+            "core-plan-failed": "core",
+            "desktop-window-unobserved": "desktop",
+            "application-interaction-unverified": "application",
+            "cleanup-delete-failed": "cleanup",
+        }
+        self.assertEqual(
+            {reason: self.baseline.failure_class(reason) for reason in expected},
+            expected,
+        )
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.failure_class("C:\\private\\arbitrary failure")
+
+    def test_execution_stage_mapping_is_independent_and_closed(self) -> None:
+        expected = {
+            "asset-fetch": "asset-fetch-failed",
+            "runtime-descriptor": "runtime-descriptor-invalid",
+            "core-plan": "core-plan-failed",
+            "desktop-launch": "desktop-launch-failed",
+            "installer-launch": "application-install-failed",
+            "cleanup-delete": "cleanup-delete-failed",
+        }
+        self.assertEqual(
+            {stage: self.baseline.failure_reason(stage) for stage in expected},
+            expected,
+        )
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.failure_reason("C:\\private\\unknown-stage")
+
+    def test_application_outcomes_have_closed_status_and_failure_class(self) -> None:
+        for status in ("failed", "unverified", "blocked"):
+            with self.subTest(status=status):
+                evidence: dict[str, object] = {"failureClass": "runtime", "reason": "local detail"}
+                self.baseline.set_application_outcome(
+                    evidence,
+                    status,
+                    "application-interaction-unverified",
+                    diagnostic="C:\\Users\\developer\\secret.txt",
+                )
+                self.assertEqual(evidence["status"], status)
+                self.assertEqual(evidence["failureClass"], "application")
+                self.assertEqual(evidence["reasonCode"], "application-interaction-unverified")
+
+        accepted: dict[str, object] = {
+            "failureClass": "cleanup",
+            "reasonCode": "cleanup-delete-failed",
+            "reason": "/Users/developer/private",
+        }
+        self.baseline.set_application_outcome(accepted, "accepted")
+        self.assertEqual(accepted, {"status": "accepted"})
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.set_application_outcome({}, "unknown")
+
+    def test_receipt_and_application_evidence_share_runtime_identity(self) -> None:
+        for runtime_id in ("crossover", "whisky"):
+            with self.subTest(runtime_id=runtime_id):
+                receipt: dict[str, object] = {"schemaVersion": "1"}
+                applications = [{"appId": "7zip"}, {"appId": "sumatrapdf"}]
+                self.baseline.bind_runtime_identity(runtime_id, receipt, applications)
+                self.assertEqual(receipt["runtimeId"], runtime_id)
+                self.assertEqual(
+                    [application["runtimeId"] for application in applications],
+                    [runtime_id, runtime_id],
+                )
+
+        automatic_receipt: dict[str, object] = {"schemaVersion": "1"}
+        automatic_applications = [{"appId": "7zip"}]
+        self.baseline.bind_runtime_identity(None, automatic_receipt, automatic_applications)
+        self.assertIsNone(automatic_receipt["runtimeId"])
+        self.assertIsNone(automatic_applications[0]["runtimeId"])
+
+    def test_compact_summary_is_canonical_closed_and_path_free(self) -> None:
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "local-crossover",
+            "version": "24.0",
+            "packDigest": "sha256:" + "a" * 64,
+            "source": "crossover-app",
+            "providerConfigPath": "/Users/developer/acceptance/provider.json",
+        }
+        applications = [
+            {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "appId": "7zip",
+                "status": "unverified",
+                "failureClass": "desktop",
+                "reasonCode": "desktop-window-unobserved",
+                "reason": "window tool failed under C:\\Users\\developer\\acceptance",
+                "cleanupError": "/Users/developer/acceptance/bottle is busy",
+                "cleanup": True,
+                "interactionChecks": {
+                    "fileList": True,
+                    "menus": False,
+                    "/Users/developer/secret": True,
+                },
+                "exit": {"present": True, "code": 0, "success": True, "path": "/private/tmp/log"},
+                "windows": {"available": False, "reason": "/Users/developer denied access"},
+                "screenshot": {"available": False, "path": "/Users/developer/7zip.png"},
+            }
+        ]
+        compact = self.baseline.compact_summary(receipt, applications)
+        expected = {
+            "schemaVersion": "1",
+            "receipt": {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "packId": "local-crossover",
+                "version": "24.0",
+                "packDigest": "sha256:" + "a" * 64,
+                "source": "crossover-app",
+            },
+            "applications": [
+                {
+                    "schemaVersion": "1",
+                    "runtimeId": "crossover",
+                    "appId": "7zip",
+                    "status": "unverified",
+                    "failureClass": "desktop",
+                    "reasonCode": "desktop-window-unobserved",
+                    "cleanup": True,
+                    "interactionChecks": {"fileList": True, "menus": False},
+                    "exit": {"present": True, "code": 0, "success": True},
+                    "windowAvailable": False,
+                    "screenshotAvailable": False,
+                }
+            ],
+        }
+        self.assertEqual(compact, expected)
+        encoded = self.baseline.compact_json(compact)
+        self.assertEqual(
+            encoded,
+            json.dumps(expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        )
+        self.assertNotIn("C:\\\\", encoded)
+        self.assertNotIn("/Users/", encoded)
+        self.assertNotIn("/private/", encoded)
+
+        poisoned_receipt = {**receipt, "source": "/Users/developer/runtime"}
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.compact_summary(poisoned_receipt, applications)
+
+    def test_each_application_evidence_is_appended_once(self) -> None:
+        source = BASELINE_TOOL.read_text(encoding="utf-8")
+        self.assertEqual(source.count("results.append(evidence)"), 1)
 
     def test_acceptance_requires_complete_structured_interaction_evidence(self) -> None:
         with self.assertRaises(self.baseline.AcceptanceError):

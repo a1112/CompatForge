@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Opt-in macOS GUI acceptance for the fixed CompatForge baseline apps.
 
-This script intentionally records ``accepted``, ``failed`` or ``unverified``
-per application. A visible process or a blank window is never promoted to an
-acceptance claim. Downloads, screenshots and evidence live in caller-owned
-external directories and are excluded from the repository.
+This script intentionally uses only ``accepted``, ``failed``, ``unverified``
+or ``blocked`` per application. A visible process or a blank window is never
+promoted to an acceptance claim. Downloads, screenshots and evidence live in
+caller-owned external directories and are excluded from the repository.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parents[1]
 DOWNLOAD = ROOT / "tools" / "download_gui_assets.py"
@@ -33,9 +33,74 @@ REQUIRED_INTERACTIONS = {
     "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
 }
 
+RUNTIME_IDS = ("crossover", "whisky")
+STATUSES = ("accepted", "failed", "unverified", "blocked")
+FAILURE_CLASSES = ("environment", "runtime", "core", "desktop", "application", "cleanup")
+FAILURE_CLASS_BY_REASON_CODE = {
+    "platform-unsupported": "environment",
+    "tool-unavailable": "environment",
+    "network-unavailable": "environment",
+    "asset-fetch-failed": "environment",
+    "runtime-descriptor-invalid": "runtime",
+    "runtime-start-failed": "runtime",
+    "runtime-version-invalid": "runtime",
+    "core-snapshot-failed": "core",
+    "core-plan-failed": "core",
+    "core-import-failed": "core",
+    "core-inspection-failed": "core",
+    "core-launch-failed": "core",
+    "core-verification-failed": "core",
+    "core-rollback-failed": "core",
+    "desktop-launch-failed": "desktop",
+    "desktop-window-unobserved": "desktop",
+    "application-install-failed": "application",
+    "application-interaction-unverified": "application",
+    "application-content-unverified": "application",
+    "cleanup-residual-processes": "cleanup",
+    "cleanup-delete-failed": "cleanup",
+}
+FAILURE_REASON_BY_STAGE = {
+    "preflight-platform": "platform-unsupported",
+    "preflight-tool": "tool-unavailable",
+    "preflight-network": "network-unavailable",
+    "asset-fetch": "asset-fetch-failed",
+    "runtime-descriptor": "runtime-descriptor-invalid",
+    "runtime-start": "runtime-start-failed",
+    "runtime-version": "runtime-version-invalid",
+    "core-snapshot": "core-snapshot-failed",
+    "core-plan": "core-plan-failed",
+    "core-import": "core-import-failed",
+    "core-inspection": "core-inspection-failed",
+    "core-launch": "core-launch-failed",
+    "core-verification": "core-verification-failed",
+    "core-rollback": "core-rollback-failed",
+    "desktop-launch": "desktop-launch-failed",
+    "desktop-window": "desktop-window-unobserved",
+    "installer-launch": "application-install-failed",
+    "application-interaction": "application-interaction-unverified",
+    "application-content": "application-content-unverified",
+    "cleanup-residual": "cleanup-residual-processes",
+    "cleanup-delete": "cleanup-delete-failed",
+}
+
 
 class AcceptanceError(Exception):
     pass
+
+
+class UniqueValueAction(argparse.Action):
+    """Reject repeated identity arguments instead of accepting the last value."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string or self.dest} may be provided only once")
+        setattr(namespace, self.dest, values)
 
 
 def absolute(value: str, field: str, *, external: bool = False) -> Path:
@@ -48,17 +113,18 @@ def absolute(value: str, field: str, *, external: bool = False) -> Path:
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(description=__doc__)
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     value.add_argument("--compatforge-cli", required=True)
     value.add_argument("--cache-root", required=True)
     value.add_argument("--runtime-store", required=True)
     value.add_argument("--storage-root", required=True)
     value.add_argument("--work-root", required=True)
     value.add_argument("--allow-network", action="store_true")
-    value.add_argument("--wine-root")
-    value.add_argument("--wine")
-    value.add_argument("--wineserver")
-    value.add_argument("--version")
+    value.add_argument("--runtime-id", choices=RUNTIME_IDS, action=UniqueValueAction)
+    value.add_argument("--wine-root", action=UniqueValueAction)
+    value.add_argument("--wine", action=UniqueValueAction)
+    value.add_argument("--wineserver", action=UniqueValueAction)
+    value.add_argument("--version", action=UniqueValueAction)
     value.add_argument(
         "--accept-interactive",
         action="store_true",
@@ -69,6 +135,150 @@ def parser() -> argparse.ArgumentParser:
         help="absolute JSON record of the required per-application manual checks",
     )
     return value
+
+
+def validate_runtime_selection(arguments: argparse.Namespace) -> str | None:
+    explicit = [arguments.wine_root, arguments.wine, arguments.wineserver, arguments.version]
+    if any(explicit) and not all(explicit):
+        raise AcceptanceError("wine-root, wine, wineserver and version must be provided together")
+    if all(explicit) and arguments.runtime_id is None:
+        raise AcceptanceError("--runtime-id is required with an explicit Runtime quartet")
+    if arguments.runtime_id is not None and not all(explicit):
+        raise AcceptanceError("--runtime-id requires an explicit Runtime quartet")
+    return arguments.runtime_id
+
+
+def failure_class(reason_code: str) -> str:
+    try:
+        return FAILURE_CLASS_BY_REASON_CODE[reason_code]
+    except KeyError as error:
+        raise AcceptanceError("failure reason code is not recognized") from error
+
+
+def failure_reason(stage: str) -> str:
+    try:
+        return FAILURE_REASON_BY_STAGE[stage]
+    except KeyError as error:
+        raise AcceptanceError("failure stage is not recognized") from error
+
+
+def set_application_outcome(
+    evidence: dict[str, object],
+    status_value: str,
+    reason_code: str | None = None,
+    *,
+    diagnostic: str | None = None,
+) -> None:
+    if status_value not in STATUSES:
+        raise AcceptanceError("application status is not recognized")
+    evidence["status"] = status_value
+    if status_value == "accepted":
+        evidence.pop("failureClass", None)
+        evidence.pop("reasonCode", None)
+        evidence.pop("reason", None)
+        return
+    if reason_code is None:
+        raise AcceptanceError("non-accepted application status requires a reason code")
+    evidence["reasonCode"] = reason_code
+    evidence["failureClass"] = failure_class(reason_code)
+    if diagnostic is not None:
+        evidence["reason"] = diagnostic
+
+
+def bind_runtime_identity(
+    runtime_id: str | None,
+    receipt: dict[str, object],
+    applications: list[dict[str, object]],
+) -> None:
+    if runtime_id is not None and runtime_id not in RUNTIME_IDS:
+        raise AcceptanceError("Runtime identity is not recognized")
+    receipt["runtimeId"] = runtime_id
+    for application in applications:
+        application["runtimeId"] = runtime_id
+
+
+def _compact_exit(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "present": value.get("present") is True,
+        "code": value.get("code") if isinstance(value.get("code"), int) else None,
+        "success": value.get("success") is True,
+    }
+
+
+def _reject_absolute_paths(value: object) -> None:
+    if isinstance(value, str):
+        if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
+            raise AcceptanceError("compact summary contains an absolute path")
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _reject_absolute_paths(nested)
+        return
+    if isinstance(value, list):
+        for nested in value:
+            _reject_absolute_paths(nested)
+
+
+def compact_summary(
+    receipt: dict[str, object],
+    applications: list[dict[str, object]],
+) -> dict[str, object]:
+    runtime_id = receipt.get("runtimeId")
+    if runtime_id is not None and runtime_id not in RUNTIME_IDS:
+        raise AcceptanceError("receipt Runtime identity is not recognized")
+    compact_receipt = {
+        key: receipt[key]
+        for key in ("schemaVersion", "runtimeId", "packId", "version", "packDigest", "source", "activated")
+        if key in receipt
+    }
+    compact_applications: list[dict[str, object]] = []
+    for application in applications:
+        if application.get("runtimeId") != runtime_id:
+            raise AcceptanceError("receipt and application Runtime identities differ")
+        status_value = application.get("status")
+        if status_value not in STATUSES:
+            raise AcceptanceError("application status is not recognized")
+        projected = {
+            key: application[key]
+            for key in ("schemaVersion", "runtimeId", "appId", "assetSha256", "status", "cleanup")
+            if key in application
+        }
+        if status_value == "accepted":
+            if "failureClass" in application or "reasonCode" in application:
+                raise AcceptanceError("accepted application includes failure metadata")
+        else:
+            reason_code = application.get("reasonCode")
+            class_value = application.get("failureClass")
+            if not isinstance(reason_code, str) or class_value != failure_class(reason_code):
+                raise AcceptanceError("application failure metadata is invalid")
+            projected["failureClass"] = class_value
+            projected["reasonCode"] = reason_code
+        interactions = application.get("interactionChecks")
+        required_interactions = REQUIRED_INTERACTIONS.get(application.get("appId"))
+        if isinstance(interactions, dict) and required_interactions is not None:
+            projected["interactionChecks"] = {
+                name: interactions.get(name) is True for name in required_interactions
+            }
+        for source_key, target_key in (("installerExit", "installerExit"), ("exit", "exit")):
+            compact_exit = _compact_exit(application.get(source_key))
+            if compact_exit is not None:
+                projected[target_key] = compact_exit
+        windows = application.get("windows")
+        if isinstance(windows, dict):
+            projected["windowAvailable"] = windows.get("available") is True
+        screenshot_value = application.get("screenshot")
+        if isinstance(screenshot_value, dict):
+            projected["screenshotAvailable"] = screenshot_value.get("available") is True
+        compact_applications.append(projected)
+    summary = {"schemaVersion": "1", "receipt": compact_receipt, "applications": compact_applications}
+    _reject_absolute_paths(summary)
+    return summary
+
+
+def compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def invoke(argv: list[str], *, timeout: int = MAX_COMMAND_SECONDS) -> subprocess.CompletedProcess[str]:
@@ -464,6 +674,7 @@ def main() -> int:
         arguments = parser().parse_args()
         if platform.system() != "Darwin" or platform.machine() != "arm64":
             raise AcceptanceError("GUI baseline requires Darwin/arm64")
+        runtime_id = validate_runtime_selection(arguments)
         arguments.compatforge_cli = absolute(arguments.compatforge_cli, "compatforge-cli")
         arguments.cache_root = absolute(arguments.cache_root, "cache-root", external=True)
         arguments.runtime_store = absolute(arguments.runtime_store, "runtime-store", external=True)
@@ -473,8 +684,6 @@ def main() -> int:
         if any(arguments.work_root.iterdir()):
             raise AcceptanceError("work-root must be empty")
         explicit = [arguments.wine_root, arguments.wine, arguments.wineserver, arguments.version]
-        if any(explicit) and not all(explicit):
-            raise AcceptanceError("wine-root, wine, wineserver and version must be provided together")
         evidence_path = (
             absolute(arguments.interaction_evidence, "interaction-evidence", external=True)
             if arguments.interaction_evidence
@@ -503,6 +712,7 @@ def main() -> int:
             invoke([str(arguments.compatforge_cli), "local", "macos", "context", str(request_path), str(context_path)]),
             "bootstrap receipt",
         )
+        bind_runtime_identity(runtime_id, receipt, [])
         context = json.loads(context_path.read_text(encoding="utf-8"))
         if not isinstance(context, dict):
             raise AcceptanceError("bootstrap context is not an object")
@@ -528,13 +738,21 @@ def main() -> int:
             bottle_root.mkdir(parents=True, exist_ok=True)
             evidence: dict[str, object] = {
                 "schemaVersion": "1",
+                "runtimeId": runtime_id,
                 "appId": asset.app_id,
                 "bottleId": bottle_id,
-                "status": "unverified",
                 "cleanup": False,
             }
+            set_application_outcome(
+                evidence,
+                "unverified",
+                failure_reason("application-interaction"),
+                diagnostic="application acceptance was not completed",
+            )
+            failure_reason_code = failure_reason("asset-fetch")
             try:
                 installer = fetch_asset(arguments, asset.app_id)
+                failure_reason_code = failure_reason("core-inspection")
                 installer_inspection = json_object(
                     invoke([str(arguments.compatforge_cli), "inspect", str(installer)]),
                     f"{asset.app_id} installer inspection",
@@ -561,6 +779,7 @@ def main() -> int:
                 }
                 installer_request_path = arguments.work_root / f"{asset.app_id}-installer-request.json"
                 write_json(installer_request_path, inspection_request)
+                failure_reason_code = failure_reason("core-plan")
                 plan = json_object(
                     invoke(
                         [
@@ -574,6 +793,7 @@ def main() -> int:
                     f"{asset.app_id} installer plan",
                 )
                 evidence["installerPlan"] = plan
+                failure_reason_code = failure_reason("installer-launch")
                 installer_events = run_events(
                     invoke(
                         [
@@ -591,9 +811,12 @@ def main() -> int:
                 evidence["installerExit"] = exit_observation(installer_events)
                 installed = installed_executable(asset, bottle_root)
                 if not installed.is_file() or installed.is_symlink():
-                    evidence["status"] = "unverified"
-                    evidence["reason"] = "installer exited but expected GUI executable was not found"
-                    results.append(evidence)
+                    set_application_outcome(
+                        evidence,
+                        "unverified",
+                        failure_reason("installer-launch"),
+                        diagnostic="installer exited but expected GUI executable was not found",
+                    )
                     continue
                 launch_request = {
                     "schemaVersion": "1",
@@ -611,6 +834,7 @@ def main() -> int:
                     },
                 }
                 launch_request_path = arguments.work_root / f"{asset.app_id}-launch-request.json"
+                failure_reason_code = failure_reason("core-inspection")
                 gui_inspection = json_object(
                     invoke([str(arguments.compatforge_cli), "inspect", str(installed)]),
                     f"{asset.app_id} GUI inspection",
@@ -621,6 +845,7 @@ def main() -> int:
                 launch_request["executable"]["architecture"] = request_architecture(gui_architecture)  # type: ignore[index]
                 write_json(launch_request_path, launch_request)
                 evidence["inspection"] = gui_inspection
+                failure_reason_code = failure_reason("core-plan")
                 evidence["plan"] = json_object(
                     invoke(
                         [
@@ -633,6 +858,7 @@ def main() -> int:
                     ),
                     f"{asset.app_id} GUI plan",
                 )
+                failure_reason_code = failure_reason("desktop-launch")
                 events, windows, shot, process_group_id = observed_launch(
                     [
                         str(arguments.compatforge_cli),
@@ -658,14 +884,46 @@ def main() -> int:
                     evidence["interactionChecks"].get(name) is True
                     for name in REQUIRED_INTERACTIONS[asset.app_id]
                 )
-                evidence["status"] = "accepted" if basic and interactions_complete else "unverified"
-                if not basic:
-                    evidence["reason"] = "target window/screenshot/exit cleanup evidence is incomplete"
+                if basic and interactions_complete:
+                    set_application_outcome(evidence, "accepted")
+                elif evidence["residualProcesses"]:
+                    set_application_outcome(
+                        evidence,
+                        "unverified",
+                        failure_reason("cleanup-residual"),
+                        diagnostic="launch left residual processes",
+                    )
+                elif (
+                    evidence["windows"].get("available") is not True
+                    or evidence["screenshot"].get("available") is not True
+                ):
+                    set_application_outcome(
+                        evidence,
+                        "unverified",
+                        failure_reason("desktop-window"),
+                        diagnostic="target window or screenshot evidence is incomplete",
+                    )
+                elif status(events) != "accepted":
+                    set_application_outcome(
+                        evidence,
+                        "unverified",
+                        failure_reason("application-content"),
+                        diagnostic="application exit evidence is incomplete",
+                    )
                 elif not interactions_complete:
-                    evidence["reason"] = "required per-application interaction evidence was not supplied"
+                    set_application_outcome(
+                        evidence,
+                        "unverified",
+                        failure_reason("application-interaction"),
+                        diagnostic="required per-application interaction evidence was not supplied",
+                    )
             except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
-                evidence["status"] = "failed"
-                evidence["reason"] = str(error)
+                set_application_outcome(
+                    evidence,
+                    "failed",
+                    failure_reason_code,
+                    diagnostic=str(error),
+                )
             finally:
                 try:
                     if bottle_root.exists() or bottle_root.is_symlink():
@@ -676,15 +934,20 @@ def main() -> int:
                 except (OSError, AcceptanceError) as error:
                     evidence["cleanup"] = False
                     evidence["cleanupError"] = str(error)
-                if evidence["status"] == "accepted" and evidence["cleanup"] is not True:
-                    evidence["status"] = "failed"
-                    evidence["reason"] = "Bottle cleanup failed"
+                if evidence["cleanup"] is not True:
+                    set_application_outcome(
+                        evidence,
+                        "failed",
+                        failure_reason("cleanup-delete"),
+                        diagnostic="Bottle cleanup failed",
+                    )
                 write_json(arguments.work_root / f"{asset.app_id}-evidence.json", evidence)
                 results.append(evidence)
 
-        summary = {"schemaVersion": "1", "receipt": receipt, "applications": results}
+        bind_runtime_identity(runtime_id, receipt, results)
+        summary = compact_summary(receipt, results)
         write_json(arguments.work_root / "summary.json", summary)
-        print(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        print(compact_json(summary))
         return 0 if all(value["status"] == "accepted" for value in results) else 1
     except (AcceptanceError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ImportError) as error:
         print(f"compatforge-gui-baseline: {error}", file=sys.stderr)
