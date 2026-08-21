@@ -470,6 +470,14 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("public-zh-prefix", "本阶段绝非公测。"),
             ("public-en-suffix", "Public release is forbidden."),
             ("public-zh-suffix", "公开发布不会发生。"),
+            (
+                "public-en-not-ready-family",
+                "This stage is NOT   ready for PUBLIC beta or public release.",
+            ),
+            (
+                "public-en-neither-family",
+                "This stage is neither a PUBLIC beta nor a public release.",
+            ),
             ("signing-en-prefix", "The application will not be signed."),
             ("signing-zh-prefix", "应用不会签名。"),
             ("signing-en-suffix", "Application signing is prohibited."),
@@ -500,9 +508,21 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "ForgeOS modification is authorized.",
             ),
             ("repositories-zh-positive", "ForgeTools 修改已获授权。"),
+            ("repositories-zh-ascii-comma", "ForgeOS, 已获授权。"),
+            ("repositories-zh-fullwidth-comma", "ForgeOS，已获授权。"),
             (
                 "public-mixed",
                 "Public beta is forbidden, but this stage is a public release.",
+            ),
+            (
+                "public-not-ready-family-mixed",
+                "This stage is not ready for public beta or public release, "
+                "but the application is signed.",
+            ),
+            (
+                "public-neither-family-mixed",
+                "This stage is neither a public beta nor a public release, "
+                "while the build is notarized.",
             ),
             (
                 "signing-mixed",

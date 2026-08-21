@@ -568,8 +568,8 @@ MACOS_ACCEPTANCE_TOPIC_GRAMMAR = (
             rf"{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b",
             rf"\b{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b(?:\s+\w+){{0,5}}\s+"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b",
-            rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\s*(?:的)?\s*"
-            r"(?:修改|变更|授权|获授权)",
+            rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}(?:\s+__comma__)?\s*"
+            r"(?:的)?\s*(?:修改|变更|授权|(?:已)?获授权)",
             r"(?:修改|变更|授权(?:修改)?|获授权)\s*"
             rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}",
         ),
@@ -583,6 +583,8 @@ MACOS_ACCEPTANCE_NEGATION_BEFORE = (
     r"(?:\b(?:not|never|without|no)\b\s*(?:a|an|the|to|be|being|been)?|"
     r"绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不是|不属于|不包含|"
     r"不允许|不授权|不|未(?:完成)?|无)\s*$",
+    r"\bnot\s+ready\s+for\s*$",
+    r"\bneither(?:\s+(?:a|an|the))?\s*$",
     r"\bneither\b.*\bnor(?:\s+(?:a|an|the))?\s*$",
 )
 MACOS_ACCEPTANCE_NEGATION_AFTER = (
