@@ -156,14 +156,16 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
         self.assertFalse(standard.negative_checks)
         self.assertEqual(standard.runtime_store_root, "/absolute/external/runtime-store")
 
-        network = acceptance.parse_arguments(
-            arguments(validator.MACOS_ACCEPTANCE_NETWORK_ORCHESTRATOR_COMMAND)
+        guide = validator._macos_acceptance_markdown(
+            validator.MACOS_ACCEPTANCE_GUIDE
         )
-        self.assertTrue(network.allow_network)
-        self.assertFalse(network.negative_checks)
+        blocks, _prose = validator._macos_acceptance_guide_fences(guide)
+        network_lines = tuple(
+            line for block in blocks for line in block if "--allow-network" in line
+        )
         self.assertEqual(
-            network.interaction_evidence_root,
-            "/absolute/external/interactions",
+            network_lines,
+            validator.MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
         )
 
         negative = acceptance.parse_arguments(
@@ -364,8 +366,11 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ("released-claim", append_guide("CompatForge has been released.")),
             ("public-beta-ready", append_guide("This stage is public   beta ready!")),
             ("signed-claim", append_guide("The application is signed.")),
+            ("signed-prefix-claim", append_guide("A signed application is available.")),
             ("notarized-claim", append_guide("The build is NOTARIZED.")),
+            ("notarized-suffix-claim", append_guide("Build notarized successfully.")),
             ("dmg-claim", append_guide("A DMG is ready for distribution.")),
+            ("generated-dmg-claim", append_guide("Generated DMG for distribution.")),
             (
                 "cross-repository-authorization",
                 append_guide(
@@ -376,10 +381,15 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "reverse-cross-repository-authorization",
                 append_guide("Modifications to ForgeTools are authorized."),
             ),
+            ("repository-authorized", append_guide("ForgeOS authorized.")),
             ("chinese-public-release", append_guide("本阶段进入公测并公开发布。")),
             ("chinese-signed-notarized", append_guide("应用已签名并完成公证。")),
+            ("chinese-signature-valid", append_guide("应用签名有效。")),
+            ("chinese-notarization-valid", append_guide("构建公证有效。")),
             ("chinese-dmg", append_guide("下一步将生成 DMG。")),
+            ("chinese-dmg-generated", append_guide("DMG 已生成。")),
             ("chinese-cross-repository", append_guide("允许修改 ForgeOS。")),
+            ("chinese-repository-authorized", append_guide("ForgeOS 获授权。")),
         )
         for label, mutate in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory(
@@ -406,6 +416,11 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "the application is not signed or "
                 "notarized, does not create a DMG, and does not authorize modifications "
                 "to ForgeOS, ForgeTools, or Mac-Win.\n"
+                "This stage is not ready for release; neither the application nor the "
+                "build is signed or notarized; it will not generate a DMG and ForgeOS "
+                "will not be authorized.\n"
+                "本阶段绝非公测或公开发布，绝不会签名或公证，不会生成 DMG，"
+                "严禁修改 ForgeOS、ForgeTools 或 Mac-Win。\n"
             )
             guide.write_bytes(source.encode("utf-8"))
             with mock.patch.object(validator, "ROOT", repository_root):

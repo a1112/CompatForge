@@ -476,18 +476,6 @@ MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND = (
     "  --work-root /absolute/external/evidence \\",
     "  --interaction-evidence-root /absolute/external/interactions",
 )
-MACOS_ACCEPTANCE_NETWORK_ORCHESTRATOR_COMMAND = (
-    "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
-    "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
-    "  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \\",
-    "  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \\",
-    "  --cache-root /absolute/external/cache \\",
-    "  --runtime-store-root /absolute/external/runtime-store \\",
-    "  --storage-root /absolute/external/storage \\",
-    "  --work-root /absolute/external/evidence \\",
-    "  --interaction-evidence-root /absolute/external/interactions \\",
-    "  --allow-network",
-)
 MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
     "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
     "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
@@ -517,7 +505,6 @@ MACOS_ACCEPTANCE_GUIDE_BLOCKS = (
     MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
     MACOS_ACCEPTANCE_INTERACTION_PATHS,
     MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND,
-    MACOS_ACCEPTANCE_NETWORK_ORCHESTRATOR_COMMAND,
     MACOS_ACCEPTANCE_NEGATIVE_COMMAND,
 )
 MACOS_ACCEPTANCE_NONCLAIMS = (
@@ -4281,31 +4268,27 @@ def _macos_acceptance_prose(source: str) -> str:
     return re.sub(r"(?ms)^```[^\n]*\n.*?^```[ \t]*$", "", source)
 
 
-def _macos_acceptance_semantic_text(prose: str) -> str:
+def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", prose).casefold()
-    normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
-    negated = (
-        r"\b(?:this|it|compatforge|stage|gate|build|application|app)?\s*"
-        r"(?:is|are|was|were)\s+not\s+(?:a\s+)?public\s+(?:beta|release)"
-        r"(?:\s+ready)?(?:\s+or\s+public\s+(?:beta|release)(?:\s+ready)?)*\b",
-        r"\bnot\s+(?:a\s+)?public\s+(?:beta|release)(?:\s+ready)?"
-        r"(?:\s+or\s+public\s+(?:beta|release)(?:\s+ready)?)*\b",
-        r"\b(?:application|app|build|artifact|binary|package|this|it)?\s*"
-        r"(?:is|are|was|were)\s+not\s+(?:signed|notarized)\b",
-        r"\bnot\s+(?:signed|notarized)\b",
-        r"\bdoes\s+not\s+(?:create|build|ship|publish|release|distribute|provide|deliver)"
-        r"\s+(?:a\s+)?dmg\b",
-        r"不\s*(?:是|进入|构成|属于)\s*(?:public\s+(?:beta|release)|公测|公开测试|公开发布)"
-        r"(?:\s+public\s+(?:beta|release))*",
-        r"(?:未|不)\s*(?:签名|notarize|notarized|(?:完成\s*)?公证)",
-        r"(?:未|不)\s*(?:公开\s*)?发布",
-        r"不\s*(?:生成|创建|构建|发布|分发|交付|提供)"
-        r"(?:\s*或\s*(?:生成|创建|构建|发布|分发|交付|提供))*\s*dmg",
-        r"不\s*(?:允许|授权|可以|会|将)?\s*修改\s*(?:forgeos|forgetools|mac\s+win)",
-    )
-    for pattern in negated:
-        normalized = re.sub(pattern, " ", normalized)
-    return re.sub(r"\s+", " ", normalized).strip()
+    clauses: list[str] = []
+    for sentence in re.split(r"[\n\r。！？!?；;,，]+", normalized):
+        for clause in re.split(r"\b(?:but|and|however)\b|但是|但", sentence):
+            compact = re.sub(r"[^\w]+", " ", clause, flags=re.UNICODE).strip()
+            if compact:
+                clauses.append(compact)
+    return tuple(clauses)
+
+
+def _macos_acceptance_claim_is_negated(
+    clause: str, match: re.Match[str]
+) -> bool:
+    context = clause[max(0, match.start() - 96) : match.end()]
+    if re.search(
+        r"\b(?:not|never|neither|nor|without|forbidden|prohibited)\b",
+        context,
+    ):
+        return True
+    return re.search(r"(?:绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不|未|无|非)", context) is not None
 
 
 def _validate_macos_acceptance_nonclaims(prose: str) -> None:
@@ -4318,36 +4301,45 @@ def _validate_macos_acceptance_nonclaims(prose: str) -> None:
     if selected != MACOS_ACCEPTANCE_NONCLAIMS:
         raise ValueError("macOS acceptance closed non-claims drifted")
 
-    semantic = _macos_acceptance_semantic_text(prose)
-    forbidden = (
+    claim_patterns = (
         r"\bpublic\s+(?:beta|release)\b",
         r"(?:公测|公开测试|公开发布)",
+        r"\brelease\s+ready\b",
         r"\bready\s+for\s+(?:a\s+)?public\s+(?:beta|release)\b",
         r"\b(?:this|it|compatforge|stage|gate|build|application|app|artifact|package)"
         r"\s+(?:is|are|was|were|will\s+be|has\s+been)\s+released\b",
+        r"\bsigned\s+(?:application|app|build|artifact|binary|package)\b",
         r"\b(?:application|app|build|artifact|binary|package|this|it)"
-        r"\s+(?:is|are|was|were|will\s+be|has\s+been)\s+(?:signed|notarized)\b",
+        r"(?:\s+\w+){0,4}\s+signed\b",
+        r"\bnotarized\s+(?:application|app|build|artifact|binary|package)\b",
+        r"\b(?:application|app|build|artifact|binary|package|this|it)"
+        r"(?:\s+\w+){0,4}\s+notarized\b",
         r"\b(?:a\s+)?dmg\s+(?:is\s+)?ready\b",
-        r"\b(?:create|creates|created|build|builds|built|ship|ships|publish|publishes|"
+        r"\bgenerated\s+dmg\b",
+        r"\bdmg(?:\s+\w+){0,4}\s+generated\b",
+        r"\b(?:generate|generates|generated|create|creates|created|build|builds|built|ship|ships|publish|publishes|"
         r"release|releases|distribute|distributes|provide|provides|deliver|delivers)"
         r"\s+(?:a\s+)?dmg\b",
         r"\bauthorized\s+to\s+modify\s+(?:forgeos|forgetools|mac\s+win)\b",
-        r"\b(?:modifications?\s+to\s+)?(?:forgeos|forgetools|mac\s+win)\s+"
-        r"modifications?\s+(?:are|is)\s+authorized\b",
         r"\bmodifications?\s+to\s+(?:forgeos|forgetools|mac\s+win)\s+"
         r"(?:are|is)\s+authorized\b",
+        r"\b(?:forgeos|forgetools|mac\s+win)(?:\s+\w+){0,4}\s+authorized\b",
         r"\b(?:may|can|will|allowed\s+to|authorized\s+to)\s+modify\s+"
         r"(?:forgeos|forgetools|mac\s+win)\b",
-        r"(?<!不)(?:是|进入|达到|构成|属于)\s*(?:public\s+(?:beta|release)|公测|公开测试|公开发布)",
-        r"公开\s*发布",
-        r"(?<!不)(?:已|已经|将|会|允许|可以|授权|完成)\s*(?:应用|构建|代码)?\s*"
-        r"(?:签名|notarize|notarized|公证)",
-        r"(?<!不)(?:生成|创建|构建|发布|分发|交付|提供|将\s*生成)\s*(?:一个)?\s*dmg",
-        r"(?<!不)(?:允许|授权|可以|将|会|需要)\s*(?:直接)?\s*修改\s*"
-        r"(?:forgeos|forgetools|mac\s+win)",
+        r"(?:签名|公证)\s*(?:有效|成功|完成)?",
+        r"(?:生成|创建|构建|分发|发布|交付)\s*dmg",
+        r"dmg\s*(?:已|已经|将|会)?\s*生成",
+        r"(?:允许|授权|可以|将|会|需要)?\s*修改\s*(?:forgeos|forgetools|mac\s+win)",
+        r"(?:forgeos|forgetools|mac\s+win)\s*(?:已|已经)?\s*获授权",
+        r"获授权",
     )
-    if any(re.search(pattern, semantic) for pattern in forbidden):
-        raise ValueError("macOS acceptance guide contains a contradictory claim")
+    for clause in _macos_acceptance_semantic_clauses(prose):
+        for pattern in claim_patterns:
+            for match in re.finditer(pattern, clause):
+                if not _macos_acceptance_claim_is_negated(clause, match):
+                    raise ValueError(
+                        "macOS acceptance guide contains a contradictory claim"
+                    )
 
 
 def _validate_macos_acceptance_guide(source: str) -> None:
@@ -4414,10 +4406,7 @@ def _validate_macos_acceptance_guide(source: str) -> None:
     network_lines = tuple(
         line for block in fences for line in block if "--allow-network" in line
     )
-    if network_lines != (
-        *MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
-        "  --allow-network",
-    ):
+    if network_lines != MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS:
         raise ValueError("macOS acceptance network opt-in escaped the fixed asset stage")
 
 

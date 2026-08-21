@@ -92,7 +92,7 @@ python3 -S -B tools/download_gui_assets.py fetch sumatrapdf --cache-root /absolu
 python3 -S -B tools/download_gui_assets.py fetch notepad-plus-plus --cache-root /absolute/external/cache --allow-network
 ```
 
-准备好缓存后，标准双轮编排保持离线。只有操作者明确把固定资产获取合并到本次编排时，才可使用第 7 节唯一列出的 opt-in 变体；不得在其他命令或阶段单独追加 `--allow-network`。
+三个固定资产获取完成后必须关闭网络。双轮编排及其余所有阶段都不得使用或追加 `--allow-network`。
 
 ## 6. 独立准备交互确认
 
@@ -121,21 +121,6 @@ python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
   --storage-root /absolute/external/storage \
   --work-root /absolute/external/evidence \
   --interaction-evidence-root /absolute/external/interactions
-```
-
-如果且仅如果固定缓存尚未准备好、操作者明确批准本次编排同时获取固定资产，可改用下面唯一的联网变体；参数顺序和网络 flag 不得改写：
-
-```text
-python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
-  --compatforge-cli /absolute/external/build/compatforge-cli \
-  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \
-  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \
-  --cache-root /absolute/external/cache \
-  --runtime-store-root /absolute/external/runtime-store \
-  --storage-root /absolute/external/storage \
-  --work-root /absolute/external/evidence \
-  --interaction-evidence-root /absolute/external/interactions \
-  --allow-network
 ```
 
 编排器会再绑定所发现 Runtime 的 identity，依次运行每个 `round/runtime` 的 Console、GUI 和 Desktop，并打印精确 Tauri 命令。每个应用出现后立即完成本组合的人工确认；不要等到整轮结束后凭记忆补写。桌面壳必须人工正常关闭并确认进程树已清理，才允许继续下一个组合。
