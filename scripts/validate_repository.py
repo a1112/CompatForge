@@ -4069,17 +4069,32 @@ def validate_macos_acceptance_surface() -> list[str]:
 
     errors: list[str] = []
     for relative in MACOS_ACCEPTANCE_REVIEWED_PATHS:
-        path = ROOT.joinpath(*PurePosixPath(relative).parts)
+        parts = PurePosixPath(relative).parts
+        path = ROOT
         try:
-            metadata = path.lstat()
+            for index, part in enumerate((None, *parts)):
+                if part is not None:
+                    path = path / part
+                metadata = path.lstat()
+                is_leaf = index == len(parts)
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or getattr(metadata, "st_reparse_tag", 0)
+                    or (
+                        not is_leaf
+                        and not stat.S_ISDIR(metadata.st_mode)
+                    )
+                ):
+                    raise ValueError("unsafe path component")
         except OSError as error:
             errors.append(f"macOS acceptance surface {relative}: {error}")
             continue
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or getattr(metadata, "st_reparse_tag", 0)
-            or not stat.S_ISREG(metadata.st_mode)
-        ):
+        except ValueError:
+            errors.append(
+                f"macOS acceptance surface {relative}: unsafe path component"
+            )
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
             errors.append(
                 f"macOS acceptance surface {relative}: expected a regular no-follow file"
             )

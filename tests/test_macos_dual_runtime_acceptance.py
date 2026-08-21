@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -64,6 +67,38 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             EXPECTED_REVIEWED_PATHS,
         )
         self.assertEqual(validator.validate_macos_acceptance_surface(), [])
+
+    def test_repository_validator_rejects_an_ancestor_link(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-macos-acceptance-validator-"
+        ) as temporary:
+            temporary_root = Path(temporary)
+            repository_root = temporary_root / "repository"
+            tests_root = repository_root / "tests"
+            external_tools = temporary_root / "external-tools"
+            tests_root.mkdir(parents=True)
+            external_tools.mkdir()
+            (tests_root / "test_macos_dual_runtime_acceptance.py").write_text(
+                "# test fixture\n", encoding="utf-8"
+            )
+            (external_tools / "run_macos_dual_runtime_acceptance.py").write_text(
+                "# external fixture\n", encoding="utf-8"
+            )
+            try:
+                os.symlink(
+                    external_tools,
+                    repository_root / "tools",
+                    target_is_directory=True,
+                )
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+            with mock.patch.object(validator, "ROOT", repository_root):
+                errors = validator.validate_macos_acceptance_surface()
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("tools/run_macos_dual_runtime_acceptance.py", errors[0])
+            self.assertIn("unsafe path component", errors[0])
 
 
 if __name__ == "__main__":
