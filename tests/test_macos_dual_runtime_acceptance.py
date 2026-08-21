@@ -53,6 +53,12 @@ CI_SETUP_PYTHON = (
     "uses:actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
 )
 CI_RUST_TOOLCHAIN = "uses:dtolnay/rust-toolchain@stable"
+EXPECTED_CI_TOP_LEVEL = {
+    "name": "CI",
+    "on": "",
+    "permissions": "",
+    "jobs": "",
+}
 EXPECTED_CI_JOBS = {
     "contracts": ("ubuntu-latest", {}),
     "macos-dual-runtime-contracts": (
@@ -64,6 +70,17 @@ EXPECTED_CI_JOBS = {
         {"os": ("ubuntu-latest", "macos-latest", "windows-latest")},
     ),
     "desktop": ("macos-latest", {}),
+}
+EXPECTED_CI_STEP_WITH = {
+    ("contracts", 1): (("python-version", "3.12"),),
+    ("macos-dual-runtime-contracts", 1): (("python-version", "3.12"),),
+    ("rust", 2): (("components", "clippy,rustfmt"),),
+    ("desktop", 1): (
+        ("cache", "npm"),
+        ("cache-dependency-path", "apps/desktop/package-lock.json"),
+        ("node-version", "24"),
+    ),
+    ("desktop", 2): (("components", "clippy,rustfmt"),),
 }
 EXPECTED_CI_STEP_SURFACES = {
     "contracts": (
@@ -151,25 +168,25 @@ EXPECTED_CI_STEP_SURFACES = {
         ),
         (
             "Run ForgeOS dynamic C ABI fixture",
-            "run-sha256:99d0dd5c67e23589d805a78895139115018ae60246be6eb49d93b2eedbc4844b",
+            "run|sha256:99d0dd5c67e23589d805a78895139115018ae60246be6eb49d93b2eedbc4844b",
             "runner.os == 'Linux'",
             "",
         ),
         (
             "Run ForgeOS PE inspection C ABI fixture",
-            "run-sha256:be7872699b22dd5039a5933445ceaf2132787d31a914bdc1f83458950d19fba5",
+            "run|sha256:be7872699b22dd5039a5933445ceaf2132787d31a914bdc1f83458950d19fba5",
             "runner.os == 'Linux'",
             "",
         ),
         (
             "Run ForgeOS PreparedLaunch C ABI fixture",
-            "run-sha256:4c59d2bef8c963c82ad6bb354a1fb9e51563e0bdd1f18cb63419f2c3798d5a42",
+            "run|sha256:4c59d2bef8c963c82ad6bb354a1fb9e51563e0bdd1f18cb63419f2c3798d5a42",
             "runner.os == 'Linux'",
             "",
         ),
         (
             "Run ForgeOS application service C ABI fixture",
-            "run-sha256:14a252e1715dd539449591b4e3e05e196b8d9c88242ee6a7e1a13a18a0f21b23",
+            "run|sha256:14a252e1715dd539449591b4e3e05e196b8d9c88242ee6a7e1a13a18a0f21b23",
             "runner.os == 'Linux'",
             "",
         ),
@@ -205,7 +222,7 @@ EXPECTED_CI_STEP_SURFACES = {
         ),
         (
             "Run Bottle migration fixture sequence",
-            "run-sha256:69c7dbad0a3aecdbf0efe5fbe51fa14913b93a59ba601081ede582fc2484ffc3",
+            "run|sha256:69c7dbad0a3aecdbf0efe5fbe51fa14913b93a59ba601081ede582fc2484ffc3",
             "runner.os != 'macOS'",
             "bash",
         ),
@@ -230,13 +247,13 @@ EXPECTED_CI_STEP_SURFACES = {
         ),
         (
             "Verify and inspect PE fixture",
-            "run-sha256:a3e34d9dfd5c25f1b50239b25ec39f5fe9c2b574f1b8467dfb756546cbfbed67",
+            "run|sha256:a3e34d9dfd5c25f1b50239b25ec39f5fe9c2b574f1b8467dfb756546cbfbed67",
             "",
             "",
         ),
         (
             "Build macOS x86_64 Provider fixture",
-            "run-sha256:aada52d4b8c4c4c27af93c40442a2f991d7e0718114169d51f936d661390e022",
+            "run|sha256:aada52d4b8c4c4c27af93c40442a2f991d7e0718114169d51f936d661390e022",
             "runner.os == 'macOS'",
             "",
         ),
@@ -250,13 +267,13 @@ EXPECTED_CI_STEP_SURFACES = {
         ),
         (
             "Probe and compile macOS Provider context",
-            "run-sha256:f901d4361c8a5b6d4de3145912c5eadd3857ac44b6c0c5ccfaac8a15811ab832",
+            "run|sha256:f901d4361c8a5b6d4de3145912c5eadd3857ac44b6c0c5ccfaac8a15811ab832",
             "runner.os == 'macOS'",
             "",
         ),
         (
             "Launch and terminate through macOS Provider",
-            "run-sha256:2137ceecf302b62d9530a57fca96ad0998f46c4a258bb04d34c05ad4eda52a41",
+            "run|sha256:2137ceecf302b62d9530a57fca96ad0998f46c4a258bb04d34c05ad4eda52a41",
             "runner.os == 'macOS'",
             "",
         ),
@@ -348,6 +365,10 @@ gui_assets = load_module("download_gui_assets_for_dual_runtime_docs", GUI_ASSET_
 desktop_smoke = load_module("desktop_smoke_for_dual_runtime_ci", DESKTOP_SMOKE)
 
 
+def _workflow_block_scalar_style(value: str) -> bool:
+    return re.fullmatch(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?", value) is not None
+
+
 def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
     def active_content(value: str) -> str:
         quote = ""
@@ -381,7 +402,7 @@ def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
             if not stripped:
                 continue
             if indent > block_parent_indent:
-                lines.append((indent, stripped.rstrip()))
+                lines.append((indent, stripped))
                 continue
             block_parent_indent = None
         content = active_content(stripped)
@@ -390,7 +411,7 @@ def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
             candidate = content[2:].strip() if content.startswith("- ") else content
             if ":" in candidate:
                 key, value = _workflow_pair(candidate)
-                if key == "run" and value in ("|", ">", "|-", ">-"):
+                if key == "run" and _workflow_block_scalar_style(value):
                     block_parent_indent = indent
     return lines
 
@@ -411,28 +432,36 @@ def _workflow_scalar(value: str) -> str:
     return value
 
 
-def _normalize_workflow_surface(value: str) -> str:
+def _normalize_workflow_surface(value: str, *, preserve_edges: bool = False) -> str:
     normalized = value.replace("\r\n", "\n").replace("\r", "\n")
-    return re.sub(r"\\\n[ \t]*", "", normalized).strip()
+    normalized = re.sub(r"\\\n[ \t]*", "", normalized)
+    return normalized if preserve_edges else normalized.strip()
 
 
-def _workflow_step_signature(step: dict[str, object]) -> tuple[str, str, str, str]:
+def _workflow_step_signature(
+    step: dict[str, object],
+) -> tuple[str, str, str, str, tuple[tuple[str, str], ...]]:
     fields = step["fields"]
     active_fields = [field for field in ("uses", "run") if field in fields]
     if len(active_fields) != 1:
         raise AssertionError("workflow step must have exactly one active uses or run field")
     active_field = active_fields[0]
-    active_value = _normalize_workflow_surface(fields[active_field])
+    run_style = step["run-style"] if active_field == "run" else ""
+    active_value = _normalize_workflow_surface(
+        fields[active_field], preserve_edges=bool(run_style)
+    )
+    surface_kind = f"run{run_style}" if active_field == "run" else "uses"
     if active_field == "run" and "\n" in active_value:
         digest = hashlib.sha256(active_value.encode("utf-8")).hexdigest()
-        surface = f"run-sha256:{digest}"
+        surface = f"{surface_kind}sha256:{digest}"
     else:
-        surface = f"{active_field}:{active_value}"
+        surface = f"{surface_kind}:{active_value}"
     return (
         _normalize_workflow_surface(fields.get("name", "")),
         surface,
         _normalize_workflow_surface(fields.get("if", "")),
         _normalize_workflow_surface(fields.get("shell", "")),
+        tuple(sorted(step["with"].items())),
     )
 
 
@@ -466,6 +495,13 @@ def _workflow_step(lines: list[tuple[int, str]]) -> dict[str, object]:
         raise AssertionError("workflow step boundary is invalid")
     fields: dict[str, str] = {}
     with_fields: dict[str, str] = {}
+    direct_keys: set[str] = set()
+    run_style = ""
+
+    def record_key(key: str) -> None:
+        if key in direct_keys:
+            raise AssertionError(f"duplicate workflow step field: {key}")
+        direct_keys.add(key)
 
     def set_field(key: str, value: str) -> None:
         if key in fields:
@@ -473,6 +509,7 @@ def _workflow_step(lines: list[tuple[int, str]]) -> dict[str, object]:
         fields[key] = _workflow_scalar(value)
 
     first_key, first_value = _workflow_pair(lines[0][1][2:].strip())
+    record_key(first_key)
     set_field(first_key, first_value)
     index = 1
     while index < len(lines):
@@ -481,6 +518,7 @@ def _workflow_step(lines: list[tuple[int, str]]) -> dict[str, object]:
             index += 1
             continue
         key, value = _workflow_pair(content)
+        record_key(key)
         if key == "with":
             if value:
                 raise AssertionError("workflow step with mapping must be expanded")
@@ -496,7 +534,8 @@ def _workflow_step(lines: list[tuple[int, str]]) -> dict[str, object]:
                     with_fields[child_key] = _workflow_scalar(child_value)
                 index += 1
             continue
-        if key == "run" and value in ("|", ">", "|-", ">-"):
+        if key == "run" and _workflow_block_scalar_style(value):
+            run_style = value
             index += 1
             command_lines: list[str] = []
             while index < len(lines) and lines[index][0] > 8:
@@ -506,7 +545,12 @@ def _workflow_step(lines: list[tuple[int, str]]) -> dict[str, object]:
             continue
         set_field(key, value)
         index += 1
-    return {"fields": fields, "with": with_fields}
+    return {
+        "fields": fields,
+        "keys": tuple(sorted(direct_keys)),
+        "run-style": run_style,
+        "with": with_fields,
+    }
 
 
 def _workflow_job(lines: list[tuple[int, str]]) -> dict[str, object]:
@@ -519,6 +563,7 @@ def _workflow_job(lines: list[tuple[int, str]]) -> dict[str, object]:
             direct_fields[key] = _workflow_scalar(value)
 
     matrix: dict[str, object] = {}
+    strategy_fields: dict[str, str] = {}
     strategy_index = next(
         (
             index
@@ -536,6 +581,12 @@ def _workflow_job(lines: list[tuple[int, str]]) -> dict[str, object]:
             ),
             len(lines),
         )
+        for indent, content in lines[strategy_index + 1 : strategy_end]:
+            if indent == 6 and not content.startswith("- "):
+                key, value = _workflow_pair(content)
+                if key in strategy_fields:
+                    raise AssertionError(f"duplicate workflow strategy field: {key}")
+                strategy_fields[key] = _workflow_scalar(value)
         matrix_index = next(
             (
                 index
@@ -591,15 +642,22 @@ def _workflow_job(lines: list[tuple[int, str]]) -> dict[str, object]:
         for position, start in enumerate(starts):
             end = starts[position + 1] if position + 1 < len(starts) else steps_end
             steps.append(_workflow_step(lines[start:end]))
-    return {"fields": direct_fields, "matrix": matrix, "steps": steps}
+    return {
+        "fields": direct_fields,
+        "matrix": matrix,
+        "steps": steps,
+        "strategy": strategy_fields,
+    }
 
 
 def _workflow_oracle(source: str) -> dict[str, object]:
     lines = _workflow_comment_free_lines(source)
     top_headers = _workflow_headers(lines, 0)
     top = {key: (index, value) for index, key, value in top_headers}
-    if "on" not in top or "jobs" not in top:
-        raise AssertionError("workflow must define top-level on and jobs mappings")
+    if not {"on", "permissions", "jobs"}.issubset(top):
+        raise AssertionError(
+            "workflow must define top-level on, permissions, and jobs mappings"
+        )
 
     def top_block(name: str) -> list[tuple[int, str]]:
         start = top[name][0]
@@ -608,6 +666,15 @@ def _workflow_oracle(source: str) -> dict[str, object]:
             len(lines),
         )
         return lines[start + 1 : end]
+
+    top_values = {key: _workflow_scalar(value) for _index, key, value in top_headers}
+    permissions: dict[str, str] = {}
+    for indent, content in top_block("permissions"):
+        if indent == 2 and not content.startswith("- "):
+            key, value = _workflow_pair(content)
+            if key in permissions:
+                raise AssertionError(f"duplicate workflow permission: {key}")
+            permissions[key] = _workflow_scalar(value)
 
     trigger_lines = top_block("on")
     trigger_headers = _workflow_headers(trigger_lines, 2)
@@ -645,7 +712,13 @@ def _workflow_oracle(source: str) -> dict[str, object]:
             else len(job_lines)
         )
         jobs[name] = _workflow_job(job_lines[start + 1 : end])
-    return {"triggers": triggers, "jobs": jobs, "lines": lines}
+    return {
+        "top": top_values,
+        "permissions": permissions,
+        "triggers": triggers,
+        "jobs": jobs,
+        "lines": lines,
+    }
 
 
 class MacOsDualRuntimeCiContractTests(unittest.TestCase):
@@ -688,27 +761,56 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             self.assertNotIn("if", fields, label)
             self.assertNotIn("continue-on-error", fields, label)
 
+        self.assertEqual(document["top"], EXPECTED_CI_TOP_LEVEL)
+        self.assertEqual(document["permissions"], {"contents": "read"})
         self.assertEqual(set(triggers), {"push", "pull_request"})
         self.assertEqual(triggers["push"], {"branches": ("main",)})
         self.assertEqual(triggers["pull_request"], {})
         self.assertEqual(tuple(jobs), tuple(EXPECTED_CI_JOBS))
         for job_name, (runner, matrix) in EXPECTED_CI_JOBS.items():
             job = jobs[job_name]
-            self.assertEqual(job["fields"].get("runs-on"), runner, job_name)
+            expected_fields = {"runs-on": runner, "steps": ""}
+            expected_strategy: dict[str, str] = {}
+            if matrix:
+                expected_fields["strategy"] = ""
+                expected_strategy = {"fail-fast": "false", "matrix": ""}
+            self.assertEqual(job["fields"], expected_fields, job_name)
+            self.assertEqual(job["strategy"], expected_strategy, job_name)
             self.assertEqual(job["matrix"], matrix, job_name)
             for control in ("needs", "if", "continue-on-error"):
                 self.assertNotIn(control, job["fields"], job_name)
             actual_steps = tuple(
                 _workflow_step_signature(step) for step in job["steps"]
             )
+            expected_steps = tuple(
+                (
+                    *surface,
+                    EXPECTED_CI_STEP_WITH.get((job_name, index), ()),
+                )
+                for index, surface in enumerate(EXPECTED_CI_STEP_SURFACES[job_name])
+            )
             self.assertEqual(
                 actual_steps,
-                EXPECTED_CI_STEP_SURFACES[job_name],
+                expected_steps,
                 job_name,
             )
             self.assertEqual(actual_steps[0][1], CI_CHECKOUT, job_name)
             self.assertEqual(job["steps"][0]["with"], {}, job_name)
-            for step in job["steps"]:
+            for index, step in enumerate(job["steps"]):
+                name, surface, condition, shell = EXPECTED_CI_STEP_SURFACES[
+                    job_name
+                ][index]
+                expected_keys = {"uses"} if surface.startswith("uses:") else {
+                    "name",
+                    "run",
+                }
+                if EXPECTED_CI_STEP_WITH.get((job_name, index)):
+                    expected_keys.add("with")
+                if condition:
+                    expected_keys.add("if")
+                if shell:
+                    expected_keys.add("shell")
+                self.assertEqual(step["keys"], tuple(sorted(expected_keys)), name)
                 for control in ("working-directory", "env", "continue-on-error"):
                     self.assertNotIn(control, step["fields"], job_name)
 
@@ -1003,6 +1105,70 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(AssertionError):
                 self._assert_workflow_contract(mutant)
 
+    def test_closed_workflow_oracle_rejects_final_review_mutants(self) -> None:
+        workflow = self._workflow()
+        dual_marker = "\n  macos-dual-runtime-contracts:\n"
+        mutants = {
+            "folded-run-scalar": workflow.replace(
+                "        run: |\n", "        run: >\n", 1
+            ),
+            "continuation-trailing-space": workflow.replace(
+                "          cc -std=c11 -Wall -Wextra -Werror \\\n",
+                "          cc -std=c11 -Wall -Wextra -Werror \\ \n",
+                1,
+            ),
+            "top-env": workflow.replace(
+                "\njobs:\n", "\nenv:\n  WINE: injected\n\njobs:\n", 1
+            ),
+            "job-env": workflow.replace(
+                dual_marker,
+                dual_marker + "    env:\n      WINE: injected\n",
+                1,
+            ),
+            "job-default-cwd": workflow.replace(
+                dual_marker,
+                dual_marker
+                + "    defaults:\n"
+                + "      run:\n"
+                + "        working-directory: /tmp\n",
+                1,
+            ),
+            "job-container": workflow.replace(
+                dual_marker,
+                dual_marker + "    container: wine:latest\n",
+                1,
+            ),
+            "setup-node-cache": workflow.replace(
+                "          cache: npm\n", "          cache: invalid\n", 1
+            ),
+            "setup-python-inputs": workflow.replace(
+                '          python-version: "3.12"\n',
+                '          python-version: "3.12"\n'
+                "          cache: invalid\n"
+                "          architecture: x86\n",
+                1,
+            ),
+            "rust-components": workflow.replace(
+                "          components: clippy,rustfmt\n",
+                "          components: invalid\n",
+                1,
+            ),
+        }
+        for label, mutant in mutants.items():
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                self._assert_workflow_contract(mutant)
+
+    def test_closed_workflow_oracle_accepts_equivalent_quoted_scalars(self) -> None:
+        workflow = self._workflow()
+        quoted = (
+            workflow.replace("name: CI\n", 'name: "CI"\n', 1)
+            .replace('python-version: "3.12"', "python-version: '3.12'")
+            .replace('node-version: "24"', "node-version: '24'")
+            .replace("cache: npm", 'cache: "npm"')
+            .replace("contents: read", 'contents: "read"')
+        )
+        self._assert_workflow_contract(quoted)
+
     def test_structured_workflow_oracle_rejects_active_forbidden_surfaces(self) -> None:
         workflow = self._workflow()
         commands = (
@@ -1039,7 +1205,11 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             self._assert_workflow_contract(self_hosted)
 
     def test_structured_workflow_oracle_ignores_comments(self) -> None:
-        workflow = self._workflow() + (
+        workflow = self._workflow().replace(
+            '          python-version: "3.12"\n',
+            '          python-version: "3.12" # pinned interpreter\n',
+            1,
+        ) + (
             "\n# curl https://example.invalid/runtime\n"
             "# sudo installer -pkg Runtime.pkg -target /\n"
             "# uses: crossover/download-runtime@v1\n"
