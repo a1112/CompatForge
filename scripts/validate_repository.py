@@ -404,6 +404,10 @@ MAX_ORDINARY_SCAN_BYTES = 32 * 1024 * 1024
 MAX_ORDINARY_SCAN_ENTRIES = 100_000
 MAX_ORDINARY_SCAN_TOTAL_BYTES = 1024 * 1024 * 1024
 DEVELOPER_PATH_VALIDATION_ERROR = "Repository developer-path validation failed"
+MACOS_ACCEPTANCE_REVIEWED_PATHS = (
+    "tests/test_macos_dual_runtime_acceptance.py",
+    "tools/run_macos_dual_runtime_acceptance.py",
+)
 
 
 def _bind_validator_directory(path: Path) -> tuple[object, tuple[int, int]]:
@@ -4060,6 +4064,28 @@ def validate_macos_preview_binary_hygiene() -> list[str]:
     return errors
 
 
+def validate_macos_acceptance_surface() -> list[str]:
+    """Require every explicitly reviewed local acceptance entry to be regular."""
+
+    errors: list[str] = []
+    for relative in MACOS_ACCEPTANCE_REVIEWED_PATHS:
+        path = ROOT.joinpath(*PurePosixPath(relative).parts)
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            errors.append(f"macOS acceptance surface {relative}: {error}")
+            continue
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or getattr(metadata, "st_reparse_tag", 0)
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            errors.append(
+                f"macOS acceptance surface {relative}: expected a regular no-follow file"
+            )
+    return errors
+
+
 def main() -> int:
     errors = (
         validate_macwin_asset_migration()
@@ -4070,6 +4096,7 @@ def main() -> int:
         + validate_no_developer_paths()
         + validate_pe_inspection_fixture()
         + validate_macos_preview_binary_hygiene()
+        + validate_macos_acceptance_surface()
     )
     if errors:
         print("repository validation failed:", file=sys.stderr)
