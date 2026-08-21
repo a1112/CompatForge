@@ -4,6 +4,7 @@ import importlib.util
 import copy
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -45,6 +46,282 @@ EXPECTED_REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
     "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+}
+
+CI_CHECKOUT = "uses:actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+CI_SETUP_PYTHON = (
+    "uses:actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+)
+CI_RUST_TOOLCHAIN = "uses:dtolnay/rust-toolchain@stable"
+EXPECTED_CI_JOBS = {
+    "contracts": ("ubuntu-latest", {}),
+    "macos-dual-runtime-contracts": (
+        "${{ matrix.os }}",
+        {"os": ("windows-latest", "macos-latest")},
+    ),
+    "rust": (
+        "${{ matrix.os }}",
+        {"os": ("ubuntu-latest", "macos-latest", "windows-latest")},
+    ),
+    "desktop": ("macos-latest", {}),
+}
+EXPECTED_CI_STEP_SURFACES = {
+    "contracts": (
+        ("", CI_CHECKOUT, "", ""),
+        ("", CI_SETUP_PYTHON, "", ""),
+        (
+            "Validate repository contracts",
+            "run:python -B scripts/validate_repository.py",
+            "",
+            "",
+        ),
+        (
+            "Test macOS headless preview contracts",
+            "run:python -S -B -m unittest tests.test_macos_headless_preview -v",
+            "",
+            "",
+        ),
+        (
+            "Test desktop GUI baseline contracts",
+            "run:python -S -B -m unittest tests.test_gui_baseline_contracts -v",
+            "",
+            "",
+        ),
+        (
+            "Test Bottle migration contracts and independent goldens",
+            "run:python -S -B -m unittest "
+            "tests.test_bottle_migration_contracts.BottleMigrationRepositoryTests "
+            "tests.test_bottle_migration_contracts.BottleMigrationGoldenTests",
+            "",
+            "",
+        ),
+        (
+            "Check portable Mac-Win assets",
+            "run:python -B tools/convert_macwin_assets.py --check",
+            "",
+            "",
+        ),
+        (
+            "Compile public C header",
+            "run:cc -std=c11 -Wall -Wextra -Werror -x c -fsyntax-only -include "
+            "crates/compatforge-ffi/include/compatforge.h /dev/null",
+            "",
+            "",
+        ),
+        (
+            "Compile public C++ header",
+            "run:c++ -std=c++17 -Wall -Wextra -Werror -x c++ -fsyntax-only "
+            "-include crates/compatforge-ffi/include/compatforge.h /dev/null",
+            "",
+            "",
+        ),
+    ),
+    "macos-dual-runtime-contracts": (
+        ("", CI_CHECKOUT, "", ""),
+        ("", CI_SETUP_PYTHON, "", ""),
+        (
+            "Test dual-Runtime macOS acceptance contracts",
+            "run:python -S -B -m unittest "
+            "tests.test_macos_dual_runtime_acceptance -v",
+            "",
+            "",
+        ),
+    ),
+    "rust": (
+        ("", CI_CHECKOUT, "", ""),
+        (
+            "Check portable Mac-Win assets",
+            "run:python -B tools/convert_macwin_assets.py --check",
+            "",
+            "",
+        ),
+        ("", CI_RUST_TOOLCHAIN, "", ""),
+        ("Check formatting", "run:cargo fmt --all --check", "", ""),
+        (
+            "Check workspace",
+            "run:cargo check --workspace --all-targets --locked",
+            "",
+            "",
+        ),
+        (
+            "Build C ABI library",
+            "run:cargo build -p compatforge-ffi --locked",
+            "",
+            "",
+        ),
+        (
+            "Run ForgeOS dynamic C ABI fixture",
+            "run-sha256:99d0dd5c67e23589d805a78895139115018ae60246be6eb49d93b2eedbc4844b",
+            "runner.os == 'Linux'",
+            "",
+        ),
+        (
+            "Run ForgeOS PE inspection C ABI fixture",
+            "run-sha256:be7872699b22dd5039a5933445ceaf2132787d31a914bdc1f83458950d19fba5",
+            "runner.os == 'Linux'",
+            "",
+        ),
+        (
+            "Run ForgeOS PreparedLaunch C ABI fixture",
+            "run-sha256:4c59d2bef8c963c82ad6bb354a1fb9e51563e0bdd1f18cb63419f2c3798d5a42",
+            "runner.os == 'Linux'",
+            "",
+        ),
+        (
+            "Run ForgeOS application service C ABI fixture",
+            "run-sha256:14a252e1715dd539449591b4e3e05e196b8d9c88242ee6a7e1a13a18a0f21b23",
+            "runner.os == 'Linux'",
+            "",
+        ),
+        ("Run tests", "run:cargo test --workspace --locked", "", ""),
+        (
+            "Install Runtime Pack fixture v1",
+            "run:cargo run -p compatforge-cli --locked -- runtime install "
+            "target/runtime-store tests/fixtures/runtime-packs/basic-v1 manifest.json",
+            "",
+            "",
+        ),
+        (
+            "Install Runtime Pack fixture v2",
+            "run:cargo run -p compatforge-cli --locked -- runtime install "
+            "target/runtime-store tests/fixtures/runtime-packs/basic-v2 manifest.json",
+            "",
+            "",
+        ),
+        (
+            "Verify Runtime Pack fixture v2",
+            "run:cargo run -p compatforge-cli --locked -- runtime verify "
+            "target/runtime-store "
+            "sha256:b7e18e933c0a51f6f1ec387862793e5d22cc2edb7e23c114449ea98357d717af",
+            "",
+            "",
+        ),
+        (
+            "Roll back Runtime Pack fixture",
+            "run:cargo run -p compatforge-cli --locked -- runtime rollback "
+            "target/runtime-store fixture-runtime",
+            "",
+            "",
+        ),
+        (
+            "Run Bottle migration fixture sequence",
+            "run-sha256:69c7dbad0a3aecdbf0efe5fbe51fa14913b93a59ba601081ede582fc2484ffc3",
+            "runner.os != 'macOS'",
+            "bash",
+        ),
+        (
+            "Check strict Bottle migration boundary on macOS",
+            "run:cargo test -p compatforge-bottle snapshot --locked",
+            "runner.os == 'macOS'",
+            "",
+        ),
+        (
+            "Compile example launch plan",
+            "run:cargo run -p compatforge-cli --locked -- plan "
+            "examples/context-config.linux-arm64.json examples/launch-request.json",
+            "",
+            "",
+        ),
+        (
+            "Probe host capabilities",
+            "run:cargo run -p compatforge-cli --locked -- probe",
+            "",
+            "",
+        ),
+        (
+            "Verify and inspect PE fixture",
+            "run-sha256:a3e34d9dfd5c25f1b50239b25ec39f5fe9c2b574f1b8467dfb756546cbfbed67",
+            "",
+            "",
+        ),
+        (
+            "Build macOS x86_64 Provider fixture",
+            "run-sha256:aada52d4b8c4c4c27af93c40442a2f991d7e0718114169d51f936d661390e022",
+            "runner.os == 'macOS'",
+            "",
+        ),
+        (
+            "Install macOS Provider Runtime Pack fixture",
+            "run:cargo run -p compatforge-cli --locked -- runtime install "
+            "target/macos-provider-fixture/store "
+            "target/macos-provider-fixture/bundle manifest.json",
+            "runner.os == 'macOS'",
+            "",
+        ),
+        (
+            "Probe and compile macOS Provider context",
+            "run-sha256:f901d4361c8a5b6d4de3145912c5eadd3857ac44b6c0c5ccfaac8a15811ab832",
+            "runner.os == 'macOS'",
+            "",
+        ),
+        (
+            "Launch and terminate through macOS Provider",
+            "run-sha256:2137ceecf302b62d9530a57fca96ad0998f46c4a258bb04d34c05ad4eda52a41",
+            "runner.os == 'macOS'",
+            "",
+        ),
+        (
+            "Run Clippy",
+            "run:cargo clippy --workspace --all-targets --locked -- -D warnings",
+            "",
+            "",
+        ),
+    ),
+    "desktop": (
+        ("", CI_CHECKOUT, "", ""),
+        (
+            "",
+            "uses:actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+            "",
+            "",
+        ),
+        ("", CI_RUST_TOOLCHAIN, "", ""),
+        (
+            "Install locked desktop dependencies",
+            "run:npm ci --prefix apps/desktop",
+            "",
+            "",
+        ),
+        (
+            "Check and build TypeScript frontend",
+            "run:npm run build --prefix apps/desktop",
+            "",
+            "",
+        ),
+        (
+            "Check Tauri Rust formatting",
+            "run:cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check",
+            "",
+            "",
+        ),
+        (
+            "Test Tauri Rust commands and state",
+            "run:cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked",
+            "",
+            "",
+        ),
+        (
+            "Lint Tauri Rust commands",
+            "run:cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml "
+            "--all-targets --locked -- -D warnings",
+            "",
+            "",
+        ),
+        (
+            "Build CompatForge.app",
+            "run:npm run tauri --prefix apps/desktop -- build --bundles app",
+            "",
+            "",
+        ),
+        (
+            "Run packaged Tauri smoke",
+            "run:python -B apps/desktop/tests/smoke.py "
+            "apps/desktop/src-tauri/target/release/bundle/macos/"
+            "CompatForge.app/Contents/MacOS/CompatForge",
+            "",
+            "",
+        ),
+    ),
 }
 
 
@@ -93,13 +370,28 @@ def _workflow_comment_free_lines(source: str) -> list[tuple[int, str]]:
         return value.rstrip()
 
     lines: list[tuple[int, str]] = []
+    block_parent_indent: int | None = None
     for raw_line in source.splitlines():
         prefix = raw_line[: len(raw_line) - len(raw_line.lstrip())]
         if "\t" in prefix:
             raise AssertionError("workflow indentation must use spaces")
-        content = active_content(raw_line.lstrip(" "))
+        indent = len(prefix)
+        stripped = raw_line.lstrip(" ")
+        if block_parent_indent is not None:
+            if not stripped:
+                continue
+            if indent > block_parent_indent:
+                lines.append((indent, stripped.rstrip()))
+                continue
+            block_parent_indent = None
+        content = active_content(stripped)
         if content:
-            lines.append((len(prefix), content))
+            lines.append((indent, content))
+            candidate = content[2:].strip() if content.startswith("- ") else content
+            if ":" in candidate:
+                key, value = _workflow_pair(candidate)
+                if key == "run" and value in ("|", ">", "|-", ">-"):
+                    block_parent_indent = indent
     return lines
 
 
@@ -117,6 +409,31 @@ def _workflow_scalar(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
     return value
+
+
+def _normalize_workflow_surface(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\\\n[ \t]*", "", normalized).strip()
+
+
+def _workflow_step_signature(step: dict[str, object]) -> tuple[str, str, str, str]:
+    fields = step["fields"]
+    active_fields = [field for field in ("uses", "run") if field in fields]
+    if len(active_fields) != 1:
+        raise AssertionError("workflow step must have exactly one active uses or run field")
+    active_field = active_fields[0]
+    active_value = _normalize_workflow_surface(fields[active_field])
+    if active_field == "run" and "\n" in active_value:
+        digest = hashlib.sha256(active_value.encode("utf-8")).hexdigest()
+        surface = f"run-sha256:{digest}"
+    else:
+        surface = f"{active_field}:{active_value}"
+    return (
+        _normalize_workflow_surface(fields.get("name", "")),
+        surface,
+        _normalize_workflow_surface(fields.get("if", "")),
+        _normalize_workflow_surface(fields.get("shell", "")),
+    )
 
 
 def _workflow_inline_list(value: str) -> tuple[str, ...]:
@@ -352,6 +669,16 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
         step = f"      - name: Mutant step\n        {field}: {value}\n"
         return workflow.replace(marker, f"\n{step}{marker}", 1)
 
+    @staticmethod
+    def _replace_after(workflow: str, marker: str, old: str, new: str) -> str:
+        start = workflow.find(marker)
+        if start < 0:
+            raise AssertionError(f"workflow marker is missing: {marker}")
+        target = workflow.find(old, start + len(marker))
+        if target < 0:
+            raise AssertionError(f"workflow target is missing after {marker}: {old}")
+        return workflow[:target] + new + workflow[target + len(old) :]
+
     def _assert_workflow_contract(self, source: str) -> None:
         document = _workflow_oracle(source)
         triggers = document["triggers"]
@@ -361,9 +688,29 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             self.assertNotIn("if", fields, label)
             self.assertNotIn("continue-on-error", fields, label)
 
-        self.assertIn("push", triggers)
-        self.assertIn("pull_request", triggers)
-        self.assertEqual(triggers["push"].get("branches"), ("main",))
+        self.assertEqual(set(triggers), {"push", "pull_request"})
+        self.assertEqual(triggers["push"], {"branches": ("main",)})
+        self.assertEqual(triggers["pull_request"], {})
+        self.assertEqual(tuple(jobs), tuple(EXPECTED_CI_JOBS))
+        for job_name, (runner, matrix) in EXPECTED_CI_JOBS.items():
+            job = jobs[job_name]
+            self.assertEqual(job["fields"].get("runs-on"), runner, job_name)
+            self.assertEqual(job["matrix"], matrix, job_name)
+            for control in ("needs", "if", "continue-on-error"):
+                self.assertNotIn(control, job["fields"], job_name)
+            actual_steps = tuple(
+                _workflow_step_signature(step) for step in job["steps"]
+            )
+            self.assertEqual(
+                actual_steps,
+                EXPECTED_CI_STEP_SURFACES[job_name],
+                job_name,
+            )
+            self.assertEqual(actual_steps[0][1], CI_CHECKOUT, job_name)
+            self.assertEqual(job["steps"][0]["with"], {}, job_name)
+            for step in job["steps"]:
+                for control in ("working-directory", "env", "continue-on-error"):
+                    self.assertNotIn(control, step["fields"], job_name)
 
         dual = jobs.get("macos-dual-runtime-contracts")
         self.assertIsNotNone(dual)
@@ -460,43 +807,6 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
             ],
         )
 
-        active_surfaces = [
-            step["fields"][field]
-            for job in jobs.values()
-            for step in job["steps"]
-            for field in ("run", "uses")
-            if field in step["fields"]
-        ]
-        forbidden = (
-            "curl",
-            "wget",
-            "invoke-webrequest",
-            "urllib",
-            "download",
-            "download_gui_assets.py",
-            "run_gui_baseline.py",
-            "--allow-network",
-            "--accept-interactive",
-            "crossover",
-            "codeweavers",
-            "whisky",
-            "screenshot",
-            "screencapture",
-            "7z.exe",
-            "sumatrapdf.exe",
-            "notepad++.exe",
-            "msiexec",
-            "sudo ",
-            "installer",
-            ".pkg",
-            ".dmg",
-            "hdiutil",
-        )
-        for surface in active_surfaces:
-            folded = surface.casefold()
-            for token in forbidden:
-                self.assertNotIn(token, folded, surface)
-
         active_lines = "\n".join(content for _indent, content in document["lines"])
         folded_lines = active_lines.casefold()
         for token in ("secrets.", "secrets[", "secrets:", "self-hosted"):
@@ -553,6 +863,12 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
 
     def test_default_ci_has_the_complete_active_contract(self) -> None:
         self._assert_workflow_contract(self._workflow())
+
+    def test_workflow_surface_normalization_closes_crlf_continuations(self) -> None:
+        self.assertEqual(
+            _normalize_workflow_surface("  cu\\\r\n    rl https://example.invalid  "),
+            "curl https://example.invalid",
+        )
 
     def test_desktop_smoke_scrubs_runtime_environment(self) -> None:
         source = {
@@ -615,6 +931,74 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
                 ),
             }
         )
+        for label, mutant in mutants.items():
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                self._assert_workflow_contract(mutant)
+
+    def test_closed_workflow_oracle_rejects_second_review_mutants(self) -> None:
+        workflow = self._workflow()
+        dual_marker = "\n  macos-dual-runtime-contracts:\n"
+        checkout = (
+            "      - uses: actions/checkout@"
+            "11bd71901bbe5b1630ceea73d27597364c9af683\n"
+        )
+        dual_command = (
+            "        run: python -S -B -m unittest "
+            "tests.test_macos_dual_runtime_acceptance -v\n"
+        )
+        needs_disabled = workflow.replace(
+            dual_marker,
+            "\n  disabled-contracts:\n"
+            "    if: false\n"
+            "    runs-on: ubuntu-latest\n"
+            "\n  macos-dual-runtime-contracts:\n"
+            "    needs: disabled-contracts\n",
+            1,
+        )
+        split_curl = workflow.replace(
+            dual_marker,
+            "\n      - name: Split network mutant\n"
+            "        run: |\n"
+            "          cu\\\n"
+            "          rl https://example.invalid/runtime\n"
+            + dual_marker,
+            1,
+        )
+        mutants = {
+            "pull-request-closed": workflow.replace(
+                "  pull_request:\n", "  pull_request:\n    types: [closed]\n", 1
+            ),
+            "push-paths-ignore-all": workflow.replace(
+                "    branches: [main]\n",
+                "    branches: [main]\n    paths-ignore: ['**']\n",
+                1,
+            ),
+            "dual-needs-disabled-job": needs_disabled,
+            "remove-dual-checkout": self._replace_after(
+                workflow, dual_marker, checkout, ""
+            ),
+            "dual-working-directory": self._replace_after(
+                workflow,
+                dual_marker,
+                dual_command,
+                dual_command + "        working-directory: /tmp\n",
+            ),
+            "wine-msi": self._append_contract_step(
+                workflow, "run", "wine Runtime.msi"
+            ),
+            "wine-setup": self._append_contract_step(
+                workflow, "run", "wine setup.exe /S"
+            ),
+            "split-curl": split_curl,
+            "block-shell-comment": workflow.replace(
+                "        run: |\n"
+                "          cc -std=c11 -Wall -Wextra -Werror \\\n",
+                "        run: |\n"
+                "          # active shell input\n"
+                "          cc -std=c11 -Wall -Wextra -Werror \\\n",
+                1,
+            ),
+        }
         for label, mutant in mutants.items():
             with self.subTest(label=label), self.assertRaises(AssertionError):
                 self._assert_workflow_contract(mutant)
