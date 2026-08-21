@@ -230,9 +230,17 @@ class SourceBinding:
 
 
 @dataclass(frozen=True)
+class OwnedDirectoryIdentity:
+    label: str
+    path: Path
+    identity: NodeIdentity
+
+
+@dataclass(frozen=True)
 class OwnedNode:
     path: Path
     identity: NodeIdentity
+    directory_chain: tuple[OwnedDirectoryIdentity, ...]
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -1260,7 +1268,7 @@ def _owned_directory(
     if parent is not None:
         if path.parent != parent.path:
             raise AcceptanceError(f"{label} parent is invalid")
-        _verify_owned_directory(parent, f"{label} parent")
+        _verify_owned_directory(parent, IntegrityError)
     try:
         if create:
             os.mkdir(path, 0o700)
@@ -1269,24 +1277,70 @@ def _owned_directory(
         raise AcceptanceError(f"{label} could not be created safely") from error
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
         raise AcceptanceError(f"{label} is unsafe")
-    owned = OwnedNode(path, _node_identity(metadata))
+    identity = _node_identity(metadata)
+    chain = (
+        parent.directory_chain if parent is not None else ()
+    ) + (OwnedDirectoryIdentity(label, path, identity),)
+    owned = OwnedNode(path, identity, chain)
     if parent is not None:
-        _verify_owned_directory(parent, f"{label} parent")
+        _verify_owned_directory(parent, IntegrityError)
+    _verify_owned_directory(owned, IntegrityError)
     return owned
 
 
-def _verify_owned_directory(owned: OwnedNode, label: str) -> None:
+def _verify_owned_chain(
+    owned: OwnedNode,
+    error_type: type[AcceptanceError],
+) -> None:
+    previous: Path | None = None
+    for component in owned.directory_chain:
+        if previous is not None and component.path.parent != previous:
+            raise error_type("owned directory chain is invalid")
+        try:
+            metadata = component.path.lstat()
+        except OSError as error:
+            raise error_type(f"{component.label} identity changed") from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or _node_identity(metadata) != component.identity
+        ):
+            raise error_type(f"{component.label} identity changed")
+        previous = component.path
+
+
+def _verify_owned_directory(
+    owned: OwnedNode,
+    error_type: type[AcceptanceError] = CleanupError,
+) -> None:
+    _verify_owned_chain(owned, error_type)
+    if (
+        not owned.directory_chain
+        or owned.directory_chain[-1].path != owned.path
+        or owned.directory_chain[-1].identity != owned.identity
+    ):
+        raise error_type("owned directory binding is invalid")
+
+
+def _verify_owned_file(
+    owned: OwnedNode,
+    error_type: type[AcceptanceError] = CleanupError,
+) -> os.stat_result:
+    _verify_owned_chain(owned, error_type)
     try:
         metadata = owned.path.lstat()
     except OSError as error:
-        raise CleanupError(f"{label} identity changed") from error
+        raise error_type("negative copy identity changed") from error
     if (
-        not stat.S_ISDIR(metadata.st_mode)
+        not stat.S_ISREG(metadata.st_mode)
         or stat.S_ISLNK(metadata.st_mode)
         or _is_reparse(metadata)
+        or metadata.st_nlink != 1
         or _node_identity(metadata) != owned.identity
     ):
-        raise CleanupError(f"{label} identity changed")
+        raise error_type("negative copy identity changed")
+    return metadata
 
 
 def _create_private_copy(
@@ -1295,7 +1349,7 @@ def _create_private_copy(
     *,
     filename: str = "payload.bin",
 ) -> OwnedNode:
-    _verify_owned_directory(case_root, "negative case root")
+    _verify_owned_directory(case_root, IntegrityError)
     if Path(filename).name != filename or not filename:
         raise AcceptanceError("negative copy filename is invalid")
     target = case_root.path / filename
@@ -1321,7 +1375,9 @@ def _create_private_copy(
             or current.st_size != len(payload)
         ):
             raise IntegrityError("negative copy identity changed")
-        return OwnedNode(target, _node_identity(opened))
+        owned = OwnedNode(target, _node_identity(opened), case_root.directory_chain)
+        _verify_owned_file(owned, IntegrityError)
+        return owned
     except IntegrityError:
         raise
     except OSError as error:
@@ -1335,6 +1391,7 @@ def _create_private_copy(
 
 
 def _mutate_owned_copy(owned: OwnedNode) -> None:
+    _verify_owned_file(owned, IntegrityError)
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
     descriptor: int | None = None
@@ -1351,6 +1408,7 @@ def _mutate_owned_copy(owned: OwnedNode) -> None:
             or opened.st_size <= 0
         ):
             raise IntegrityError("negative copy identity changed")
+        _verify_owned_file(owned, IntegrityError)
         original = os.read(descriptor, 1)
         if len(original) != 1:
             raise OSError("negative copy is empty")
@@ -1368,6 +1426,7 @@ def _mutate_owned_copy(owned: OwnedNode) -> None:
             or current.st_size != opened.st_size
         ):
             raise IntegrityError("negative copy identity changed")
+        _verify_owned_file(owned, IntegrityError)
     except IntegrityError:
         raise
     except OSError as error:
@@ -1381,25 +1440,23 @@ def _mutate_owned_copy(owned: OwnedNode) -> None:
 
 
 def _cleanup_owned_case(case_root: OwnedNode, owned_file: OwnedNode) -> None:
-    _verify_owned_directory(case_root, "negative case root")
+    _verify_owned_directory(case_root)
     try:
         entries = _bounded_entries(case_root.path, 1, "negative case root")
         if entries != [owned_file.path]:
             raise CleanupError("negative case contents changed")
-        metadata = owned_file.path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or _is_reparse(metadata)
-            or metadata.st_nlink != 1
-            or _node_identity(metadata) != owned_file.identity
-        ):
-            raise CleanupError("negative copy identity changed")
+        _verify_owned_file(owned_file)
         owned_file.path.unlink()
-        _verify_owned_directory(case_root, "negative case root")
+        _verify_owned_directory(case_root)
         if _bounded_entries(case_root.path, 1, "negative case root"):
             raise CleanupError("negative case cleanup is incomplete")
         case_root.path.rmdir()
+        parent_chain = OwnedNode(
+            case_root.path.parent,
+            case_root.directory_chain[-2].identity,
+            case_root.directory_chain[:-1],
+        )
+        _verify_owned_directory(parent_chain)
     except CleanupError:
         raise
     except AcceptanceError as error:
@@ -1411,13 +1468,19 @@ def _cleanup_owned_case(case_root: OwnedNode, owned_file: OwnedNode) -> None:
 def _prepare_negative_layout(paths: AcceptancePaths) -> dict[str, OwnedNode]:
     _revalidate_bindings(paths)
     _empty_or_absent_directory(paths.work_root, "work-root")
-    try:
-        paths.work_root.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise AcceptanceError("negative work root could not be created") from error
-    _refresh_root_bindings(paths)
+    work_binding = paths.bindings.get("work-root")
+    if work_binding is None or not work_binding.target_existed:
+        raise AcceptanceError("negative checks require a bound empty work-root")
     work_metadata = paths.work_root.lstat()
-    work_root = OwnedNode(paths.work_root, _node_identity(work_metadata))
+    work_identity = _node_identity(work_metadata)
+    if dict(work_binding.components).get(paths.work_root) != work_identity:
+        raise IntegrityError("work-root identity changed")
+    work_root = OwnedNode(
+        paths.work_root,
+        work_identity,
+        (OwnedDirectoryIdentity("work-root", paths.work_root, work_identity),),
+    )
+    _verify_owned_directory(work_root, IntegrityError)
     negative = _owned_directory(
         paths.work_root / "negative",
         "negative root",
@@ -1468,7 +1531,11 @@ def _runtime_negative_boundary(path: Path, validator: Callable[[Path], object]) 
         return "negative-boundary-error-invalid"
     if not isinstance(architectures, set) or any(not isinstance(value, str) for value in architectures):
         return "negative-boundary-error-invalid"
-    return None if architectures != {"x86_64"} else "negative-boundary-unexpectedly-accepted"
+    if not architectures:
+        return None
+    if architectures == {"x86_64"}:
+        return "negative-boundary-unexpectedly-accepted"
+    return "negative-boundary-error-invalid"
 
 
 def _guest_negative_boundary(
@@ -1488,7 +1555,11 @@ def _guest_negative_boundary(
         return "negative-boundary-error-invalid"
     if result.returncode == 0:
         return "negative-boundary-unexpectedly-accepted"
-    if result.returncode != 1 or result.stdout != "" or not result.stderr.strip():
+    if (
+        result.returncode != 1
+        or result.stdout != ""
+        or result.stderr != "compatforge-cli: invalid DOS header\n"
+    ):
         return "negative-boundary-error-invalid"
     return None
 
@@ -1612,7 +1683,7 @@ def run_negative_checks(
             bindings[source_key], f"negative source {source_key}"
         )
         _revalidate_source(bindings["sentinel"], "negative sentinel")
-        _verify_owned_directory(runtime_roots[runtime_id], "negative Runtime root")
+        _verify_owned_directory(runtime_roots[runtime_id], IntegrityError)
         if _bounded_entries(
             runtime_roots[runtime_id].path,
             1,
@@ -1631,11 +1702,13 @@ def run_negative_checks(
             filename=filename if case_id == "cached-installer-bytes-changed" else "payload.bin",
         )
         _mutate_owned_copy(owned_file)
+        _verify_owned_file(owned_file, IntegrityError)
         _revalidate_source(bindings[source_key], f"negative source {source_key}")
         _revalidate_source(bindings["sentinel"], "negative sentinel")
 
         failure_reason: str | None = None
         try:
+            _verify_owned_file(owned_file, IntegrityError)
             if case_id in ("wine-bytes-changed", "wineserver-bytes-changed"):
                 failure_reason = _runtime_negative_boundary(owned_file.path, runtime_validator)
             elif case_id == "console-guest-bytes-changed":
@@ -1651,6 +1724,7 @@ def run_negative_checks(
                     asset_fetcher,
                     asset_error,
                 )
+            _verify_owned_file(owned_file, IntegrityError)
         finally:
             _cleanup_owned_case(case_root, owned_file)
         if _bounded_entries(
@@ -1675,7 +1749,7 @@ def run_negative_checks(
     for descriptor in runtimes:
         _revalidate_runtime(descriptor)
     for runtime_id in RUNTIME_IDS:
-        _verify_owned_directory(runtime_roots[runtime_id], "negative Runtime root")
+        _verify_owned_directory(runtime_roots[runtime_id], CleanupError)
         if _bounded_entries(
             runtime_roots[runtime_id].path,
             1,

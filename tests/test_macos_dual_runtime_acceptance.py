@@ -4,6 +4,7 @@ import importlib.util
 import copy
 import hashlib
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -407,6 +408,7 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         return acceptance.parse_arguments(self._argv(*extra))
 
     def _negative_fixture(self):
+        self.work.mkdir(exist_ok=True)
         guest = self.external / "console-guest.exe"
         guest.write_bytes(b"MZ" + b"guest-fixture")
         sentinel = self.external / "negative-sentinel"
@@ -451,7 +453,9 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             inspected = Path(argv[-1])
             self.assertEqual(list(inspected.parent.iterdir()), [inspected])
             self.assertFalse(inspected.read_bytes().startswith(b"MZ"))
-            return subprocess.CompletedProcess(argv, 1, "", "invalid PE")
+            return subprocess.CompletedProcess(
+                argv, 1, "", "compatforge-cli: invalid DOS header\n"
+            )
 
         class AssetError(Exception):
             pass
@@ -525,7 +529,9 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             if argv[-1] == "--all":
                 return subprocess.CompletedProcess(argv, 0, json.dumps(self._discovery()), "")
             if len(argv) == 3 and argv[1] == "inspect":
-                return subprocess.CompletedProcess(argv, 1, "", "invalid PE")
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "compatforge-cli: invalid DOS header\n"
+                )
             raise AssertionError("negative mode attempted a non-validation process")
 
         class AssetError(Exception):
@@ -632,6 +638,82 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         candidate.write_bytes(mutated)
         self.assertEqual(acceptance._default_runtime_validator(candidate), set())
 
+    def test_runtime_negative_refusal_accepts_only_the_exact_empty_verified_set(self) -> None:
+        candidate = self.external / "runtime-mutant"
+        candidate.write_bytes(b"mutant")
+        self.assertIsNone(
+            acceptance._runtime_negative_boundary(candidate, lambda _path: set())
+        )
+        for result in ({"arm64"}, {"unknown"}, {"arm64", "x86_64"}):
+            with self.subTest(result=result):
+                self.assertEqual(
+                    acceptance._runtime_negative_boundary(
+                        candidate, lambda _path, value=result: value
+                    ),
+                    "negative-boundary-error-invalid",
+                )
+
+    def test_guest_negative_refusal_requires_the_exact_cli_diagnostic(self) -> None:
+        candidate = self.external / "guest-mutant.exe"
+        candidate.write_bytes(b"not-a-PE")
+
+        def result(returncode: int, stdout: str, stderr: str):
+            return lambda argv, **_kwargs: subprocess.CompletedProcess(
+                argv, returncode, stdout, stderr
+            )
+
+        self.assertIsNone(
+            acceptance._guest_negative_boundary(
+                candidate,
+                self.cli,
+                result(1, "", "compatforge-cli: invalid DOS header\n"),
+            )
+        )
+        for returncode, stdout, stderr in (
+            (1, "", "unrelated failure\n"),
+            (1, "unexpected output", "compatforge-cli: invalid DOS header\n"),
+            (2, "", "compatforge-cli: invalid DOS header\n"),
+            (1, "", "compatforge-cli: invalid PE signature\n"),
+        ):
+            with self.subTest(returncode=returncode, stdout=stdout, stderr=stderr):
+                self.assertEqual(
+                    acceptance._guest_negative_boundary(
+                        candidate,
+                        self.cli,
+                        result(returncode, stdout, stderr),
+                    ),
+                    "negative-boundary-error-invalid",
+                )
+
+    def test_real_cli_rejects_the_isolated_mutated_pe_with_the_exact_diagnostic(self) -> None:
+        configured = os.environ.get("COMPATFORGE_TEST_CLI")
+        if not configured:
+            self.skipTest("set COMPATFORGE_TEST_CLI to a built compatforge-cli")
+        cli = Path(configured).resolve(strict=True)
+        source = ROOT / "tests" / "fixtures" / "hello-x86_64.exe"
+        mutant = self.external / "real-cli-mutant.exe"
+        shutil.copyfile(source, mutant)
+        payload = bytearray(mutant.read_bytes())
+        payload[0] ^= 0xFF
+        mutant.write_bytes(payload)
+
+        actual = subprocess.run(
+            [str(cli), "inspect", str(mutant)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=acceptance.DISCOVERY_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            (actual.returncode, actual.stdout, actual.stderr),
+            (1, "", "compatforge-cli: invalid DOS header\n"),
+        )
+        self.assertIsNone(
+            acceptance._guest_negative_boundary(mutant, cli, subprocess.run)
+        )
+
     def test_wrong_negative_boundary_errors_are_closed_and_sequentially_isolated(self) -> None:
         guest, sentinel, asset = self._negative_fixture()
         paths = acceptance.preflight(
@@ -707,7 +789,7 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
                 asset_fetcher=lambda *_args: None,
                 asset_error=RuntimeError,
             )
-        self.assertFalse(self.work.exists())
+        self.assertEqual(list(self.work.iterdir()), [])
         self.assertEqual(guest_target.read_bytes(), b"MZ" + b"guest-fixture")
 
         guest.unlink()
@@ -764,6 +846,156 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             )
         self.assertEqual((victim / "sentinel").read_bytes(), b"foreign-directory")
         self.assertFalse((victim / "payload.bin").exists())
+
+    def test_negative_cleanup_binds_negative_root_ancestor_identity(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        replacement_payload = b""
+
+        def replace_negative_root(path: Path) -> set[str]:
+            nonlocal replacement_payload
+            replacement_payload = path.read_bytes()
+            negative_root = path.parents[2]
+            negative_root.rename(negative_root.with_name("negative-owned"))
+            replacement = negative_root / "crossover" / "wine-bytes-changed"
+            replacement.mkdir(parents=True)
+            (replacement / "payload.bin").write_bytes(replacement_payload)
+            return set()
+
+        with self.assertRaisesRegex(
+            acceptance.CleanupError, "negative root identity changed"
+        ):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=replace_negative_root,
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertEqual(
+            (
+                self.work
+                / "negative"
+                / "crossover"
+                / "wine-bytes-changed"
+                / "payload.bin"
+            ).read_bytes(),
+            replacement_payload,
+        )
+
+    def test_negative_cleanup_binds_runtime_root_ancestor_identity(self) -> None:
+        guest, sentinel, asset = self._negative_fixture()
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        descriptors = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        replacement_payload = b""
+
+        def replace_runtime_root(path: Path) -> set[str]:
+            nonlocal replacement_payload
+            replacement_payload = path.read_bytes()
+            runtime_root = path.parents[1]
+            runtime_root.rename(runtime_root.with_name("crossover-owned"))
+            replacement = runtime_root / "wine-bytes-changed"
+            replacement.mkdir(parents=True)
+            (replacement / "payload.bin").write_bytes(replacement_payload)
+            return set()
+
+        with self.assertRaisesRegex(
+            acceptance.CleanupError, "negative Runtime root identity changed"
+        ):
+            acceptance.run_negative_checks(
+                paths,
+                descriptors,
+                console_guest=guest,
+                sentinel=sentinel,
+                runtime_validator=replace_runtime_root,
+                guest_runner=lambda *_args, **_kwargs: None,
+                asset=asset,
+                asset_fetcher=lambda *_args: None,
+                asset_error=RuntimeError,
+            )
+        self.assertEqual(
+            (
+                self.work
+                / "negative"
+                / "crossover"
+                / "wine-bytes-changed"
+                / "payload.bin"
+            ).read_bytes(),
+            replacement_payload,
+        )
+
+    def test_negative_cleanup_rejects_symlink_replacement_at_every_owned_directory(self) -> None:
+        levels = (
+            ("work-root", "work-root identity changed"),
+            ("negative", "negative root identity changed"),
+            ("runtime", "negative Runtime root identity changed"),
+            ("case", "negative case root identity changed"),
+        )
+        for level, diagnostic in levels:
+            with self.subTest(level=level), tempfile.TemporaryDirectory(
+                prefix=f"compatforge-negative-chain-{level}-"
+            ) as temporary:
+                root = Path(temporary)
+                work = root / "work"
+                work.mkdir()
+                work_node = acceptance._owned_directory(
+                    work, "work-root", create=False
+                )
+                negative = acceptance._owned_directory(
+                    work / "negative",
+                    "negative root",
+                    create=True,
+                    parent=work_node,
+                )
+                runtime = acceptance._owned_directory(
+                    negative.path / "crossover",
+                    "negative Runtime root",
+                    create=True,
+                    parent=negative,
+                )
+                case = acceptance._owned_directory(
+                    runtime.path / "wine-bytes-changed",
+                    "negative case root",
+                    create=True,
+                    parent=runtime,
+                )
+                payload = acceptance._create_private_copy(case, b"mutant")
+                selected = {
+                    "work-root": work_node,
+                    "negative": negative,
+                    "runtime": runtime,
+                    "case": case,
+                }[level]
+                moved = selected.path.with_name(selected.path.name + "-owned")
+                selected.path.rename(moved)
+                victim = root / f"{level}-foreign-victim"
+                victim.mkdir()
+                (victim / "sentinel").write_bytes(b"foreign-directory")
+                try:
+                    os.symlink(victim, selected.path, target_is_directory=True)
+                except OSError as error:
+                    self.skipTest(f"directory symlinks are unavailable: {error}")
+
+                with self.assertRaisesRegex(acceptance.CleanupError, diagnostic):
+                    acceptance._cleanup_owned_case(case, payload)
+                self.assertEqual(
+                    (victim / "sentinel").read_bytes(), b"foreign-directory"
+                )
+                self.assertFalse((victim / "payload.bin").exists())
+                selected.path.unlink()
 
     def test_negative_cleanup_refuses_hardlink_file_substitution(self) -> None:
         guest, sentinel, asset = self._negative_fixture()
