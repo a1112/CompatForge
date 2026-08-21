@@ -6,7 +6,26 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+
+
+RUNTIME_ENVIRONMENT_PREFIXES = (
+    "COMPATFORGE_",
+    "WINE",
+    "CX_",
+    "CROSSOVER_",
+    "WHISKY_",
+)
+
+
+def smoke_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if source is None else source)
+    for name in tuple(environment):
+        if name.startswith(RUNTIME_ENVIRONMENT_PREFIXES):
+            del environment[name]
+    environment["COMPATFORGE_DESKTOP_SMOKE"] = "1"
+    return environment
 
 
 def main() -> int:
@@ -17,8 +36,7 @@ def main() -> int:
     if not executable.is_file():
         print(f"application executable is missing: {executable}", file=sys.stderr)
         return 2
-    environment = os.environ.copy()
-    environment["COMPATFORGE_DESKTOP_SMOKE"] = "1"
+    environment = smoke_environment()
     try:
         result = subprocess.run(
             [str(executable)],

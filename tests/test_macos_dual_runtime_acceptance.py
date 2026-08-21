@@ -26,6 +26,8 @@ VALIDATOR = ROOT / "scripts" / "validate_repository.py"
 GUI_ASSET_TOOL = ROOT / "tools" / "download_gui_assets.py"
 ACCEPTANCE_GUIDE = ROOT / "docs" / "guides" / "macos-local-dual-runtime-acceptance.md"
 ACCEPTANCE_INTERACTIONS = ROOT / "examples" / "macos-dual-runtime-interactions.json"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+DESKTOP_SMOKE = ROOT / "apps" / "desktop" / "tests" / "smoke.py"
 
 EXPECTED_MATRIX = {
     "crossover": ("console", "7zip", "sumatrapdf", "notepad-plus-plus"),
@@ -66,6 +68,137 @@ acceptance = load_module("run_macos_dual_runtime_acceptance", ACCEPTANCE_TOOL)
 gui_baseline = load_module("run_gui_baseline_for_dual_runtime", GUI_BASELINE_TOOL)
 validator = load_module("validate_repository_for_macos_acceptance", VALIDATOR)
 gui_assets = load_module("download_gui_assets_for_dual_runtime_docs", GUI_ASSET_TOOL)
+desktop_smoke = load_module("desktop_smoke_for_dual_runtime_ci", DESKTOP_SMOKE)
+
+
+class MacOsDualRuntimeCiContractTests(unittest.TestCase):
+    @staticmethod
+    def _workflow() -> str:
+        return CI_WORKFLOW.read_text(encoding="utf-8")
+
+    @classmethod
+    def _job(cls, name: str) -> str:
+        workflow = cls._workflow()
+        marker = f"  {name}:\n"
+        start = workflow.find(marker)
+        if start < 0:
+            raise AssertionError(f"CI job is missing: {name}")
+        end = len(workflow)
+        for line in workflow[start + len(marker) :].splitlines(keepends=True):
+            if (
+                line.startswith("  ")
+                and not line.startswith("    ")
+                and line.rstrip().endswith(":")
+            ):
+                end = workflow.find(line, start + len(marker))
+                break
+        return workflow[start:end]
+
+    def test_default_ci_runs_dual_runtime_contracts_on_windows_and_macos(self) -> None:
+        job = self._job("macos-dual-runtime-contracts")
+        self.assertIn("os: [windows-latest, macos-latest]", job)
+        self.assertIn("runs-on: ${{ matrix.os }}", job)
+        self.assertNotIn("if:", job)
+        self.assertIn("uses: actions/setup-python@", job)
+        self.assertIn('python-version: "3.12"', job)
+        self.assertEqual(
+            job.count(
+                "python -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v"
+            ),
+            1,
+        )
+
+    def test_default_ci_keeps_the_repository_and_desktop_gates(self) -> None:
+        workflow = self._workflow()
+        for command in (
+            "python -B scripts/validate_repository.py",
+            "python -S -B -m unittest tests.test_macos_headless_preview -v",
+            "python -S -B -m unittest tests.test_gui_baseline_contracts -v",
+            "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked",
+            "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings",
+            "npm run build --prefix apps/desktop",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(workflow.count(command), 1)
+
+        desktop = self._job("desktop")
+        self.assertIn("runs-on: macos-latest", desktop)
+        self.assertIn('node-version: "24"', desktop)
+        self.assertIn("npm ci --prefix apps/desktop", desktop)
+        self.assertEqual(
+            desktop.count(
+                "python -B apps/desktop/tests/smoke.py "
+                "apps/desktop/src-tauri/target/release/bundle/macos/"
+                "CompatForge.app/Contents/MacOS/CompatForge"
+            ),
+            1,
+        )
+
+    def test_default_ci_has_no_interactive_or_commercial_runtime_path(self) -> None:
+        workflow = self._workflow().casefold()
+        for forbidden in (
+            "--allow-network",
+            "--accept-interactive",
+            "crossover",
+            "whisky",
+            "download_gui_assets.py",
+            "run_gui_baseline.py",
+            "screenshot",
+            "msiexec",
+            ".msi",
+            "7z.exe",
+            "sumatrapdf.exe",
+            "notepad++.exe",
+            "self-hosted",
+            "${{ secrets.",
+            "secrets:",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
+    def test_desktop_smoke_scrubs_runtime_environment(self) -> None:
+        source = {
+            "PATH": "/usr/bin",
+            "HOME": "/tmp/home",
+            "COMPATFORGE_RUNTIME_ROOT": "/private/runtime",
+            "COMPATFORGE_DESKTOP_SMOKE": "stale",
+            "WINEPREFIX": "/private/bottle",
+            "WINESERVER": "/private/runtime/bin/wineserver",
+            "CX_BOTTLE": "private-bottle",
+            "CROSSOVER_ROOT": "/private/crossover",
+            "WHISKY_BOTTLE": "/private/whisky",
+        }
+        environment = desktop_smoke.smoke_environment(source)
+        self.assertEqual(
+            environment,
+            {
+                "PATH": "/usr/bin",
+                "HOME": "/tmp/home",
+                "COMPATFORGE_DESKTOP_SMOKE": "1",
+            },
+        )
+
+    def test_desktop_smoke_launches_only_the_packaged_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "CompatForge"
+            executable.write_bytes(b"packaged-app")
+            completed = subprocess.CompletedProcess(
+                [str(executable)],
+                0,
+                "COMPATFORGE_TAURI_SMOKE_READY\n",
+                "",
+            )
+            with (
+                mock.patch.object(
+                    desktop_smoke.sys, "argv", ["smoke.py", str(executable)]
+                ),
+                mock.patch.object(
+                    desktop_smoke.subprocess, "run", return_value=completed
+                ) as run,
+            ):
+                self.assertEqual(desktop_smoke.main(), 0)
+        self.assertEqual(run.call_args.args[0], [str(executable)])
+        self.assertEqual(run.call_args.kwargs["env"]["COMPATFORGE_DESKTOP_SMOKE"], "1")
 
 
 class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
