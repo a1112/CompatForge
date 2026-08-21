@@ -1141,6 +1141,63 @@ def _write_all(file_descriptor: int, payload: bytes) -> None:
         written += count
 
 
+def _same_private_output_identity(
+    opened: os.stat_result, entry: os.stat_result
+) -> bool:
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and stat.S_ISREG(entry.st_mode)
+        and opened.st_nlink == 1
+        and entry.st_nlink == 1
+        and _node_identity(opened) == _node_identity(entry)
+    )
+
+
+def _verify_output_entry(
+    paths: AcceptancePaths,
+    relative_parts: tuple[str, ...],
+    file_descriptor: int,
+    opened_metadata: os.stat_result,
+    parent_directory_descriptor: int | None,
+) -> None:
+    try:
+        current_metadata = os.fstat(file_descriptor)
+        if parent_directory_descriptor is not None:
+            entry_metadata = os.stat(
+                relative_parts[-1],
+                dir_fd=parent_directory_descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            entry_metadata = paths.work_root.joinpath(*relative_parts).lstat()
+    except OSError as error:
+        raise IntegrityError("output identity changed") from error
+    if not _same_private_output_identity(
+        opened_metadata, current_metadata
+    ) or not _same_private_output_identity(opened_metadata, entry_metadata):
+        raise IntegrityError("output identity changed")
+
+    parent_path = paths.work_root.joinpath(*relative_parts[:-1])
+    binding_key = (
+        "work-root"
+        if len(relative_parts) == 1
+        else f"work-output:{relative_parts[0]}"
+    )
+    binding = paths.bindings.get(binding_key)
+    if binding is None:
+        raise IntegrityError("output parent identity changed")
+    if parent_directory_descriptor is not None:
+        expected = dict(binding.components).get(parent_path)
+        if (
+            expected is None
+            or _node_identity(os.fstat(parent_directory_descriptor)) != expected
+        ):
+            raise IntegrityError("output parent identity changed")
+    else:
+        _revalidate_binding(binding, "output parent")
+    _revalidate_bindings(paths)
+
+
 def _safe_create_output(
     paths: AcceptancePaths,
     relative_parts: tuple[str, ...],
@@ -1202,13 +1259,27 @@ def _safe_create_output(
             file_descriptor = os.open(
                 paths.work_root.joinpath(*relative_parts), create_flags, 0o600
             )
-        metadata = os.fstat(file_descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        opened_metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode) or opened_metadata.st_nlink != 1:
             raise OSError("acceptance output is not a private regular file")
         _write_all(file_descriptor, payload)
         os.fsync(file_descriptor)
+        _verify_output_entry(
+            paths,
+            relative_parts,
+            file_descriptor,
+            opened_metadata,
+            directory_descriptors[-1] if directory_descriptors else None,
+        )
         if directory_descriptors:
             os.fsync(directory_descriptors[-1])
+        _verify_output_entry(
+            paths,
+            relative_parts,
+            file_descriptor,
+            opened_metadata,
+            directory_descriptors[-1] if directory_descriptors else None,
+        )
     except IntegrityError:
         raise
     except (OSError, ValueError) as error:

@@ -831,6 +831,77 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             (self.work / "comparison.json").read_text(encoding="utf-8"), "foreign"
         )
 
+    def test_private_output_identity_binds_device_inode_kind_and_single_link(self) -> None:
+        first = self.external / "identity-first"
+        second = self.external / "identity-second"
+        first.write_text("first", encoding="utf-8")
+        second.write_text("second", encoding="utf-8")
+        self.assertTrue(
+            acceptance._same_private_output_identity(first.stat(), first.stat())
+        )
+        self.assertFalse(
+            acceptance._same_private_output_identity(first.stat(), second.stat())
+        )
+        linked = self.external / "identity-linked"
+        try:
+            os.link(first, linked)
+        except OSError as error:
+            self.skipTest(f"hardlinks are unavailable: {error}")
+        self.assertFalse(
+            acceptance._same_private_output_identity(first.stat(), linked.stat())
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix", "output directory-entry race requires POSIX"
+    )
+    def test_post_write_entry_races_are_fatal_without_touching_replacements(self) -> None:
+        paths = acceptance.preflight(
+            self._arguments(), host_system="Darwin", host_machine="arm64"
+        )
+        acceptance._prepare_layout(paths)
+        original_write_all = acceptance._write_all
+
+        for replacement in ("missing", "regular", "symlink", "hardlink"):
+            with self.subTest(replacement=replacement):
+                target = self.work / f"comparison-{replacement}.json"
+                moved = self.work / f"comparison-{replacement}-moved.json"
+                victim = self.external / f"comparison-{replacement}-victim"
+                victim.write_text(f"unchanged-{replacement}", encoding="utf-8")
+
+                def racing_write(file_descriptor: int, payload: bytes) -> None:
+                    target.rename(moved)
+                    if replacement == "regular":
+                        target.write_text("attacker-regular", encoding="utf-8")
+                    elif replacement == "symlink":
+                        os.symlink(victim, target)
+                    elif replacement == "hardlink":
+                        os.link(victim, target)
+                    original_write_all(file_descriptor, payload)
+
+                with (
+                    mock.patch.object(acceptance, "_write_all", side_effect=racing_write),
+                    self.assertRaisesRegex(
+                        acceptance.AcceptanceError, "output identity changed"
+                    ),
+                ):
+                    acceptance._safe_create_output(
+                        paths,
+                        (target.name,),
+                        '{"closed":true}',
+                        "comparison output",
+                    )
+                self.assertTrue(moved.is_file())
+                self.assertEqual(
+                    moved.read_text(encoding="utf-8"), '{"closed":true}\n'
+                )
+                self.assertEqual(
+                    victim.read_text(encoding="utf-8"), f"unchanged-{replacement}"
+                )
+                if replacement == "missing":
+                    self.assertFalse(target.exists())
+                elif replacement == "regular":
+                    self.assertEqual(target.read_text(encoding="utf-8"), "attacker-regular")
+
     def test_round_projection_revalidates_its_bound_directory_before_writing(self) -> None:
         paths = acceptance.preflight(
             self._arguments(), host_system="Darwin", host_machine="arm64"
