@@ -15,7 +15,9 @@ use compatforge_inspect::{PeArchitecture, PeImageKind, PeInspectionReport, PeSub
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
@@ -113,12 +115,35 @@ struct PinnedExecutionIdentity {
     inode: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct PinnedBottleSnapshot {
     binding: BottleExecutableBinding,
     inspection: PeInspectionReport,
     execution_identity: PinnedExecutionIdentity,
+    _execution_guard: Arc<File>,
 }
+
+impl fmt::Debug for PinnedBottleSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedBottleSnapshot")
+            .field("binding", &self.binding)
+            .field("inspection", &self.inspection)
+            .field("execution_identity", &self.execution_identity)
+            .field("execution_guard", &"held")
+            .finish()
+    }
+}
+
+impl PartialEq for PinnedBottleSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding
+            && self.inspection == other.inspection
+            && self.execution_identity == other.execution_identity
+    }
+}
+
+impl Eq for PinnedBottleSnapshot {}
 
 impl PreparedLaunch {
     pub fn prepare(config: &CoreConfig, source: &Path, request: &LaunchRequest) -> Result<Self, PreparationError> {
@@ -190,7 +215,7 @@ impl PreparedLaunch {
             .validate()
             .map_err(PlanError::InvalidConfig)
             .map_err(PreparationError::Planning)?;
-        validate_pinned_request(request, &snapshot)?;
+        validate_pinned_request(config, request, &snapshot)?;
         let executable = PreparedExecutable::PinnedBottle(snapshot.clone());
         let plan = compile_prepared_plan(config, request, &executable)?;
         let context_fingerprint = fingerprint_context(config)?;
@@ -251,16 +276,16 @@ impl PreparedLaunch {
         config: &CoreConfig,
         candidate: &PinnedBottleSnapshot,
     ) -> Result<&'a LaunchPlan, PreparationError> {
-        if fingerprint_context(config)? != self.context_fingerprint {
-            return Err(PreparationError::ContextMismatch);
-        }
         let PreparedExecutable::PinnedBottle(prepared) = &self.executable else {
             return Err(PreparationError::PinnedLeaseMismatch);
         };
         if prepared != candidate {
             return Err(PreparationError::PinnedLeaseMismatch);
         }
-        validate_pinned_request(&self.request, candidate)?;
+        validate_pinned_request(config, &self.request, candidate)?;
+        if fingerprint_context(config)? != self.context_fingerprint {
+            return Err(PreparationError::ContextMismatch);
+        }
         let recompiled = compile_prepared_plan(config, &self.request, &self.executable)?;
         if recompiled != self.plan {
             return Err(PreparationError::PreparedPlanMismatch);
@@ -292,6 +317,7 @@ fn capture_pinned_snapshot(pinned: &PinnedBottleExecutable) -> Result<PinnedBott
             device: metadata.dev(),
             inode: metadata.ino(),
         },
+        _execution_guard: Arc::new(execution),
     })
 }
 
@@ -302,17 +328,32 @@ fn capture_pinned_snapshot(_pinned: &PinnedBottleExecutable) -> Result<PinnedBot
     ))
 }
 
-fn validate_pinned_request(request: &LaunchRequest, snapshot: &PinnedBottleSnapshot) -> Result<(), PreparationError> {
+fn validate_pinned_request(
+    config: &CoreConfig,
+    request: &LaunchRequest,
+    snapshot: &PinnedBottleSnapshot,
+) -> Result<(), PreparationError> {
     request.validate().map_err(PreparationError::InvalidRequest)?;
     snapshot
         .binding
         .validate()
         .map_err(GuestArtifactError::InvalidBottleBinding)
         .map_err(PreparationError::GuestArtifact)?;
-    if request.executable.mode != ExecutableMode::BottleInPlace || request.bottle_id != snapshot.binding.bottle_id {
+    if request.executable.mode != ExecutableMode::BottleInPlace
+        || request.bottle_id != "gui-sumatrapdf"
+        || snapshot.binding.bottle_id != "gui-sumatrapdf"
+    {
         return Err(PreparationError::PinnedLeaseMismatch);
     }
-    if request.executable.path != snapshot.binding.path {
+    let expected_path = Path::new(&config.storage_root)
+        .join("bottles")
+        .join("gui-sumatrapdf")
+        .join("prefix")
+        .join("drive_c")
+        .join("CompatForge")
+        .join("SumatraPDF")
+        .join("SumatraPDF.exe");
+    if Path::new(&snapshot.binding.path) != expected_path || request.executable.path != snapshot.binding.path {
         return Err(PreparationError::SourcePathMismatch);
     }
     validate_requested_binding(request, snapshot.binding.architecture, &snapshot.binding.digest)?;
@@ -1014,11 +1055,12 @@ mod tests {
         PinnedBottleSnapshot,
     ) {
         let (config, root) = prepared_config(label);
-        let source = root.join("store/bottles/gui-test/prefix/drive_c/Program Files/Example/Example.exe");
+        let source = Path::new(&config.storage_root)
+            .join("bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe");
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, gui_fixture_bytes()).unwrap();
         let mut request = request();
-        request.bottle_id = "gui-test".into();
+        request.bottle_id = "gui-sumatrapdf".into();
         request.executable.path = source.to_string_lossy().into_owned();
         request.executable.mode = ExecutableMode::BottleInPlace;
         request.executable.architecture = CpuArchitecture::X86_64;
@@ -1034,6 +1076,7 @@ mod tests {
             binding,
             inspection: ordinary.inspection.clone(),
             execution_identity: PinnedExecutionIdentity { device: 17, inode: 29 },
+            _execution_guard: Arc::new(File::open(prepared_fixture()).unwrap()),
         };
         (config, root, request, ordinary, snapshot)
     }
@@ -1047,6 +1090,7 @@ mod tests {
         std::path::PathBuf,
         LaunchRequest,
         compatforge_guest_artifact::PinnedBottleExecutable,
+        compatforge_guest_artifact::HeldExternalWorkRoot,
     ) {
         use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot};
         use std::os::fd::AsRawFd;
@@ -1073,7 +1117,7 @@ mod tests {
         request.executable.mode = ExecutableMode::BottleInPlace;
         request.executable.architecture = CpuArchitecture::X86_64;
         request.executable.sha256 = None;
-        (config, root, source, request, pinned)
+        (config, root, source, request, pinned, held)
     }
 
     fn make_object_writable(prepared: &PreparedLaunch) {
@@ -1223,6 +1267,34 @@ mod tests {
     }
 
     #[test]
+    fn pinned_authorization_compares_lease_fields_instead_of_guard_arc_identity() {
+        let (config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-guard-equality");
+        let pinned = PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot.clone()).unwrap();
+        let mut candidate = snapshot;
+        candidate._execution_guard = Arc::new(File::open(prepared_fixture()).unwrap());
+
+        pinned.authorize_pinned_snapshot(&config, &candidate).unwrap();
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_prepared_state_keeps_the_execution_guard_alive_across_clones() {
+        let (config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-guard-lifetime");
+        let guard = std::sync::Arc::downgrade(&snapshot._execution_guard);
+        let prepared = PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot).unwrap();
+        assert!(guard.upgrade().is_some());
+
+        let cloned = prepared.clone();
+        drop(prepared);
+        assert!(guard.upgrade().is_some());
+        drop(cloned);
+        assert!(guard.upgrade().is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pinned_authorization_rejects_another_lease_identity() {
         let (config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-other-lease");
         let pinned = PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot.clone()).unwrap();
@@ -1310,6 +1382,47 @@ mod tests {
     }
 
     #[test]
+    fn pinned_preparation_rejects_an_initial_cross_storage_root() {
+        let (mut config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-cross-storage");
+        config.storage_root = root.join("other-store").to_string_lossy().into_owned();
+
+        assert!(matches!(
+            PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot),
+            Err(PreparationError::SourcePathMismatch)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_preparation_rejects_non_bottle_request_mode() {
+        let (config, root, mut request, _ordinary, snapshot) = pinned_oracle_input("pinned-request-mode");
+        request.executable.mode = ExecutableMode::ImmutableArtifact;
+
+        assert!(matches!(
+            PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot),
+            Err(PreparationError::PinnedLeaseMismatch)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_authorization_rejects_cross_storage_before_context_fingerprint() {
+        let (config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-authorize-storage");
+        let prepared = PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot.clone()).unwrap();
+        let mut changed = config;
+        changed.storage_root = root.join("other-store").to_string_lossy().into_owned();
+
+        assert!(matches!(
+            prepared.authorize_pinned_snapshot(&changed, &snapshot),
+            Err(PreparationError::SourcePathMismatch)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn pinned_authorization_rejects_context_and_prepared_request_drift() {
         let (config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-context-request");
         let mut pinned = PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot.clone()).unwrap();
@@ -1321,6 +1434,20 @@ mod tests {
         ));
 
         pinned.request.arguments.push("--drift".into());
+        assert!(matches!(
+            pinned.authorize_pinned_snapshot(&config, &snapshot),
+            Err(PreparationError::PreparedPlanMismatch)
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_authorization_rejects_direct_plan_drift() {
+        let (config, root, request, _ordinary, snapshot) = pinned_oracle_input("pinned-plan-drift");
+        let mut pinned = PreparedLaunch::prepare_pinned_snapshot(&config, &request, snapshot.clone()).unwrap();
+        pinned.plan.process.arguments.push("--drift".into());
+
         assert!(matches!(
             pinned.authorize_pinned_snapshot(&config, &snapshot),
             Err(PreparationError::PreparedPlanMismatch)
@@ -1346,7 +1473,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_same_lease_prepares_and_authorizes() {
-        let (config, root, _source, request, pinned) = real_pinned_fixture("pinned-valid-same-lease");
+        let (config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-valid-same-lease");
         let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
 
         prepared.authorize_pinned(&config, &pinned).unwrap();
@@ -1358,7 +1485,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_preparation_revalidates_source_drift() {
-        let (config, root, source, request, pinned) = real_pinned_fixture("pinned-prepare-source-drift");
+        let (config, root, source, request, pinned, _held) = real_pinned_fixture("pinned-prepare-source-drift");
         std::fs::write(&source, b"drifted after capture").unwrap();
 
         assert!(matches!(
@@ -1373,7 +1500,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_authorization_revalidates_source_drift() {
-        let (config, root, source, request, pinned) = real_pinned_fixture("pinned-authorize-source-drift");
+        let (config, root, source, request, pinned, _held) = real_pinned_fixture("pinned-authorize-source-drift");
         let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
         std::fs::write(&source, b"drifted after preparation").unwrap();
 
@@ -1383,6 +1510,82 @@ mod tests {
         ));
 
         drop(pinned);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_public_preparation_rejects_an_initial_cross_storage_root() {
+        let (mut config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-public-storage");
+        config.storage_root = root.join("other-store").to_string_lossy().into_owned();
+
+        assert!(matches!(
+            PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned),
+            Err(PreparationError::SourcePathMismatch)
+        ));
+
+        drop(pinned);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_public_preparation_rejects_execution_overwrite() {
+        use std::io::{Seek, Write};
+
+        let (config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-execution-overwrite");
+        let mut execution = pinned.duplicate_execution_file().unwrap();
+        execution.seek(std::io::SeekFrom::Start(0)).unwrap();
+        execution.write_all(b"XX").unwrap();
+        execution.sync_all().unwrap();
+
+        assert!(matches!(
+            PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned),
+            Err(PreparationError::GuestArtifact(_))
+        ));
+
+        drop(execution);
+        drop(pinned);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_public_authorization_rejects_execution_size_drift() {
+        let (config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-execution-size");
+        let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
+        let execution = pinned.duplicate_execution_file().unwrap();
+        execution.set_len(pinned.binding().size_bytes - 1).unwrap();
+        execution.sync_all().unwrap();
+
+        assert!(matches!(
+            prepared.authorize_pinned(&config, &pinned),
+            Err(PreparationError::GuestArtifact(_))
+        ));
+
+        drop(execution);
+        drop(pinned);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_public_authorization_rejects_another_equivalent_lease() {
+        use compatforge_guest_artifact::GuestArtifactStore;
+
+        let (config, root, source, request, pinned, held) = real_pinned_fixture("pinned-public-other-lease");
+        let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
+        drop(pinned);
+        let other = GuestArtifactStore::new(&config.storage_root)
+            .pin_sumatra_bottle_executable("gui-sumatrapdf", &source, &held)
+            .unwrap();
+
+        assert!(matches!(
+            prepared.authorize_pinned(&config, &other),
+            Err(PreparationError::PinnedLeaseMismatch)
+        ));
+
+        drop(other);
         std::fs::remove_dir_all(root).unwrap();
     }
 
