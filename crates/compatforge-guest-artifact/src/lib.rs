@@ -132,6 +132,46 @@ impl HeldExternalWorkRoot {
         Ok(anonymous.into_file())
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    fn create_unlinked_with_test_fault_counted(
+        &self,
+        bytes: [u8; 16],
+        fault: pinned_platform::CreateTestFault,
+    ) -> (Result<File, GuestArtifactError>, usize) {
+        let Some(handle) = self.handle.as_ref() else {
+            return (Err(GuestArtifactError::PinnedUnsupportedPlatform), 0);
+        };
+        let (result, attempts) = pinned_platform::create_unlinked_with_test_fault_counted(handle, bytes, fault);
+        (
+            result.map(|anonymous| anonymous.into_file()).map_err(map_capture_error),
+            attempts,
+        )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_raw_cloexec_for_test(&self) {
+        self.handle
+            .as_ref()
+            .expect("test work root is held")
+            .clear_raw_cloexec_for_test();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_inherited_cloexec_for_test(&self) {
+        self.handle
+            .as_ref()
+            .expect("test work root is held")
+            .clear_inherited_cloexec_for_test();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_path_cloexec_for_test(&self) {
+        self.handle
+            .as_ref()
+            .expect("test work root is held")
+            .clear_path_cloexec_for_test();
+    }
+
     #[cfg(target_os = "macos")]
     fn reject_overlap(&self, forbidden_roots: &[&Path]) -> Result<(), GuestArtifactError> {
         if forbidden_roots
@@ -182,11 +222,23 @@ impl InheritedEvidenceFile {
         validate_pinned_evidence_length(bytes.len() as u64)?;
         self.handle.revalidate(0).map_err(map_evidence_error)?;
         write_and_read_back_canonical(self.handle.file_mut(), bytes)?;
-        self.handle.revalidate(bytes.len() as u64).map_err(map_evidence_error)?;
+        self.handle
+            .revalidate_after_successful_write(bytes.len() as u64)
+            .map_err(map_evidence_error)?;
         Ok(PublishedEvidenceBinding {
             byte_length: bytes.len() as u64,
             sha256: digest_bytes(bytes),
         })
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_raw_cloexec_for_test(&self) {
+        self.handle.clear_raw_cloexec_for_test();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_owned_cloexec_for_test(&self) {
+        self.handle.clear_owned_cloexec_for_test();
     }
 }
 
@@ -239,6 +291,16 @@ impl PinnedBottleExecutable {
             return Err(GuestArtifactError::PinnedIntegrityFailure);
         }
         Ok(())
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_source_parent_cloexec_for_test(&self) {
+        self.source.clear_parent_cloexec_for_test();
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn clear_source_cloexec_for_test(&self) {
+        self.source.clear_source_cloexec_for_test();
     }
 }
 
@@ -1618,6 +1680,92 @@ mod tests {
         }
 
         #[test]
+        fn full_directory_metadata_and_cloexec_drift_are_rejected() {
+            let context = context("pinned-directory-metadata-drift");
+            let (_raw_work, work) = held_work(&context);
+            let original_mode = fs::metadata(&context.work).unwrap().permissions().mode();
+            fs::set_permissions(&context.work, fs::Permissions::from_mode(original_mode ^ 0o100)).unwrap();
+            assert!(matches!(
+                work.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            fs::set_permissions(&context.work, fs::Permissions::from_mode(original_mode)).unwrap();
+
+            let (_raw_work, work) = held_work(&context);
+            work.clear_raw_cloexec_for_test();
+            assert!(matches!(
+                work.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+
+            let (_raw_work, work) = held_work(&context);
+            work.clear_inherited_cloexec_for_test();
+            assert!(matches!(
+                work.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+
+            let (_raw_work, work) = held_work(&context);
+            work.clear_path_cloexec_for_test();
+            assert!(matches!(
+                work.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn source_parent_metadata_and_held_fd_cloexec_drift_are_rejected() {
+            let context = context("pinned-source-parent-drift");
+            let (_raw_work, work) = held_work(&context);
+            let store = GuestArtifactStore::new(&context.storage);
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            let source_parent = context.source.parent().unwrap();
+            let original_mode = fs::metadata(source_parent).unwrap().permissions().mode();
+            fs::set_permissions(source_parent, fs::Permissions::from_mode(original_mode ^ 0o100)).unwrap();
+            assert!(matches!(
+                pinned.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            fs::set_permissions(source_parent, fs::Permissions::from_mode(original_mode)).unwrap();
+            drop(pinned);
+
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            let sibling = source_parent.join("sibling.tmp");
+            fs::write(&sibling, b"metadata drift").unwrap();
+            assert!(matches!(
+                pinned.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            drop(pinned);
+            fs::remove_file(&sibling).unwrap();
+
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            pinned.clear_source_parent_cloexec_for_test();
+            assert!(matches!(
+                pinned.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            drop(pinned);
+
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            pinned.clear_source_cloexec_for_test();
+            assert!(matches!(
+                pinned.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
         fn evidence_is_unlinked_distinct_bounded_and_offset_independent() {
             let context = context("pinned-evidence");
             let (inspection_path, mut inspection_raw) = create_output(&context.work, "inspection");
@@ -1736,35 +1884,113 @@ mod tests {
         }
 
         #[test]
+        fn evidence_raw_and_duplicate_cloexec_drift_are_rejected() {
+            let context = context("pinned-evidence-cloexec-drift");
+            let (raw_path, raw) = create_output(&context.work, "raw-cloexec");
+            fs::remove_file(raw_path).unwrap();
+            let mut evidence =
+                InheritedEvidenceFile::duplicate_inherited(raw.as_raw_fd(), PinnedEvidenceKind::Inspection).unwrap();
+            evidence.clear_raw_cloexec_for_test();
+            assert!(matches!(
+                evidence.write_canonical(b"{}"),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+
+            let (owned_path, owned) = create_output(&context.work, "owned-cloexec");
+            fs::remove_file(owned_path).unwrap();
+            let mut evidence =
+                InheritedEvidenceFile::duplicate_inherited(owned.as_raw_fd(), PinnedEvidenceKind::Plan).unwrap();
+            evidence.clear_owned_cloexec_for_test();
+            assert!(matches!(
+                evidence.write_canonical(b"{}"),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn fifo_leaf_and_forbidden_root_reject_within_a_bound() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            assert!(pinned_platform::leaf_open_flags_are_nonblocking_for_test());
+            let context = context("pinned-fifo-bound");
+            let fifo = context.root.join("forbidden.fifo");
+            assert!(std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            let raw_work = File::open(&context.work).unwrap();
+            let raw_fd = raw_work.as_raw_fd();
+            let reviewed = context.work.clone();
+            let forbidden = fifo.clone();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = HeldExternalWorkRoot::duplicate_inherited(raw_fd, &reviewed, &[&forbidden]);
+                sender.send((result.is_err(), raw_work)).unwrap();
+            });
+            assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap().0);
+
+            let raw_work = File::open(&context.work).unwrap();
+            let held =
+                HeldExternalWorkRoot::duplicate_inherited(raw_work.as_raw_fd(), &context.work, &[&context.storage])
+                    .unwrap();
+            fs::remove_file(&context.source).unwrap();
+            assert!(std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&context.source)
+                .status()
+                .unwrap()
+                .success());
+            let store = GuestArtifactStore::new(&context.storage);
+            let source = context.source.clone();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = store.pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &source, &held);
+                sender.send((result.is_err(), raw_work)).unwrap();
+            });
+            assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap().0);
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
         fn ordinary_file_trust_boundary_does_not_claim_acl_capable_window_protection() {
             // This assertion is deliberately narrow: the inode is mode 0600,
             // single-link before unlink, and zero-link afterwards. It does not
             // claim protection from a directory-search-capable principal that
             // opens the random name between successful openat and unlinkat.
             let context = context("pinned-trust-boundary");
-            let (_raw_work, work) = held_work(&context);
             let random = [0x7a; 16];
             let staging_path = context.work.join(pinned_staging_name(random));
-            fs::write(&staging_path, b"pre-created collision").unwrap();
-            assert!(matches!(
-                work.create_unlinked_with_test_fault(random, pinned_platform::CreateTestFault::None),
-                Err(GuestArtifactError::PinnedCaptureFailed)
-            ));
+            fs::write(&staging_path, b"").unwrap();
+            fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let collision_before = fs::metadata(&staging_path).unwrap();
+            let (_raw_work, work) = held_work(&context);
+            let (collision_result, attempts) =
+                work.create_unlinked_with_test_fault_counted(random, pinned_platform::CreateTestFault::None);
+            assert!(matches!(collision_result, Err(GuestArtifactError::PinnedCaptureFailed)));
+            assert_eq!(attempts, 16);
+            let collision_after = fs::metadata(&staging_path).unwrap();
+            assert_eq!(collision_after.ino(), collision_before.ino());
+            assert_eq!(collision_after.len(), 0);
+            assert_eq!(collision_after.mode() & 0o777, 0o600);
             fs::remove_file(&staging_path).unwrap();
             for fault in [
                 pinned_platform::CreateTestFault::NonzeroBeforeInitialCheck,
                 pinned_platform::CreateTestFault::RemoveBeforeUnlink,
                 pinned_platform::CreateTestFault::NonzeroAfterUnlink,
             ] {
+                let (_raw_fault_work, fault_work) = held_work(&context);
                 assert!(matches!(
-                    work.create_unlinked_with_test_fault(random, fault),
+                    fault_work.create_unlinked_with_test_fault(random, fault),
                     Err(GuestArtifactError::PinnedCaptureFailed)
                 ));
                 if staging_path.exists() {
                     fs::remove_file(&staging_path).unwrap();
                 }
             }
-            let file = work
+            let (_raw_final_work, final_work) = held_work(&context);
+            let file = final_work
                 .create_unlinked_with_test_fault(random, pinned_platform::CreateTestFault::None)
                 .unwrap();
             let metadata = file.metadata().unwrap();
