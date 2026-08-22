@@ -55,8 +55,8 @@ ASSETS = (
         "SumatraPDF-3.6.1-64-install.exe",
         "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64-install.exe",
         "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381",
-        ("-silent",),
-        "Program Files/SumatraPDF/SumatraPDF.exe",
+        ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+        "CompatForge/SumatraPDF/SumatraPDF.exe",
         ("SumatraPDF",),
     ),
     GuiAsset(

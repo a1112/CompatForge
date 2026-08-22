@@ -764,6 +764,32 @@ def _workflow_oracle(source: str) -> dict[str, object]:
 
 
 class MacOsDualRuntimeCiContractTests(unittest.TestCase):
+    def test_gui_modules_share_the_fixed_sumatrapdf_contract(self) -> None:
+        asset = gui_assets.asset_for("sumatrapdf")
+        self.assertEqual(
+            asset.install_args,
+            ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+        )
+        self.assertEqual(
+            asset.installed_executable,
+            "CompatForge/SumatraPDF/SumatraPDF.exe",
+        )
+        baseline_source = GUI_BASELINE_TOOL.read_text(encoding="utf-8")
+        for forbidden in (
+            "os.environ",
+            "os.getenv",
+            "Path.home",
+            "expanduser",
+            "getpass",
+            "pwd.getpw",
+            '"USER"',
+            '"HOME"',
+            '"users"',
+            '"Public"',
+            '"AppData"',
+        ):
+            self.assertNotIn(forbidden, baseline_source)
+
     @staticmethod
     def _workflow() -> str:
         return CI_WORKFLOW.read_text(encoding="utf-8")

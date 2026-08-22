@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -286,6 +287,119 @@ struct RealCode;
             self.assertTrue(asset.url.startswith("https://"))
             self.assertEqual(len(asset.sha256), 64)
             self.assertTrue(asset.window_title_tokens)
+
+    def test_sumatrapdf_uses_the_fixed_bottle_install_location(self) -> None:
+        asset = self.assets.asset_for("sumatrapdf")
+        self.assertEqual(
+            asset.install_args,
+            ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+        )
+        self.assertEqual(
+            asset.installed_executable,
+            "CompatForge/SumatraPDF/SumatraPDF.exe",
+        )
+        unchanged = {
+            value.app_id: (value.install_args, value.installed_executable)
+            for value in self.assets.ASSETS
+            if value.app_id != "sumatrapdf"
+        }
+        self.assertEqual(
+            unchanged,
+            {
+                "7zip": (("/S",), "Program Files/7-Zip/7zFM.exe"),
+                "notepad-plus-plus": (
+                    ("/S",),
+                    "Program Files/Notepad++/notepad++.exe",
+                ),
+            },
+        )
+
+    def test_sumatrapdf_lookup_ignores_ambient_user_state(self) -> None:
+        class ForbiddenEnvironment(dict[str, str]):
+            def get(self, key: str, default: object = None) -> object:
+                raise AssertionError(f"ambient environment was consulted: {key}")
+
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-fixed-sumatra-"
+        ) as temporary:
+            bottle = Path(temporary) / "drive_c"
+            expected = bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
+            expected.parent.mkdir(parents=True)
+            expected.write_bytes(b"MZsumatra")
+            asset = self.assets.asset_for("sumatrapdf")
+            with mock.patch.object(
+                self.baseline.os, "environ", ForbiddenEnvironment()
+            ):
+                self.assertEqual(
+                    self.baseline.installed_executable(asset, bottle), expected
+                )
+
+    def test_installed_executable_rejects_path_drift_and_unsafe_entries(self) -> None:
+        asset = self.assets.asset_for("sumatrapdf")
+        variants = (
+            "missing",
+            "wrong-location",
+            "escape",
+            "symlink",
+            "linked-parent",
+            "linked-bottle",
+            "hardlink-multiple",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(
+                prefix="compatforge-unsafe-sumatra-"
+            ) as temporary:
+                root = Path(temporary)
+                bottle = root / "drive_c"
+                expected = bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
+                expected.parent.mkdir(parents=True)
+                selected_asset = asset
+                if variant == "wrong-location":
+                    wrong = bottle / "Program Files" / "SumatraPDF" / "SumatraPDF.exe"
+                    wrong.parent.mkdir(parents=True)
+                    wrong.write_bytes(b"MZwrong")
+                elif variant == "escape":
+                    outside = root / "outside.exe"
+                    outside.write_bytes(b"MZoutside")
+                    selected_asset = dataclasses.replace(
+                        asset, installed_executable="../outside.exe"
+                    )
+                elif variant == "symlink":
+                    victim = root / "victim.exe"
+                    victim.write_bytes(b"MZvictim")
+                    try:
+                        expected.symlink_to(victim)
+                    except OSError as error:
+                        self.skipTest(f"symlinks are unavailable: {error}")
+                elif variant == "linked-parent":
+                    expected.parent.rmdir()
+                    target = root / "linked-target"
+                    target.mkdir()
+                    (target / "SumatraPDF.exe").write_bytes(b"MZlinked-parent")
+                    try:
+                        expected.parent.symlink_to(target, target_is_directory=True)
+                    except OSError as error:
+                        self.skipTest(f"directory links are unavailable: {error}")
+                elif variant == "linked-bottle":
+                    shutil.rmtree(bottle)
+                    target = root / "bottle-target"
+                    target.joinpath("CompatForge", "SumatraPDF").mkdir(parents=True)
+                    target.joinpath(
+                        "CompatForge", "SumatraPDF", "SumatraPDF.exe"
+                    ).write_bytes(b"MZlinked-bottle")
+                    try:
+                        bottle.symlink_to(target, target_is_directory=True)
+                    except OSError as error:
+                        self.skipTest(f"directory links are unavailable: {error}")
+                elif variant == "hardlink-multiple":
+                    victim = root / "victim.exe"
+                    victim.write_bytes(b"MZvictim")
+                    try:
+                        os.link(victim, expected)
+                    except OSError as error:
+                        self.skipTest(f"hardlinks are unavailable: {error}")
+                with self.assertRaises(self.baseline.AcceptanceError):
+                    self.baseline.installed_executable(selected_asset, bottle)
 
     def test_desktop_shell_is_tauri_and_qt_sources_are_removed(self) -> None:
         self.assertTrue((DESKTOP / "package-lock.json").is_file())

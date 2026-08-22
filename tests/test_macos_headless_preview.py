@@ -17,6 +17,16 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTER = ROOT / "tools" / "register_macos_local_wine.py"
 HARNESS = ROOT / "tools" / "run_macos_headless_preview.py"
 DISCOVER = ROOT / "tools" / "discover_macos_wine.py"
+GUI_ASSETS = ROOT / "tools" / "download_gui_assets.py"
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def sha256(path: Path) -> str:
@@ -39,6 +49,51 @@ class MacOsHeadlessPreviewRegistrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_gui_asset_contract_pins_sumatrapdf_inside_drive_c(self) -> None:
+        assets = load_module("headless_preview_gui_assets", GUI_ASSETS)
+        sumatra = assets.asset_for("sumatrapdf")
+        self.assertEqual(
+            (sumatra.install_args, sumatra.installed_executable),
+            (
+                ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+                "CompatForge/SumatraPDF/SumatraPDF.exe",
+            ),
+        )
+
+    def test_sumatrapdf_fixed_lookup_runs_with_an_empty_child_environment(self) -> None:
+        bottle = self.root / "empty-environment" / "drive_c"
+        expected = bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(b"MZsumatra")
+        program = """
+import pathlib
+import sys
+sys.path.insert(0, sys.argv[1])
+import download_gui_assets
+import run_gui_baseline
+asset = download_gui_assets.asset_for("sumatrapdf")
+print(run_gui_baseline.installed_executable(asset, pathlib.Path(sys.argv[2])))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-B",
+                "-c",
+                program,
+                str(ROOT / "tools"),
+                str(bottle),
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), expected)
 
     def run_register(self, output: Path, *extra: str) -> subprocess.CompletedProcess[str]:
         arguments = [

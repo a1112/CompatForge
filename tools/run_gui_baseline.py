@@ -1791,24 +1791,63 @@ def open_interaction_session(
         ) from error
 
 
+EXPECTED_INSTALLED_EXECUTABLES = {
+    "7zip": "Program Files/7-Zip/7zFM.exe",
+    "sumatrapdf": "CompatForge/SumatraPDF/SumatraPDF.exe",
+    "notepad-plus-plus": "Program Files/Notepad++/notepad++.exe",
+}
+
+
+def _is_reparse(metadata: os.stat_result) -> bool:
+    return bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
 def installed_executable(asset, bottle_root: Path) -> Path:  # type: ignore[no-untyped-def]
-    """Resolve only fixed, application-specific install locations."""
-    primary = bottle_root / Path(asset.installed_executable)
-    candidates = [primary]
-    if asset.app_id == "sumatrapdf":
-        candidates.append(
-            bottle_root
-            / "users"
-            / os.environ.get("USER", "Public")
-            / "AppData"
-            / "Local"
-            / "SumatraPDF"
-            / "SumatraPDF.exe"
-        )
-    for candidate in candidates:
-        if candidate.is_file() and not candidate.is_symlink():
-            return candidate
-    return primary
+    """Return the one verified executable path fixed by the asset descriptor."""
+    expected_relative = EXPECTED_INSTALLED_EXECUTABLES.get(asset.app_id)
+    if expected_relative is None or asset.installed_executable != expected_relative:
+        raise AcceptanceError("GUI asset installed executable location is invalid")
+    if not bottle_root.is_absolute():
+        raise AcceptanceError("Bottle root must be absolute")
+
+    relative = Path(expected_relative)
+    components = [bottle_root]
+    candidate = bottle_root
+    for part in relative.parts:
+        candidate /= part
+        components.append(candidate)
+    try:
+        for index, component in enumerate(components):
+            metadata = component.lstat()
+            linked = stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata)
+            if index == len(components) - 1:
+                if (
+                    linked
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                ):
+                    raise AcceptanceError(
+                        "installed GUI executable is linked or not a unique regular file"
+                    )
+            elif linked or not stat.S_ISDIR(metadata.st_mode):
+                raise AcceptanceError(
+                    "installed GUI executable path contains a linked or invalid directory"
+                )
+        bottle_resolved = bottle_root.resolve(strict=True)
+        candidate_resolved = candidate.resolve(strict=True)
+        candidate_resolved.relative_to(bottle_resolved)
+    except AcceptanceError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise AcceptanceError(
+            "expected installed GUI executable is missing or escapes the Bottle"
+        ) from error
+    if candidate_resolved != bottle_resolved.joinpath(*relative.parts):
+        raise AcceptanceError("installed GUI executable resolved to the wrong location")
+    return candidate
 
 
 def request_architecture(value: str) -> str:
