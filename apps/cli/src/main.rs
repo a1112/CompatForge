@@ -273,10 +273,17 @@ fn is_closed_macos_absolute_path(value: &str) -> bool {
 }
 
 fn has_fixed_sumatrapdf_suffix(value: &str) -> bool {
+    if !is_closed_macos_absolute_path(value) {
+        return false;
+    }
     let mut components = value.rsplit('/');
     components.next() == Some("SumatraPDF.exe")
         && components.next() == Some("SumatraPDF")
         && components.next() == Some("CompatForge")
+        && components.next() == Some("drive_c")
+        && components.next() == Some("prefix")
+        && components.next() == Some("gui-sumatrapdf")
+        && components.next() == Some("bottles")
 }
 
 fn parse_closed_inherited_fd(value: &str) -> Option<i32> {
@@ -813,6 +820,39 @@ mod tests {
             words(&[
                 "prepared-pinned-sumatrapdf-launch-terminate",
                 "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-7zip/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
                 "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
                 "/private/compatforge//request.json",
                 "/private/compatforge/work",
@@ -850,6 +890,27 @@ mod tests {
                 "invalid pinned SumatraPDF command arguments"
             );
         }
+    }
+
+    #[test]
+    fn pinned_sumatrapdf_suffix_rejects_an_ordinary_bottle_id() {
+        assert!(!has_fixed_sumatrapdf_suffix(
+            "/private/compatforge/storage/bottles/gui-7zip/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"
+        ));
+    }
+
+    #[test]
+    fn pinned_sumatrapdf_suffix_requires_the_complete_bottle_tail_chain() {
+        assert!(!has_fixed_sumatrapdf_suffix(
+            "/private/compatforge/CompatForge/SumatraPDF/SumatraPDF.exe"
+        ));
+    }
+
+    #[test]
+    fn pinned_sumatrapdf_suffix_rejects_a_relative_complete_tail_chain() {
+        assert!(!has_fixed_sumatrapdf_suffix(
+            "bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"
+        ));
     }
 
     #[test]
