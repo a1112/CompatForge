@@ -862,6 +862,64 @@ struct RealCode;
                 )
         self.assertEqual(self.baseline.status(nonzero_events), "failed")
 
+    def test_live_ack_error_never_masks_process_window_or_cleanup_failure(self) -> None:
+        accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
+        failed_events = [{"kind": "exited", "exit": {"code": 9, "success": False}}]
+        cases = (
+            (
+                "residual-before-unverified",
+                accepted_events,
+                {"available": True},
+                {"available": True},
+                ["residual"],
+                self.baseline.InteractionUnverifiedError("unverified"),
+                ("failed", "cleanup-residual-processes"),
+            ),
+            (
+                "exit-before-invalid",
+                failed_events,
+                {"available": True},
+                {"available": True},
+                [],
+                self.baseline.InteractionInvalidError("invalid"),
+                ("failed", "application-content-verification-failed"),
+            ),
+            (
+                "window-before-invalid",
+                accepted_events,
+                {"available": False},
+                {"available": True},
+                [],
+                self.baseline.InteractionInvalidError("invalid"),
+                ("failed", "desktop-window-unobserved"),
+            ),
+            (
+                "invalid-after-clean-boundary",
+                accepted_events,
+                {"available": True},
+                {"available": True},
+                [],
+                self.baseline.InteractionInvalidError("invalid"),
+                ("failed", "application-interaction-invalid"),
+            ),
+        )
+        for name, events, windows, shot, residual, error, expected in cases:
+            evidence: dict[str, object] = {}
+            with self.subTest(name=name):
+                self.baseline.evaluate_live_interaction_outcome(
+                    evidence,
+                    "7zip",
+                    events,
+                    windows,
+                    shot,
+                    residual,
+                    None,
+                    error,
+                )
+                self.assertEqual(
+                    (evidence["status"], evidence["reasonCode"]), expected
+                )
+
     def test_actual_installer_branches_fail_for_nonzero_or_missing_executable(self) -> None:
         accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
         nonzero_events = [{"kind": "exited", "exit": {"code": 5, "success": False}}]
@@ -1831,6 +1889,502 @@ struct RealCode;
                 .read_bytes()
                 .startswith(b"!"),
             )
+
+    def test_observed_launch_calls_ack_hook_after_window_while_process_is_alive(self) -> None:
+        order: list[str] = []
+        observed_processes: list[object] = []
+
+        class Output:
+            def __init__(self) -> None:
+                self.first = True
+
+            def readline(self) -> str:
+                if self.first:
+                    self.first = False
+                    return '{"kind":"started","processId":321}\n'
+                return ""
+
+            def read(self) -> str:
+                return '{"kind":"exited","exit":{"code":0,"success":true}}\n'
+
+        class Errors:
+            @staticmethod
+            def read() -> str:
+                return ""
+
+        class Process:
+            def __init__(self) -> None:
+                self.stdout = Output()
+                self.stderr = Errors()
+                self.returncode = 0
+                self.polls = 0
+
+            def poll(self) -> int | None:
+                self.polls += 1
+                return None if self.polls <= 2 else 0
+
+            def wait(self, timeout: int) -> int:
+                del timeout
+                return 0
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        process = Process()
+
+        class Selector:
+            def register(self, _stream: object, _events: object) -> None:
+                return None
+
+            def select(self, timeout: float) -> list[tuple[object, object]]:
+                del timeout
+                return [(type("Key", (), {"fileobj": process.stdout})(), None)]
+
+            def unregister(self, _stream: object) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def observe(_process_group_id: int, _tokens: tuple[str, ...]) -> dict[str, object]:
+            order.append("window")
+            return {"available": True, "windows": [{"title": "7-Zip"}]}
+
+        def capture(_path: Path) -> dict[str, object]:
+            order.append("screenshot")
+            return {"available": True}
+
+        def acknowledge(live_process: object) -> None:
+            observed_processes.append(live_process)
+
+            def write_receipt(
+                challenge: dict[str, object],
+                challenge_path: Path,
+                receipt_path: Path,
+            ) -> bool:
+                order.append("acknowledgement")
+                self.assertIsNone(live_process.poll())
+                self.assertTrue(challenge_path.is_file())
+                self.acknowledgements.write_acknowledgement(
+                    receipt_path,
+                    self.acknowledgements.make_acknowledgement(challenge),
+                )
+                return True
+
+            checks = session.acknowledge_application(
+                app_id="7zip",
+                runtime_version="24.0",
+                pack_digest="sha256:" + "a" * 64,
+                asset_digest="sha256:" + "b" * 64,
+                window_observed=True,
+                nonce_source=lambda _size: "c" * 64,
+                wait_for_acknowledgement=write_receipt,
+            )
+            self.assertEqual(checks, {"fileList": True, "menus": True})
+
+        with (
+            tempfile.TemporaryDirectory(prefix="compatforge-live-window-") as temporary,
+            mock.patch.object(self.baseline.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                self.baseline.selectors, "DefaultSelector", return_value=Selector()
+            ),
+            mock.patch.object(self.baseline, "observer", side_effect=observe),
+            mock.patch.object(self.baseline, "screenshot", side_effect=capture),
+        ):
+            root = Path(temporary)
+            plan_path = root / "plans" / "plan.json"
+            acknowledgement_root = root / "ack"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+            try:
+                events, windows, shot, _process_id = self.baseline.observed_launch(
+                    ["/absolute/compatforge", "prepared-launch-terminate"],
+                    root / "window.png",
+                    ("7-Zip",),
+                    on_window_observed=acknowledge,
+                    timeout=5,
+                )
+            finally:
+                session.close()
+        self.assertEqual(order, ["window", "acknowledgement", "screenshot"])
+        self.assertEqual(self.baseline.status(events), "accepted")
+        self.assertTrue(windows["available"])
+        self.assertTrue(shot["available"])
+        self.assertIsNotNone(observed_processes[0].poll())
+
+    def test_receipt_at_the_deadline_is_late_and_cannot_be_accepted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-ack-deadline-") as temporary:
+            root = Path(temporary)
+            plan_path = root / "plans" / "plan.json"
+            acknowledgement_root = root / "ack"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+            now = [0.0]
+
+            def late_receipt(
+                challenge: dict[str, object], _challenge: Path, receipt: Path
+            ) -> bool:
+                self.acknowledgements.write_acknowledgement(
+                    receipt, self.acknowledgements.make_acknowledgement(challenge)
+                )
+                now[0] = 0.1
+                return True
+
+            try:
+                with self.assertRaises(self.baseline.InteractionUnverifiedError):
+                    session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=True,
+                        nonce_source=lambda _size: "c" * 64,
+                        monotonic=lambda: now[0],
+                        sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                        deadline_seconds=0.1,
+                        wait_for_acknowledgement=late_receipt,
+                    )
+            finally:
+                session.close()
+
+    def test_accepted_compact_application_requires_literal_complete_checks(self) -> None:
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "local-crossover",
+            "version": "24.0",
+            "packDigest": "sha256:" + "a" * 64,
+            "source": "crossover-app",
+        }
+        accepted_without_checks = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "appId": "7zip",
+            "assetSha256": "b" * 64,
+            "status": "accepted",
+            "cleanup": True,
+        }
+        compact_without_checks = {
+            "schemaVersion": "1",
+            "receipt": dict(receipt),
+            "applications": [dict(accepted_without_checks)],
+        }
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.compact_summary(receipt, [accepted_without_checks])
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.validate_compact_summary(compact_without_checks)
+
+        literal_checks = {"fileList": True, "menus": True}
+        accepted = {**accepted_without_checks, "interactionChecks": literal_checks}
+        compact = self.baseline.compact_summary(receipt, [accepted])
+        self.assertEqual(compact["applications"][0]["interactionChecks"], literal_checks)
+        self.baseline.validate_compact_summary(compact)
+
+    def test_unverified_or_invalid_interaction_outcome_cannot_claim_checks(self) -> None:
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "local-crossover",
+            "version": "24.0",
+            "packDigest": "sha256:" + "a" * 64,
+            "source": "crossover-app",
+        }
+        for status, reason_code in (
+            ("unverified", "application-interaction-unverified"),
+            ("failed", "application-interaction-invalid"),
+        ):
+            application = {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "appId": "7zip",
+                "status": status,
+                "failureClass": "application",
+                "reasonCode": reason_code,
+                "cleanup": True,
+                "interactionChecks": {"fileList": True, "menus": True},
+            }
+            compact = {
+                "schemaVersion": "1",
+                "receipt": dict(receipt),
+                "applications": [dict(application)],
+            }
+            with self.subTest(status=status, boundary="full"), self.assertRaises(
+                self.baseline.AcceptanceError
+            ):
+                self.baseline.compact_summary(receipt, [application])
+            with self.subTest(status=status, boundary="compact"), self.assertRaises(
+                self.baseline.AcceptanceError
+            ):
+                self.baseline.validate_compact_summary(compact)
+
+    def test_nonwindow_path_revalidates_bound_roots_before_returning(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-ack-nonwindow-") as temporary:
+            root = Path(temporary)
+            plan_path = root / "plans" / "plan.json"
+            acknowledgement_root = root / "ack"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+            try:
+                with mock.patch.object(
+                    self.baseline.InteractionSession,
+                    "_revalidate",
+                    side_effect=self.baseline.InteractionIntegrityError(
+                        "application interaction root identity changed"
+                    ),
+                ) as revalidate, self.assertRaises(
+                    self.baseline.InteractionIntegrityError
+                ):
+                    session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=False,
+                    )
+                self.assertEqual(revalidate.call_count, 1)
+            finally:
+                session.close()
+
+    def test_main_treats_root_drift_on_application_path_as_integrity_fatal(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-main-drift-") as temporary:
+            root = Path(temporary)
+            cli = root / "compatforge"
+            cli.write_bytes(b"placeholder")
+            work = root / "work"
+            plan = root / "plans" / "plan.json"
+            acknowledgements = root / "acknowledgements"
+            plan.parent.mkdir()
+            acknowledgements.mkdir()
+            calls: list[str] = []
+
+            class DriftingSession:
+                def revalidate(self) -> None:
+                    calls.append(f"revalidate-{len(calls) + 1}")
+                    if len(calls) == 1:
+                        raise self_error
+
+                def close(self) -> None:
+                    calls.append("close")
+
+            self_error = self.baseline.InteractionIntegrityError(
+                "application interaction root identity changed"
+            )
+
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(root / "storage"),
+                "--work-root",
+                str(work),
+                "--runtime-id",
+                "crossover",
+                "--wine-root",
+                str(root / "runtime"),
+                "--wine",
+                "bin/wine",
+                "--wineserver",
+                "bin/wineserver",
+                "--version",
+                "24.0",
+                "--accept-interactive",
+                "--interaction-plan",
+                str(plan),
+                "--acknowledgement-root",
+                str(acknowledgements),
+                "--round-id",
+                "round-1",
+            ]
+
+            def fake_invoke(command: list[str], *, timeout: int = 0) -> subprocess.CompletedProcess[str]:
+                del timeout
+                self.assertEqual(command[1:4], ["local", "macos", "context"])
+                receipt = self.descriptor_receipt()
+                Path(command[-1]).write_text(
+                    json.dumps(self.descriptor_context(root / "storage", receipt)),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, json.dumps(receipt), "")
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                mock.patch.object(self.baseline.os, "access", return_value=True),
+                mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                mock.patch.object(
+                    self.baseline,
+                    "open_interaction_session",
+                    return_value=DriftingSession(),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.baseline.main()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(calls, ["revalidate-1", "revalidate-2", "close"])
+            self.assertIn("application interaction root identity changed", stderr.getvalue())
+
+    def test_main_revalidates_after_window_failure_and_before_last_summary(self) -> None:
+        for raise_at in (3, 13):
+            with self.subTest(raise_at=raise_at), tempfile.TemporaryDirectory(
+                prefix="compatforge-gui-window-drift-"
+            ) as temporary:
+                root = Path(temporary)
+                cli = root / "compatforge"
+                cli.write_bytes(b"placeholder")
+                installer = root / "installer.exe"
+                installer.write_bytes(b"MZ")
+                installed = root / "installed.exe"
+                installed.write_bytes(b"MZ")
+                work = root / "work"
+                plan = root / "plans" / "plan.json"
+                acknowledgements = root / "acknowledgements"
+                plan.parent.mkdir()
+                acknowledgements.mkdir()
+                calls: list[object] = []
+
+                class DriftingSession:
+                    def revalidate(self) -> None:
+                        number = len([value for value in calls if isinstance(value, int)]) + 1
+                        calls.append(number)
+                        if number == raise_at:
+                            raise self_error
+
+                    def close(self) -> None:
+                        calls.append("close")
+
+                self_error = self.baseline.InteractionIntegrityError(
+                    "application interaction root identity changed"
+                )
+                argv = [
+                    str(BASELINE_TOOL),
+                    "--compatforge-cli",
+                    str(cli),
+                    "--cache-root",
+                    str(root / "cache"),
+                    "--runtime-store",
+                    str(root / "runtime-store"),
+                    "--storage-root",
+                    str(root / "storage"),
+                    "--work-root",
+                    str(work),
+                    "--runtime-id",
+                    "crossover",
+                    "--wine-root",
+                    str(root / "runtime"),
+                    "--wine",
+                    "bin/wine",
+                    "--wineserver",
+                    "bin/wineserver",
+                    "--version",
+                    "24.0",
+                    "--accept-interactive",
+                    "--interaction-plan",
+                    str(plan),
+                    "--acknowledgement-root",
+                    str(acknowledgements),
+                    "--round-id",
+                    "round-1",
+                    "--allow-network",
+                ]
+
+                def fake_invoke(
+                    command: list[str], *, timeout: int = 0
+                ) -> subprocess.CompletedProcess[str]:
+                    del timeout
+                    if command[1:4] == ["local", "macos", "context"]:
+                        receipt = self.descriptor_receipt()
+                        Path(command[-1]).write_text(
+                            json.dumps(self.descriptor_context(root / "storage", receipt)),
+                            encoding="utf-8",
+                        )
+                        return subprocess.CompletedProcess(
+                            command, 0, json.dumps(receipt), ""
+                        )
+                    if command[1] == "inspect":
+                        return subprocess.CompletedProcess(
+                            command, 0, '{"architecture":"x86_64"}', ""
+                        )
+                    if command[1] == "prepared-plan":
+                        return subprocess.CompletedProcess(command, 0, "{}", "")
+                    if command[1] == "prepared-launch-terminate":
+                        return subprocess.CompletedProcess(
+                            command,
+                            0,
+                            '{"kind":"exited","exit":{"code":0,"success":true}}\n',
+                            "",
+                        )
+                    raise AssertionError(f"unexpected command: {command}")
+
+                def window_failure(
+                    _argv: list[str],
+                    _screenshot_path: Path,
+                    _title_tokens: tuple[str, ...],
+                    **_options: object,
+                ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], int]:
+                    return (
+                        [{"kind": "exited", "exit": {"code": 0, "success": True}}],
+                        {"available": False},
+                        {"available": True},
+                        321,
+                    )
+
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                    mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                    mock.patch.object(self.baseline.os, "access", return_value=True),
+                    mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                    mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                    mock.patch.object(self.baseline, "fetch_asset", return_value=installer),
+                    mock.patch.object(
+                        self.baseline, "installed_executable", return_value=installed
+                    ),
+                    mock.patch.object(
+                        self.baseline, "observed_launch", side_effect=window_failure
+                    ),
+                    mock.patch.object(self.baseline, "process_snapshot", return_value=[]),
+                    mock.patch.object(
+                        self.baseline,
+                        "open_interaction_session",
+                        return_value=DriftingSession(),
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = self.baseline.main()
+
+                self.assertEqual(result, 1)
+                expected_numbers = list(range(1, 5 if raise_at == 3 else 14))
+                self.assertEqual(calls, [*expected_numbers, "close"])
+                self.assertIn(
+                    "application interaction root identity changed", stderr.getvalue()
+                )
 
     def test_acknowledgement_binds_every_identity_digest_nonce_and_check(self) -> None:
         mutations = (

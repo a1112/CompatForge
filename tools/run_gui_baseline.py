@@ -556,6 +556,32 @@ def _validate_exit_projection(value: object, label: str) -> None:
     _require_bool(value["success"], f"{label}.success")
 
 
+def _validated_interaction_checks(
+    app_id: str,
+    status_value: str,
+    reason_code: object,
+    interactions: object,
+    label: str,
+) -> dict[str, bool] | None:
+    if interactions is None:
+        if status_value == "accepted":
+            raise AcceptanceError(f"accepted {label} omitted interaction checks")
+        return None
+    if not isinstance(interactions, dict):
+        raise AcceptanceError(f"{label} interaction checks must be an object")
+    required = REQUIRED_INTERACTIONS[app_id]
+    if set(interactions) != set(required) or any(
+        interactions.get(name) is not True for name in required
+    ):
+        raise AcceptanceError(f"{label} interaction checks are invalid")
+    if reason_code in {
+        "application-interaction-unverified",
+        "application-interaction-invalid",
+    }:
+        raise AcceptanceError(f"{label} interaction failure claimed checks")
+    return {name: True for name in required}
+
+
 def validate_compact_summary(value: object) -> None:
     if not isinstance(value, dict):
         raise AcceptanceError("compact summary must be an object")
@@ -633,15 +659,13 @@ def validate_compact_summary(value: object) -> None:
             not isinstance(asset_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", asset_sha256) is None
         ):
             raise AcceptanceError("compact application assetSha256 is invalid")
-        interactions = application.get("interactionChecks")
-        if interactions is not None:
-            if not isinstance(interactions, dict):
-                raise AcceptanceError("compact interaction checks must be an object")
-            required = set(REQUIRED_INTERACTIONS[app_id])
-            _require_exact_keys(interactions, required, set(), "compact interaction checks")
-            for checked in interactions.values():
-                if _require_bool(checked, "compact interaction check") is not True:
-                    raise AcceptanceError("compact interaction check must be true")
+        _validated_interaction_checks(
+            app_id,
+            status_value,
+            application.get("reasonCode"),
+            application.get("interactionChecks"),
+            "compact application",
+        )
         for field in ("installerExit", "exit"):
             if field in application:
                 _validate_exit_projection(application[field], f"compact application {field}")
@@ -706,15 +730,17 @@ def compact_summary(
             projected["reasonCode"] = reason_code
         interactions = application.get("interactionChecks")
         required_interactions = REQUIRED_INTERACTIONS.get(application.get("appId"))
-        if interactions is not None:
-            if not isinstance(interactions, dict) or required_interactions is None:
-                raise AcceptanceError("application interaction checks are invalid")
-            if (
-                set(interactions) != set(required_interactions)
-                or any(interactions.get(name) is not True for name in required_interactions)
-            ):
-                raise AcceptanceError("application interaction checks are invalid")
-            projected["interactionChecks"] = dict(interactions)
+        if required_interactions is None:
+            raise AcceptanceError("application interaction checks are invalid")
+        validated_interactions = _validated_interaction_checks(
+            application["appId"],
+            status_value,
+            application.get("reasonCode"),
+            interactions,
+            "application",
+        )
+        if validated_interactions is not None:
+            projected["interactionChecks"] = validated_interactions
         for source_key, target_key in (("installerExit", "installerExit"), ("exit", "exit")):
             compact_exit = _compact_exit(application.get(source_key))
             if compact_exit is not None:
@@ -931,9 +957,12 @@ def observed_launch(
     screenshot_path: Path,
     title_tokens: tuple[str, ...],
     *,
+    on_window_observed: Callable[[subprocess.Popen[str]], None] | None = None,
     timeout: int = MAX_COMMAND_SECONDS,
 ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], int | None]:
     """Keep the Core launch process alive while collecting visual evidence."""
+    if on_window_observed is not None and not callable(on_window_observed):
+        raise AcceptanceError("window acknowledgement hook is invalid")
     process = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -953,6 +982,7 @@ def observed_launch(
     events: list[dict[str, object]] = []
     root_process_id: int | None = None
     next_observation = started
+    acknowledgement_hook_called = False
     while process.poll() is None:
         elapsed = time.monotonic() - started
         for key, _mask in selector.select(timeout=0.1):
@@ -972,6 +1002,12 @@ def observed_launch(
         ):
             windows = observer(root_process_id, title_tokens)
             if windows.get("available") is True:
+                if (
+                    on_window_observed is not None
+                    and not acknowledgement_hook_called
+                ):
+                    acknowledgement_hook_called = True
+                    on_window_observed(process)
                 shot = screenshot(screenshot_path)
             next_observation = now + 0.5
         if elapsed >= timeout:
@@ -1052,6 +1088,39 @@ def evaluate_application_outcome(
         )
         return
     set_application_outcome(evidence, "accepted")
+
+
+def evaluate_live_interaction_outcome(
+    evidence: dict[str, object],
+    app_id: str,
+    events: list[dict[str, object]],
+    windows: dict[str, object],
+    shot: dict[str, object],
+    residual: list[str],
+    checks: dict[str, bool] | None,
+    interaction_error: AcceptanceError | None,
+) -> None:
+    """Apply process and desktop failures before acknowledgement failures."""
+
+    if checks is not None:
+        evidence["interactionChecks"] = checks
+    evaluate_application_outcome(
+        evidence,
+        app_id,
+        events,
+        windows,
+        shot,
+        residual,
+        checks or {},
+    )
+    if evidence.get("reasonCode") != "application-interaction-unverified":
+        return
+    if isinstance(interaction_error, InteractionInvalidError):
+        apply_stage_outcome(
+            evidence,
+            "application-interaction-invalid",
+            diagnostic="application interaction acknowledgement was invalid",
+        )
 
 
 def installer_succeeded(
@@ -1298,6 +1367,11 @@ class InteractionSession:
                 "application interaction root identity changed"
             ) from error
 
+    def revalidate(self) -> None:
+        """Revalidate every held root at an application boundary."""
+
+        self._revalidate()
+
     def _entry_identity(self, binding: object, name: str, label: str) -> tuple[int, int, int, int, int]:
         protocol = _acknowledgement_protocol()
         try:
@@ -1427,6 +1501,7 @@ class InteractionSession:
             Callable[[dict[str, object], Path, Path], bool | None] | None
         ) = None,
     ) -> dict[str, bool]:
+        self._revalidate()
         if window_observed is not True:
             return {}
         if (
@@ -1492,14 +1567,14 @@ class InteractionSession:
                 self._assert_challenge_unchanged(
                     name, challenge_path, challenge, challenge_identity
                 )
+                now = monotonic()
+                if now >= deadline:
+                    raise InteractionUnverifiedError(
+                        "application interaction acknowledgement timed out"
+                    )
                 try:
                     protocol._relative_stat(self.receipt_binding, name)
                 except FileNotFoundError:
-                    now = monotonic()
-                    if now >= deadline:
-                        raise InteractionUnverifiedError(
-                            "application interaction acknowledgement timed out"
-                        )
                     sleeper(min(ACKNOWLEDGEMENT_POLL_SECONDS, deadline - now))
                     continue
                 except OSError as error:
@@ -1799,6 +1874,8 @@ def main() -> int:
             }
             failure_stage = "asset-fetch"
             try:
+                if interaction_session is not None:
+                    interaction_session.revalidate()
                 cache_entry = arguments.cache_root / asset.filename
                 if not asset_preflight(evidence, cache_entry, arguments.allow_network):
                     continue
@@ -1904,6 +1981,46 @@ def main() -> int:
                     f"{asset.app_id} GUI plan",
                 )
                 failure_stage = "desktop-launch"
+                interaction_state: dict[str, object] = {
+                    "checks": None,
+                    "error": None,
+                }
+
+                def acknowledge_live_window(
+                    process: subprocess.Popen[str],
+                ) -> None:
+                    if interaction_session is None:
+                        return
+                    try:
+                        interaction_session.revalidate()
+                        if process.poll() is not None:
+                            raise InteractionUnverifiedError(
+                                "application closed before interaction acknowledgement"
+                            )
+                        interaction_state["checks"] = (
+                            interaction_session.acknowledge_application(
+                                app_id=asset.app_id,
+                                runtime_version=receipt["version"],
+                                pack_digest=receipt["packDigest"],
+                                asset_digest="sha256:" + asset.sha256,
+                                window_observed=True,
+                            )
+                        )
+                    except (
+                        InteractionUnverifiedError,
+                        InteractionInvalidError,
+                        InteractionIntegrityError,
+                        InteractionCleanupError,
+                    ) as error:
+                        interaction_state["error"] = error
+                    finally:
+                        try:
+                            interaction_session.revalidate()
+                        except InteractionIntegrityError as error:
+                            interaction_state["error"] = error
+
+                if interaction_session is not None:
+                    interaction_session.revalidate()
                 events, windows, shot, process_group_id = observed_launch(
                     [
                         str(arguments.compatforge_cli),
@@ -1915,61 +2032,38 @@ def main() -> int:
                     ],
                     arguments.work_root / f"{asset.app_id}.png",
                     asset.window_title_tokens,
+                    on_window_observed=(
+                        acknowledge_live_window
+                        if interaction_session is not None
+                        else None
+                    ),
                 )
+                if interaction_session is not None:
+                    interaction_session.revalidate()
                 evidence["events"] = events
                 evidence["exit"] = exit_observation(events)
                 evidence["windows"] = windows
                 evidence["screenshot"] = shot
                 evidence["residualProcesses"] = process_snapshot(str(bottle_root), process_group_id)
-                can_acknowledge = (
-                    interaction_session is not None
-                    and not evidence["residualProcesses"]
-                    and status(events) == "accepted"
-                    and windows.get("available") is True
-                    and shot.get("available") is True
+                interaction_error = interaction_state["error"]
+                checks = interaction_state["checks"]
+                if isinstance(
+                    interaction_error,
+                    (InteractionIntegrityError, InteractionCleanupError),
+                ):
+                    raise interaction_error
+                evaluate_live_interaction_outcome(
+                    evidence,
+                    asset.app_id,
+                    events,
+                    windows,
+                    shot,
+                    evidence["residualProcesses"],
+                    checks if isinstance(checks, dict) else None,
+                    interaction_error
+                    if isinstance(interaction_error, AcceptanceError)
+                    else None,
                 )
-                if can_acknowledge:
-                    try:
-                        checks = interaction_session.acknowledge_application(
-                            app_id=asset.app_id,
-                            runtime_version=receipt["version"],
-                            pack_digest=receipt["packDigest"],
-                            asset_digest="sha256:" + asset.sha256,
-                            window_observed=True,
-                        )
-                    except InteractionUnverifiedError:
-                        apply_stage_outcome(
-                            evidence,
-                            "application-interaction",
-                            diagnostic="required application interactions were not acknowledged",
-                        )
-                    except InteractionInvalidError:
-                        apply_stage_outcome(
-                            evidence,
-                            "application-interaction-invalid",
-                            diagnostic="application interaction acknowledgement was invalid",
-                        )
-                    else:
-                        evidence["interactionChecks"] = checks
-                        evaluate_application_outcome(
-                            evidence,
-                            asset.app_id,
-                            events,
-                            windows,
-                            shot,
-                            evidence["residualProcesses"],
-                            checks,
-                        )
-                else:
-                    evaluate_application_outcome(
-                        evidence,
-                        asset.app_id,
-                        events,
-                        windows,
-                        shot,
-                        evidence["residualProcesses"],
-                        {},
-                    )
             except NetworkUnavailableError as error:
                 apply_stage_outcome(
                     evidence,
@@ -2008,9 +2102,13 @@ def main() -> int:
                         "cleanup-delete",
                         diagnostic=cleanup_diagnostic,
                     )
+                if interaction_session is not None:
+                    interaction_session.revalidate()
                 write_json(arguments.work_root / f"{asset.app_id}-evidence.json", evidence)
                 results.append(evidence)
 
+        if interaction_session is not None:
+            interaction_session.revalidate()
         bind_runtime_identity(runtime_id, receipt, results)
         summary = compact_summary(receipt, results)
         write_json(arguments.work_root / "summary.json", summary)
