@@ -3784,6 +3784,84 @@ raise SystemExit(1)
             )
         )
 
+    def test_discovery_fails_closed_when_physical_overlap_identity_cannot_be_read(self) -> None:
+        with mock.patch.object(
+            acceptance,
+            "_physical_paths_overlap",
+            side_effect=acceptance.AcceptanceError("path identity could not be captured"),
+        ):
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError, "path identity could not be captured"
+            ):
+                acceptance.parse_discovery(
+                    json.dumps(self._discovery()), self._arguments()
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Runtime alias probes")
+    def test_discovery_rejects_runtime_unc_junction_and_native_aliases(self) -> None:
+        local_parent = self.external
+        drive = local_parent.drive.rstrip(":").lower()
+        relative = str(local_parent)[3:].replace("/", "\\")
+        unc_parent = Path(f"\\\\localhost\\{drive}$\\{relative}")
+        if not unc_parent.is_dir():
+            self.skipTest("localhost administrative share is unavailable")
+
+        def unc_alias(path: Path) -> Path:
+            return unc_parent.joinpath(*path.relative_to(local_parent).parts)
+
+        self.assertFalse(
+            acceptance._physical_paths_overlap(
+                unc_alias(self.runtime_roots["crossover"]),
+                unc_alias(self.runtime_roots["whisky"]),
+            )
+        )
+        accepted = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )
+        self.assertEqual(
+            [descriptor["runtimeId"] for descriptor in accepted],
+            ["crossover", "whisky"],
+        )
+
+        same_runtime = self._discovery()
+        same_runtime["runtimes"][1]["materializedRoot"] = str(
+            unc_alias(self.runtime_roots["crossover"])
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "Runtime roots overlap"):
+            acceptance.parse_discovery(json.dumps(same_runtime), self._arguments())
+
+        for protected in (self.interactions, self.acknowledgements):
+            with self.subTest(protected=protected.name):
+                (protected / "bin").mkdir()
+                self._macho_tool_at(protected / "bin" / "wine")
+                self._macho_tool_at(protected / "bin" / "wineserver")
+                protected_runtime = self._discovery()
+                protected_runtime["runtimes"][0]["materializedRoot"] = str(
+                    unc_alias(protected)
+                )
+                with self.assertRaisesRegex(
+                    acceptance.AcceptanceError, "overlaps protected input"
+                ):
+                    acceptance.parse_discovery(
+                        json.dumps(protected_runtime), self._arguments()
+                    )
+
+        import _winapi
+
+        junction = self.external / "runtime-junction"
+        _winapi.CreateJunction(str(self.runtime_roots["crossover"]), str(junction))
+        junction_runtime = self._discovery()
+        junction_runtime["runtimes"][0]["materializedRoot"] = str(junction)
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "unsafe path component"):
+            acceptance.parse_discovery(json.dumps(junction_runtime), self._arguments())
+
+        native_runtime = self._discovery()
+        native_runtime["runtimes"][0]["materializedRoot"] = (
+            "\\\\?\\" + str(self.runtime_roots["crossover"])
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "non-traversing path"):
+            acceptance.parse_discovery(json.dumps(native_runtime), self._arguments())
+
     @unittest.skipUnless(os.name == "nt", "Windows physical alias probes")
     def test_windows_local_unc_and_junction_aliases_are_rejected(self) -> None:
         local_parent = self.external

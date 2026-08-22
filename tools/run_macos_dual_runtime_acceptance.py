@@ -898,9 +898,16 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
             raise AcceptanceError("Runtime descriptor source is invalid")
         version = _runtime_version(descriptor["version"])
         root = _canonical(_absolute(descriptor["materializedRoot"], "Runtime root"), "Runtime root")
-        if not root.is_dir() or any(_overlaps(root, protected_path) for protected_path in protected):
+        if not root.is_dir() or any(
+            _overlaps(root, protected_path)
+            or _physical_paths_overlap(root, protected_path)
+            for protected_path in protected
+        ):
             raise AcceptanceError("Runtime root is invalid or overlaps protected input")
-        if any(_overlaps(root, other) for other in runtime_roots):
+        if any(
+            _overlaps(root, other) or _physical_paths_overlap(root, other)
+            for other in runtime_roots
+        ):
             raise AcceptanceError("Runtime roots overlap")
         runtime_roots.append(root)
         root_binding = _capture_binding(root, "Runtime root")
