@@ -734,6 +734,53 @@ struct RealCode;
             r'pub\s+const\s+extern\s+"C"\s+fn\s+cf_abi_version\(\)\s*->\s*u32\s*\{\s*1\s*\}',
         )
 
+    def test_pinned_cli_session_is_one_closed_capture_to_receipt_boundary(self) -> None:
+        source = rust_without_comments(
+            (ROOT / "apps" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
+        )
+        cargo = tomllib.loads(
+            (ROOT / "apps" / "cli" / "Cargo.toml").read_text(encoding="utf-8")
+        )
+        self.assertIn("compatforge-guest-artifact", cargo["dependencies"])
+        ordered = (
+            "session.validate_closed_inputs()",
+            "session.capture_source()",
+            "session.prepare_pinned()",
+            "session.authorize_pinned()",
+            "session.publish_evidence()",
+            "session.start_pinned()",
+            "session.post_spawn_revalidate()",
+            "session.supervise_pinned(handle)",
+            "session.finalize_session()",
+        )
+        positions = [source.index(token) for token in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            '"compatforge-cli: pinned SumatraPDF launch failed\\n"', source
+        )
+        self.assertIn('"pinned-evidence-receipt"', source)
+        self.assertNotIn("COMPATFORGE_PINNED", source)
+
+    def test_pinned_cli_receipt_contract_is_fixed_and_path_free(self) -> None:
+        source = rust_without_comments(
+            (ROOT / "apps" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
+        )
+        for field in (
+            "PinnedEvidenceReceipt",
+            "PinnedEvidenceOutput",
+            "byte_length",
+            "record_type",
+            "schema_version",
+            'kind: "inspection"',
+            'kind: "plan"',
+        ):
+            self.assertIn(field, source)
+        self.assertRegex(
+            source,
+            r'const\s+PINNED_SUMATRAPDF_FAILURE\s*:\s*&str\s*=\s*'
+            r'"pinned SumatraPDF launch failed"',
+        )
+
     def test_application_grid_and_function_switches_are_stable(self) -> None:
         frontend = (DESKTOP / "src" / "main.ts").read_text(encoding="utf-8")
         for label in (

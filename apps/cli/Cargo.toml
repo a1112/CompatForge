@@ -9,6 +9,7 @@ publish.workspace = true
 compatforge-bottle = { path = "../../crates/compatforge-bottle" }
 compatforge-capability = { path = "../../crates/compatforge-capability" }
 compatforge-domain = { path = "../../crates/compatforge-domain" }
+compatforge-guest-artifact = { path = "../../crates/compatforge-guest-artifact" }
 compatforge-inspect = { path = "../../crates/compatforge-inspect" }
 compatforge-orchestrator = { path = "../../crates/compatforge-orchestrator" }
 compatforge-process = { path = "../../crates/compatforge-process" }

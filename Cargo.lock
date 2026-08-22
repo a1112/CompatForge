@@ -45,6 +45,7 @@ dependencies = [
  "compatforge-bottle",
  "compatforge-capability",
  "compatforge-domain",
+ "compatforge-guest-artifact",
  "compatforge-inspect",
  "compatforge-orchestrator",
  "compatforge-process",
