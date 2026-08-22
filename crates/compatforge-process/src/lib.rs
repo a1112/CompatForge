@@ -2,15 +2,23 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(any(test, target_os = "macos"))]
+use compatforge_domain::BottleExecutableBinding;
 use compatforge_domain::{
     ContractError, LaunchPlan, OutputStream, ProcessExit, ProcessOutput, RuntimeEvent, RuntimeEventKind, RuntimeKind,
     WineServerLifecycle, SCHEMA_VERSION_V1,
 };
-use compatforge_guest_artifact::{verify_binding_contents, verify_in_place_binding_contents, GuestArtifactError};
+use compatforge_guest_artifact::{
+    verify_binding_contents, verify_in_place_binding_contents, GuestArtifactError, PinnedBottleExecutable,
+};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, target_os = "macos"))]
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
+#[cfg(target_os = "macos")]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,74 +121,252 @@ impl ProcessSupervisor {
                 Stdio::piped()
             });
 
-        let prepared_tree = platform::PreparedProcessTree::prepare(&mut command).map_err(ProcessError::Isolation)?;
-        let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-        let process_tree = match prepared_tree.attach(&child) {
-            Ok(process_tree) => Arc::new(process_tree),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProcessError::Isolation(error));
-            }
-        };
+        supervise_command(plan, command, wine_session, keep_alive_after_root_exit, ())
+    }
 
-        let process_id = child.id();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let child = Arc::new(Mutex::new(child));
-        let root_exited = Arc::new(AtomicBool::new(false));
-        let completed = Arc::new(AtomicBool::new(false));
-        let termination_started = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = mpsc::channel();
-        let emitter = Arc::new(EventEmitter::new(plan.request_id.clone(), sender));
-        let controller = Arc::new(TerminationController {
-            child: Arc::clone(&child),
-            process_tree: Arc::clone(&process_tree),
-            emitter: Arc::clone(&emitter),
+    /// Start the fixed, captured SumatraPDF Bottle executable without reopening
+    /// its logical pathname. The caller retains ownership of `pinned`.
+    pub fn start_pinned_bottle(
+        plan: &LaunchPlan,
+        pinned: &PinnedBottleExecutable,
+    ) -> Result<LaunchHandle, ProcessError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (plan, pinned);
+            Err(ProcessError::InvalidGuestArtifact(
+                GuestArtifactError::PinnedUnsupportedPlatform,
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        start_pinned_bottle_macos(plan, pinned)
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug)]
+struct PinnedCommandSpec {
+    executable: String,
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+    current_dir: String,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn validate_pinned_launch_contract(plan: &LaunchPlan, binding: &BottleExecutableBinding) -> Result<(), ProcessError> {
+    plan.validate().map_err(|_| invalid_pinned_launch())?;
+    if plan.runtime.provider != RuntimeKind::Wine
+        || plan.guest_artifact.is_some()
+        || plan.bottle_executable.as_ref() != Some(binding)
+        || plan.process.arguments.as_slice() != [binding.path.as_str()]
+    {
+        return Err(invalid_pinned_launch());
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn pinned_command_spec(
+    plan: &LaunchPlan,
+    binding: &BottleExecutableBinding,
+    descriptor: i32,
+) -> Result<PinnedCommandSpec, ProcessError> {
+    validate_pinned_launch_contract(plan, binding)?;
+    if descriptor <= 2 {
+        return Err(invalid_pinned_launch());
+    }
+    Ok(PinnedCommandSpec {
+        executable: plan.process.executable.clone(),
+        arguments: vec!["start.exe".into(), "/unix".into(), format!("/dev/fd/{descriptor}")],
+        environment: plan.process.environment.clone(),
+        current_dir: plan.process.working_directory.clone(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+struct ProcessOwnedPinnedExecution {
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessOwnedPinnedExecution {
+    fn duplicate(pinned: &PinnedBottleExecutable) -> Result<Self, ProcessError> {
+        use std::os::fd::AsRawFd;
+
+        let mut file = pinned.duplicate_execution_file().map_err(|_| pinned_launch_failed())?;
+        file.seek(SeekFrom::Start(0)).map_err(|_| pinned_launch_failed())?;
+        let descriptor = file.as_raw_fd();
+        // SAFETY: `descriptor` is owned by the live `file`. F_GETFD only reads
+        // descriptor flags and neither transfers nor reconstructs ownership.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(pinned_launch_failed());
+        }
+        // SAFETY: F_SETFD updates flags on the same live, process-owned
+        // duplicate. Clearing only CLOEXEC is what permits the subsequent
+        // direct exec to inherit it; `file` remains its sole Rust owner.
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(pinned_launch_failed());
+        }
+        // SAFETY: F_GETFD performs the same non-owning flag query used above.
+        let inherited_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if inherited_flags < 0 || inherited_flags & libc::FD_CLOEXEC != 0 {
+            return Err(pinned_launch_failed());
+        }
+        Ok(Self { file })
+    }
+
+    fn descriptor(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+
+        self.file.as_raw_fd()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_pinned_bottle_macos(plan: &LaunchPlan, pinned: &PinnedBottleExecutable) -> Result<LaunchHandle, ProcessError> {
+    pinned.revalidate().map_err(|_| pinned_launch_failed())?;
+    validate_pinned_launch_contract(plan, pinned.binding())?;
+    verify_pinned_runtime(plan).map_err(|_| pinned_launch_failed())?;
+    validate_existing_pinned_directory(Path::new(&plan.process.working_directory))?;
+    let wine_session = WineSession::acquire(plan).map_err(|_| pinned_launch_failed())?;
+    let execution = ProcessOwnedPinnedExecution::duplicate(pinned)?;
+    let command_spec = pinned_command_spec(plan, pinned.binding(), execution.descriptor())?;
+    let keep_alive_after_root_exit = true;
+
+    let mut command = Command::new(command_spec.executable);
+    command
+        .args(command_spec.arguments)
+        .current_dir(command_spec.current_dir)
+        .env_clear()
+        .envs(command_spec.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    supervise_command(plan, command, wine_session, keep_alive_after_root_exit, execution)
+        .map_err(sanitize_pinned_launch_error)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_existing_pinned_directory(path: &Path) -> Result<(), ProcessError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(invalid_pinned_launch());
+    }
+    let mut cursor = Path::new("").to_path_buf();
+    for component in path.components() {
+        cursor.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&cursor).map_err(|_| pinned_launch_failed())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid_pinned_launch());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn invalid_pinned_launch() -> ProcessError {
+    ProcessError::InvalidGuestArtifact(GuestArtifactError::InvalidPinnedContract)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn pinned_launch_failed() -> ProcessError {
+    ProcessError::InvalidGuestArtifact(GuestArtifactError::PinnedCaptureFailed)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn sanitize_pinned_launch_error(_error: ProcessError) -> ProcessError {
+    pinned_launch_failed()
+}
+
+fn release_parent_duplicate_after_spawn_attempt<G, T, E>(
+    guard: G,
+    spawn: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let result = spawn();
+    drop(guard);
+    result
+}
+
+fn supervise_command<G>(
+    plan: &LaunchPlan,
+    mut command: Command,
+    wine_session: Option<Arc<WineSession>>,
+    keep_alive_after_root_exit: bool,
+    parent_execution_guard: G,
+) -> Result<LaunchHandle, ProcessError> {
+    let prepared_tree = platform::PreparedProcessTree::prepare(&mut command).map_err(ProcessError::Isolation)?;
+    let mut child = release_parent_duplicate_after_spawn_attempt(parent_execution_guard, || command.spawn())
+        .map_err(ProcessError::Spawn)?;
+    let process_tree = match prepared_tree.attach(&child) {
+        Ok(process_tree) => Arc::new(process_tree),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProcessError::Isolation(error));
+        }
+    };
+
+    let process_id = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let root_exited = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicBool::new(false));
+    let termination_started = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = mpsc::channel();
+    let emitter = Arc::new(EventEmitter::new(plan.request_id.clone(), sender));
+    let controller = Arc::new(TerminationController {
+        child: Arc::clone(&child),
+        process_tree: Arc::clone(&process_tree),
+        emitter: Arc::clone(&emitter),
+        root_exited: Arc::clone(&root_exited),
+        completed: Arc::clone(&completed),
+        termination_started: Arc::clone(&termination_started),
+        process_id,
+        grace_period: Duration::from_millis(plan.lifecycle.termination_grace_milliseconds),
+        wine_session: wine_session.clone(),
+        keep_alive_after_root_exit,
+    });
+
+    emitter.emit(RuntimeEventKind::Started, Some(process_id), None, None, None);
+    let mut output_readers = Vec::new();
+    if let Some(pipe) = stdout {
+        output_readers.push(spawn_output_reader(pipe, OutputStream::Stdout, Arc::clone(&emitter)));
+    }
+    if let Some(pipe) = stderr {
+        output_readers.push(spawn_output_reader(pipe, OutputStream::Stderr, Arc::clone(&emitter)));
+    }
+    spawn_exit_watcher(
+        child,
+        process_tree,
+        ExitWatcherConfig {
             root_exited: Arc::clone(&root_exited),
             completed: Arc::clone(&completed),
+            emitter: Arc::clone(&emitter),
+            wine_session,
+            output_readers,
             termination_started: Arc::clone(&termination_started),
-            process_id,
-            grace_period: Duration::from_millis(plan.lifecycle.termination_grace_milliseconds),
-            wine_session: wine_session.clone(),
             keep_alive_after_root_exit,
-        });
-
-        emitter.emit(RuntimeEventKind::Started, Some(process_id), None, None, None);
-        let mut output_readers = Vec::new();
-        if let Some(pipe) = stdout {
-            output_readers.push(spawn_output_reader(pipe, OutputStream::Stdout, Arc::clone(&emitter)));
-        }
-        if let Some(pipe) = stderr {
-            output_readers.push(spawn_output_reader(pipe, OutputStream::Stderr, Arc::clone(&emitter)));
-        }
-        spawn_exit_watcher(
-            child,
-            process_tree,
-            ExitWatcherConfig {
-                root_exited: Arc::clone(&root_exited),
-                completed: Arc::clone(&completed),
-                emitter: Arc::clone(&emitter),
-                wine_session,
-                output_readers,
-                termination_started: Arc::clone(&termination_started),
-                keep_alive_after_root_exit,
-            },
+        },
+    );
+    if let Some(maximum_runtime) = plan.lifecycle.maximum_runtime_milliseconds {
+        spawn_timeout_watcher(
+            Arc::downgrade(&controller),
+            root_exited,
+            keep_alive_after_root_exit,
+            Duration::from_millis(maximum_runtime),
         );
-        if let Some(maximum_runtime) = plan.lifecycle.maximum_runtime_milliseconds {
-            spawn_timeout_watcher(
-                Arc::downgrade(&controller),
-                root_exited,
-                keep_alive_after_root_exit,
-                Duration::from_millis(maximum_runtime),
-            );
-        }
-
-        Ok(LaunchHandle {
-            receiver: Mutex::new(receiver),
-            controller,
-        })
     }
+
+    Ok(LaunchHandle {
+        receiver: Mutex::new(receiver),
+        controller,
+    })
 }
 
 fn execution_arguments(plan: &LaunchPlan, guest_alias: Option<&Path>) -> Vec<String> {
@@ -1192,9 +1378,9 @@ mod platform {
 mod tests {
     use super::*;
     use compatforge_domain::{
-        CpuArchitecture, GraphicsBackendKind, GraphicsSelection, GuestArtifactBinding, NativeCommand, NetworkPolicy,
-        ProcessLifecycle, RuntimeKind, RuntimeSelection, SandboxPolicy, SandboxProfile, TranslatorKind,
-        TranslatorSelection,
+        BottleExecutableBinding, CpuArchitecture, GraphicsBackendKind, GraphicsSelection, GuestArtifactBinding,
+        NativeCommand, NetworkPolicy, ProcessLifecycle, RuntimeKind, RuntimeSelection, SandboxPolicy, SandboxProfile,
+        TranslatorKind, TranslatorSelection,
     };
     use std::collections::BTreeMap;
 
@@ -1233,6 +1419,308 @@ mod tests {
             lifecycle: ProcessLifecycle::default(),
             decision_trace: Vec::new(),
         }
+    }
+
+    fn pinned_fixture_plan() -> (LaunchPlan, BottleExecutableBinding) {
+        let mut plan = fixture_plan();
+        let binding = BottleExecutableBinding {
+            bottle_id: "gui-sumatrapdf".into(),
+            digest: format!("sha256:{}", "1".repeat(64)),
+            size_bytes: 4096,
+            path: "/reviewed/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe".into(),
+            original_name: "SumatraPDF.exe".into(),
+            architecture: CpuArchitecture::X86_64,
+            image_kind: "executable".into(),
+            subsystem: "windowsGui".into(),
+            inspection_schema_version: SCHEMA_VERSION_V1.into(),
+        };
+        plan.process.executable = "/reviewed/CrossOver/bin/wine64".into();
+        plan.process.arguments = vec![binding.path.clone()];
+        plan.process
+            .environment
+            .insert("WINEPREFIX".into(), "/reviewed/bottles/gui-sumatrapdf/prefix".into());
+        plan.bottle_executable = Some(binding.clone());
+        (plan, binding)
+    }
+
+    #[test]
+    fn pinned_command_uses_only_reviewed_wine_start_unix_and_actual_descriptor() {
+        let (plan, binding) = pinned_fixture_plan();
+        let serialized_before = serde_json::to_string(&plan).unwrap();
+
+        let command = pinned_command_spec(&plan, &binding, 41).unwrap();
+
+        assert_eq!(command.executable, plan.process.executable);
+        assert_eq!(command.arguments, ["start.exe", "/unix", "/dev/fd/41"]);
+        assert_eq!(command.current_dir, plan.process.working_directory);
+        assert_eq!(command.environment, plan.process.environment);
+        assert!(!command.arguments.iter().any(|argument| argument == &binding.path));
+        assert_eq!(serde_json::to_string(&plan).unwrap(), serialized_before);
+        assert!(!serialized_before.contains("/dev/fd/41"));
+    }
+
+    #[test]
+    fn pinned_command_rejects_non_wine_extra_arguments_mismatch_and_fallback() {
+        let (plan, binding) = pinned_fixture_plan();
+        let assert_rejected = |plan: &LaunchPlan, binding: &BottleExecutableBinding| {
+            assert!(matches!(
+                pinned_command_spec(plan, binding, 41),
+                Err(ProcessError::InvalidGuestArtifact(
+                    GuestArtifactError::InvalidPinnedContract
+                ))
+            ));
+        };
+
+        let mut non_wine = plan.clone();
+        non_wine.runtime.provider = RuntimeKind::Remote;
+        assert_rejected(&non_wine, &binding);
+
+        let mut extra = plan.clone();
+        extra.process.arguments.push("--unsafe-extra".into());
+        assert_rejected(&extra, &binding);
+
+        let mut mismatched = binding.clone();
+        mismatched.digest = format!("sha256:{}", "2".repeat(64));
+        assert_rejected(&plan, &mismatched);
+
+        let mut fallback = plan.clone();
+        fallback.process.arguments.clear();
+        assert_rejected(&fallback, &binding);
+
+        let mut immutable_fallback = plan.clone();
+        immutable_fallback.guest_artifact = Some(GuestArtifactBinding {
+            digest: binding.digest.clone(),
+            size_bytes: binding.size_bytes,
+            stored_path: binding.path.clone(),
+            original_name: binding.original_name.clone(),
+            architecture: binding.architecture,
+            image_kind: binding.image_kind.clone(),
+            subsystem: binding.subsystem.clone(),
+            inspection_schema_version: binding.inspection_schema_version.clone(),
+        });
+        assert_rejected(&immutable_fallback, &binding);
+    }
+
+    #[test]
+    fn pinned_parent_duplicate_is_released_for_spawn_and_every_later_phase() {
+        #[derive(Clone)]
+        struct DropProbe(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                lock_recover(&self.0).push("duplicate-closed");
+            }
+        }
+
+        for post_spawn_phase in ["attach-failure", "timeout", "cleanup"] {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let guard = DropProbe(Arc::clone(&order));
+            let result: Result<(), ()> = release_parent_duplicate_after_spawn_attempt(guard, || {
+                lock_recover(&order).push("spawn");
+                Ok(())
+            });
+            result.unwrap();
+            lock_recover(&order).push(post_spawn_phase);
+            assert_eq!(&*lock_recover(&order), &["spawn", "duplicate-closed", post_spawn_phase]);
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let guard = DropProbe(Arc::clone(&order));
+        let result: Result<(), ()> = release_parent_duplicate_after_spawn_attempt(guard, || {
+            lock_recover(&order).push("spawn-failure");
+            Err(())
+        });
+        assert!(result.is_err());
+        assert_eq!(&*lock_recover(&order), &["spawn-failure", "duplicate-closed"]);
+    }
+
+    #[test]
+    fn pinned_api_and_pre_exec_boundary_remain_closed() {
+        let _api: fn(
+            &LaunchPlan,
+            &compatforge_guest_artifact::PinnedBottleExecutable,
+        ) -> Result<LaunchHandle, ProcessError> = ProcessSupervisor::start_pinned_bottle;
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.trim_start().starts_with("command.pre_exec("))
+                .count(),
+            1
+        );
+        assert!(source.contains("setpgid(0, 0)"));
+    }
+
+    #[test]
+    fn pinned_descriptor_is_absent_from_errors_events_and_the_ordinary_plan() {
+        let (mut plan, binding) = pinned_fixture_plan();
+        plan.process.arguments.push("rejected".into());
+        let error = pinned_command_spec(&plan, &binding, 41).unwrap_err();
+        let rendered_error = error.to_string();
+        assert!(!rendered_error.contains("41"));
+        assert!(!rendered_error.contains("/dev/fd"));
+
+        let event = RuntimeEvent {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            request_id: plan.request_id.clone(),
+            sequence: 0,
+            elapsed_milliseconds: 0,
+            kind: RuntimeEventKind::Failed,
+            process_id: None,
+            output: None,
+            exit: None,
+            message: Some(rendered_error),
+        };
+        assert!(!serde_json::to_string(&event).unwrap().contains("/dev/fd"));
+        assert!(!serde_json::to_string(&plan).unwrap().contains("/dev/fd"));
+    }
+
+    #[test]
+    fn pinned_launch_errors_erase_raw_paths_and_descriptor_numbers() {
+        let raw = ProcessError::Spawn(io::Error::other(
+            "could not execute /secret/reviewed-wine with /dev/fd/41",
+        ));
+        let sanitized = sanitize_pinned_launch_error(raw);
+        let rendered = sanitized.to_string();
+        assert_eq!(
+            rendered,
+            "invalid guest artifact: pinned Bottle executable capture failed"
+        );
+        assert!(!rendered.contains("/secret"));
+        assert!(!rendered.contains("41"));
+        assert!(std::error::Error::source(&sanitized).is_some());
+    }
+
+    #[test]
+    fn ordinary_start_argument_selection_remains_byte_compatible() {
+        let plan = fixture_plan();
+        let before = serde_json::to_string(&plan).unwrap();
+        assert_eq!(execution_arguments(&plan, None), plan.process.arguments);
+        assert_eq!(serde_json::to_string(&plan).unwrap(), before);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_pinned_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        compatforge_guest_artifact::PinnedBottleExecutable,
+        LaunchPlan,
+        Vec<u8>,
+        PathBuf,
+        PathBuf,
+    ) {
+        use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot};
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let provisional_root = std::env::temp_dir().join(format!("compatforge-process-pinned-{label}-{nonce}"));
+        std::fs::create_dir_all(&provisional_root).unwrap();
+        let root = provisional_root.canonicalize().unwrap();
+        let storage = root.join("store");
+        let work = root.join("external-work");
+        let source = storage.join("bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/hello-x86_64.exe");
+        let mut gui_bytes = std::fs::read(fixture).unwrap();
+        gui_bytes[0xdc..0xde].copy_from_slice(&2_u16.to_le_bytes());
+        std::fs::write(&source, &gui_bytes).unwrap();
+
+        let inherited_work = std::fs::File::open(&work).unwrap();
+        let held = HeldExternalWorkRoot::duplicate_inherited(inherited_work.as_raw_fd(), &work, &[&storage]).unwrap();
+        let pinned = GuestArtifactStore::new(&storage)
+            .pin_sumatra_bottle_executable("gui-sumatrapdf", &source, &held)
+            .unwrap();
+
+        let output = root.join("child-bytes.bin");
+        let arguments = root.join("child-arguments.txt");
+        let reviewed_wine = root.join("reviewed-wine");
+        let mut wine = std::fs::File::create(&reviewed_wine).unwrap();
+        wine.write_all(
+            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$COMPATFORGE_PINNED_ARGUMENTS\"\n/bin/cat \"$3\" > \"$COMPATFORGE_PINNED_OUTPUT\"\n",
+        )
+        .unwrap();
+        wine.sync_all().unwrap();
+        drop(wine);
+        let mut permissions = std::fs::metadata(&reviewed_wine).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&reviewed_wine, permissions).unwrap();
+
+        let mut plan = fixture_plan();
+        plan.process.executable = reviewed_wine.to_string_lossy().into_owned();
+        plan.process.arguments = vec![pinned.binding().path.clone()];
+        plan.process.working_directory = storage.join("bottles/gui-sumatrapdf").to_string_lossy().into_owned();
+        plan.process.environment.insert(
+            "COMPATFORGE_PINNED_OUTPUT".into(),
+            output.to_string_lossy().into_owned(),
+        );
+        plan.process.environment.insert(
+            "COMPATFORGE_PINNED_ARGUMENTS".into(),
+            arguments.to_string_lossy().into_owned(),
+        );
+        plan.bottle_executable = Some(pinned.binding().clone());
+        (root, pinned, plan, gui_bytes, output, arguments)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_process_owned_duplicate_is_rewound_inheritable_and_caller_lease_stays_valid() {
+        use std::os::fd::AsRawFd;
+
+        let (root, pinned, _plan, _bytes, _output, _arguments) = macos_pinned_fixture("owned-duplicate");
+        let execution = ProcessOwnedPinnedExecution::duplicate(&pinned).unwrap();
+        let descriptor = execution.file.as_raw_fd();
+        // SAFETY: `descriptor` belongs to the live `execution` file and lseek
+        // only reads its current kernel-maintained offset.
+        assert_eq!(unsafe { libc::lseek(descriptor, 0, libc::SEEK_CUR) }, 0);
+        // SAFETY: F_GETFD only queries flags for the live descriptor.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+        drop(execution);
+        // SAFETY: querying the former number proves this owner closed it; no
+        // ownership is reconstructed from the raw integer.
+        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        pinned.revalidate().unwrap();
+        drop(pinned);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_start_inherits_only_the_process_duplicate_and_closes_the_parent_copy() {
+        let (root, pinned, plan, bytes, output, arguments) = macos_pinned_fixture("start");
+        let handle = ProcessSupervisor::start_pinned_bottle(&plan, &pinned).unwrap();
+        pinned.revalidate().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (!output.exists() || !arguments.exists()) && Instant::now() < deadline {
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        let child_arguments = std::fs::read_to_string(&arguments).unwrap();
+        let lines = child_arguments.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(&lines[..2], ["start.exe", "/unix"]);
+        let descriptor = lines[2].strip_prefix("/dev/fd/").unwrap().parse::<i32>().unwrap();
+        // SAFETY: F_GETFD does not take ownership. The process-owned parent
+        // descriptor must already be closed once spawn returned.
+        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+
+        handle.terminate().unwrap();
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(5));
+        assert!(events.iter().all(|event| {
+            !serde_json::to_string(event)
+                .unwrap()
+                .contains(&format!("/dev/fd/{descriptor}"))
+        }));
+        drop(handle);
+        drop(pinned);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

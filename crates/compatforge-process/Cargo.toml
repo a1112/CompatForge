@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 compatforge-domain = { path = "../compatforge-domain" }
 compatforge-guest-artifact = { path = "../compatforge-guest-artifact" }
+libc.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]

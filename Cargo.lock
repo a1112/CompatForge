@@ -114,6 +114,7 @@ version = "0.12.0"
 dependencies = [
  "compatforge-domain",
  "compatforge-guest-artifact",
+ "libc",
  "serde_json",
  "sha2",
 ]
