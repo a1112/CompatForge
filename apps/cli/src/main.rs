@@ -743,6 +743,30 @@ mod tests {
             "9",
             "1000",
         ]);
+        let Some(PreparedCommand::PinnedSumatraPdfLaunchTerminate {
+            config_path,
+            logical_executable_path,
+            request_path,
+            external_work_root,
+            inherited_work_root_fd,
+            inherited_inspection_fd,
+            inherited_plan_fd,
+            terminate_after_milliseconds,
+        }) = parse_prepared_command(&valid)
+        else {
+            panic!("closed pinned SumatraPDF argv did not select its private command variant");
+        };
+        assert_eq!(config_path, "/private/compatforge/context.json");
+        assert_eq!(
+            logical_executable_path,
+            "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"
+        );
+        assert_eq!(request_path, "/private/compatforge/request.json");
+        assert_eq!(external_work_root, "/private/compatforge/work");
+        assert_eq!(inherited_work_root_fd, 7);
+        assert_eq!(inherited_inspection_fd, 8);
+        assert_eq!(inherited_plan_fd, 9);
+        assert_eq!(terminate_after_milliseconds, 1000);
         assert_eq!(
             run_arguments(&valid).unwrap_err().to_string(),
             "pinned SumatraPDF launch is not implemented"
@@ -830,16 +854,21 @@ mod tests {
 
     #[test]
     fn pinned_sumatrapdf_argv_accepts_full_i32_descriptors_and_bounded_duration() {
-        for (work_root_fd, milliseconds) in [("2147483647", "1"), ("7", "86400000")] {
+        for (descriptors, milliseconds) in [
+            (["2147483647", "8", "9"], "1"),
+            (["7", "2147483647", "9"], "1000"),
+            (["7", "8", "2147483647"], "1000"),
+            (["7", "8", "9"], "86400000"),
+        ] {
             let arguments = words(&[
                 "prepared-pinned-sumatrapdf-launch-terminate",
                 "/private/compatforge/context.json",
                 "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
                 "/private/compatforge/request.json",
                 "/private/compatforge/work",
-                work_root_fd,
-                "8",
-                "9",
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
                 milliseconds,
             ]);
             assert_eq!(
@@ -877,8 +906,11 @@ mod tests {
             ("stdin", ["0", "8", "9"]),
             ("stdout", ["7", "1", "9"]),
             ("stderr", ["7", "8", "2"]),
-            ("duplicate-work", ["7", "7", "9"]),
-            ("duplicate-output", ["7", "8", "8"]),
+            ("duplicate-work-inspection", ["7", "7", "9"]),
+            ("duplicate-work-plan", ["7", "8", "7"]),
+            ("duplicate-inspection-plan", ["7", "8", "8"]),
+            ("leading-zero-inspection", ["7", "08", "9"]),
+            ("leading-zero-plan", ["7", "8", "09"]),
             ("too-large", ["2147483648", "8", "9"]),
             ("option", ["--work-root-fd", "8", "9"]),
         ] {
