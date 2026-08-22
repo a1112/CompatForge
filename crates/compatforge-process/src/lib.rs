@@ -28,7 +28,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
 const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+// Keep cleanup timeout tests fast while preserving the production five-second bound.
+#[cfg(test)]
+const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
 const SUPERVISOR_FORCE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(16);
 const WINE_PREFIX_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 const EXECUTABLE_BUSY_RETRY_LIMIT: usize = 20;
@@ -98,11 +102,7 @@ impl ProcessSupervisor {
         let wine_session = WineSession::acquire(plan)?;
         initialize_wine_prefix(plan)?;
         let guest_execution_alias = prepare_guest_execution_alias(plan)?;
-        let keep_alive_after_root_exit = plan.bottle_executable.is_some()
-            || plan
-                .guest_artifact
-                .as_ref()
-                .is_some_and(|binding| binding.subsystem == "windowsGui");
+        let keep_alive_after_root_exit = managed_wine_gui_requires_idle_wait(plan);
 
         let mut command = Command::new(&plan.process.executable);
         command
@@ -122,7 +122,7 @@ impl ProcessSupervisor {
                 Stdio::piped()
             });
 
-        supervise_command(plan, command, wine_session, keep_alive_after_root_exit, ())
+        supervise_command(plan, command, wine_session, ())
     }
 
     /// Start the fixed, captured SumatraPDF Bottle executable without reopening
@@ -233,8 +233,6 @@ fn start_pinned_bottle_macos(plan: &LaunchPlan, pinned: &PinnedBottleExecutable)
     let wine_session = WineSession::acquire(plan).map_err(|_| pinned_launch_failed())?;
     let execution = ProcessOwnedPinnedExecution::duplicate(pinned)?;
     let command_spec = pinned_command_spec(plan, pinned.binding(), execution.descriptor())?;
-    let keep_alive_after_root_exit = true;
-
     let mut command = Command::new(command_spec.executable);
     command
         .args(command_spec.arguments)
@@ -245,8 +243,7 @@ fn start_pinned_bottle_macos(plan: &LaunchPlan, pinned: &PinnedBottleExecutable)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    supervise_command(plan, command, wine_session, keep_alive_after_root_exit, execution)
-        .map_err(sanitize_pinned_launch_error)
+    supervise_command(plan, command, wine_session, execution).map_err(sanitize_pinned_launch_error)
 }
 
 #[cfg(target_os = "macos")]
@@ -267,6 +264,14 @@ fn validate_existing_pinned_directory(path: &Path) -> Result<(), ProcessError> {
         }
     }
     Ok(())
+}
+
+fn managed_wine_gui_requires_idle_wait(plan: &LaunchPlan) -> bool {
+    plan.bottle_executable.is_some()
+        || plan
+            .guest_artifact
+            .as_ref()
+            .is_some_and(|binding| binding.subsystem == "windowsGui")
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -297,9 +302,9 @@ fn supervise_command<G>(
     plan: &LaunchPlan,
     mut command: Command,
     wine_session: Option<Arc<WineSession>>,
-    keep_alive_after_root_exit: bool,
     parent_execution_guard: G,
 ) -> Result<LaunchHandle, ProcessError> {
+    let keep_alive_after_root_exit = managed_wine_gui_requires_idle_wait(plan);
     let prepared_tree = platform::PreparedProcessTree::prepare(&mut command).map_err(ProcessError::Isolation)?;
     let mut child = release_parent_duplicate_after_spawn_attempt(parent_execution_guard, || command.spawn())
         .map_err(ProcessError::Spawn)?;
@@ -1002,7 +1007,7 @@ fn spawn_exit_watcher(
 
         if keep_alive_after_root_exit {
             if let Some(wine_session) = wine_session.as_ref() {
-                if let Err(error) = wine_session.wait_until_idle() {
+                if let Err(error) = wine_session.wait_until_idle(&termination_started) {
                     cleanup_failed.store(true, Ordering::Release);
                     emitter.emit(
                         RuntimeEventKind::Failed,
@@ -1120,6 +1125,54 @@ struct WineSession {
     lease_released: AtomicBool,
 }
 
+trait NaturalIdleCommand {
+    fn try_wait_success(&mut self) -> io::Result<Option<bool>>;
+    fn interrupt_and_reap(&mut self) -> io::Result<()>;
+}
+
+impl NaturalIdleCommand for Child {
+    fn try_wait_success(&mut self) -> io::Result<Option<bool>> {
+        self.try_wait().map(|status| status.map(|status| status.success()))
+    }
+
+    fn interrupt_and_reap(&mut self) -> io::Result<()> {
+        if self.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Err(kill_error) = self.kill() {
+            return if self.try_wait()?.is_some() {
+                Ok(())
+            } else {
+                Err(kill_error)
+            };
+        }
+        self.wait().map(|_| ())
+    }
+}
+
+fn wait_for_natural_idle_command<C: NaturalIdleCommand>(
+    command: &mut C,
+    termination_started: &AtomicBool,
+    mut wait_for_next_poll: impl FnMut(),
+) -> io::Result<()> {
+    loop {
+        if termination_started.load(Ordering::Acquire) {
+            return command.interrupt_and_reap();
+        }
+        match command.try_wait_success() {
+            Ok(Some(true)) => return Ok(()),
+            Ok(Some(false)) => return Err(io::Error::other("wineserver -w exited unsuccessfully")),
+            Ok(None) => wait_for_next_poll(),
+            Err(error) => {
+                return match command.interrupt_and_reap() {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
+            }
+        }
+    }
+}
+
 impl WineSession {
     fn acquire(plan: &LaunchPlan) -> Result<Option<Arc<Self>>, ProcessError> {
         let Some(lifecycle) = plan.lifecycle.wineserver.clone() else {
@@ -1187,21 +1240,26 @@ impl WineSession {
         stop_result
     }
 
-    /// Wait until the pinned Wine server reports that every process in the
+    /// Wait until the managed Wine server reports that every process in the
     /// managed prefix has exited. Unlike `stop`, this does not terminate a
     /// normally closing GUI application; an explicit termination request may
     /// still run `stop` concurrently and wake this rendezvous.
-    fn wait_until_idle(&self) -> io::Result<()> {
-        let child = self.spawn_command("-w")?;
-        Self::wait_for_command(child, "-w")
+    fn wait_until_idle(&self, termination_started: &AtomicBool) -> io::Result<()> {
+        if termination_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut child = self.spawn_command("-w")?;
+        wait_for_natural_idle_command(&mut child, termination_started, || {
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        })
     }
 
     fn run_command(&self, argument: &str) -> io::Result<()> {
         let child = self.spawn_command(argument)?;
-        Self::wait_for_command(child, argument)
+        Self::wait_for_cleanup_command(child, argument)
     }
 
-    fn wait_for_command(mut child: Child, argument: &str) -> io::Result<()> {
+    fn wait_for_cleanup_command(mut child: Child, argument: &str) -> io::Result<()> {
         let deadline = Instant::now() + WINE_SERVER_COMMAND_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -1974,6 +2032,96 @@ mod tests {
         plan
     }
 
+    struct FakeNaturalIdleCommand {
+        polls: usize,
+        poll_error: bool,
+        interrupted: Arc<AtomicBool>,
+        reaped: bool,
+    }
+
+    impl NaturalIdleCommand for FakeNaturalIdleCommand {
+        fn try_wait_success(&mut self) -> io::Result<Option<bool>> {
+            self.polls += 1;
+            if self.poll_error {
+                Err(io::Error::other("natural idle poll failed"))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn interrupt_and_reap(&mut self) -> io::Result<()> {
+            self.interrupted.store(true, Ordering::Release);
+            self.reaped = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ordinary_and_pinned_gui_idle_waits_outlive_five_virtual_seconds_until_termination() {
+        let mut ordinary = fixture_plan();
+        ordinary.guest_artifact = Some(GuestArtifactBinding {
+            digest: format!("sha256:{}", "1".repeat(64)),
+            size_bytes: 3,
+            stored_path: "C:\\managed\\gui.exe".into(),
+            original_name: "gui.exe".into(),
+            architecture: CpuArchitecture::X86_64,
+            image_kind: "executable".into(),
+            subsystem: "windowsGui".into(),
+            inspection_schema_version: SCHEMA_VERSION_V1.into(),
+        });
+        let (pinned, _) = pinned_fixture_plan();
+
+        for plan in [&ordinary, &pinned] {
+            assert!(managed_wine_gui_requires_idle_wait(plan));
+            let termination_started = AtomicBool::new(false);
+            let virtual_elapsed_seconds = std::cell::Cell::new(0_u64);
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let mut command = FakeNaturalIdleCommand {
+                polls: 0,
+                poll_error: false,
+                interrupted: Arc::clone(&interrupted),
+                reaped: false,
+            };
+
+            wait_for_natural_idle_command(&mut command, &termination_started, || {
+                let elapsed = virtual_elapsed_seconds.get() + 1;
+                virtual_elapsed_seconds.set(elapsed);
+                if elapsed == 6 {
+                    assert!(!interrupted.load(Ordering::Acquire));
+                    termination_started.store(true, Ordering::Release);
+                }
+            })
+            .unwrap();
+
+            assert_eq!(virtual_elapsed_seconds.get(), 6);
+            assert_eq!(command.polls, 6);
+            assert!(command.interrupted.load(Ordering::Acquire));
+            assert!(command.reaped);
+        }
+    }
+
+    #[test]
+    fn natural_idle_poll_failure_interrupts_and_reaps_before_returning() {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let mut command = FakeNaturalIdleCommand {
+            polls: 0,
+            poll_error: true,
+            interrupted: Arc::clone(&interrupted),
+            reaped: false,
+        };
+
+        assert!(
+            wait_for_natural_idle_command(&mut command, &AtomicBool::new(false), || {
+                panic!("a failed poll must not wait again");
+            })
+            .is_err()
+        );
+
+        assert_eq!(command.polls, 1);
+        assert!(interrupted.load(Ordering::Acquire));
+        assert!(command.reaped);
+    }
+
     fn collect_until_exit(handle: &LaunchHandle, deadline: Instant) -> Vec<RuntimeEvent> {
         let mut events = Vec::new();
         while Instant::now() < deadline {
@@ -2073,6 +2221,127 @@ mod tests {
             .iter()
             .any(|event| event.kind == RuntimeEventKind::WineServerStopRequested));
         assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gui_launch_does_not_fail_or_stop_a_live_wineserver_before_caller_termination() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("compatforge-gui-live-{}-{nonce}", std::process::id()));
+        let prefix = directory.join("prefix");
+        let system32 = prefix.join("drive_c/windows/system32");
+        std::fs::create_dir_all(&system32).unwrap();
+        std::fs::write(system32.join("ntdll.dll"), b"marker").unwrap();
+        let runtime = directory.join("wine");
+        let wineserver = directory.join("wineserver");
+        let release = directory.join("release");
+        let started = directory.join("started");
+        let gate = directory.join("gate");
+        assert!(Command::new("/usr/bin/mkfifo").arg(&gate).status().unwrap().success());
+        let mut runtime_file = std::fs::File::create(&runtime).unwrap();
+        runtime_file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        runtime_file.sync_all().unwrap();
+        drop(runtime_file);
+        let mut wineserver_file = std::fs::File::create(&wineserver).unwrap();
+        wineserver_file
+            .write_all(
+                b"#!/bin/sh\nif [ \"$1\" = \"-k\" ]; then\n  : > \"$COMPATFORGE_WINESERVER_RELEASE\"\nelif [ \"$1\" = \"-w\" ] && [ ! -e \"$COMPATFORGE_WINESERVER_RELEASE\" ]; then\n  : > \"$COMPATFORGE_WINESERVER_STARTED\"\n  read ignored < \"$COMPATFORGE_WINESERVER_GATE\"\nfi\n",
+            )
+            .unwrap();
+        wineserver_file.sync_all().unwrap();
+        drop(wineserver_file);
+        for path in [&runtime, &wineserver] {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        let guest = directory.join("guest.exe");
+        std::fs::write(&guest, b"gui").unwrap();
+
+        let mut plan = fixture_plan();
+        plan.process.executable = runtime.to_string_lossy().into_owned();
+        plan.process.arguments = vec![guest.to_string_lossy().into_owned()];
+        plan.process.working_directory = directory.to_string_lossy().into_owned();
+        plan.process
+            .environment
+            .insert("WINEPREFIX".into(), prefix.to_string_lossy().into_owned());
+        plan.process.environment.insert(
+            "COMPATFORGE_WINESERVER_RELEASE".into(),
+            release.to_string_lossy().into_owned(),
+        );
+        plan.process.environment.insert(
+            "COMPATFORGE_WINESERVER_STARTED".into(),
+            started.to_string_lossy().into_owned(),
+        );
+        plan.process.environment.insert(
+            "COMPATFORGE_WINESERVER_GATE".into(),
+            gate.to_string_lossy().into_owned(),
+        );
+        plan.process
+            .environment
+            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), sha256_file(&runtime).unwrap());
+        plan.process.environment.insert(
+            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(&wineserver).unwrap(),
+        );
+        plan.guest_artifact = Some(GuestArtifactBinding {
+            digest: sha256_file(&guest).unwrap(),
+            size_bytes: 3,
+            stored_path: guest.to_string_lossy().into_owned(),
+            original_name: "guest.exe".into(),
+            architecture: CpuArchitecture::X86_64,
+            image_kind: "executable".into(),
+            subsystem: "windowsGui".into(),
+            inspection_schema_version: SCHEMA_VERSION_V1.into(),
+        });
+        plan.lifecycle.wineserver = Some(WineServerLifecycle {
+            executable: wineserver.to_string_lossy().into_owned(),
+            prefix: prefix.to_string_lossy().into_owned(),
+        });
+
+        let handle = ProcessSupervisor::start(&plan).unwrap();
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        let mut before_termination = Vec::new();
+        while !started.exists() && Instant::now() < start_deadline {
+            if let EventPoll::Event(event) = handle.next_event(PROCESS_POLL_INTERVAL) {
+                before_termination.push(event);
+            }
+        }
+        assert!(started.exists());
+        thread::sleep(WINE_SERVER_COMMAND_TIMEOUT + Duration::from_millis(50));
+        while let EventPoll::Event(event) = handle.next_event(Duration::ZERO) {
+            before_termination.push(event);
+        }
+        assert!(!before_termination.iter().any(|event| {
+            matches!(
+                event.kind,
+                RuntimeEventKind::Failed | RuntimeEventKind::WineServerStopRequested | RuntimeEventKind::Exited
+            )
+        }));
+
+        handle.terminate().unwrap();
+        let after_termination = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
+
+        assert!(after_termination
+            .iter()
+            .any(|event| event.kind == RuntimeEventKind::WineServerStopRequested));
+        assert!(!after_termination
+            .iter()
+            .any(|event| event.kind == RuntimeEventKind::Failed));
+        assert_eq!(
+            after_termination.last().map(|event| event.kind),
+            Some(RuntimeEventKind::Exited)
+        );
+        assert_eq!(handle.controller.worker_count(), 0);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2351,7 +2620,7 @@ mod tests {
         plan.process.working_directory = directory.to_string_lossy().into_owned();
         let session = WineSession::acquire(&plan).unwrap().unwrap();
 
-        session.wait_until_idle().unwrap();
+        session.wait_until_idle(&AtomicBool::new(false)).unwrap();
 
         assert_eq!(std::fs::read_to_string(output).unwrap(), format!("-w:{prefix}\n"));
         assert!(matches!(
