@@ -981,6 +981,10 @@ def observed_launch(
         selector.register(process.stdout, selectors.EVENT_READ)
         selector_registered = True
         started = time.monotonic()
+        outer_deadline = started + float(timeout)
+        application_deadline = (
+            started + INTERACTIVE_RUNTIME_MILLISECONDS / 1000
+        )
         windows: dict[str, object] = {
             "available": False,
             "reason": "observation pending",
@@ -1016,20 +1020,26 @@ def observed_launch(
                         and not acknowledgement_hook_called
                     ):
                         acknowledgement_hook_called = True
-                        hook_elapsed = time.monotonic() - started
-                        remaining_budget = min(
-                            float(ACKNOWLEDGEMENT_WAIT_SECONDS),
-                            max(0.0, float(timeout) - hook_elapsed),
-                            max(
-                                0.0,
-                                INTERACTIVE_RUNTIME_MILLISECONDS / 1000
-                                - hook_elapsed,
-                            ),
+                        hook_started = time.monotonic()
+                        hook_deadline = min(
+                            outer_deadline,
+                            application_deadline,
+                            hook_started + ACKNOWLEDGEMENT_WAIT_SECONDS,
                         )
+                        remaining_budget = max(0.0, hook_deadline - hook_started)
                         on_window_observed(process, remaining_budget)
+                        after_hook = time.monotonic()
+                        if after_hook >= outer_deadline:
+                            raise AcceptanceError(
+                                "GUI launch exceeded the bounded observation timeout"
+                            )
+                        if after_hook >= hook_deadline:
+                            raise InteractionUnverifiedError(
+                                "application interaction acknowledgement timed out"
+                            )
                     shot = screenshot(screenshot_path)
                 next_observation = now + 0.5
-            if elapsed >= timeout:
+            if time.monotonic() >= outer_deadline:
                 raise AcceptanceError(
                     "GUI launch exceeded the bounded observation timeout"
                 )

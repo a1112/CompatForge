@@ -2241,6 +2241,110 @@ struct RealCode;
             captured.exception.__cause__, self.baseline.InteractionInvalidError
         )
 
+    def test_hook_cannot_cross_absolute_deadline_then_exit_successfully(self) -> None:
+        now = [0.0]
+        hook_budgets: list[float] = []
+        screenshot_calls: list[str] = []
+
+        class Output:
+            def __init__(self) -> None:
+                self.emitted = False
+
+            def readline(self) -> str:
+                if self.emitted:
+                    return ""
+                self.emitted = True
+                return '{"kind":"started","processId":321}\n'
+
+            def read(self) -> str:
+                return '{"kind":"exited","exit":{"code":0,"success":true}}\n'
+
+        class Errors:
+            def read(self) -> str:
+                return ""
+
+        class Process:
+            def __init__(self) -> None:
+                self.stdout = Output()
+                self.stderr = Errors()
+                self.returncode: int | None = None
+                self.terminated = False
+                self.killed = False
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+
+            def wait(self, timeout: int) -> int:
+                del timeout
+                return self.returncode or 0
+
+        process = Process()
+
+        class Selector:
+            def __init__(self) -> None:
+                self.unregistered = False
+                self.closed = False
+
+            def register(self, _stream: object, _events: object) -> None:
+                return None
+
+            def select(self, timeout: float) -> list[tuple[object, object]]:
+                del timeout
+                return [(type("Key", (), {"fileobj": process.stdout})(), None)]
+
+            def unregister(self, _stream: object) -> None:
+                self.unregistered = True
+
+            def close(self) -> None:
+                self.closed = True
+
+        selector = Selector()
+
+        def acknowledge(_process: object, remaining_budget: float) -> None:
+            hook_budgets.append(remaining_budget)
+            now[0] = 2.0
+            process.returncode = 0
+
+        def capture(_path: Path) -> dict[str, object]:
+            screenshot_calls.append("screenshot")
+            return {"available": True}
+
+        with (
+            mock.patch.object(self.baseline.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                self.baseline.selectors, "DefaultSelector", return_value=selector
+            ),
+            mock.patch.object(self.baseline.time, "monotonic", side_effect=lambda: now[0]),
+            mock.patch.object(self.baseline.time, "sleep", return_value=None),
+            mock.patch.object(
+                self.baseline, "observer", return_value={"available": True}
+            ),
+            mock.patch.object(self.baseline, "screenshot", side_effect=capture),
+            self.assertRaisesRegex(
+                self.baseline.AcceptanceError,
+                "bounded observation timeout",
+            ),
+        ):
+            self.baseline.observed_launch(
+                ["/absolute/compatforge", "prepared-launch-terminate"],
+                Path("/absolute/window.png"),
+                ("7-Zip",),
+                on_window_observed=acknowledge,
+                timeout=1,
+            )
+        self.assertEqual(hook_budgets, [1.0])
+        self.assertEqual(screenshot_calls, [])
+        self.assertTrue(selector.unregistered)
+        self.assertTrue(selector.closed)
+        self.assertFalse(process.terminated)
+        self.assertFalse(process.killed)
+
     def test_ack_wait_polls_liveness_before_every_read_or_sleep(self) -> None:
         cases = (
             ("initially-dead", (False,), (False,), (), 0.0),
