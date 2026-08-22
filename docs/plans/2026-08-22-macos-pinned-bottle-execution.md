@@ -2,74 +2,74 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Launch the fixed SumatraPDF acceptance executable from verified anonymous bytes instead of reopening a mutable Bottle pathname.
+**Goal:** Launch the fixed SumatraPDF acceptance executable from one verified anonymous lease instead of reopening a mutable Bottle pathname.
 
-**Architecture:** Add an opt-in, in-process Rust execution lease that captures a no-follow Bottle executable into an anonymous unlinked file, inspects and plans against those bytes, and passes the inherited descriptor to Wine. Keep the ordinary `LaunchPlan` JSON, FFI ABI, default `BottleInPlace`, 7-Zip, and Notepad++ behavior unchanged; only the SumatraPDF acceptance runner selects the new CLI command.
+**Architecture:** A closed macOS-only CLI session captures the fixed Bottle executable through a held no-follow directory chain, immediately anonymizes a private execution file, and uses the same lease for inspection, planning, authorization, and Wine process creation. The ordinary `LaunchPlan` JSON, FFI ABI, default `BottleInPlace`, 7-Zip, and Notepad++ behavior remain unchanged.
 
-**Tech Stack:** Rust 2021, Python 3.12 contracts, `std::fs::File`, Unix descriptor inheritance, Wine Unix-path launch, existing CompatForge inspection/orchestration/process crates.
+**Tech Stack:** Rust 2021, Python 3.12 contracts, audited Unix `openat`/`fstatat`, anonymous files, inherited descriptors, Wine `start.exe /unix`, existing CompatForge process supervision.
 
 ---
 
-### Task 1: Freeze the public compatibility boundary
+### Task 1: Freeze compatibility and the closed command contract
 
 **Files:**
-- Modify: `tests/test_gui_baseline_contracts.py`
 - Modify: `crates/compatforge-domain/src/lib.rs`
-- Reference: `crates/compatforge-ffi/src/lib.rs`
+- Modify: `apps/cli/src/main.rs`
+- Modify: `tests/test_gui_baseline_contracts.py`
 
-**Step 1: Write the failing compatibility tests**
+**Step 1: Add RED compatibility tests**
 
-Add literal tests that serialize the current `LaunchPlan` and assert that the key set remains exactly:
+Assert that serialized `LaunchPlan`, `LaunchRequest`, `BottleExecutableBinding`, and existing FFI exports remain byte-compatible. Add a parser RED test for exactly:
 
 ```text
-schemaVersion, requestId, runtime, translator, graphics, process,
-guestArtifact?, bottleExecutable?, mounts, sandbox, lifecycle, decisionTrace
+prepared-pinned-sumatrapdf-launch-terminate \
+  <config.json> <fixed-logical-executable> <request.json> \
+  <inspection-output.json> <plan-output.json> <milliseconds>
 ```
 
-Add a Python source contract asserting that the pinned Sumatra command is private to the CLI/runner and does not add a `LaunchPlan` field or FFI symbol.
+Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary-Bottle uses. Pin the future command to:
 
-**Step 2: Run the tests and record RED only if the new implementation has already leaked schema**
+- Bottle id `gui-sumatrapdf`;
+- mode `bottleInPlace`;
+- architecture `x86_64`;
+- logical suffix `CompatForge/SumatraPDF/SumatraPDF.exe`;
+- no guest arguments; and
+- create-new inspection/plan outputs.
 
-Run:
-
-```powershell
-cargo test -p compatforge-domain --all-targets --locked
-& '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
-```
-
-Expected before implementation: existing schema test passes; the new private-command source contract fails because the command does not exist yet.
-
-**Step 3: Keep the domain model unchanged**
-
-Do not add a field to `LaunchPlan`, `BottleExecutableBinding`, `LaunchRequest`, or an exported FFI structure. If implementation pressure requires such a field, stop and revise the design instead of weakening this test.
-
-**Step 4: Commit the compatibility oracle**
+**Step 2: Run RED**
 
 ```bash
-git add tests/test_gui_baseline_contracts.py crates/compatforge-domain/src/lib.rs
+cargo test -p compatforge-domain -p compatforge-cli --all-targets --locked pinned
+```
+
+Expected: the schema snapshots pass and the command parser tests fail because the command does not exist.
+
+**Step 3: Add only the closed parser shape**
+
+Parse the command into a private enum variant, but return a fixed unsupported/not-implemented error before any file access. Do not add domain fields or FFI symbols.
+
+**Step 4: Run GREEN and commit**
+
+```bash
+cargo test -p compatforge-domain -p compatforge-cli --all-targets --locked
+git add crates/compatforge-domain/src/lib.rs apps/cli/src/main.rs tests/test_gui_baseline_contracts.py
 git commit -s -m "test: freeze pinned launch compatibility"
 ```
 
-### Task 2: Inspect an already-open regular file
+### Task 2: Inspect a caller-owned file handle
 
 **Files:**
 - Modify: `crates/compatforge-inspect/src/lib.rs`
 
-**Step 1: Write handle-inspection RED tests**
+**Step 1: Add RED tests**
 
-Add an internal API with this shape:
+Introduce:
 
 ```rust
 pub fn inspect_file(file: &mut std::fs::File) -> Result<PeInspectionReport, InspectionError>;
 ```
 
-Tests must prove:
-
-- inspection reads from offset zero and restores or documents the final offset;
-- a renamed/replaced pathname cannot redirect an already-open file;
-- a short read or in-place size change is `ChangedDuringRead`;
-- non-regular files and files over 64 MiB are rejected; and
-- `inspect_path()` remains byte-compatible and delegates to the same bounded parser.
+Tests cover offset zero, renamed source identity, regular-file and 64 MiB bounds, short/change-during-read failure, and unchanged `inspect_path()` bytes.
 
 **Step 2: Run RED**
 
@@ -77,100 +77,92 @@ Tests must prove:
 cargo test -p compatforge-inspect --all-targets --locked inspect_file
 ```
 
-Expected: compile failure because `inspect_file` does not exist.
+**Step 3: Implement**
 
-**Step 3: Implement the minimal handle reader**
+Seek to zero, validate metadata, read through `take(MAX_PE_FILE_BYTES + 1)`, compare read length with metadata, and call `inspect_bytes`. Never reopen a pathname or resolve `/dev/fd`.
 
-Use `stream_position`, `seek(SeekFrom::Start(0))`, `file.metadata()`, and `take(MAX_PE_FILE_BYTES + 1)`. Validate regular-file kind before allocating, compare the number of bytes read with the metadata length, then call `inspect_bytes`.
-
-The implementation must never resolve `/dev/fd`, reopen a pathname, map the file, or execute it.
-
-**Step 4: Run GREEN and existing inspection races**
+**Step 4: Run GREEN and commit**
 
 ```bash
 cargo test -p compatforge-inspect --all-targets --locked
 cargo clippy -p compatforge-inspect --all-targets --locked -- -D warnings
-```
-
-**Step 5: Commit**
-
-```bash
 git add crates/compatforge-inspect/src/lib.rs
 git commit -s -m "feat: inspect held PE files"
 ```
 
-### Task 3: Capture an anonymous pinned Bottle lease
+### Task 3: Capture a held and anonymous Bottle lease
 
 **Files:**
 - Modify: `crates/compatforge-guest-artifact/src/lib.rs`
-- Modify: `crates/compatforge-guest-artifact/Cargo.toml` only if an existing workspace dependency is required
+- Create: `crates/compatforge-guest-artifact/src/pinned_platform.rs`
+- Modify: `crates/compatforge-guest-artifact/Cargo.toml`
 
-**Step 1: Write lease RED tests**
+**Step 1: Add RED platform and capture tests**
 
-Define an opaque non-serializable type:
+Define an opaque, non-serializable `PinnedBottleExecutable` containing:
 
-```rust
-pub struct PinnedBottleExecutable {
-    binding: BottleExecutableBinding,
-    inspection: PeInspectionReport,
-    execution_file: std::fs::File,
-}
-```
+- the existing `BottleExecutableBinding`;
+- `PeInspectionReport`;
+- caller-owned anonymous execution `File`;
+- opened source `File`;
+- each held directory handle and its identity from storage root through the executable parent; and
+- the source entry identity and link count.
 
-Expose read-only accessors and no raw pathname for the anonymous file. Tests must cover:
+Tests prove component-by-component `openat(O_NOFOLLOW)` capture, reparse/symlink/hardlink rejection, same/ancestor substitution detection, and exact fixed path containment.
 
-- source opened no-follow and complete Bottle ancestry validated;
-- regular file, `nlink == 1`, bounded size, and expected fixed logical path;
-- same-inode overwrite during capture is detected by length/digest consistency;
-- rename/substitution after capture does not change lease bytes;
-- the anonymous file has no usable directory entry before return;
-- failure closes the file and removes any staging name; and
-- 7-Zip/Notepad++ default bindings are unaffected.
+Create the execution staging entry with `create_new`, unlink it immediately, assert `nlink == 0`, and only then copy source bytes. Add injected tests for directory enumeration, attempted hardlink, retained foreign write handle, unlink failure, short copy, sync, rewind, and inspection failures.
 
 **Step 2: Run RED**
 
 ```bash
-cargo test -p compatforge-guest-artifact --all-targets --locked pinned_bottle
+cargo test -p compatforge-guest-artifact --all-targets --locked pinned
 ```
 
-**Step 3: Implement capture**
+**Step 3: Implement the audited platform boundary**
 
-Add an opt-in method similar to:
+Replace crate-wide `forbid(unsafe_code)` with `deny(unsafe_op_in_unsafe_fn)`. Confine all unsafe calls to `pinned_platform.rs`, with one safety comment per call. Use `openat`, `fstatat`, `unlinkat`, `fstat`, and `fcntl` only; expose safe RAII wrappers to the rest of the crate.
+
+The Windows implementation is a fixed unsupported-platform branch plus pure helper tests. It must compile without accessing a source path.
+
+**Step 4: Implement capture and revalidation**
 
 ```rust
-pub fn pin_bottle_in_place(
+pub fn pin_sumatra_bottle_executable(
     &self,
     bottle_id: &str,
     source: &Path,
 ) -> Result<PinnedBottleExecutable, GuestArtifactError>;
 ```
 
-Open the source atomically without following links. Create a random `create_new` staging file in an external process-private temporary directory, copy at most 64 MiB from the opened source, sync, rewind, inspect with `inspect_file`, and unlink the staging directory entry before returning on Unix. Windows may retain a delete-on-close staging entry for test compilation, but the CLI must reject this acceptance-only command off macOS.
+Require `gui-sumatrapdf` and the fixed relative path. Revalidate every held identity and the source link count before returning and on each later lease boundary. The anonymous digest/size/inspection are the binding of record.
 
-The binding digest and size come from the anonymous bytes, not a later pathname read.
-
-**Step 4: Run GREEN**
+**Step 5: Run GREEN and commit**
 
 ```bash
 cargo test -p compatforge-guest-artifact --all-targets --locked
 cargo clippy -p compatforge-guest-artifact --all-targets --locked -- -D warnings
+git add crates/compatforge-guest-artifact
+git commit -s -m "feat: pin SumatraPDF Bottle bytes"
 ```
 
-**Step 5: Commit**
-
-```bash
-git add crates/compatforge-guest-artifact/src/lib.rs crates/compatforge-guest-artifact/Cargo.toml
-git commit -s -m "feat: pin Bottle executable bytes"
-```
-
-### Task 4: Prepare and authorize against the lease
+### Task 4: Prepare and authorize only with the same lease
 
 **Files:**
 - Modify: `crates/compatforge-orchestrator/src/lib.rs`
 
-**Step 1: Write prepared-lease RED tests**
+**Step 1: Add RED tests**
 
-Add a private/explicit constructor such as:
+Add private prepared state:
+
+```rust
+enum PreparedExecutable {
+    Immutable(GuestArtifactBinding),
+    Bottle(BottleExecutableBinding),
+    PinnedBottle(BottleExecutableBinding),
+}
+```
+
+Add APIs shaped like:
 
 ```rust
 pub fn prepare_pinned_bottle(
@@ -178,11 +170,15 @@ pub fn prepare_pinned_bottle(
     request: &LaunchRequest,
     pinned: &PinnedBottleExecutable,
 ) -> Result<Self, PreparationError>;
+
+pub fn authorize_pinned<'a>(
+    &'a self,
+    config: &CoreConfig,
+    pinned: &PinnedBottleExecutable,
+) -> Result<&'a LaunchPlan, PreparationError>;
 ```
 
-Tests assert exact logical source equality, Bottle id, requested architecture/digest constraints, ordinary policy decisions, and byte-identical serialized plan versus an equivalent stable `BottleInPlace` plan.
-
-Mutants for a different logical path, Bottle id, digest, architecture, or changed config must reject before process creation.
+Tests require the same binding, inspection, Bottle id, logical path, digest, architecture, and context. Ordinary `authorize()` must reject a `PinnedBottle` state instead of reopening the pathname.
 
 **Step 2: Run RED**
 
@@ -190,32 +186,28 @@ Mutants for a different logical path, Bottle id, digest, architecture, or change
 cargo test -p compatforge-orchestrator --all-targets --locked pinned
 ```
 
-**Step 3: Implement without adding schema**
+**Step 3: Implement without schema changes**
 
-Reuse `compile_prepared_plan`. Store no file descriptor in the plan. The caller continues to own the lease; the prepared launch only binds the lease inspection and `BottleExecutableBinding` into its existing private fields.
+Reuse `compile_prepared_plan`; the resulting serialized plan must be byte-identical to the equivalent stable Bottle plan. Call `pinned.revalidate()` at prepare and authorize boundaries.
 
-**Step 4: Run GREEN**
+**Step 4: Run GREEN and commit**
 
 ```bash
 cargo test -p compatforge-orchestrator --all-targets --locked
 cargo clippy -p compatforge-orchestrator --all-targets --locked -- -D warnings
-```
-
-**Step 5: Commit**
-
-```bash
 git add crates/compatforge-orchestrator/src/lib.rs
-git commit -s -m "feat: prepare pinned Bottle launches"
+git commit -s -m "feat: authorize pinned Bottle leases"
 ```
 
-### Task 5: Start Wine with the inherited anonymous descriptor
+### Task 5: Supervise the inherited descriptor
 
 **Files:**
 - Modify: `crates/compatforge-process/src/lib.rs`
+- Modify: `crates/compatforge-process/Cargo.toml`
 
-**Step 1: Write process RED tests**
+**Step 1: Add RED command/ownership tests**
 
-Add an opt-in API:
+Add:
 
 ```rust
 pub fn start_pinned_bottle(
@@ -224,98 +216,127 @@ pub fn start_pinned_bottle(
 ) -> Result<LaunchHandle, ProcessError>;
 ```
 
-Use a fake Wine helper in tests to assert:
+Pure command tests require exactly:
 
-- the child receives a fixed inherited descriptor;
-- the execution argument is `/dev/fd/<fixed-number>` and the naked Bottle path is absent from the child argv;
-- the working directory remains the logical Sumatra directory;
-- descriptor bytes equal the lease digest even after source rename/overwrite;
-- no descriptor number enters the plan or emitted evidence;
-- descriptor setup, spawn, attach, timeout, and cleanup failures close all parent copies; and
-- ordinary `ProcessSupervisor::start()` remains unchanged.
+```text
+<reviewed-wine> start.exe /unix /dev/fd/<actual-duplicated-fd>
+```
+
+and the existing Bottle directory as `current_dir`. Reject non-Wine plans, extra guest arguments, mismatched binding, or any attempt to fall back to the logical path.
+
+Ownership tests cover:
+
+- caller-owned lease remains valid;
+- process-owned duplicate is created in the parent;
+- duplicate is rewound before spawn and has `CLOEXEC` cleared;
+- existing `setpgid` remains the only `pre_exec` callback;
+- duplicate closes after spawn, attach failure, spawn failure, timeout, and cleanup;
+- descriptor number never enters plan/events; and
+- normal `ProcessSupervisor::start` is byte-compatible.
 
 **Step 2: Run RED**
 
 ```bash
-cargo test -p compatforge-process --all-targets --locked pinned_bottle
+cargo test -p compatforge-process --all-targets --locked pinned
 ```
 
-**Step 3: Implement the Unix descriptor path**
+**Step 3: Implement macOS-only execution**
 
-On Unix, duplicate the lease file onto one reserved descriptor in `pre_exec`, clear close-on-exec for that descriptor, and substitute the first process argument with the descriptor path. Preserve the existing process-group preparation and Wine-session lifecycle. Reject non-Wine plans, extra guest arguments if Wine's Unix-path entry point cannot preserve them, and mismatched plan/binding/digest.
+Use `dup` and `fcntl` in the parent to obtain the actual descriptor number. The child inherits that descriptor naturally; do not guess a fixed descriptor and do not call non-async-signal-safe code from `pre_exec`. Immediately after `spawn`, close the parent duplicate while retaining the caller lease.
 
-Use the approved Wine Unix-path command form for the macOS-only acceptance entry point. Never fall back to the naked path if descriptor preparation or Wine launch fails.
+Non-macOS calls return a stable unsupported-platform error before spawning. No raw path-bearing OS error may escape the pinned API.
 
-On non-macOS targets the public opt-in API must return a fixed unsupported-platform error without spawning. Unit tests may exercise command construction through a pure helper.
-
-**Step 4: Run GREEN and regress process cleanup**
+**Step 4: Run GREEN and commit**
 
 ```bash
 cargo test -p compatforge-process --all-targets --locked
 cargo clippy -p compatforge-process --all-targets --locked -- -D warnings
+git add crates/compatforge-process
+git commit -s -m "feat: supervise pinned SumatraPDF descriptors"
 ```
 
-**Step 5: Commit**
-
-```bash
-git add crates/compatforge-process/src/lib.rs
-git commit -s -m "feat: supervise pinned Bottle descriptors"
-```
-
-### Task 6: Add the closed acceptance-only CLI command
+### Task 6: Complete one closed CLI capture-to-launch session
 
 **Files:**
 - Modify: `apps/cli/src/main.rs`
-- Modify: `apps/cli/Cargo.toml` only if required by existing crate APIs
+- Modify: `apps/cli/Cargo.toml`
+- Modify: `tests/test_gui_baseline_contracts.py`
 
-**Step 1: Write parser and forwarding RED tests**
+**Step 1: Add RED orchestration tests**
 
-Add one closed command shape, for example:
+The command must execute, in order:
 
-```text
-prepared-pinned-launch-terminate <config> <logical-executable> <request> <milliseconds>
-```
+1. closed argument and platform validation;
+2. no-follow lease capture;
+3. pinned prepare;
+4. pinned authorize;
+5. canonical create-new inspection and plan evidence publication;
+6. pinned process start and existing event supervision.
 
-Tests reject missing/extra/combined/options/relative arguments and non-macOS execution. They assert the command calls lease capture, pinned preparation, authorization, and pinned supervision in that order. The existing prepared commands stay byte-compatible.
+Mutation tests replace or overwrite the logical path after capture and assert the emitted plan/inspection still describe the anonymous lease and the child consumes only the lease bytes.
 
-**Step 2: Run RED**
+**Step 2: Add stable error mapping tests**
+
+Every open, component, capture, unlink, copy, sync, inspect, authorize, evidence-write, descriptor, spawn, and cleanup error maps to one fixed `compatforge-cli: pinned SumatraPDF launch failed\n` message. Assert stdout, stderr, inspection/plan outputs, full evidence, and compact evidence contain no storage path, temp path, source path, developer path, or descriptor number.
+
+**Step 3: Run RED**
 
 ```bash
 cargo test -p compatforge-cli --all-targets --locked pinned
+& '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 ```
 
-**Step 3: Implement the command**
+**Step 4: Implement and run GREEN**
 
-The command reads the ordinary config/request files, verifies the logical path, captures one lease, prepares and authorizes against it, then passes the same lease to `start_pinned_bottle`. It prints only the existing runtime events. It must not print inspection bytes, descriptor numbers, temporary paths, or raw OS errors containing host paths.
-
-**Step 4: Run GREEN**
+Use create-new/no-follow output publication with canonical readback. Do not add stdin, PATH, shell, ambient environment, network, or fallback behavior.
 
 ```bash
 cargo test -p compatforge-cli --all-targets --locked
 cargo clippy -p compatforge-cli --all-targets --locked -- -D warnings
+git add apps/cli tests/test_gui_baseline_contracts.py
+git commit -s -m "feat: launch a pinned SumatraPDF session"
 ```
 
-**Step 5: Commit**
+### Task 7: Stop for the real macOS Wine spike
 
-```bash
-git add apps/cli/src/main.rs apps/cli/Cargo.toml
-git commit -s -m "feat: launch pinned Bottle acceptance executables"
-```
+**Files:**
+- Create: `docs/testing/macos-pinned-sumatrapdf-spike.md` only as a local handoff until evidence exists
 
-### Task 7: Select pinned execution only for SumatraPDF
+**Step 1: Build the exact branch on Apple Silicon**
+
+Build the CLI with the existing locked toolchain and run only the closed pinned command against the fixed SumatraPDF asset in CrossOver and Whisky. Keep the source pathname present for logical identity but mutate it after capture through the test hook; the launched window must still come from the anonymous digest.
+
+**Step 2: Verify both Runtimes**
+
+For CrossOver and Whisky independently require:
+
+- the Wine child inherits the descriptor;
+- `start.exe /unix /dev/fd/<n>` opens the Sumatra window;
+- the expected title is observed;
+- the post-window acknowledgement succeeds;
+- source overwrite/substitution does not change executed bytes; and
+- zero residual process and cleanup failures.
+
+**Step 3: Gate the remainder**
+
+If either Runtime fails, stop and revise the design. Do not integrate the command into `run_gui_baseline.py`, do not fall back to pathname execution, and do not claim Task 4 complete.
+
+If both pass, record only redacted command/result evidence and continue.
+
+### Task 8: Select the pinned session only for SumatraPDF
 
 **Files:**
 - Modify: `tools/run_gui_baseline.py`
 - Modify: `tests/test_gui_baseline_contracts.py`
 - Modify: `tests/test_macos_dual_runtime_acceptance.py`
 - Modify: `tests/test_macos_headless_preview.py`
-- Modify: `scripts/validate_repository.py` only if the reviewed CLI surface requires an exact new command contract
+- Modify: `scripts/validate_repository.py` only for an exact reviewed command contract
 
-**Step 1: Write runner RED tests**
+**Step 1: Add RED runner tests**
 
-Assert that SumatraPDF uses the exact pinned command for launch while 7-Zip and Notepad++ retain `prepared-launch-terminate`. Reject a mutant that falls back to the naked command after a pinned failure. Assert compact/full evidence and stdout contain neither `/dev/fd`, descriptor integers, anonymous temporary paths, nor developer paths.
+Use exact app id `sumatrapdf`. Assert that Sumatra omits the separate GUI `inspect` and `prepared-plan` calls and instead invokes the single pinned session. The runner reads the create-new inspection/plan outputs after completion. 7-Zip and Notepad++ remain byte-compatible.
 
-Add mutation hooks proving original-path overwrite or replacement after binding does not change bytes consumed by the fake Wine helper.
+Reject naked-path fallback, wrong app id, wrong fixed path, missing output evidence, dynamic descriptor/path leakage, and pinned errors rewritten as ordinary accepted evidence.
 
 **Step 2: Run RED**
 
@@ -323,33 +344,29 @@ Add mutation hooks proving original-path overwrite or replacement after binding 
 & '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts tests.test_macos_dual_runtime_acceptance -v
 ```
 
-**Step 3: Implement the narrow selection**
-
-Select the pinned command only when `asset.app_id == "sumatra-pdf"` and the installed path equals the fixed reviewed location. A pinned-command error remains a closed application/core failure; there is no fallback.
-
-**Step 4: Run GREEN**
+**Step 3: Implement narrow selection and run GREEN**
 
 ```powershell
 & '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts tests.test_macos_dual_runtime_acceptance tests.test_macos_interaction_acknowledgements -v
 & '<python-3.12>' -S -B scripts/validate_repository.py
 ```
 
-Run the stable headless subset and record the known Windows executable-bit baseline separately.
+Run the stable headless subset and preserve the known Windows executable-bit baseline separately.
 
-**Step 5: Commit**
+**Step 4: Commit**
 
 ```bash
 git add tools/run_gui_baseline.py tests/test_gui_baseline_contracts.py tests/test_macos_dual_runtime_acceptance.py tests/test_macos_headless_preview.py scripts/validate_repository.py
 git commit -s -m "fix: launch pinned SumatraPDF bytes"
 ```
 
-### Task 8: Full verification and real-Mac handoff gate
+### Task 9: Full verification and reviews
 
 **Files:**
-- Modify: `docs/guides/macos-local-dual-runtime-acceptance.md` only if the operator command or compatibility warning changes
-- Modify: `docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md` only to record verified results, not aspirations
+- Modify: `docs/guides/macos-local-dual-runtime-acceptance.md` only to record verified behavior
+- Modify: `docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md` only to record verified behavior
 
-**Step 1: Run repository gates**
+**Step 1: Run full gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -358,22 +375,15 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Run all acknowledgement, GUI, dual-Runtime, headless stable, validator, converter, `py_compile`, diff-check, DCO, LF, and status gates. Do not use network to fill npm or Runtime caches.
+Run all acknowledgement, GUI, dual-Runtime, stable headless, validator, converter, `py_compile`, diff-check, DCO, LF, and status gates without network access.
 
 **Step 2: Independent reviews**
 
-Require a specification review and a quality review to both report `C0 / I0 / M0`. Replay same-inode overwrite, pathname replacement during child calls, descriptor inheritance failure, naked-path fallback, and evidence-leak mutants.
+Require specification and quality reviews to both report `C0 / I0 / M0`. Replay initial capture, same-inode overwrite, pathname replacement during every boundary, staging hardlink/write-handle attempts, descriptor inheritance/cleanup, naked fallback, and evidence-leak mutants.
 
-**Step 3: Real macOS checkpoint**
-
-On the Apple Silicon host, run the focused command against CrossOver and Whisky with the fixed SumatraPDF asset. Both must launch from the inherited descriptor, show the expected window, accept the post-window acknowledgement, and clean up with no residual processes.
-
-If either Runtime cannot execute the inherited descriptor, stop and revise the design. Do not fall back to pathname execution and do not report the matrix accepted.
-
-**Step 4: Commit verified documentation only after the Mac run**
+**Step 3: Commit verified documentation**
 
 ```bash
 git add docs/guides/macos-local-dual-runtime-acceptance.md docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md
 git commit -s -m "docs: record pinned macOS execution evidence"
 ```
-
