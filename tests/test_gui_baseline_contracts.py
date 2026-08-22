@@ -330,9 +330,228 @@ struct RealCode;
             with mock.patch.object(
                 self.baseline.os, "environ", ForbiddenEnvironment()
             ):
-                self.assertEqual(
-                    self.baseline.installed_executable(asset, bottle), expected
+                binding = self.baseline.installed_executable(asset, bottle)
+            try:
+                self.assertEqual(binding.path, expected)
+                binding.revalidate()
+            finally:
+                binding.close()
+
+    def test_sumatrapdf_rejects_exact_known_legacy_locations(self) -> None:
+        asset = self.assets.asset_for("sumatrapdf")
+        legacy_locations = (
+            "Program Files/SumatraPDF/SumatraPDF.exe",
+            "users/Public/AppData/Local/SumatraPDF/SumatraPDF.exe",
+        )
+        for fixed_present in (False, True):
+            for legacy_relative in legacy_locations:
+                with self.subTest(
+                    fixed_present=fixed_present, legacy=legacy_relative
+                ), tempfile.TemporaryDirectory(
+                    prefix="compatforge-legacy-sumatra-"
+                ) as temporary:
+                    bottle = Path(temporary) / "drive_c"
+                    fixed = (
+                        bottle
+                        / "CompatForge"
+                        / "SumatraPDF"
+                        / "SumatraPDF.exe"
+                    )
+                    if fixed_present:
+                        fixed.parent.mkdir(parents=True)
+                        fixed.write_bytes(b"MZfixed")
+                    legacy = bottle.joinpath(*Path(legacy_relative).parts)
+                    legacy.parent.mkdir(parents=True, exist_ok=True)
+                    legacy.write_bytes(b"MZlegacy")
+                    with self.assertRaises(self.baseline.ExecutableIntegrityError):
+                        self.baseline.installed_executable(asset, bottle)
+
+    def test_installed_executable_binding_detects_post_validation_mutation(self) -> None:
+        asset = self.assets.asset_for("sumatrapdf")
+        variants = ["hardlink-added"]
+        if os.name != "nt":
+            variants.extend(("bottle-replaced", "parent-replaced", "file-replaced"))
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(
+                prefix="compatforge-bound-sumatra-"
+            ) as temporary:
+                root = Path(temporary)
+                bottle = root / "drive_c"
+                installed = (
+                    bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
                 )
+                installed.parent.mkdir(parents=True)
+                installed.write_bytes(b"MZoriginal")
+                binding = self.baseline.installed_executable(asset, bottle)
+                try:
+                    if variant == "hardlink-added":
+                        os.link(installed, root / "second-name.exe")
+                    else:
+                        replaced = {
+                            "bottle-replaced": bottle,
+                            "parent-replaced": installed.parent,
+                            "file-replaced": installed,
+                        }[variant]
+                        old = replaced.with_name(replaced.name + ".old")
+                        replaced.rename(old)
+                        if variant == "file-replaced":
+                            replaced.write_bytes(b"MZforeign")
+                        else:
+                            replaced.mkdir()
+                            relative = installed.relative_to(
+                                bottle if variant == "bottle-replaced" else installed.parent
+                            )
+                            foreign = replaced / relative
+                            foreign.parent.mkdir(parents=True, exist_ok=True)
+                            foreign.write_bytes(b"MZforeign")
+                    with self.assertRaises(self.baseline.ExecutableIntegrityError):
+                        binding.revalidate()
+                finally:
+                    binding.close()
+
+    def test_main_never_inspects_an_executable_mutated_after_binding(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-main-bound-sumatra-"
+        ) as temporary:
+            root = Path(temporary)
+            cli = root / "compatforge"
+            cli.write_bytes(b"placeholder")
+            installer = root / "SumatraPDF-installer.exe"
+            installer.write_bytes(b"MZinstaller")
+            storage = root / "storage"
+            work = root / "work"
+            bottle = (
+                storage
+                / "bottles"
+                / "gui-sumatrapdf"
+                / "prefix"
+                / "drive_c"
+            )
+            installed = (
+                bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
+            )
+            inspected: list[Path] = []
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(storage),
+                "--work-root",
+                str(work),
+                "--allow-network",
+            ]
+
+            def fake_invoke(
+                command: list[str], *, timeout: int = 0
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout
+                if command[1:4] == ["local", "macos", "context"]:
+                    receipt = self.descriptor_receipt()
+                    Path(command[-1]).write_text(
+                        json.dumps(self.descriptor_context(storage, receipt)),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps(receipt), ""
+                    )
+                if command[1] == "inspect":
+                    inspected.append(Path(command[2]))
+                    return subprocess.CompletedProcess(
+                        command, 0, '{"architecture":"x86_64"}', ""
+                    )
+                if command[1] == "prepared-plan":
+                    return subprocess.CompletedProcess(command, 0, "{}", "")
+                if command[1] == "prepared-launch-terminate":
+                    installed.parent.mkdir(parents=True, exist_ok=True)
+                    installed.write_bytes(b"MZoriginal")
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        '{"kind":"exited","exit":{"code":0,"success":true}}\n',
+                        "",
+                    )
+                raise AssertionError(f"unexpected command: {command}")
+
+            original_installer_succeeded = self.baseline.installer_succeeded
+
+            def mutate_after_validation(
+                evidence: dict[str, object],
+                events: list[dict[str, object]],
+                binding: object,
+            ) -> bool:
+                succeeded = original_installer_succeeded(evidence, events, binding)
+                if succeeded:
+                    os.link(installed, root / "second-name.exe")
+                return succeeded
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    self.assets,
+                    "ASSETS",
+                    (self.assets.asset_for("sumatrapdf"),),
+                ),
+                mock.patch.object(
+                    self.baseline.platform, "system", return_value="Darwin"
+                ),
+                mock.patch.object(
+                    self.baseline.platform, "machine", return_value="arm64"
+                ),
+                mock.patch.object(self.baseline.os, "access", return_value=True),
+                mock.patch.object(
+                    self.baseline, "rosetta_available", return_value=True
+                ),
+                mock.patch.object(
+                    self.baseline, "invoke", side_effect=fake_invoke
+                ),
+                mock.patch.object(
+                    self.baseline, "fetch_asset", return_value=installer
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "installer_succeeded",
+                    side_effect=mutate_after_validation,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.baseline.main()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(inspected, [installer])
+            self.assertIn("installed GUI executable identity changed", stderr.getvalue())
+
+    def test_failed_initial_executable_binding_closes_every_held_handle(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-failed-bind-cleanup-"
+        ) as temporary:
+            root = Path(temporary)
+            bottle = root / "drive_c"
+            installed = (
+                bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
+            )
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b"MZsumatra")
+            asset = self.assets.asset_for("sumatrapdf")
+            with (
+                mock.patch.object(
+                    self.baseline.InstalledExecutableBinding,
+                    "revalidate",
+                    side_effect=self.baseline.ExecutableIntegrityError(
+                        "forced initial binding drift"
+                    ),
+                ),
+                self.assertRaises(self.baseline.ExecutableIntegrityError),
+            ):
+                self.baseline.installed_executable(asset, bottle)
+            shutil.rmtree(bottle)
+            self.assertFalse(bottle.exists())
 
     def test_installed_executable_rejects_path_drift_and_unsafe_entries(self) -> None:
         asset = self.assets.asset_for("sumatrapdf")

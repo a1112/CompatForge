@@ -139,6 +139,10 @@ class AcceptanceError(Exception):
     pass
 
 
+class ExecutableIntegrityError(AcceptanceError):
+    """The installed executable or its fixed Bottle path changed identity."""
+
+
 class InvocationError(AcceptanceError):
     closed_code = "command-failed"
 
@@ -1185,7 +1189,7 @@ def evaluate_live_interaction_outcome(
 def installer_succeeded(
     evidence: dict[str, object],
     events: list[dict[str, object]],
-    installed: Path,
+    installed: Path | InstalledExecutableBinding,
 ) -> bool:
     if status(events) != "accepted":
         stage = (
@@ -1203,7 +1207,11 @@ def installer_succeeded(
             ),
         )
         return False
-    if not installed.is_file() or installed.is_symlink():
+    revalidate_installed_executable(installed)
+    if isinstance(installed, InstalledExecutableBinding):
+        return True
+    installed_path = installed
+    if not installed_path.is_file() or installed_path.is_symlink():
         apply_stage_outcome(
             evidence,
             "installer-launch",
@@ -1797,6 +1805,13 @@ EXPECTED_INSTALLED_EXECUTABLES = {
     "notepad-plus-plus": "Program Files/Notepad++/notepad++.exe",
 }
 
+KNOWN_LEGACY_INSTALLED_EXECUTABLES = {
+    "sumatrapdf": (
+        "Program Files/SumatraPDF/SumatraPDF.exe",
+        "users/Public/AppData/Local/SumatraPDF/SumatraPDF.exe",
+    ),
+}
+
 
 def _is_reparse(metadata: os.stat_result) -> bool:
     return bool(
@@ -1805,49 +1820,201 @@ def _is_reparse(metadata: os.stat_result) -> bool:
     )
 
 
-def installed_executable(asset, bottle_root: Path) -> Path:  # type: ignore[no-untyped-def]
+def _installed_node_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+@dataclass(slots=True)
+class InstalledExecutableBinding:
+    path: Path
+    directories: tuple[object, ...]
+    descriptor: int
+    identity: tuple[int, int, int]
+    legacy_paths: tuple[Path, ...]
+    closed: bool = False
+
+    def __fspath__(self) -> str:
+        return str(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def revalidate(self) -> None:
+        if self.closed:
+            raise ExecutableIntegrityError(
+                "installed GUI executable binding is closed"
+            )
+        protocol = _acknowledgement_protocol()
+        try:
+            for binding in self.directories:
+                protocol._revalidate_directory(
+                    binding, "installed GUI executable directory"
+                )
+            for legacy in self.legacy_paths:
+                try:
+                    legacy.lstat()
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise ExecutableIntegrityError(
+                        "legacy GUI executable location cannot be verified"
+                    ) from error
+                else:
+                    raise ExecutableIntegrityError(
+                        "multiple GUI executable locations are present"
+                    )
+            parent = self.directories[-1]
+            current = protocol._relative_stat(parent, self.path.name)
+            opened = os.fstat(self.descriptor)
+            for metadata in (current, opened):
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or _is_reparse(metadata)
+                    or metadata.st_nlink != 1
+                    or _installed_node_identity(metadata) != self.identity
+                ):
+                    raise ExecutableIntegrityError(
+                        "installed GUI executable identity changed"
+                    )
+        except ExecutableIntegrityError:
+            raise
+        except (OSError, protocol.AcknowledgementError) as error:
+            raise ExecutableIntegrityError(
+                "installed GUI executable identity changed"
+            ) from error
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            os.close(self.descriptor)
+        except OSError:
+            pass
+        protocol = _acknowledgement_protocol()
+        for binding in reversed(self.directories):
+            protocol._close_directory(binding)
+
+
+def revalidate_installed_executable(
+    installed: Path | InstalledExecutableBinding,
+) -> None:
+    if isinstance(installed, InstalledExecutableBinding):
+        installed.revalidate()
+
+
+def close_installed_executable(
+    installed: Path | InstalledExecutableBinding | None,
+) -> None:
+    if isinstance(installed, InstalledExecutableBinding):
+        installed.close()
+
+
+def installed_executable(  # type: ignore[no-untyped-def]
+    asset, bottle_root: Path
+) -> InstalledExecutableBinding:
     """Return the one verified executable path fixed by the asset descriptor."""
     expected_relative = EXPECTED_INSTALLED_EXECUTABLES.get(asset.app_id)
     if expected_relative is None or asset.installed_executable != expected_relative:
-        raise AcceptanceError("GUI asset installed executable location is invalid")
+        raise ExecutableIntegrityError(
+            "GUI asset installed executable location is invalid"
+        )
     if not bottle_root.is_absolute():
-        raise AcceptanceError("Bottle root must be absolute")
+        raise ExecutableIntegrityError("Bottle root must be absolute")
 
     relative = Path(expected_relative)
-    components = [bottle_root]
-    candidate = bottle_root
-    for part in relative.parts:
-        candidate /= part
-        components.append(candidate)
+    candidate = bottle_root.joinpath(*relative.parts)
+    legacy_paths = tuple(
+        bottle_root.joinpath(*Path(value).parts)
+        for value in KNOWN_LEGACY_INSTALLED_EXECUTABLES.get(asset.app_id, ())
+    )
+    directories: list[object] = []
+    descriptor: int | None = None
+    binding: InstalledExecutableBinding | None = None
+    complete = False
+    protocol = _acknowledgement_protocol()
     try:
-        for index, component in enumerate(components):
-            metadata = component.lstat()
-            linked = stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata)
-            if index == len(components) - 1:
-                if (
-                    linked
-                    or not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                ):
-                    raise AcceptanceError(
-                        "installed GUI executable is linked or not a unique regular file"
-                    )
-            elif linked or not stat.S_ISDIR(metadata.st_mode):
-                raise AcceptanceError(
-                    "installed GUI executable path contains a linked or invalid directory"
+        current = bottle_root
+        directories.append(protocol._bind_directory(current, "Bottle root"))
+        for part in relative.parts[:-1]:
+            current /= part
+            directories.append(
+                protocol._bind_directory(
+                    current, "installed GUI executable directory"
                 )
-        bottle_resolved = bottle_root.resolve(strict=True)
-        candidate_resolved = candidate.resolve(strict=True)
-        candidate_resolved.relative_to(bottle_resolved)
-    except AcceptanceError:
+            )
+        for legacy in legacy_paths:
+            try:
+                legacy.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise ExecutableIntegrityError(
+                    "legacy GUI executable location cannot be verified"
+                ) from error
+            else:
+                raise ExecutableIntegrityError(
+                    "multiple GUI executable locations are present"
+                )
+        parent = directories[-1]
+        entry = protocol._relative_stat(parent, candidate.name)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or stat.S_ISLNK(entry.st_mode)
+            or _is_reparse(entry)
+            or entry.st_nlink != 1
+        ):
+            raise ExecutableIntegrityError(
+                "installed GUI executable is not a unique regular file"
+            )
+        descriptor = protocol._relative_open(
+            parent,
+            candidate.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0),
+        )
+        opened = os.fstat(descriptor)
+        identity = _installed_node_identity(entry)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _installed_node_identity(opened) != identity
+        ):
+            raise ExecutableIntegrityError(
+                "installed GUI executable changed while it was bound"
+            )
+        binding = InstalledExecutableBinding(
+            candidate,
+            tuple(directories),
+            descriptor,
+            identity,
+            legacy_paths,
+        )
+        descriptor = None
+        binding.revalidate()
+        complete = True
+        return binding
+    except ExecutableIntegrityError:
         raise
-    except (OSError, RuntimeError, ValueError) as error:
-        raise AcceptanceError(
-            "expected installed GUI executable is missing or escapes the Bottle"
+    except (OSError, protocol.AcknowledgementError) as error:
+        raise ExecutableIntegrityError(
+            "expected installed GUI executable is missing or unsafe"
         ) from error
-    if candidate_resolved != bottle_resolved.joinpath(*relative.parts):
-        raise AcceptanceError("installed GUI executable resolved to the wrong location")
-    return candidate
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if binding is not None and not complete:
+            binding.close()
+        elif binding is None:
+            for directory in reversed(directories):
+                protocol._close_directory(directory)
 
 
 def request_architecture(value: str) -> str:
@@ -1999,6 +2166,7 @@ def main() -> int:
                 "cleanup": False,
             }
             failure_stage = "asset-fetch"
+            installed: Path | InstalledExecutableBinding | None = None
             try:
                 if interaction_session is not None:
                     interaction_session.revalidate()
@@ -2083,10 +2251,12 @@ def main() -> int:
                 }
                 launch_request_path = arguments.work_root / f"{asset.app_id}-launch-request.json"
                 failure_stage = "core-inspection"
+                revalidate_installed_executable(installed)
                 gui_inspection = json_object(
                     invoke([str(arguments.compatforge_cli), "inspect", str(installed)]),
                     f"{asset.app_id} GUI inspection",
                 )
+                revalidate_installed_executable(installed)
                 gui_architecture = gui_inspection.get("architecture")
                 if not isinstance(gui_architecture, str):
                     raise AcceptanceError(f"{asset.app_id} GUI inspection omitted architecture")
@@ -2094,6 +2264,7 @@ def main() -> int:
                 write_json(launch_request_path, launch_request)
                 evidence["inspection"] = gui_inspection
                 failure_stage = "core-plan"
+                revalidate_installed_executable(installed)
                 evidence["plan"] = json_object(
                     invoke(
                         [
@@ -2106,6 +2277,7 @@ def main() -> int:
                     ),
                     f"{asset.app_id} GUI plan",
                 )
+                revalidate_installed_executable(installed)
                 failure_stage = "desktop-launch"
                 interaction_state: dict[str, object] = {
                     "checks": None,
@@ -2157,6 +2329,7 @@ def main() -> int:
 
                 if interaction_session is not None:
                     interaction_session.revalidate()
+                revalidate_installed_executable(installed)
                 events, windows, shot, process_group_id = observed_launch(
                     [
                         str(arguments.compatforge_cli),
@@ -2174,6 +2347,7 @@ def main() -> int:
                         else None
                     ),
                 )
+                revalidate_installed_executable(installed)
                 if interaction_session is not None:
                     interaction_session.revalidate()
                 evidence["events"] = events
@@ -2212,6 +2386,8 @@ def main() -> int:
                     "asset-fetch",
                     diagnostic=str(error),
                 )
+            except ExecutableIntegrityError:
+                raise
             except (InteractionIntegrityError, InteractionCleanupError):
                 raise
             except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
@@ -2221,6 +2397,7 @@ def main() -> int:
                     diagnostic=str(error),
                 )
             finally:
+                close_installed_executable(installed)
                 cleanup_diagnostic = "Bottle cleanup failed"
                 try:
                     if bottle_root.exists() or bottle_root.is_symlink():
