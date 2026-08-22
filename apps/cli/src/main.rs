@@ -44,10 +44,21 @@ fn run_arguments(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if arguments.first().is_some_and(|command| {
         matches!(
             command.as_str(),
-            "prepared-plan" | "prepared-launch" | "prepared-launch-terminate"
+            "prepared-plan"
+                | "prepared-launch"
+                | "prepared-launch-terminate"
+                | "prepared-pinned-sumatrapdf-launch-terminate"
         )
     }) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid prepared command arguments").into());
+        let message = if arguments
+            .first()
+            .is_some_and(|command| command == "prepared-pinned-sumatrapdf-launch-terminate")
+        {
+            "invalid pinned SumatraPDF command arguments"
+        } else {
+            "invalid prepared command arguments"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message).into());
     }
 
     match arguments {
@@ -163,6 +174,16 @@ enum PreparedCommand<'a> {
         request_path: &'a str,
         terminate_after_milliseconds: Option<u64>,
     },
+    PinnedSumatraPdfLaunchTerminate {
+        config_path: &'a str,
+        logical_executable_path: &'a str,
+        request_path: &'a str,
+        external_work_root: &'a str,
+        inherited_work_root_fd: i32,
+        inherited_inspection_fd: i32,
+        inherited_plan_fd: i32,
+        terminate_after_milliseconds: u64,
+    },
 }
 
 fn parse_prepared_command(arguments: &[String]) -> Option<PreparedCommand<'_>> {
@@ -196,11 +217,108 @@ fn parse_prepared_command(arguments: &[String]) -> Option<PreparedCommand<'_>> {
                 terminate_after_milliseconds: Some(milliseconds),
             })
         }
+        [command, config_path, logical_executable_path, request_path, external_work_root, inherited_work_root_fd, inherited_inspection_fd, inherited_plan_fd, milliseconds]
+            if command == "prepared-pinned-sumatrapdf-launch-terminate" =>
+        {
+            if ![
+                config_path.as_str(),
+                logical_executable_path.as_str(),
+                request_path.as_str(),
+                external_work_root.as_str(),
+            ]
+            .into_iter()
+            .all(is_closed_macos_absolute_path)
+                || !has_fixed_sumatrapdf_suffix(logical_executable_path)
+            {
+                return None;
+            }
+
+            let inherited_work_root_fd = parse_closed_inherited_fd(inherited_work_root_fd)?;
+            let inherited_inspection_fd = parse_closed_inherited_fd(inherited_inspection_fd)?;
+            let inherited_plan_fd = parse_closed_inherited_fd(inherited_plan_fd)?;
+            if inherited_work_root_fd == inherited_inspection_fd
+                || inherited_work_root_fd == inherited_plan_fd
+                || inherited_inspection_fd == inherited_plan_fd
+            {
+                return None;
+            }
+
+            let terminate_after_milliseconds = milliseconds.parse::<u64>().ok()?;
+            if !(1..=86_400_000).contains(&terminate_after_milliseconds) {
+                return None;
+            }
+            Some(PreparedCommand::PinnedSumatraPdfLaunchTerminate {
+                config_path,
+                logical_executable_path,
+                request_path,
+                external_work_root,
+                inherited_work_root_fd,
+                inherited_inspection_fd,
+                inherited_plan_fd,
+                terminate_after_milliseconds,
+            })
+        }
         _ => None,
     }
 }
 
+fn is_closed_macos_absolute_path(value: &str) -> bool {
+    value.strip_prefix('/').is_some_and(|relative| {
+        !relative.is_empty()
+            && !relative.contains('\\')
+            && relative
+                .split('/')
+                .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+    })
+}
+
+fn has_fixed_sumatrapdf_suffix(value: &str) -> bool {
+    let mut components = value.rsplit('/');
+    components.next() == Some("SumatraPDF.exe")
+        && components.next() == Some("SumatraPDF")
+        && components.next() == Some("CompatForge")
+}
+
+fn parse_closed_inherited_fd(value: &str) -> Option<i32> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let descriptor = value.parse::<i32>().ok()?;
+    (descriptor > 2).then_some(descriptor)
+}
+
 fn run_prepared_command(command: PreparedCommand<'_>) -> Result<(), Box<dyn Error>> {
+    if let PreparedCommand::PinnedSumatraPdfLaunchTerminate {
+        config_path,
+        logical_executable_path,
+        request_path,
+        external_work_root,
+        inherited_work_root_fd,
+        inherited_inspection_fd,
+        inherited_plan_fd,
+        terminate_after_milliseconds,
+    } = command
+    {
+        let _closed_contract = (
+            config_path,
+            logical_executable_path,
+            request_path,
+            external_work_root,
+            inherited_work_root_fd,
+            inherited_inspection_fd,
+            inherited_plan_fd,
+            terminate_after_milliseconds,
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pinned SumatraPDF launch is not implemented",
+        )
+        .into());
+    }
+
     let (config_path, executable_path, request_path) = match command {
         PreparedCommand::Plan {
             config_path,
@@ -213,6 +331,7 @@ fn run_prepared_command(command: PreparedCommand<'_>) -> Result<(), Box<dyn Erro
             request_path,
             ..
         } => (config_path, executable_path, request_path),
+        PreparedCommand::PinnedSumatraPdfLaunchTerminate { .. } => unreachable!(),
     };
     let config = read_json::<CoreConfig>(Path::new(config_path))?;
     let request = read_json::<LaunchRequest>(Path::new(request_path))?;
@@ -225,6 +344,7 @@ fn run_prepared_command(command: PreparedCommand<'_>) -> Result<(), Box<dyn Erro
             terminate_after_milliseconds,
             ..
         } => supervise_plan(plan, terminate_after_milliseconds.map(Duration::from_millis))?,
+        PreparedCommand::PinnedSumatraPdfLaunchTerminate { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -607,6 +727,177 @@ mod tests {
         ] {
             assert!(parse_prepared_command(&invalid).is_none());
             assert!(run_arguments(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn pinned_sumatrapdf_argv_accepts_only_the_closed_future_form() {
+        let valid = words(&[
+            "prepared-pinned-sumatrapdf-launch-terminate",
+            "/private/compatforge/context.json",
+            "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+            "/private/compatforge/request.json",
+            "/private/compatforge/work",
+            "7",
+            "8",
+            "9",
+            "1000",
+        ]);
+        assert_eq!(
+            run_arguments(&valid).unwrap_err().to_string(),
+            "pinned SumatraPDF launch is not implemented"
+        );
+
+        let invalid = [
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+            ]),
+            {
+                let mut arguments = valid.clone();
+                arguments.push("extra".into());
+                arguments
+            },
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "relative/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-7zip/prefix/drive_c/Program Files/7-Zip/7zFM.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge//request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "--work-root",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+            words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "C:\\compatforge\\context.json",
+                "C:\\storage\\gui-sumatrapdf\\CompatForge\\SumatraPDF\\SumatraPDF.exe",
+                "C:\\compatforge\\request.json",
+                "C:\\compatforge\\work",
+                "7",
+                "8",
+                "9",
+                "1000",
+            ]),
+        ];
+        for arguments in invalid {
+            assert_eq!(
+                run_arguments(&arguments).unwrap_err().to_string(),
+                "invalid pinned SumatraPDF command arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_sumatrapdf_argv_accepts_full_i32_descriptors_and_bounded_duration() {
+        for (work_root_fd, milliseconds) in [("2147483647", "1"), ("7", "86400000")] {
+            let arguments = words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                work_root_fd,
+                "8",
+                "9",
+                milliseconds,
+            ]);
+            assert_eq!(
+                run_arguments(&arguments).unwrap_err().to_string(),
+                "pinned SumatraPDF launch is not implemented"
+            );
+        }
+
+        for milliseconds in ["0", "86400001", "--milliseconds"] {
+            let arguments = words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                "7",
+                "8",
+                "9",
+                milliseconds,
+            ]);
+            assert_eq!(
+                run_arguments(&arguments).unwrap_err().to_string(),
+                "invalid pinned SumatraPDF command arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_sumatrapdf_argv_rejects_noncanonical_or_aliased_descriptors() {
+        for (name, descriptors) in [
+            ("sign", ["+7", "8", "9"]),
+            ("negative", ["-7", "8", "9"]),
+            ("whitespace", [" 7", "8", "9"]),
+            ("leading-zero", ["07", "8", "9"]),
+            ("stdin", ["0", "8", "9"]),
+            ("stdout", ["7", "1", "9"]),
+            ("stderr", ["7", "8", "2"]),
+            ("duplicate-work", ["7", "7", "9"]),
+            ("duplicate-output", ["7", "8", "8"]),
+            ("too-large", ["2147483648", "8", "9"]),
+            ("option", ["--work-root-fd", "8", "9"]),
+        ] {
+            let arguments = words(&[
+                "prepared-pinned-sumatrapdf-launch-terminate",
+                "/private/compatforge/context.json",
+                "/private/compatforge/storage/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe",
+                "/private/compatforge/request.json",
+                "/private/compatforge/work",
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                "1000",
+            ]);
+            assert_eq!(
+                run_arguments(&arguments).unwrap_err().to_string(),
+                "invalid pinned SumatraPDF command arguments",
+                "{name}"
+            );
         }
     }
 

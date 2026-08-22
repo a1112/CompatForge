@@ -685,6 +685,55 @@ struct RealCode;
         self.assertNotIn("runtimeId", rust)
         self.assertNotIn("failureClass", rust)
 
+    def test_pinned_launch_keeps_the_existing_ffi_header_and_exports_byte_stable(
+        self,
+    ) -> None:
+        ffi_root = ROOT / "crates" / "compatforge-ffi"
+        header = (ffi_root / "include" / "compatforge.h").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(header).hexdigest(),
+            "d616269ff5ddf8c3df44179854cca771cd2a85800d04cfe68c6fdb750a357fbb",
+        )
+
+        source = rust_without_comments(
+            (ffi_root / "src" / "lib.rs").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            re.findall(
+                r'#\[no_mangle\]\s*pub(?:\s+unsafe|\s+const)?\s+extern\s+"C"\s+fn\s+(cf_[a-z0-9_]+)',
+                source,
+            ),
+            [
+                "cf_api_version",
+                "cf_abi_version",
+                "cf_probe_capabilities",
+                "cf_inspect_executable",
+                "cf_capabilities_get",
+                "cf_context_create",
+                "cf_macos_local_context_create",
+                "cf_service_create",
+                "cf_service_call",
+                "cf_compile_launch",
+                "cf_launch_prepare",
+                "cf_prepared_launch_inspection_get",
+                "cf_prepared_launch_plan_get",
+                "cf_prepared_launch_start",
+                "cf_launch_start",
+                "cf_launch_next_event",
+                "cf_launch_terminate",
+                "cf_last_error_json",
+                "cf_string_free",
+                "cf_context_release",
+                "cf_service_release",
+                "cf_prepared_launch_release",
+                "cf_launch_release",
+            ],
+        )
+        self.assertRegex(
+            source,
+            r'pub\s+const\s+extern\s+"C"\s+fn\s+cf_abi_version\(\)\s*->\s*u32\s*\{\s*1\s*\}',
+        )
+
     def test_application_grid_and_function_switches_are_stable(self) -> None:
         frontend = (DESKTOP / "src" / "main.ts").read_text(encoding="utf-8")
         for label in (
