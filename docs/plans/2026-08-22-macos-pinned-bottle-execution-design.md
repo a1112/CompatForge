@@ -43,8 +43,9 @@ computes the SHA-256 digest used by inspection and planning.
 
 For each Sumatra session, the Python caller opens its already-bound repository-external work root
 no-follow and keeps that directory descriptor alive until all CLI evidence has been verified. It
-creates two empty output files there with independent 128-bit names, `O_EXCL|O_NOFOLLOW`, and mode
-`0600`, immediately unlinks them, and retains their descriptors. Python passes the reviewed work-root
+creates two empty output files there with independent 128-bit names,
+`O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`, and mode `0600`, immediately unlinks them, and retains their
+descriptors. Python passes the reviewed work-root
 path, its directory descriptor, and both anonymous output descriptors through `pass_fds`; the
 installed CLI has no repository-root input, so Python contract tests establish repository
 externality. The CLI duplicates each inherited descriptor with `F_DUPFD_CLOEXEC`, immediately
@@ -75,7 +76,12 @@ to each, syncs and rewinds them, and returns each bounded byte length and SHA-25
 path-free stdout receipt after the existing byte-compatible RuntimeEvent lines. After the CLI exits,
 Python rewinds and reads its original descriptors, requires the same zero-link identities, applies
 the same 1,048,576-byte bound, and compares length and digest before parsing the in-memory bytes.
-Only descriptor close remains; no pathname unlink is used for either evidence output.
+All duplicates share one open-file description per output: Python does not seek, read, or write while
+the CLI runs; the CLI seeks to zero before write and readback; Python ignores the inherited offset
+and seeks to zero only after CLI exit. `O_APPEND` is rejected. Only descriptor close remains; no
+pathname unlink is used for either evidence output. Rust RAII guarantees a close attempt but does not
+claim `OwnedFd::drop` reports close errors; `sync_all` plus canonical readback are the Rust integrity
+gate, while Python's explicit `os.close` failure remains cleanup-fatal.
 
 The acceptance-only launch command passes the inherited descriptor to Wine through
 `/dev/fd/<descriptor>`. On macOS the command uses Wine's Unix-path launch entry point. The original
@@ -189,7 +195,8 @@ Required RED/GREEN coverage includes:
 - persisted plan/full evidence contain only their existing authorized logical paths;
 - CLI-to-Python output-fd substitution, duplicate/closed/stdin/stdout/stderr fd, digest/size mismatch,
   over-limit bytes, directory-path substitution, ACL-capable create-to-unlink opener boundary, and
-  close-failure mutants are covered through anonymous descriptors and the stdout receipt;
+  Python explicit-close failure mutants are covered through anonymous descriptors and the stdout
+  receipt;
 - compact evidence and stdout contain no host path;
 - no output contains a descriptor number, random staging name, or anonymous path;
 - stable pinned error codes contain no storage, temporary, developer, or executable path;

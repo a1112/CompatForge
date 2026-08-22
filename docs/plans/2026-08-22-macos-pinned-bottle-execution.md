@@ -43,7 +43,8 @@ Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary
 
 All descriptor arguments use canonical unsigned decimal, are greater than `2`, fit in `i32`, are
 pairwise distinct, and name live descriptors of the required type. Reject signs, whitespace,
-leading zeroes, closed/reused descriptors, `0/1/2`, duplicates, and option-shaped values.
+leading zeroes, closed descriptors, `0/1/2`, duplicates, and option-shaped values. The two output
+descriptors must be `O_RDWR` and must not have `O_APPEND`.
 
 **Step 2: Run RED**
 
@@ -163,10 +164,13 @@ impl InheritedEvidenceFile {
 }
 ```
 
-Both constructors reject raw descriptors `<= 2`, invalid/closed/reused descriptors, wrong kinds,
-and duplicate identities. They validate the live descriptor with `F_GETFD`, set `FD_CLOEXEC` on the
-raw inherited descriptor, then obtain their own `OwnedFd` with `F_DUPFD_CLOEXEC`; they never close or
-assume ownership of the raw input.
+Both constructors reject raw descriptors `<= 2`, invalid/closed descriptors, wrong kinds, and
+duplicate identities. They validate the live descriptor with `F_GETFD`, use `F_GETFL` to require
+evidence files are `O_RDWR` without `O_APPEND`, capture the pre-duplicate identity, set `FD_CLOEXEC`
+on the raw inherited descriptor, obtain their own `OwnedFd` with `F_DUPFD_CLOEXEC`, and require the
+duplicate has the same identity. They never close or assume ownership of the raw input. A descriptor
+that was reused before validation but now satisfies the complete expected identity/type contract is
+not distinguishable and is not claimed to be rejected.
 Do not expose a caller-selected filename, absolute output path, raw-descriptor accessor, or
 `FromRawFd` call outside the audited platform module. The CLI must not reconstruct the work root or
 either output by pathname.
@@ -187,10 +191,12 @@ during the successful `openat`-to-`unlinkat` interval. Tests must still prove th
 lose to `O_EXCL`, mode/owner checks are enforced without claiming they override ACL or filesystem
 configuration, and no pathname can acquire the inode after unlink.
 
-Test exact evidence bounds at `1_048_576` bytes accepted and `1_048_577` rejected, plus short write,
-wrong offset, nonzero initial size, linked file, descriptor reuse, input/output alias, and close/sync
-failures. Before any Wine spawn, assert that the raw inherited work/output descriptors and all owned
-duplicates have `FD_CLOEXEC`; only the dedicated execution duplicate may have it cleared.
+Test exact evidence bounds at `1_048_576` bytes accepted and `1_048_577` rejected, plus read-only,
+write-only, `O_APPEND`, short write, wrong offset, nonzero initial size, linked file, construction-time
+identity drift, input/output alias, sync, and canonical-readback failures. Rust RAII guarantees a
+close attempt but does not report `OwnedFd::drop` close errors. Before any Wine spawn, assert that the
+raw inherited work/output descriptors and all owned duplicates have `FD_CLOEXEC`; only the dedicated
+execution duplicate may have it cleared.
 
 **Step 2: Run RED**
 
@@ -359,9 +365,9 @@ The command must execute, in order:
 1. closed argument and platform validation;
 2. mark every raw inherited work/output descriptor `FD_CLOEXEC`, duplicate each with
    `F_DUPFD_CLOEXEC`, bind the work-root duplicate to the supplied path, validate two distinct empty
-   unlinked output files, and reject physical/lexical root overlap with storage, Bottle, source,
-   Runtime and other CLI-known writable roots; the Python caller separately proves repository
-   externality before invoking the command;
+   unlinked `O_RDWR` non-`O_APPEND` output files, and reject physical/lexical root overlap with
+   storage, Bottle, source, Runtime and other CLI-known writable roots; the Python caller separately
+   proves repository externality before invoking the command;
 3. no-follow source capture into an ordinary file created and immediately unlinked relative to that
    held root;
 4. pinned prepare;
@@ -414,6 +420,11 @@ that the work-root and output raw/duplicate descriptors are close-on-exec and th
 command inherits only the dedicated unlinked execution descriptor. Do not add stdin, PATH, shell,
 ambient environment, network, or fallback behavior.
 
+`write_canonical` must seek to zero, truncate to zero, write no more than
+`MAX_PINNED_EVIDENCE_BYTES`, `sync_all`, seek to zero, read back the same bounded canonical bytes, and
+only then compute the returned binding. It must not depend on the incoming shared offset. Rust drop
+provides the close attempt; do not map an unobservable `OwnedFd::drop` result into a claimed error.
+
 ```powershell
 cargo test -p compatforge-cli --all-targets --locked
 cargo clippy -p compatforge-cli --all-targets --locked -- -D warnings
@@ -427,10 +438,28 @@ git commit -s -m "feat: launch a pinned SumatraPDF session"
 **Files:**
 - Modify: `crates/compatforge-process/Cargo.toml`
 - Create: `crates/compatforge-process/tests/macos_pinned_sumatrapdf_spike.rs`
+- Create: `tests/macos_pinned_cli_spike.py`
+- Create: `tests/test_macos_pinned_cli_spike.py`
 - Create: `docs/testing/macos-pinned-sumatrapdf-spike.md` only as a local handoff until redacted
   evidence exists
 
-**Step 1: Add the test-only macOS harness before using the Mac**
+**Step 1: Add the complete test-only CLI handoff driver**
+
+`tests/macos_pinned_cli_spike.py` accepts exactly `--manifest <external-canonical-json>` on macOS.
+For each CrossOver/Whisky record it opens the reviewed existing work root, creates two independent
+`O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` mode-`0600` output files, immediately unlinks them, and
+invokes the exact closed CLI with
+`pass_fds=(work_root_fd, inspection_fd, plan_fd)`, observes the expected Sumatra window, parses the
+unchanged RuntimeEvent lines plus one final receipt, and verifies both anonymous output descriptors'
+identity, `1_048_576`-byte bound, size, digest, and canonical JSON before closing them. It performs no
+network access, acknowledgement, production-runner import side effect, or source mutation.
+
+`tests/test_macos_pinned_cli_spike.py` uses fake Popen/window probes on every host and kills omitted or
+extra fd, named output, read-only/write-only/append output, seek-before-child-exit, malformed event or
+receipt order, bound/digest mismatch, path leak, and close-failure mutants. The real driver is
+test-only and is not called by default CI or `run_gui_baseline.py`.
+
+**Step 2: Add the deterministic post-spawn Rust harness**
 
 Add `compatforge-orchestrator` as a dev-dependency only; this does not change the production
 dependency graph. Create host-independent fake-process ordering tests in the integration-test file
@@ -440,7 +469,7 @@ without a file-level macOS cfg. Give only the real test function
 managed termination APIs as the CLI. It may read exactly one test-only
 `COMPATFORGE_PINNED_SPIKE_INPUT` variable naming a repository-external canonical JSON manifest. The
 manifest supplies two reviewed Runtime executable paths, a dedicated disposable Bottle, fixed
-Sumatra source, and private empty work roots; it is never committed and the production CLI does not
+Sumatra source, and reviewed work roots; it is never committed and the production CLI does not
 read this variable.
 
 The harness must have two explicit phases per Runtime:
@@ -454,19 +483,21 @@ The harness must have two explicit phases per Runtime:
 Add host-independent fake-process tests for this ordering before running the ignored test. The
 production command must contain no corresponding hook or environment branch.
 
-**Step 2: Build the exact branch on Apple Silicon**
+**Step 3: Build and run the exact branch on Apple Silicon**
 
-Build the CLI with the existing locked toolchain and first run only the closed pinned command against
-the fixed SumatraPDF asset in CrossOver and Whisky with a stable source. Then run the ignored harness
-against a dedicated disposable copy:
+Build the CLI with the existing locked toolchain. First use the Python driver to run the complete
+closed CLI fd handoff against a stable fixed SumatraPDF asset in both CrossOver and Whisky. Then run
+the ignored Rust harness against a dedicated disposable copy:
 
 ```bash
+python3.12 -S -B -m tests.macos_pinned_cli_spike \
+  --manifest /private/.../pinned-spike.json
 COMPATFORGE_PINNED_SPIKE_INPUT=/private/.../pinned-spike.json \
   cargo test -p compatforge-process --test macos_pinned_sumatrapdf_spike \
   --locked -- --ignored --nocapture
 ```
 
-**Step 3: Verify both Runtimes**
+**Step 4: Verify both Runtimes**
 
 For CrossOver and Whisky independently require:
 
@@ -476,7 +507,7 @@ For CrossOver and Whisky independently require:
 - source overwrite/substitution does not change executed bytes; and
 - zero residual process and cleanup failures.
 
-**Step 4: Gate the remainder**
+**Step 5: Gate the remainder**
 
 If either Runtime fails, stop and revise the design. Do not integrate the command into
 `run_gui_baseline.py`, do not fall back to pathname execution, and do not claim the pinned-execution
@@ -505,11 +536,17 @@ The existing GUI `arguments.work_root` is already nonempty; reuse its existing i
 rather than requiring an empty root. Open it no-follow and keep the directory descriptor through
 subprocess completion and evidence verification. For each Sumatra launch, create two independent
 mode-`0600` output files relative to that descriptor under `secrets.token_hex(16)` names with
-`O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`, validate each empty regular single-link inode, immediately
-unlink each name, and require the same inode with `st_nlink == 0`. Pass the root and both output
+`O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`, validate each empty regular single-link inode, reject
+`O_APPEND`, immediately unlink each name, and require the same inode with `st_nlink == 0`. Pass the
+root and both output
 descriptors with `pass_fds` and include their three numbers only in the closed CLI argv; never include
 them or the temporary names in evidence or diagnostics. Retry a colliding name at most 16 times and
 apply the same documented directory-search-capable create-to-unlink trust boundary.
+
+The parent does not seek, read, or write either output while the CLI process is alive. Because the
+parent, inherited raw fd, and Rust duplicate share one open-file description, the CLI seeks to zero
+before writing and before its own readback; the parent ignores the resulting shared offset and seeks
+to zero only after the CLI has exited.
 
 Extend `observed_launch` with one explicit `pass_fds: tuple[int, ...] = ()` parameter. The pinned
 Sumatra call supplies exactly the three descriptors; every existing caller and every non-Sumatra app
@@ -521,7 +558,7 @@ event, require exactly one final `pinned-evidence-receipt` record and no later l
 the original anonymous output descriptors: rewind, require the same zero-link regular identities,
 read at most `1_048_576 + 1` bytes each, reject `1_048_577`, and compare exact length and SHA-256
 before parsing either in-memory document. Revalidate the work-root identity before and after both
-reads. A descriptor alias/reuse/close, root replacement, digest/size mismatch, over-limit output,
+reads. A descriptor alias/close, construction-time identity drift, root replacement, digest/size mismatch, over-limit output,
 stdout drift, or close failure is fatal.
 
 No output filename or session directory enters the work-tree allowlist because both outputs are
@@ -532,8 +569,9 @@ no descriptor or stale byte buffer is reused.
 Reject naked-path fallback, wrong app id, wrong fixed path, missing output evidence, dynamic
 descriptor/path leakage, and pinned errors rewritten as ordinary accepted evidence. Add explicit
 mutants for omitted `pass_fds`, root swap, named output, failure to unlink before CLI, duplicate or
-stdio descriptor, output-fd substitution/reuse, same-size content mutation, `1_048_576`/
-`1_048_577` boundaries, missing final receipt, and premature descriptor close.
+stdio descriptor, read-only/write-only/`O_APPEND` output, construction-time output identity drift,
+same-size content mutation, `1_048_576`/`1_048_577` boundaries, missing final receipt, and premature
+descriptor close.
 
 **Step 2: Run RED**
 
