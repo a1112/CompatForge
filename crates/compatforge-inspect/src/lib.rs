@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const MAX_PE_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -97,6 +97,49 @@ pub struct PeInspectionReport {
 /// Inspect one absolute regular-file path with a 64 MiB pre-allocation limit.
 pub fn inspect_path(path: &Path) -> Result<PeInspectionReport, InspectionError> {
     inspect_path_with_before_open(path, || {})
+}
+
+/// Inspect one caller-owned open regular file without reopening a pathname.
+pub fn inspect_file(file: &mut fs::File) -> Result<PeInspectionReport, InspectionError> {
+    inspect_file_with_before_read(file, || {})
+}
+
+fn inspect_file_with_before_read(
+    file: &mut fs::File,
+    before_read: impl FnOnce(),
+) -> Result<PeInspectionReport, InspectionError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| InspectionError::FileHandle {
+            operation: "seek",
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| InspectionError::FileHandle {
+        operation: "read metadata for",
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(InspectionError::NotRegularFileHandle);
+    }
+    if metadata.len() > MAX_PE_FILE_BYTES {
+        return Err(InspectionError::FileTooLarge(metadata.len()));
+    }
+
+    before_read();
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_PE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| InspectionError::FileHandle {
+            operation: "read",
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_PE_FILE_BYTES {
+        return Err(InspectionError::FileTooLarge(bytes.len() as u64));
+    }
+    if bytes.len() as u64 != metadata.len() {
+        return Err(InspectionError::ChangedDuringRead);
+    }
+    inspect_bytes(&bytes)
 }
 
 fn inspect_path_with_before_open(
@@ -552,7 +595,9 @@ pub enum InspectionError {
     RelativePath(PathBuf),
     SymbolicLink(PathBuf),
     NotRegularFile(PathBuf),
+    NotRegularFileHandle,
     Filesystem { path: PathBuf, source: io::Error },
+    FileHandle { operation: &'static str, source: io::Error },
     FileTooLarge(u64),
     ChangedDuringRead,
     InvalidDosHeader,
@@ -590,7 +635,11 @@ impl fmt::Display for InspectionError {
             Self::NotRegularFile(path) => {
                 write!(formatter, "inspection path is not a regular file: {}", path.display())
             }
+            Self::NotRegularFileHandle => formatter.write_str("inspection file handle is not a regular file"),
             Self::Filesystem { path, source } => write!(formatter, "could not read {}: {source}", path.display()),
+            Self::FileHandle { operation, source } => {
+                write!(formatter, "could not {operation} inspection file handle: {source}")
+            }
             Self::FileTooLarge(size) => write!(formatter, "PE image exceeds {MAX_PE_FILE_BYTES} bytes: {size}"),
             Self::ChangedDuringRead => formatter.write_str("PE image changed while it was being read"),
             Self::InvalidDosHeader => formatter.write_str("invalid DOS header"),
@@ -625,7 +674,7 @@ impl fmt::Display for InspectionError {
 impl std::error::Error for InspectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Filesystem { source, .. } => Some(source),
+            Self::Filesystem { source, .. } | Self::FileHandle { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -634,6 +683,8 @@ impl std::error::Error for InspectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture() -> Vec<u8> {
         let mut bytes = vec![0u8; 0x400];
@@ -667,6 +718,139 @@ mod tests {
         bytes[0x20c..0x210].copy_from_slice(&0x1040u32.to_le_bytes());
         bytes[0x240..0x24d].copy_from_slice(b"KERNEL32.dll\0");
         bytes
+    }
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("compatforge-inspect-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn inspect_file_seeks_to_zero_and_leaves_ownership_with_the_caller() {
+        let path = unique_test_path("offset.exe");
+        fs::write(&path, fixture()).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+
+        let report = inspect_file(&mut file).unwrap();
+
+        assert_eq!(report, inspect_bytes(&fixture()).unwrap());
+        assert_eq!(file.stream_position().unwrap(), fixture().len() as u64);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), fixture().len() as u64);
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inspect_file_keeps_inspecting_the_held_inode_after_source_rename() {
+        let path = unique_test_path("rename.exe");
+        let renamed = path.with_extension("held");
+        let original = fixture();
+        fs::write(&path, &original).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        fs::rename(&path, &renamed).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+
+        let report = inspect_file(&mut file).unwrap();
+
+        assert_eq!(report, inspect_bytes(&original).unwrap());
+        drop(file);
+        fs::remove_file(path).unwrap();
+        fs::remove_file(renamed).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_file_rejects_non_regular_handles() {
+        let directory = unique_test_path("directory");
+        fs::create_dir(&directory).unwrap();
+        let mut file = fs::File::open(&directory).unwrap();
+
+        assert!(matches!(
+            inspect_file(&mut file),
+            Err(InspectionError::NotRegularFileHandle)
+        ));
+
+        drop(file);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn inspect_file_accepts_the_exact_size_limit_and_rejects_larger_files() {
+        let exact_path = unique_test_path("exact-limit.exe");
+        let exact = fs::File::create(&exact_path).unwrap();
+        exact.set_len(MAX_PE_FILE_BYTES).unwrap();
+        drop(exact);
+        let mut exact = fs::File::open(&exact_path).unwrap();
+        assert!(matches!(
+            inspect_file(&mut exact),
+            Err(InspectionError::InvalidDosHeader)
+        ));
+        drop(exact);
+        fs::remove_file(exact_path).unwrap();
+
+        let over_path = unique_test_path("over-limit.exe");
+        let over = fs::File::create(&over_path).unwrap();
+        over.set_len(MAX_PE_FILE_BYTES + 1).unwrap();
+        drop(over);
+        let mut over = fs::File::open(&over_path).unwrap();
+        assert!(matches!(
+            inspect_file(&mut over),
+            Err(InspectionError::FileTooLarge(size)) if size == MAX_PE_FILE_BYTES + 1
+        ));
+        drop(over);
+        fs::remove_file(over_path).unwrap();
+    }
+
+    #[test]
+    fn inspect_file_rejects_a_short_read_after_metadata() {
+        let path = unique_test_path("short.exe");
+        fs::write(&path, fixture()).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+
+        let result = inspect_file_with_before_read(&mut file, || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(32)
+                .unwrap();
+        });
+
+        assert!(matches!(result, Err(InspectionError::ChangedDuringRead)));
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inspect_file_rejects_growth_after_metadata() {
+        use std::io::Write;
+
+        let path = unique_test_path("growth.exe");
+        fs::write(&path, fixture()).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+
+        let result = inspect_file_with_before_read(&mut file, || {
+            let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writer.write_all(b"changed").unwrap();
+        });
+
+        assert!(matches!(result, Err(InspectionError::ChangedDuringRead)));
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inspect_file_matches_the_existing_inspect_path_report() {
+        let path = unique_test_path("compatibility.exe");
+        fs::write(&path, fixture()).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+
+        assert_eq!(inspect_file(&mut file).unwrap(), inspect_path(&path).unwrap());
+
+        drop(file);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
