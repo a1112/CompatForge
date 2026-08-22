@@ -41,26 +41,41 @@ completes. The lease also holds every directory handle from the reviewed Bottle 
 entry. The capture enforces the existing size bound, single-link and reparse restrictions, and
 computes the SHA-256 digest used by inspection and planning.
 
-The caller supplies one repository-external work root before capture. The Python caller and its
-contract tests establish repository externality because the installed CLI has no repository-root
-input. The CLI binds the work root by a held directory descriptor, requires a real empty directory
-owned by the effective user with mode `0700`, and rejects lexical or physical overlap with the
+For each Sumatra session, the Python caller creates one unique empty `0700` child beneath its
+repository-external work root, opens that child no-follow, and keeps the directory descriptor alive
+until the CLI evidence has been verified and the session directory has been cleaned. Python passes
+both the reviewed path and that descriptor through `pass_fds`; the installed CLI has no
+repository-root input, so Python contract tests establish repository externality. The CLI consumes
+the inherited descriptor through `HeldExternalWorkRoot`, proves it still names the supplied path,
+requires effective-user ownership and mode `0700`, and rejects lexical or physical overlap with the
 storage root, Bottle root, source path, Runtime roots, or another CLI-known writable root. Inside
 that held directory Rust generates a
 128-bit OS-random name, calls
 `openat(O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600)`, validates an empty single-link regular
 file, and calls `unlinkat` immediately. No PE byte may be copied until `fstat` confirms the opened
-file is still the same inode, has size zero, and has `st_nlink == 0`. Collision retries are bounded,
-and the random name is never logged, serialized, returned, or persisted. The unlinked ordinary file
-is synchronized, rewound, inspected, and held until Wine has inherited it.
+file is still the same inode, has size zero, and has `st_nlink == 0`. Collision retries are bounded.
+The name necessarily exists briefly as filesystem metadata but never enters a log, serialized
+evidence, return value, or retained directory entry after `unlinkat`. The unlinked ordinary file is
+synchronized, rewound, inspected, and held until Wine has inherited it.
 
-This design explicitly does not defend against a malicious process with the same effective UID that
-can enumerate or correctly guess the 128-bit name and open the file during the small successful
-`openat`-to-`unlinkat` interval. Other users are excluded by the held `0700` directory; same-name
-pre-creation loses to `O_EXCL`; after `unlinkat` no pathname can acquire the inode. Closing that
-same-UID interval would require a privileged broker, a private filesystem, or another platform
-primitive outside this phase. All later pathname, directory, source, evidence-output, and process
-substitution races remain in scope and must fail closed.
+This design explicitly does not defend against a malicious principal that has directory-search
+permission and can enumerate or correctly guess the 128-bit name and open the file during the small
+successful `openat`-to-`unlinkat` interval. That normally means the same effective UID, but an ACL or
+filesystem configuration may grant another principal equivalent access despite mode `0700`.
+Same-name pre-creation loses to `O_EXCL`; after `unlinkat` no pathname can acquire the inode. Closing
+that interval would require a privileged broker, a private filesystem, or another platform primitive
+outside this phase. All later pathname, directory, source, evidence-output, and process substitution
+races remain in scope and must fail closed.
+
+Evidence handoff does not rely on directory permissions. `HeldExternalWorkRoot` publishes only
+`pinned-inspection.json` and `pinned-plan.json`, returns each file's bounded byte length and SHA-256
+in one final closed path-free stdout receipt after the existing byte-compatible RuntimeEvent lines,
+and revalidates the named inode after write, file sync, directory sync, and canonical readback. After
+the CLI exits, Python opens those exact names
+fd-relative and no-follow through its still-held directory descriptor, requires a regular single-link
+file, performs a bounded canonical read, and compares length and digest with the stdout receipt.
+Replacement with different bytes is therefore an integrity failure; replacement with identical
+bytes is evidence-equivalent.
 
 The acceptance-only launch command passes the inherited descriptor to Wine through
 `/dev/fd/<descriptor>`. On macOS the command uses Wine's Unix-path launch entry point. The original
@@ -75,9 +90,10 @@ context.
   and directory identities, verified inspection result, digest, size, and unlinked execution file.
   A small platform module contains the only audited `openat`/`fstatat` boundary; the rest of the
   crate remains safe Rust. The crate exposes a safe, opaque, non-serializable
-  `HeldExternalWorkRoot` wrapper. The CLI may use only its fixed-name create-new publication,
-  canonical readback, identity revalidation, and unlinked-file capture methods; it never receives a
-  raw directory descriptor.
+  `HeldExternalWorkRoot` wrapper. Its safe constructor consumes and validates the inherited
+  descriptor number; it exposes no raw-descriptor accessor. The CLI may then use only fixed-name
+  create-new publication, canonical readback, identity revalidation, and unlinked-file capture
+  methods.
 - `compatforge-orchestrator` uses a private `PinnedBottle` prepared-executable variant. It prepares
   and authorizes only when the caller supplies the same lease, and keeps the serialized plan
   unchanged. Ordinary `authorize()` refuses this private variant so it cannot reopen the pathname.
@@ -97,7 +113,8 @@ context.
 1. The installer writes the fixed SumatraPDF executable inside the current Bottle.
 2. The runner rejects missing, linked, hardlinked, reparse, wrong-location, or duplicate legacy
    installations.
-3. The acceptance-only CLI binds the empty private external work root, opens the fixed source path
+3. Python creates and holds a dedicated empty private session root, then the acceptance-only CLI
+   consumes the inherited duplicate, binds it to the reviewed path, and opens the fixed source path
    component-by-component with held no-follow directory handles, creates one random ordinary file
    relative to the held work-root descriptor, and unlinks it before reading source bytes.
 4. Rust computes and inspects the unlinked bytes, then writes canonical inspection and ordinary
@@ -111,6 +128,9 @@ context.
    remains the only `pre_exec` hook.
 7. The parent closes the process-owned duplicate immediately after spawn and keeps the caller-owned
    lease until process attachment succeeds or the failure path has reaped the child.
+8. The CLI returns only the fixed output length/digest receipt. Python reads both evidence files
+   through its original held session-root descriptor, verifies them against that receipt, then uses
+   identity-safe cleanup. No pathname-only cross-process handoff is accepted.
 
 The canonical ordinary plan and external full evidence retain their already-authorized logical
 Bottle, Runtime, storage and working-directory paths. Compact evidence, stdout and all pinned error
@@ -159,12 +179,14 @@ Required RED/GREEN coverage includes:
   never emitted;
 - the ordinary staging file is created relative to the held private work root, unlinked before the
   first copied byte, and verified as the same zero-link inode;
-- the acknowledged same-UID `openat`-to-`unlinkat` trust boundary is documented and no test claims a
-  stronger guarantee;
+- the acknowledged directory-search-capable principal `openat`-to-`unlinkat` trust boundary is
+  documented and no test claims a stronger guarantee from mode bits alone;
 - anonymous execution bytes remain the initially captured digest;
 - child receives the inherited descriptor and never the naked fixed path;
 - descriptor is closed on every preparation, spawn, timeout, and cleanup failure;
 - persisted plan/full evidence contain only their existing authorized logical paths;
+- CLI-to-Python output replacement, directory-path substitution, digest/size mismatch, link, reparse,
+  ACL-granted writer, and cleanup mutants fail closed through the held fd and stdout receipt;
 - compact evidence and stdout contain no host path;
 - no output contains a descriptor number, random staging name, or anonymous path;
 - stable pinned error codes contain no storage, temporary, developer, or executable path;

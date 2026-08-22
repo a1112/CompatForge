@@ -24,7 +24,7 @@ Assert that serialized `LaunchPlan`, `LaunchRequest`, `BottleExecutableBinding`,
 ```text
 prepared-pinned-sumatrapdf-launch-terminate \
   <config.json> <fixed-logical-executable> <request.json> \
-  <external-work-root> <milliseconds>
+  <external-work-root> <inherited-work-root-fd> <milliseconds>
 ```
 
 Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary-Bottle uses. Pin the future command to:
@@ -36,12 +36,14 @@ Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary
 - no guest arguments; and
 - a pre-created empty external work root, owned by the effective user with mode `0700`, held for the
   full session and used for both the unlinked execution file and fixed create-new inspection/plan
-  output names.
+  output names; the numeric descriptor must be inherited by the CLI, must resolve to that exact
+  path identity, and is never echoed.
 
 **Step 2: Run RED**
 
 ```bash
 cargo test -p compatforge-domain -p compatforge-cli --all-targets --locked pinned
+& '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 ```
 
 Expected: the schema snapshots pass and the command parser tests fail because the command does not exist.
@@ -54,6 +56,7 @@ Parse the command into a private enum variant, but return a fixed unsupported/no
 
 ```bash
 cargo test -p compatforge-domain -p compatforge-cli --all-targets --locked
+& '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 git add crates/compatforge-domain/src/lib.rs apps/cli/src/main.rs tests/test_gui_baseline_contracts.py
 git commit -s -m "test: freeze pinned launch compatibility"
 ```
@@ -126,14 +129,23 @@ pub enum PinnedEvidenceFile {
     Plan,       // pinned-plan.json
 }
 
+pub struct PublishedEvidenceBinding {
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
 impl HeldExternalWorkRoot {
-    pub fn bind(path: &Path, forbidden_roots: &[&Path]) -> Result<Self, GuestArtifactError>;
+    pub fn from_inherited(
+        raw_fd: i32,
+        reviewed_path: &Path,
+        forbidden_roots: &[&Path],
+    ) -> Result<Self, GuestArtifactError>;
     pub fn create_unlinked_execution_file(&self) -> Result<File, GuestArtifactError>;
     pub fn publish_canonical(
         &self,
         kind: PinnedEvidenceFile,
         bytes: &[u8],
-    ) -> Result<(), GuestArtifactError>;
+    ) -> Result<PublishedEvidenceBinding, GuestArtifactError>;
     pub fn read_canonical(
         &self,
         kind: PinnedEvidenceFile,
@@ -142,23 +154,25 @@ impl HeldExternalWorkRoot {
 }
 ```
 
-Do not expose a method accepting a caller-selected filename, an absolute output path, or a raw file
-descriptor.
+Do not expose a method accepting a caller-selected filename or absolute output path, and do not
+expose a raw-descriptor accessor. `from_inherited` consumes the inherited descriptor on success and
+closes it on every failure; the CLI must not reconstruct the directory by pathname.
 
 On macOS, generate exactly 128 bits with `arc4random_buf`, encode them as a fixed 32-lowercase-hex
 suffix, and create `.compatforge-pinned-<suffix>` relative to the held work-root descriptor with
 `openat(O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600)`. Retry collisions at most 16 times. After
 an initial `fstat` proves an empty, single-link, owned regular file, call `unlinkat` immediately and
 require a second `fstat` to prove the same inode, size zero, and `st_nlink == 0`. Copy no source byte
-before that second check. The name must never be logged, serialized, returned, or persisted. Add
+before that second check. The name necessarily exists briefly as filesystem metadata; it must never
+enter a log, serialized evidence, return value, or retained directory entry after `unlinkat`. Add
 injected tests for collision exhaustion, unlink failure, identity drift, nonzero pre-copy size,
 short copy, sync, rewind, and inspection failures.
 
 Document the accepted trust boundary in the tests: this phase does not claim protection from a
-malicious same-effective-UID process that guesses or enumerates the random name and opens it during
-the successful `openat`-to-`unlinkat` interval. Tests must still prove that pre-created names lose to
-`O_EXCL`, other users cannot traverse the `0700` root, and no pathname can acquire the inode after
-unlink.
+malicious directory-search-capable principal that guesses or enumerates the random name and opens it
+during the successful `openat`-to-`unlinkat` interval. Tests must still prove that pre-created names
+lose to `O_EXCL`, mode/owner checks are enforced without claiming they override ACL or filesystem
+configuration, and no pathname can acquire the inode after unlink.
 
 **Step 2: Run RED**
 
@@ -325,9 +339,10 @@ git commit -s -m "feat: supervise pinned SumatraPDF descriptors"
 The command must execute, in order:
 
 1. closed argument and platform validation;
-2. bind the supplied empty private external work root and reject physical/lexical overlap with
-   storage, Bottle, source, Runtime and other CLI-known writable roots; the Python caller separately
-   proves repository externality before invoking the command;
+2. consume the inherited work-root descriptor, bind it to the supplied path, require the directory
+   is initially empty, and reject physical/lexical overlap with storage, Bottle, source, Runtime and
+   other CLI-known writable roots; the Python caller separately proves repository externality before
+   invoking the command;
 3. no-follow source capture into an ordinary file created and immediately unlinked relative to that
    held root;
 4. pinned prepare;
@@ -352,6 +367,18 @@ and external full evidence may retain only the authorized logical Bottle/Runtime
 already present in an ordinary `LaunchPlan`; neither may contain descriptor numbers, random staging
 names, anonymous paths, or temporary paths.
 
+On success the existing RuntimeEvent JSON lines remain byte-compatible. After the terminal event,
+stdout contains exactly one final compact canonical receipt line with fixed field order and no path:
+
+```json
+{"outputs":[{"byteLength":123,"kind":"inspection","sha256":"sha256:<64-lower-hex>"},{"byteLength":456,"kind":"plan","sha256":"sha256:<64-lower-hex>"}],"recordType":"pinned-evidence-receipt","schemaVersion":1}
+```
+
+Require literal output order `inspection`, then `plan`; bounded positive integer lengths; exact
+digest syntax; and no extra keys, non-event records, text, stderr, or receipt line. The receipt is
+mandatory and last. These digests bind the post-CLI Python readback, not the executable-content
+digest in the plan.
+
 **Step 3: Run RED**
 
 ```bash
@@ -363,8 +390,9 @@ cargo test -p compatforge-cli --all-targets --locked pinned
 
 Use only `HeldExternalWorkRoot` fixed-name create-new/no-follow output publication with canonical
 readback. Revalidate the held root before and after each publication and once more before returning
-the final session result. Do not add stdin, PATH, shell, ambient environment, network, or fallback
-behavior.
+the final session result. The CLI takes ownership only of its inherited descriptor duplicate; the
+Python parent keeps its original descriptor open. Do not add stdin, PATH, shell, ambient environment,
+network, or fallback behavior.
 
 ```bash
 cargo test -p compatforge-cli --all-targets --locked
@@ -376,13 +404,17 @@ git commit -s -m "feat: launch a pinned SumatraPDF session"
 ### Task 7: Stop for the real macOS Wine spike
 
 **Files:**
+- Modify: `crates/compatforge-process/Cargo.toml`
 - Create: `crates/compatforge-process/tests/macos_pinned_sumatrapdf_spike.rs`
 - Create: `docs/testing/macos-pinned-sumatrapdf-spike.md` only as a local handoff until redacted
   evidence exists
 
 **Step 1: Add the test-only macOS harness before using the Mac**
 
-Create a `#[cfg(target_os = "macos")]`, `#[ignore]` integration test that calls the same
+Add `compatforge-orchestrator` as a dev-dependency only; this does not change the production
+dependency graph. Create host-independent fake-process ordering tests in the integration-test file
+without a file-level macOS cfg. Give only the real test function
+`#[cfg(target_os = "macos")]` and `#[ignore]`. That function calls the same
 `HeldExternalWorkRoot`, capture, prepare, authorize, `start_pinned_bottle`, source revalidation, and
 managed termination APIs as the CLI. It may read exactly one test-only
 `COMPATFORGE_PINNED_SPIKE_INPUT` variable naming a repository-external canonical JSON manifest. The
@@ -444,9 +476,35 @@ acknowledgement path is verified after runner integration in Task 8.
 
 **Step 1: Add RED runner tests**
 
-Use exact app id `sumatrapdf`. Assert that Sumatra omits the separate GUI `inspect` and `prepared-plan` calls and instead invokes the single pinned session. The runner reads the create-new inspection/plan outputs after completion. 7-Zip and Notepad++ remain byte-compatible.
+Use exact app id `sumatrapdf`. Assert that Sumatra omits the separate GUI `inspect` and
+`prepared-plan` calls and instead invokes the single pinned session. 7-Zip and Notepad++ remain
+byte-compatible.
 
-Reject naked-path fallback, wrong app id, wrong fixed path, missing output evidence, dynamic descriptor/path leakage, and pinned errors rewritten as ordinary accepted evidence.
+The existing GUI `arguments.work_root` is already nonempty and is not the pinned root. For each
+Sumatra launch, create exactly one unique child directory beneath that already-bound external root
+using create-new semantics and explicit mode `0700`; open it no-follow, verify owner/mode/identity and
+emptiness, and keep the parent and child directory descriptors through subprocess completion,
+evidence verification, and cleanup. Pass the child descriptor with `pass_fds` and include its number
+only in the closed CLI argv; never include it in evidence or diagnostics.
+
+Preserve the existing RuntimeEvent JSONL observation and acknowledgement flow. After its terminal
+event, require exactly one final `pinned-evidence-receipt` record and no later line. Then open only
+`pinned-inspection.json` and `pinned-plan.json` fd-relative/no-follow, require regular single-link
+files and bounded canonical bytes, and compare exact byte length and SHA-256 before consuming either
+document. Revalidate the parent/child identities before and after both reads. An inode/path/root
+replacement, digest/size mismatch, extra/missing file, link/reparse, stdout drift, or cleanup failure
+is fatal. A replacement containing byte-identical canonical content is evidence-equivalent.
+
+Extend the work-tree allowlist only for the dedicated session directory and the two fixed filenames.
+On success remove only still-owned files and the still-owned empty child directory. On foreign
+substitution do not delete foreign bytes; raise the existing cleanup-fatal classification. Tests
+cover consecutive sessions and prove no stale file is reused.
+
+Reject naked-path fallback, wrong app id, wrong fixed path, missing output evidence, dynamic
+descriptor/path leakage, and pinned errors rewritten as ordinary accepted evidence. Add explicit
+mutants for the current nonempty work root being passed directly, omitted `pass_fds`, parent or child
+root swap, ACL/mode assumptions used as a substitute for digest verification, post-CLI output
+replacement, same-size content replacement, and premature descriptor close.
 
 **Step 2: Run RED**
 
@@ -493,7 +551,9 @@ Require specification and quality reviews to both report `C0 / I0 / M0`. Replay 
 pre-final-revalidation overwrite/path replacement, post-spawn source mutation, random-name collision,
 create-before-unlink and zero-link failures, work-root substitution, descriptor inheritance/cleanup,
 naked fallback, and evidence-leak mutants. Confirm that the review does not claim protection against
-the explicitly excluded same-UID create-to-unlink opener.
+the explicitly excluded directory-search-capable create-to-unlink opener. Separately prove that
+post-CLI evidence replacement is detected by held-fd length/digest verification even when the writer
+has the same UID or ACL-granted directory access.
 
 **Step 3: Commit verified documentation**
 
