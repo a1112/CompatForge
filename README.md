@@ -118,10 +118,12 @@ python tools/run_gui_baseline.py \
   --allow-network
 ```
 
-默认运行只生成 `unverified` 证据。只有完成逐应用人工行为检查后，才可追加
-`--accept-interactive --interaction-evidence /absolute/external/interactions.json`；该 JSON 的固定字段见
-`docs/implementation/phase-2-tauri-gui-baseline.md`。验收结果逐应用标记为 `accepted`、`failed` 或
-`unverified`；截图和 RuntimeEvent 证据不会进入 Git，也不由默认 CI 生成。
+默认运行只生成 `unverified` 证据。显式人工验收使用只列 required checks 的
+`--interaction-plan`、独立 `--acknowledgement-root` 与 `--round-id`；第二终端 helper 只在应用窗口
+出现后接收确认，预填 boolean 不能产生 `accepted`。完整双轮流程要求 12 个 GUI receipts 与 4 个
+Console 自动结果；固定计划、命令与清理边界见
+[双 Runtime 指南](docs/guides/macos-local-dual-runtime-acceptance.md)。截图和
+RuntimeEvent 证据不会进入 Git，也不由默认 CI 生成。
 
 ## 设计入口
 

@@ -443,6 +443,7 @@ MACOS_ACCEPTANCE_GUIDE = "docs/guides/macos-local-dual-runtime-acceptance.md"
 MACOS_ACCEPTANCE_INTERACTIONS = "examples/macos-dual-runtime-interactions.json"
 MACOS_ACCEPTANCE_MAX_MARKDOWN_BYTES = 96 * 1024
 MACOS_ACCEPTANCE_MAX_JSON_BYTES = 32 * 1024
+MACOS_ACCEPTANCE_MAX_SOURCE_BYTES = 512 * 1024
 MACOS_ACCEPTANCE_RECORDS = (
     ("round-1", "crossover"),
     ("round-1", "whisky"),
@@ -450,11 +451,9 @@ MACOS_ACCEPTANCE_RECORDS = (
     ("round-2", "whisky"),
 )
 MACOS_ACCEPTANCE_INTERACTION_CHECKS = {
-    "7zip": frozenset({"fileList", "menus"}),
-    "sumatrapdf": frozenset({"mainWindow", "openDialog"}),
-    "notepad-plus-plus": frozenset(
-        {"open", "edit", "saveUtf8Chinese", "rereadMatches"}
-    ),
+    "7zip": ("fileList", "menus"),
+    "sumatrapdf": ("mainWindow", "openDialog"),
+    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
 }
 MACOS_ACCEPTANCE_DISCOVERY_COMMAND = (
     "python3 -S -B tools/discover_macos_wine.py --all",
@@ -500,7 +499,13 @@ MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND = (
     "  --runtime-store-root /absolute/external/runtime-store \\",
     "  --storage-root /absolute/external/storage \\",
     "  --work-root /absolute/external/evidence \\",
-    "  --interaction-evidence-root /absolute/external/interactions",
+    "  --interaction-plan-root /absolute/external/interactions \\",
+    "  --acknowledgement-root /absolute/external/acknowledgements",
+)
+MACOS_ACCEPTANCE_ACKNOWLEDGEMENT_COMMAND = (
+    "python3 -S -B tools/confirm_macos_gui_interactions.py \\",
+    "  --interaction-plan-root /absolute/external/interactions \\",
+    "  --acknowledgement-root /absolute/external/acknowledgements",
 )
 MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
     "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
@@ -511,7 +516,8 @@ MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
     "  --runtime-store-root /absolute/external/negative/runtime-store \\",
     "  --storage-root /absolute/external/negative/storage \\",
     "  --work-root /absolute/external/negative/evidence \\",
-    "  --interaction-evidence-root /absolute/external/interactions \\",
+    "  --interaction-plan-root /absolute/external/interactions \\",
+    "  --acknowledgement-root /absolute/external/negative/acknowledgements \\",
     "  --negative-checks \\",
     "  --console-guest /absolute/external/inputs/windows-console-smoke.exe \\",
     "  --negative-sentinel /absolute/external/inputs/negative-sentinel.txt",
@@ -522,6 +528,10 @@ MACOS_ACCEPTANCE_INTERACTION_PATHS = (
     "/absolute/external/interactions/round-2/crossover.json",
     "/absolute/external/interactions/round-2/whisky.json",
 )
+MACOS_ACCEPTANCE_INTERACTION_PREP_COMMANDS = (
+    "python3 -S -B -c 'import json,pathlib; source=json.loads(pathlib.Path(\"examples/macos-dual-runtime-interactions.json\").read_text(encoding=\"utf-8\")); root=pathlib.Path(\"/absolute/external/interactions\"); [(root / record[\"planPath\"]).parent.mkdir(parents=True,exist_ok=True) or (root / record[\"planPath\"]).write_text(json.dumps(record[\"document\"],ensure_ascii=False,sort_keys=True,separators=(\",\",\":\"))+\"\\n\",encoding=\"utf-8\",newline=\"\\n\") for record in source[\"records\"]]'",
+    "mkdir -p /absolute/external/acknowledgements/challenges /absolute/external/acknowledgements/receipts",
+)
 MACOS_ACCEPTANCE_GUIDE_BLOCKS = (
     MACOS_ACCEPTANCE_PREFLIGHT_COMMANDS,
     MACOS_ACCEPTANCE_ROSETTA_INSTALL_COMMAND,
@@ -530,6 +540,8 @@ MACOS_ACCEPTANCE_GUIDE_BLOCKS = (
     MACOS_ACCEPTANCE_ASSET_LIST_COMMAND,
     MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
     MACOS_ACCEPTANCE_INTERACTION_PATHS,
+    MACOS_ACCEPTANCE_INTERACTION_PREP_COMMANDS,
+    MACOS_ACCEPTANCE_ACKNOWLEDGEMENT_COMMAND,
     MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND,
     MACOS_ACCEPTANCE_NEGATIVE_COMMAND,
 )
@@ -4606,34 +4618,35 @@ def _validate_macos_acceptance_example(source: str) -> None:
         raise ValueError("macOS acceptance interaction records are incomplete")
     for record, (round_id, runtime_id) in zip(records, MACOS_ACCEPTANCE_RECORDS):
         if not isinstance(record, dict) or set(record) != {
-            "confirmationId",
             "document",
-            "evidencePath",
+            "planPath",
             "roundId",
             "runtimeId",
         }:
             raise ValueError("macOS acceptance interaction record is not closed")
         if record["roundId"] != round_id or record["runtimeId"] != runtime_id:
             raise ValueError("macOS acceptance interaction identity drifted")
-        if record["confirmationId"] != f"{round_id}-{runtime_id}-operator-confirmation":
-            raise ValueError("macOS acceptance confirmation identity drifted")
-        if record["evidencePath"] != f"{round_id}/{runtime_id}.json":
+        if record["planPath"] != f"{round_id}/{runtime_id}.json":
             raise ValueError("macOS acceptance interaction path is not fixed and relative")
-        evidence = record["document"]
+        plan = record["document"]
         if (
-            not isinstance(evidence, dict)
-            or set(evidence) != {"schemaVersion", "applications"}
-            or evidence["schemaVersion"] != "1"
-            or not isinstance(evidence["applications"], dict)
-            or set(evidence["applications"]) != set(MACOS_ACCEPTANCE_INTERACTION_CHECKS)
+            not isinstance(plan, dict)
+            or set(plan)
+            != {"schemaVersion", "roundId", "runtimeId", "applications"}
+            or plan["schemaVersion"] != "1"
+            or plan["roundId"] != round_id
+            or plan["runtimeId"] != runtime_id
+            or not isinstance(plan["applications"], dict)
+            or set(plan["applications"]) != set(MACOS_ACCEPTANCE_INTERACTION_CHECKS)
         ):
             raise ValueError("macOS acceptance runner document is not closed")
         for application_id, expected_checks in MACOS_ACCEPTANCE_INTERACTION_CHECKS.items():
-            checks = evidence["applications"][application_id]
+            application = plan["applications"][application_id]
             if (
-                not isinstance(checks, dict)
-                or set(checks) != expected_checks
-                or any(value is not True for value in checks.values())
+                not isinstance(application, dict)
+                or set(application) != {"requiredChecks"}
+                or not isinstance(application["requiredChecks"], list)
+                or application["requiredChecks"] != list(expected_checks)
             ):
                 raise ValueError("macOS acceptance interaction checks drifted")
     canonical = json.dumps(
@@ -4722,6 +4735,16 @@ def validate_macos_acceptance_surface() -> list[str]:
             errors.append(
                 f"macOS acceptance surface {relative}: expected a regular no-follow file"
             )
+            continue
+        if metadata.st_size > MACOS_ACCEPTANCE_MAX_SOURCE_BYTES:
+            errors.append(
+                f"macOS acceptance surface {relative}: exceeds its source byte bound"
+            )
+            continue
+        try:
+            _read_bound_regular_file(path, MACOS_ACCEPTANCE_MAX_SOURCE_BYTES)
+        except (OSError, ValueError) as error:
+            errors.append(f"macOS acceptance surface {relative}: {error}")
     return errors
 
 

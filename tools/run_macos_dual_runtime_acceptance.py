@@ -215,7 +215,8 @@ class AcceptancePaths:
     runtime_store_root: Path
     storage_root: Path
     work_root: Path
-    interaction_evidence_root: Path
+    interaction_plan_root: Path
+    acknowledgement_root: Path
     allow_network: bool
     bindings: dict[str, PathBinding]
 
@@ -266,7 +267,8 @@ def parser() -> argparse.ArgumentParser:
         "runtime-store-root",
         "storage-root",
         "work-root",
-        "interaction-evidence-root",
+        "interaction-plan-root",
+        "acknowledgement-root",
     ):
         value.add_argument(f"--{flag}", required=True, action=UniqueValueAction)
     value.add_argument("--allow-network", action=UniqueFlagAction)
@@ -292,8 +294,27 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     return parsed
 
 
+def _uses_windows_native_namespace(value: object) -> bool:
+    if os.name != "nt" or type(value) is not str or len(value) < 4:
+        return False
+    separators = "\\/"
+    return (
+        value[0] in separators
+        and value[1] in separators
+        and value[2] in "?."
+        and value[3] in separators
+    ) or (
+        value[0] in separators
+        and value[1] == "?"
+        and value[2] == "?"
+        and value[3] in separators
+    )
+
+
 def _absolute(value: object, field: str) -> Path:
     if not isinstance(value, str) or not value:
+        raise AcceptanceError(f"{field} must be an absolute non-traversing path")
+    if _uses_windows_native_namespace(value):
         raise AcceptanceError(f"{field} must be an absolute non-traversing path")
     path = Path(value)
     if not path.is_absolute() or any(part in ("", ".", "..") for part in path.parts[1:]):
@@ -531,22 +552,35 @@ def _read_closed_json(path: Path, label: str) -> object:
     return parse_closed_json(text, label)
 
 
-def _validate_interaction_document(value: object) -> None:
-    if not isinstance(value, dict) or set(value) != {"schemaVersion", "applications"}:
-        raise AcceptanceError("interaction evidence schema is invalid")
-    if value["schemaVersion"] != "1" or not isinstance(value["applications"], dict):
-        raise AcceptanceError("interaction evidence schema is invalid")
+def _validate_interaction_document(
+    value: object, round_id: str, runtime_id: str
+) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "schemaVersion",
+        "roundId",
+        "runtimeId",
+        "applications",
+    }:
+        raise AcceptanceError("interaction plan schema is invalid")
+    if (
+        value["schemaVersion"] != "1"
+        or value["roundId"] != round_id
+        or value["runtimeId"] != runtime_id
+        or not isinstance(value["applications"], dict)
+    ):
+        raise AcceptanceError("interaction plan identity is invalid")
     applications = value["applications"]
     if set(applications) != set(GUI_APPLICATIONS):
-        raise AcceptanceError("interaction evidence applications are incomplete")
+        raise AcceptanceError("interaction plan applications are incomplete")
     for application_id, required in REQUIRED_INTERACTIONS.items():
-        checks = applications[application_id]
+        application = applications[application_id]
         if (
-            not isinstance(checks, dict)
-            or set(checks) != set(required)
-            or any(checked is not True for checked in checks.values())
+            not isinstance(application, dict)
+            or set(application) != {"requiredChecks"}
+            or not isinstance(application["requiredChecks"], list)
+            or application["requiredChecks"] != list(required)
         ):
-            raise AcceptanceError("interaction evidence checks must all be true")
+            raise AcceptanceError("interaction plan required checks are invalid")
 
 
 def _bounded_entries(root: Path, limit: int, label: str) -> list[Path]:
@@ -564,28 +598,68 @@ def _bounded_entries(root: Path, limit: int, label: str) -> list[Path]:
     return entries
 
 
+def _read_interaction_plan(path: Path, round_id: str, runtime_id: str) -> None:
+    _binding, payload = _read_bound_source(
+        path, "interaction plan", max_bytes=MAX_JSON_BYTES
+    )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeError as error:
+        raise AcceptanceError("interaction plan JSON is invalid") from error
+    document = parse_closed_json(text, "interaction plan")
+    _validate_interaction_document(document, round_id, runtime_id)
+    canonical = (
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if payload != canonical:
+        raise AcceptanceError("interaction plan bytes are non-canonical")
+
+
 def _validate_interaction_root(root: Path) -> None:
     if not root.is_dir():
-        raise AcceptanceError("interaction-evidence-root must be a directory")
-    entries = _bounded_entries(root, len(ROUNDS), "interaction evidence root")
+        raise AcceptanceError("interaction-plan-root must be a directory")
+    entries = _bounded_entries(root, len(ROUNDS), "interaction plan root")
     if len(entries) != len(ROUNDS) or {entry.name for entry in entries} != set(ROUNDS):
-        raise AcceptanceError("interaction evidence layout is incomplete or contains extras")
+        raise AcceptanceError("interaction plan layout is incomplete or contains extras")
     for round_id in ROUNDS:
         round_root = root / round_id
-        _reject_unsafe_components(round_root, "interaction evidence")
+        _reject_unsafe_components(round_root, "interaction plan")
         if not round_root.is_dir():
-            raise AcceptanceError("interaction evidence round must be a directory")
+            raise AcceptanceError("interaction plan round must be a directory")
         expected = {f"{runtime_id}.json" for runtime_id in RUNTIME_IDS}
         round_entries = _bounded_entries(
-            round_root, len(expected), "interaction evidence round"
+            round_root, len(expected), "interaction plan round"
         )
         if len(round_entries) != len(expected) or {entry.name for entry in round_entries} != expected:
-            raise AcceptanceError("interaction evidence layout is incomplete or contains extras")
+            raise AcceptanceError("interaction plan layout is incomplete or contains extras")
         for runtime_id in RUNTIME_IDS:
-            document = _read_closed_json(
-                round_root / f"{runtime_id}.json", "interaction evidence"
+            _read_interaction_plan(
+                round_root / f"{runtime_id}.json", round_id, runtime_id
             )
-            _validate_interaction_document(document)
+
+
+def _validate_acknowledgement_root(root: Path) -> None:
+    if not root.is_dir():
+        raise AcceptanceError("acknowledgement-root must be a directory")
+    entries = _bounded_entries(root, 2, "acknowledgement root")
+    if len(entries) != 2 or {entry.name for entry in entries} != {
+        "challenges",
+        "receipts",
+    }:
+        raise AcceptanceError("acknowledgement root contains foreign entries")
+    for name in ("challenges", "receipts"):
+        child = root / name
+        _reject_unsafe_components(child, "acknowledgement root")
+        if not child.is_dir():
+            raise AcceptanceError("acknowledgement root layout is invalid")
+        if _bounded_entries(child, 1, f"acknowledgement {name}"):
+            raise AcceptanceError("acknowledgement root must start empty")
 
 
 def preflight(
@@ -606,8 +680,11 @@ def preflight(
         "runtime-store-root": _absolute(arguments.runtime_store_root, "runtime-store-root"),
         "storage-root": _absolute(arguments.storage_root, "storage-root"),
         "work-root": _absolute(arguments.work_root, "work-root"),
-        "interaction-evidence-root": _absolute(
-            arguments.interaction_evidence_root, "interaction-evidence-root"
+        "interaction-plan-root": _absolute(
+            arguments.interaction_plan_root, "interaction-plan-root"
+        ),
+        "acknowledgement-root": _absolute(
+            arguments.acknowledgement_root, "acknowledgement-root"
         ),
     }
     resolved = {field: _canonical(path, field) for field, path in named.items()}
@@ -618,7 +695,8 @@ def preflight(
         resolved["runtime-store-root"],
         resolved["storage-root"],
         resolved["work-root"],
-        resolved["interaction-evidence-root"],
+        resolved["interaction-plan-root"],
+        resolved["acknowledgement-root"],
     ]
     for tool, field in zip(tools, ("compatforge-cli", "desktop-app", "cc")):
         _regular_executable(tool, field)
@@ -645,10 +723,14 @@ def preflight(
     }
     for round_id in ROUNDS:
         for runtime_id in RUNTIME_IDS:
-            field = f"interaction-evidence:{round_id}:{runtime_id}"
-            path = resolved["interaction-evidence-root"] / round_id / f"{runtime_id}.json"
+            field = f"interaction-plan:{round_id}:{runtime_id}"
+            path = resolved["interaction-plan-root"] / round_id / f"{runtime_id}.json"
             bindings[field] = _capture_binding(path, field)
-    _validate_interaction_root(resolved["interaction-evidence-root"])
+    for name in ("challenges", "receipts"):
+        field = f"acknowledgement-{name}"
+        bindings[field] = _capture_binding(resolved["acknowledgement-root"] / name, field)
+    _validate_interaction_root(resolved["interaction-plan-root"])
+    _validate_acknowledgement_root(resolved["acknowledgement-root"])
     for field, binding in bindings.items():
         _revalidate_binding(binding, field)
 
@@ -660,7 +742,8 @@ def preflight(
         runtime_store_root=resolved["runtime-store-root"],
         storage_root=resolved["storage-root"],
         work_root=resolved["work-root"],
-        interaction_evidence_root=resolved["interaction-evidence-root"],
+        interaction_plan_root=resolved["interaction-plan-root"],
+        acknowledgement_root=resolved["acknowledgement-root"],
         allow_network=arguments.allow_network is True,
         bindings=bindings,
     )
@@ -725,7 +808,8 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
                 "runtime_store_root",
                 "storage_root",
                 "work_root",
-                "interaction_evidence_root",
+                "interaction_plan_root",
+                "acknowledgement_root",
             )
         ),
     ]
@@ -1125,6 +1209,7 @@ def _invoke(
             timeout=timeout,
             env=dict(CHILD_ENV),
             shell=False,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise AcceptanceError("bounded child process failed") from error
@@ -1702,7 +1787,8 @@ def run_negative_checks(
         paths.work_root,
         paths.runtime_store_root,
         paths.storage_root,
-        paths.interaction_evidence_root,
+        paths.interaction_plan_root,
+        paths.acknowledgement_root,
         paths.compatforge_cli,
         paths.desktop_app,
         paths.cc,
@@ -2988,8 +3074,12 @@ def _gui_command(paths: AcceptancePaths, round_id: str, descriptor: dict[str, ob
         "--version",
         _descriptor_text(descriptor, "version"),
         "--accept-interactive",
-        "--interaction-evidence",
-        str(paths.interaction_evidence_root / round_id / f"{runtime_id}.json"),
+        "--interaction-plan",
+        str(paths.interaction_plan_root / round_id / f"{runtime_id}.json"),
+        "--acknowledgement-root",
+        str(paths.acknowledgement_root),
+        "--round-id",
+        round_id,
     ]
     if paths.allow_network:
         command.append("--allow-network")

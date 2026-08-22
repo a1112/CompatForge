@@ -25,6 +25,7 @@ ACCEPTANCE_TOOL = ROOT / "tools" / "run_macos_dual_runtime_acceptance.py"
 GUI_BASELINE_TOOL = ROOT / "tools" / "run_gui_baseline.py"
 VALIDATOR = ROOT / "scripts" / "validate_repository.py"
 GUI_ASSET_TOOL = ROOT / "tools" / "download_gui_assets.py"
+ACKNOWLEDGEMENT_TOOL = ROOT / "tools" / "confirm_macos_gui_interactions.py"
 ACCEPTANCE_GUIDE = ROOT / "docs" / "guides" / "macos-local-dual-runtime-acceptance.md"
 ACCEPTANCE_INTERACTIONS = ROOT / "examples" / "macos-dual-runtime-interactions.json"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -362,6 +363,9 @@ acceptance = load_module("run_macos_dual_runtime_acceptance", ACCEPTANCE_TOOL)
 gui_baseline = load_module("run_gui_baseline_for_dual_runtime", GUI_BASELINE_TOOL)
 validator = load_module("validate_repository_for_macos_acceptance", VALIDATOR)
 gui_assets = load_module("download_gui_assets_for_dual_runtime_docs", GUI_ASSET_TOOL)
+acknowledgements = load_module(
+    "confirm_macos_gui_interactions_for_dual_runtime_docs", ACKNOWLEDGEMENT_TOOL
+)
 desktop_smoke = load_module("desktop_smoke_for_dual_runtime_ci", DESKTOP_SMOKE)
 
 
@@ -1432,7 +1436,10 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             "16",
             "developer-local",
             "python3 -S -B tools/discover_macos_wine.py --all",
+            "python3 -S -B tools/confirm_macos_gui_interactions.py",
             "python3 -S -B tools/run_macos_dual_runtime_acceptance.py",
+            "12 receipts",
+            "4 Console",
         ):
             self.assertIn(required, guide)
 
@@ -1451,20 +1458,27 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             ],
         )
         for record in document["records"]:
-            evidence = record["document"]
-            self.assertEqual(evidence["schemaVersion"], "1")
+            plan = record["document"]
             self.assertEqual(
-                {name: set(checks) for name, checks in evidence["applications"].items()},
+                set(record), {"document", "planPath", "roundId", "runtimeId"}
+            )
+            self.assertEqual(plan["schemaVersion"], "1")
+            self.assertEqual(plan["roundId"], record["roundId"])
+            self.assertEqual(plan["runtimeId"], record["runtimeId"])
+            self.assertEqual(
                 {
-                    name: set(checks)
+                    name: tuple(application["requiredChecks"])
+                    for name, application in plan["applications"].items()
+                },
+                {
+                    name: checks
                     for name, checks in EXPECTED_REQUIRED_INTERACTIONS.items()
                 },
             )
-            self.assertTrue(
-                all(
-                    checked is True
-                    for checks in evidence["applications"].values()
-                    for checked in checks.values()
+            self.assertFalse(
+                any(
+                    isinstance(value, bool)
+                    for value in MacOsDualRuntimeOrchestratorTests._walk_scalars(plan)
                 )
             )
 
@@ -1485,6 +1499,45 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
         self.assertFalse(standard.allow_network)
         self.assertFalse(standard.negative_checks)
         self.assertEqual(standard.runtime_store_root, "/absolute/external/runtime-store")
+        self.assertEqual(
+            standard.interaction_plan_root, "/absolute/external/interactions"
+        )
+        self.assertEqual(
+            standard.acknowledgement_root,
+            "/absolute/external/acknowledgements",
+        )
+
+        helper_arguments = arguments(
+            validator.MACOS_ACCEPTANCE_ACKNOWLEDGEMENT_COMMAND
+        )
+        self.assertEqual(
+            helper_arguments,
+            [
+                "--interaction-plan-root",
+                "/absolute/external/interactions",
+                "--acknowledgement-root",
+                "/absolute/external/acknowledgements",
+            ],
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-documented-helper-"
+        ) as temporary:
+            external = Path(temporary).resolve()
+            plan_root = external / "plans"
+            acknowledgement_root = external / "acknowledgements"
+            plan_root.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            helper = acknowledgements.parse_arguments(
+                [
+                    "--interaction-plan-root",
+                    str(plan_root),
+                    "--acknowledgement-root",
+                    str(acknowledgement_root),
+                ]
+            )
+            self.assertEqual(helper.interaction_plan_root, plan_root)
+            self.assertEqual(helper.acknowledgement_root, acknowledgement_root)
 
         guide = validator._macos_acceptance_markdown(
             validator.MACOS_ACCEPTANCE_GUIDE
@@ -1606,7 +1659,7 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 "path-leak",
                 mutate_example(
                     lambda value: value["records"][0].update(
-                        evidencePath="/Users/operator/private.json"
+                        planPath="/Users/operator/private.json"
                     )
                 ),
             ),
@@ -2133,6 +2186,21 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             self.assertIn("tools/run_macos_dual_runtime_acceptance.py", errors[0])
             self.assertIn("unsafe path component", errors[0])
 
+    def test_repository_validator_bounds_every_reviewed_acceptance_source(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-macos-acceptance-validator-size-"
+        ) as temporary:
+            repository_root = Path(temporary) / "repository"
+            self._copy_reviewed_surface(repository_root)
+            oversized = repository_root / "tools/run_macos_dual_runtime_acceptance.py"
+            oversized.write_bytes(
+                b"#" * (validator.MACOS_ACCEPTANCE_MAX_SOURCE_BYTES + 1)
+            )
+            with mock.patch.object(validator, "ROOT", repository_root):
+                errors = validator.validate_macos_acceptance_surface()
+            self.assertEqual(len(errors), 1)
+            self.assertIn("source byte bound", errors[0])
+
 
 class MacOsDualRuntimeProjectionTests(unittest.TestCase):
     @staticmethod
@@ -2345,6 +2413,9 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         self.storage = self.external / "storage"
         self.work = self.external / "work"
         self.interactions = self.external / "interactions"
+        self.acknowledgements = self.external / "acknowledgements"
+        (self.acknowledgements / "challenges").mkdir(parents=True)
+        (self.acknowledgements / "receipts").mkdir()
         self._write_interactions()
         self.runtime_roots: dict[str, Path] = {}
         for runtime_id in ("crossover", "whisky"):
@@ -2373,25 +2444,21 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
         return self._tool_at(self.tools / name)
 
     def _write_interactions(self) -> None:
-        document = {
-            "schemaVersion": "1",
-            "applications": {
-                "7zip": {"fileList": True, "menus": True},
-                "sumatrapdf": {"mainWindow": True, "openDialog": True},
-                "notepad-plus-plus": {
-                    "open": True,
-                    "edit": True,
-                    "saveUtf8Chinese": True,
-                    "rereadMatches": True,
-                },
-            },
-        }
         for round_id in ("round-1", "round-2"):
             round_root = self.interactions / round_id
             round_root.mkdir(parents=True)
             for runtime_id in ("crossover", "whisky"):
-                (round_root / f"{runtime_id}.json").write_text(
-                    json.dumps(document), encoding="utf-8"
+                document = {
+                    "schemaVersion": "1",
+                    "roundId": round_id,
+                    "runtimeId": runtime_id,
+                    "applications": {
+                        app_id: {"requiredChecks": list(checks)}
+                        for app_id, checks in EXPECTED_REQUIRED_INTERACTIONS.items()
+                    },
+                }
+                (round_root / f"{runtime_id}.json").write_bytes(
+                    (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
                 )
 
     def _argv(self, *extra: str) -> list[str]:
@@ -2410,8 +2477,10 @@ class MacOsDualRuntimeOrchestratorTests(unittest.TestCase):
             str(self.storage),
             "--work-root",
             str(self.work),
-            "--interaction-evidence-root",
+            "--interaction-plan-root",
             str(self.interactions),
+            "--acknowledgement-root",
+            str(self.acknowledgements),
             *extra,
         ]
 
@@ -3437,12 +3506,21 @@ raise SystemExit(1)
 
     def test_closed_parser_rejects_missing_duplicate_unknown_positional_and_empty(self) -> None:
         invalid_argv = (
-            self._argv()[:-2],
+            self._argv()[:-4],
             self._argv("--work-root", str(self.external / "other")),
+            self._argv("--interaction-plan-root", str(self.interactions)),
+            self._argv("--acknowledgement-root", str(self.acknowledgements)),
             self._argv("--unknown"),
             [*self._argv(), "positional"],
             [*self._argv()[:-1], ""],
             self._argv("--allow-network", "--allow-network"),
+            [
+                *self._argv()[:-4],
+                "--interaction-evidence-root",
+                str(self.interactions),
+                "--acknowledgement-root",
+                str(self.acknowledgements),
+            ],
         )
         for argv in invalid_argv:
             with self.subTest(argv=argv), self.assertRaises(acceptance.AcceptanceError):
@@ -3450,6 +3528,125 @@ raise SystemExit(1)
 
         parsed = self._arguments("--allow-network")
         self.assertTrue(parsed.allow_network)
+        self.assertEqual(parsed.interaction_plan_root, str(self.interactions))
+        self.assertEqual(parsed.acknowledgement_root, str(self.acknowledgements))
+
+    def test_interaction_plan_is_identity_bound_and_contains_no_truth_claims(self) -> None:
+        for round_id in acceptance.ROUNDS:
+            for runtime_id in acceptance.RUNTIME_IDS:
+                document = json.loads(
+                    (self.interactions / round_id / f"{runtime_id}.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    set(document),
+                    {"schemaVersion", "roundId", "runtimeId", "applications"},
+                )
+                self.assertEqual(document["roundId"], round_id)
+                self.assertEqual(document["runtimeId"], runtime_id)
+                self.assertNotIn(True, tuple(self._walk_scalars(document)))
+                self.assertNotIn(False, tuple(self._walk_scalars(document)))
+                self.assertEqual(
+                    document["applications"],
+                    {
+                        app_id: {"requiredChecks": list(checks)}
+                        for app_id, checks in EXPECTED_REQUIRED_INTERACTIONS.items()
+                    },
+                )
+
+    @staticmethod
+    def _walk_scalars(value: object):
+        if isinstance(value, dict):
+            for nested in value.values():
+                yield from MacOsDualRuntimeOrchestratorTests._walk_scalars(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from MacOsDualRuntimeOrchestratorTests._walk_scalars(nested)
+        else:
+            yield value
+
+    def test_preflight_rejects_acknowledgement_overlap_and_foreign_entries(self) -> None:
+        overlapping = self._argv()
+        overlapping[overlapping.index("--acknowledgement-root") + 1] = str(
+            self.interactions / "nested"
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "overlap"):
+            acceptance.preflight(
+                acceptance.parse_arguments(overlapping),
+                host_system="Darwin",
+                host_machine="arm64",
+            )
+
+        foreign = self.acknowledgements / "foreign.json"
+        foreign.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "acknowledgement"):
+            acceptance.preflight(
+                self._arguments(), host_system="Darwin", host_machine="arm64"
+            )
+
+    def test_prefilled_plan_booleans_extra_records_and_linked_entries_are_rejected(self) -> None:
+        target = self.interactions / "round-1" / "crossover.json"
+        original = target.read_bytes()
+        plan = json.loads(original)
+        plan["applications"]["7zip"]["observed"] = True
+        target.write_bytes(
+            (json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "interaction plan"):
+            acceptance.preflight(
+                self._arguments(), host_system="Darwin", host_machine="arm64"
+            )
+        target.write_bytes(original)
+
+        extra = self.interactions / "extra.json"
+        extra.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "interaction plan"):
+            acceptance.preflight(
+                self._arguments(), host_system="Darwin", host_machine="arm64"
+            )
+        extra.unlink()
+
+        victim = self.external / "plan-victim.json"
+        victim.write_bytes(original)
+        target.unlink()
+        try:
+            os.symlink(victim, target)
+        except OSError as error:
+            self.skipTest(f"file symlinks are unavailable: {error}")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "unsafe path component"):
+            acceptance.preflight(
+                self._arguments(), host_system="Darwin", host_machine="arm64"
+            )
+
+    def test_hardlinked_plan_and_linked_acknowledgement_subtree_are_rejected(self) -> None:
+        target = self.interactions / "round-1" / "crossover.json"
+        victim = self.external / "hardlinked-plan.json"
+        victim.write_bytes(target.read_bytes())
+        target.unlink()
+        try:
+            os.link(victim, target)
+        except OSError as error:
+            self.skipTest(f"hardlinks are unavailable: {error}")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "private bounded"):
+            acceptance.preflight(
+                self._arguments(), host_system="Darwin", host_machine="arm64"
+            )
+
+        target.unlink()
+        target.write_bytes(victim.read_bytes())
+        challenges = self.acknowledgements / "challenges"
+        real_challenges = self.external / "real-challenges"
+        challenges.rmdir()
+        real_challenges.mkdir()
+        try:
+            os.symlink(real_challenges, challenges, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"directory symlinks are unavailable: {error}")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "unsafe path component"):
+            acceptance.preflight(
+                self._arguments(), host_system="Darwin", host_machine="arm64"
+            )
 
     def test_negative_mode_is_explicit_closed_and_always_offline(self) -> None:
         guest, sentinel, _asset = self._negative_fixture()
@@ -3511,13 +3708,21 @@ raise SystemExit(1)
             root.rmdir()
 
         (self.interactions / "round-2" / "whisky.json").unlink()
-        with self.assertRaisesRegex(acceptance.AcceptanceError, "interaction evidence"):
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "interaction plan"):
             acceptance.preflight(
                 self._arguments(), host_system="Darwin", host_machine="arm64"
             )
-        (self.interactions / "round-2" / "whisky.json").write_text(
-            (self.interactions / "round-1" / "whisky.json").read_text(encoding="utf-8"),
-            encoding="utf-8",
+        restored = {
+            "schemaVersion": "1",
+            "roundId": "round-2",
+            "runtimeId": "whisky",
+            "applications": {
+                app_id: {"requiredChecks": list(checks)}
+                for app_id, checks in EXPECTED_REQUIRED_INTERACTIONS.items()
+            },
+        }
+        (self.interactions / "round-2" / "whisky.json").write_bytes(
+            (json.dumps(restored, sort_keys=True, separators=(",", ":")) + "\n").encode()
         )
         (self.interactions / "extra.json").write_text("{}", encoding="utf-8")
         with self.assertRaisesRegex(acceptance.AcceptanceError, "too many entries"):
@@ -3553,6 +3758,20 @@ raise SystemExit(1)
                 host_system="Darwin",
                 host_machine="arm64",
             )
+
+        if os.name == "nt":
+            namespace = self._argv()
+            namespace[namespace.index("--acknowledgement-root") + 1] = (
+                "\\\\?\\" + str(self.acknowledgements)
+            )
+            with self.assertRaisesRegex(
+                acceptance.AcceptanceError, "non-traversing path"
+            ):
+                acceptance.preflight(
+                    acceptance.parse_arguments(namespace),
+                    host_system="Darwin",
+                    host_machine="arm64",
+                )
 
     def test_orchestration_has_exact_order_argv_layout_and_one_discovery(self) -> None:
         calls: list[tuple[list[str], dict[str, object]]] = []
@@ -3667,8 +3886,15 @@ raise SystemExit(1)
             self.assertEqual(argv[argv.index("--wineserver") + 1], "bin/wineserver")
             if "--runtime-id" in argv:
                 self.assertEqual(argv[argv.index("--runtime-id") + 1], runtime_id)
-                interaction = Path(argv[argv.index("--interaction-evidence") + 1])
+                interaction = Path(argv[argv.index("--interaction-plan") + 1])
                 self.assertEqual(interaction.name, f"{runtime_id}.json")
+                self.assertEqual(
+                    argv[argv.index("--acknowledgement-root") + 1],
+                    str(self.acknowledgements),
+                )
+                self.assertIn("--round-id", argv)
+                self.assertIn("--version", argv)
+                self.assertNotIn("--interaction-evidence", argv)
                 self.assertNotIn("--allow-network", argv)
         for argv, kwargs in desktop_calls:
             self.assertFalse(kwargs["shell"])
@@ -3708,6 +3934,8 @@ raise SystemExit(1)
             encoded_artifact = artifact.read_text(encoding="utf-8")
             self.assertNotIn(str(self.external), encoded_artifact)
             self.assertNotIn("requestId", encoded_artifact)
+            self.assertNotIn("nonce", encoded_artifact)
+            self.assertNotIn("challengeDigest", encoded_artifact)
         self.assertEqual(
             source_snapshots,
             {path: path.read_bytes() for path in source_snapshots},
@@ -4008,26 +4236,26 @@ raise SystemExit(1)
         with self.assertRaisesRegex(acceptance.AcceptanceError, "structural bound"):
             acceptance.parse_closed_json(too_deep, "child")
 
-    def test_interaction_preflight_requires_every_literal_check_to_be_true(self) -> None:
+    def test_interaction_preflight_requires_exact_required_check_names_without_observations(self) -> None:
         target = self.interactions / "round-1" / "crossover.json"
         original = json.loads(target.read_text(encoding="utf-8"))
         cases: list[tuple[str, object]] = []
 
-        false_check = json.loads(json.dumps(original))
-        false_check["applications"]["7zip"]["menus"] = False
-        cases.append(("false", false_check))
-        integer_check = json.loads(json.dumps(original))
-        integer_check["applications"]["sumatrapdf"]["mainWindow"] = 0
-        cases.append(("integer", integer_check))
-        string_check = json.loads(json.dumps(original))
-        string_check["applications"]["notepad-plus-plus"]["edit"] = "true"
-        cases.append(("string", string_check))
+        prefilled = json.loads(json.dumps(original))
+        prefilled["applications"]["7zip"]["fileList"] = True
+        cases.append(("prefilled", prefilled))
         missing_check = json.loads(json.dumps(original))
-        del missing_check["applications"]["7zip"]["fileList"]
+        missing_check["applications"]["7zip"]["requiredChecks"].remove("fileList")
         cases.append(("missing", missing_check))
         extra_check = json.loads(json.dumps(original))
-        extra_check["applications"]["sumatrapdf"]["extra"] = True
+        extra_check["applications"]["sumatrapdf"]["requiredChecks"].append("extra")
         cases.append(("extra", extra_check))
+        wrong_round = json.loads(json.dumps(original))
+        wrong_round["roundId"] = "round-2"
+        cases.append(("round", wrong_round))
+        wrong_runtime = json.loads(json.dumps(original))
+        wrong_runtime["runtimeId"] = "whisky"
+        cases.append(("runtime", wrong_runtime))
 
         self.assertEqual(
             EXPECTED_REQUIRED_INTERACTIONS,
@@ -4044,15 +4272,19 @@ raise SystemExit(1)
         )
         for label, document in cases:
             with self.subTest(label=label):
-                target.write_text(json.dumps(document), encoding="utf-8")
+                target.write_bytes(
+                    (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                )
                 with self.assertRaisesRegex(
-                    acceptance.AcceptanceError, "interaction evidence"
+                    acceptance.AcceptanceError, "interaction plan"
                 ):
                     acceptance.preflight(
                         self._arguments(), host_system="Darwin", host_machine="arm64"
                     )
                 self.assertFalse(self.work.exists())
-        target.write_text(json.dumps(original), encoding="utf-8")
+        target.write_bytes(
+            (json.dumps(original, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        )
 
     def test_runtime_descriptor_rejects_option_versions_and_aliased_entrypoints(self) -> None:
         for version in ("--allow-network", "--foo", "-1", "24.0\nsecret", "é"):
@@ -4593,6 +4825,17 @@ raise SystemExit(1)
             interaction.write_text(
                 interaction.read_text(encoding="utf-8") + " ", encoding="utf-8"
             )
+
+        self._run_final_wait_mutation(mutation)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_final_desktop_wait_acknowledgement_root_swap_is_integrity_fatal(self) -> None:
+        challenges = self.acknowledgements / "challenges"
+        original = self.acknowledgements / "challenges-original"
+
+        def mutation() -> None:
+            challenges.rename(original)
+            challenges.mkdir()
 
         self._run_final_wait_mutation(mutation)
         self.assertFalse((self.work / "summary.json").exists())

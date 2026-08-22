@@ -38,11 +38,12 @@ sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
 
 ## 2. 外部根与清理边界
 
-以下五类输入必须是绝对路径，位于 CompatForge 仓库和整个 FOS sibling 树之外，彼此不重叠，任何祖先或叶子都不得是 symlink/reparse point：
+以下六类输入必须是绝对路径，位于 CompatForge 仓库和整个 FOS sibling 树之外，彼此不重叠，任何祖先或叶子都不得是 symlink/reparse point：
 
 - `cache-root`：资产准备前不存在或为空；标准编排时只保存固定 URL 与 SHA-256 通过校验的三个安装器；
 - `runtime-store-root`、`storage-root`、`work-root`：开始时不存在或为空；
-- `interaction-evidence-root`：只能含 `round-1|round-2` × `crossover|whisky` 四个 JSON；
+- `interaction-plan-root`：只读，只能含 `round-1|round-2` × `crossover|whisky` 四个规范 JSON 计划；计划仅列出 required checks，不能含观察结果或 boolean；
+- `acknowledgement-root`：开始时只含空的 `challenges` 与 `receipts` 子目录；第二终端 helper 和编排器共同绑定其 identity，不能复用旧根；
 - CLI、Tauri 可执行文件、MinGW、Console guest 与 negative sentinel 也使用明确的绝对路径，且不与上述根重叠。
 
 工具会在 `round/runtime/console|gui|desktop` 下隔离写入。只允许清理工具创建并重新校验 identity 的叶子；禁止 `rm -rf` 广泛目录、未解析变量、仓库根、FOS 根或任一 Runtime 安装。重新运行必须选择新的空 `runtime-store-root`、`storage-root` 和 `work-root`，不要复用失败根。
@@ -96,7 +97,7 @@ python3 -S -B tools/download_gui_assets.py fetch notepad-plus-plus --cache-root 
 
 ## 6. 独立准备交互确认
 
-[交互模板](../../examples/macos-dual-runtime-interactions.json)包含四条独立记录。每条 `document` 都是运行器实际接受的 `schemaVersion: "1"` 文档，需分别写到其相对 `evidencePath`：
+[交互计划模板](../../examples/macos-dual-runtime-interactions.json)包含四条独立记录。每条 `document` 都是运行器实际接受的 `schemaVersion: "1"` 计划，需以规范紧凑 JSON 加换行分别写到其相对 `planPath`。同时新建 acknowledgement 根及其两个空子目录：
 
 ```text
 /absolute/external/interactions/round-1/crossover.json
@@ -105,7 +106,22 @@ python3 -S -B tools/download_gui_assets.py fetch notepad-plus-plus --cache-root 
 /absolute/external/interactions/round-2/whisky.json
 ```
 
-不要批量复制一套 boolean。模板中的 `true` 只是运行器允许进入人工验收的闭集形状，不是真实证据。每个 Runtime、每轮、每个应用都必须重新观察后逐项确认：7-Zip 的 `fileList`/`menus`；SumatraPDF 的 `mainWindow`/`openDialog`（当前 schema 对打开流程的键）；Notepad++ 的 `open`/`edit`/`saveUtf8Chinese`/`rereadMatches`。Console 由无头 runner 的既有事件 schema 验证，不出现在人工交互 JSON 中。
+从仓库根用已通过 validator 的模板生成四份规范计划，并创建全新的空 acknowledgement 子目录：
+
+```text
+python3 -S -B -c 'import json,pathlib; source=json.loads(pathlib.Path("examples/macos-dual-runtime-interactions.json").read_text(encoding="utf-8")); root=pathlib.Path("/absolute/external/interactions"); [(root / record["planPath"]).parent.mkdir(parents=True,exist_ok=True) or (root / record["planPath"]).write_text(json.dumps(record["document"],ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8",newline="\n") for record in source["records"]]'
+mkdir -p /absolute/external/acknowledgements/challenges /absolute/external/acknowledgements/receipts
+```
+
+计划中没有 `true`/`false`、nonce、challenge digest 或任何观察结论，因此预填计划不能产生 `accepted`。准备 `/absolute/external/acknowledgements/challenges` 与 `/absolute/external/acknowledgements/receipts` 两个空目录后，在第二终端只启动一次 watch helper；它会按固定顺序等待全部 12 个 GUI challenge：
+
+```text
+python3 -S -B tools/confirm_macos_gui_interactions.py \
+  --interaction-plan-root /absolute/external/interactions \
+  --acknowledgement-root /absolute/external/acknowledgements
+```
+
+helper 出现 challenge 后，才在已显示的应用窗口执行对应动作：7-Zip 的 `fileList`/`menus`；SumatraPDF 的 `mainWindow`/`openDialog`；Notepad++ 的 `open`/`edit`/`saveUtf8Chinese`/`rereadMatches`。每完成一项立即在第二终端确认；不要提前确认、批量确认或在应用关闭后凭记忆确认。否定回答或超时保持 `unverified`，错误 identity、digest、nonce、重复/跨轮 receipt 或 unsafe entry 为 `failed`。Console 由无头 runner 自动验证，不需要人工 receipt。
 
 ## 7. 执行两轮矩阵
 
@@ -120,16 +136,17 @@ python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
   --runtime-store-root /absolute/external/runtime-store \
   --storage-root /absolute/external/storage \
   --work-root /absolute/external/evidence \
-  --interaction-evidence-root /absolute/external/interactions
+  --interaction-plan-root /absolute/external/interactions \
+  --acknowledgement-root /absolute/external/acknowledgements
 ```
 
-编排器会再绑定所发现 Runtime 的 identity，依次运行每个 `round/runtime` 的 Console、GUI 和 Desktop，并打印精确 Tauri 命令。每个应用出现后立即完成本组合的人工确认；不要等到整轮结束后凭记忆补写。桌面壳必须人工正常关闭并确认进程树已清理，才允许继续下一个组合。
+保持编排器离线，不启用网络参数。编排器会再绑定所发现 Runtime、四份 plan 与 acknowledgement 根的 identity，依次运行每个 `round/runtime` 的 Console、GUI 和 Desktop，并打印精确 Tauri 命令。GUI runner 只有在观察到应用窗口后才发布 challenge；完成对应交互并立即确认。桌面壳必须人工正常关闭并确认进程树已清理，才允许继续下一个组合。watch helper 只启动这一次，直到写出 12 receipts 后退出。
 
 失败必须归入闭集 `environment|runtime|core|desktop|application|cleanup`，状态只能是 `accepted|failed|unverified|blocked`。修复环境或代码后使用全新的空输出根重跑整个两轮矩阵，不在旧证据上续跑。
 
 ## 8. 负向隔离检查
 
-正常矩阵通过后，用新的空输出根、已缓存的固定 7-Zip 安装器、独立 Console guest 和 sentinel 运行负向检查；该模式始终离线：
+正常矩阵通过后，用新的空输出根、已缓存的固定 7-Zip 安装器、独立 Console guest 和 sentinel 运行负向检查；另为 `/absolute/external/negative/acknowledgements` 准备空的 `challenges` 与 `receipts` 子目录。该模式始终离线：
 
 ```text
 python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
@@ -140,7 +157,8 @@ python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
   --runtime-store-root /absolute/external/negative/runtime-store \
   --storage-root /absolute/external/negative/storage \
   --work-root /absolute/external/negative/evidence \
-  --interaction-evidence-root /absolute/external/interactions \
+  --interaction-plan-root /absolute/external/interactions \
+  --acknowledgement-root /absolute/external/negative/acknowledgements \
   --negative-checks \
   --console-guest /absolute/external/inputs/windows-console-smoke.exe \
   --negative-sentinel /absolute/external/inputs/negative-sentinel.txt
@@ -152,7 +170,7 @@ python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
 
 仅当以下条件同时成立，当前 developer-local 阶段才完成：
 
-- `2 runtimes × (console + 3 GUI) × 2 rounds = 16 paths` 全部为 `accepted`；
+- `2 runtimes × (console + 3 GUI) × 2 rounds = 16 paths` 全部为 `accepted`：其中必须有 12 receipts 与 4 Console 自动结果；
 - `round-1/round-projection.json` 与 `round-2/round-projection.json` 的规范脱敏字节相等，`comparison.json` 为 `roundsEqual: true` 且 `status: accepted`；
 - 16 条路径达到 zero cleanup failure，三个 GUI 应用的 `cleanup` 全为 `true`，Desktop 正常退出；
 - 没有任何 `unverified`、`blocked` 或 `failed`；
