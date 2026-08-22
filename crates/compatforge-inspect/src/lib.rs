@@ -842,6 +842,29 @@ mod tests {
     }
 
     #[test]
+    fn inspect_file_caps_growth_reads_at_one_byte_beyond_the_limit() {
+        let path = unique_test_path("bounded-growth.exe");
+        fs::write(&path, fixture()).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+
+        let result = inspect_file_with_before_read(&mut file, || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(MAX_PE_FILE_BYTES + 2)
+                .unwrap();
+        });
+
+        match result {
+            Err(InspectionError::FileTooLarge(size)) => assert_eq!(size, MAX_PE_FILE_BYTES + 1),
+            other => panic!("expected a bounded oversized-file error, got {other:?}"),
+        }
+        drop(file);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn inspect_file_matches_the_existing_inspect_path_report() {
         let path = unique_test_path("compatibility.exe");
         fs::write(&path, fixture()).unwrap();
