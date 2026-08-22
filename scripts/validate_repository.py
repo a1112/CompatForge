@@ -4917,8 +4917,11 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "compile",
         "eval",
         "exec",
+        "breakpoint",
         "getattr",
         "globals",
+        "help",
+        "input",
         "locals",
         "open",
         "setattr",
@@ -4926,7 +4929,10 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
     }
     forbidden_os_attributes = {"environ", "get_exec_path", "getenv", "popen", "system"}
     mutating_methods = {
+        "chmod",
         "hardlink_to",
+        "lchmod",
+        "link_to",
         "mkdir",
         "open",
         "rename",
@@ -4949,7 +4955,15 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "symlink",
         "unlink",
     }
-    forbidden_module_names = {"http", "requests", "shutil", "socket", "subprocess", "urllib"}
+    forbidden_module_names = {
+        "__builtins__",
+        "http",
+        "requests",
+        "shutil",
+        "socket",
+        "subprocess",
+        "urllib",
+    }
     allowed_mutating_scopes = {
         "open": {"_bind_directory", "_relative_open"},
         "unlink": {"_relative_unlink"},
@@ -5284,6 +5298,17 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         if (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
+            and node.id in forbidden_builtins
+            and not (
+                node.id == "input"
+                and isinstance(parents.get(node), ast.arguments)
+                and scope(node) == "watch"
+            )
+        ):
+            return True
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
             and not allowed_native_name_use(node)
         ):
             return True
@@ -5300,6 +5325,12 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
                 return True
         if isinstance(node, ast.Attribute):
             base = node.value
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return True
+            if node.attr in mutating_methods:
+                parent = parents.get(node)
+                if not isinstance(parent, ast.Call) or parent.func is not node:
+                    return True
             if (
                 isinstance(base, ast.Call)
                 and qualified_name(base.func) in ("ctypes.CDLL", "ctypes.WinDLL")
@@ -5311,6 +5342,12 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
             if isinstance(base, ast.Name) and aliases.get(base.id) == "ctypes":
                 if node.attr not in allowed_ctypes_attributes:
                     return True
+            if (
+                isinstance(base, ast.Name)
+                and aliases.get(base.id) == "argparse"
+                and node.attr == "FileType"
+            ):
+                return True
             if isinstance(base, ast.Name) and base.id in dll_bindings:
                 kernel32_attribute = (
                     dll_bindings[base.id] == "ctypes.WinDLL"

@@ -856,7 +856,28 @@ def write_acknowledgement(
     )
 
 
+def _uses_windows_native_namespace(value: object) -> bool:
+    if os.name != "nt" or type(value) is not str or len(value) < 4:
+        return False
+    separators = "\\/"
+    return (
+        value[0] in separators
+        and value[1] in separators
+        and value[2] in "?."
+        and value[3] in separators
+    ) or (
+        value[0] in separators
+        and value[1] == "?"
+        and value[2] == "?"
+        and value[3] in separators
+    )
+
+
 def _external_path(value: str, label: str) -> Path:
+    if _uses_windows_native_namespace(value):
+        raise argparse.ArgumentTypeError(
+            f"{label} uses a forbidden Windows namespace"
+        )
     path = Path(value)
     if not path.is_absolute() or any(part in ("", ".", "..") for part in path.parts[1:]):
         raise argparse.ArgumentTypeError(
@@ -872,8 +893,10 @@ def _overlaps(left: Path, right: Path) -> bool:
 
 
 def _is_external_root(path: Path) -> bool:
+    raw = str(path)
     return (
-        path.is_absolute()
+        not _uses_windows_native_namespace(raw)
+        and path.is_absolute()
         and not any(part in ("", ".", "..") for part in path.parts[1:])
         and path != ROOT
         and path not in ROOT.parents
@@ -908,6 +931,20 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parsed = value.parse_args(arguments)
     if _overlaps(parsed.interaction_plan_root, parsed.acknowledgement_root):
         value.error("interaction and acknowledgement roots must not overlap")
+    bindings: (
+        tuple[DirectoryBinding, DirectoryBinding, DirectoryBinding] | None
+    ) = None
+    try:
+        bindings = _bind_watch_roots(
+            parsed.interaction_plan_root,
+            parsed.acknowledgement_root,
+        )
+    except AcknowledgementError as error:
+        value.error(str(error))
+    finally:
+        if bindings is not None:
+            for binding in reversed(bindings):
+                _close_directory(binding)
     return parsed
 
 
@@ -1003,6 +1040,42 @@ def _close_directory(binding: DirectoryBinding) -> None:
             os.close(binding.handle)
     except OSError:
         pass
+
+
+def _directory_bindings_overlap(
+    left: DirectoryBinding,
+    right: DirectoryBinding,
+) -> bool:
+    left_chain = {identity for _path, identity in left.chain}
+    right_chain = {identity for _path, identity in right.chain}
+    return left.identity in right_chain or right.identity in left_chain
+
+
+def _bind_watch_roots(
+    interaction_plan_root: Path,
+    acknowledgement_root: Path,
+) -> tuple[DirectoryBinding, DirectoryBinding, DirectoryBinding]:
+    held: list[DirectoryBinding] = []
+    try:
+        repository = _bind_directory(ROOT, "repository root")
+        held.append(repository)
+        plan = _bind_directory(interaction_plan_root, "interaction plan root")
+        held.append(plan)
+        acknowledgements = _bind_directory(
+            acknowledgement_root, "acknowledgement root"
+        )
+        held.append(acknowledgements)
+        if _directory_bindings_overlap(repository, plan) or _directory_bindings_overlap(
+            repository, acknowledgements
+        ):
+            _fail("watch root configuration is invalid")
+        if _directory_bindings_overlap(plan, acknowledgements):
+            _fail("watch roots overlap")
+        return repository, plan, acknowledgements
+    except BaseException:
+        for binding in reversed(held):
+            _close_directory(binding)
+        raise
 
 
 def _revalidate_directory(binding: DirectoryBinding, label: str) -> None:
@@ -1172,17 +1245,17 @@ def watch(
     receipts_root = acknowledgement_root / "receipts"
     held: list[DirectoryBinding] = []
     try:
-        plan_binding = _bind_directory(interaction_plan_root, "interaction plan root")
-        held.append(plan_binding)
-        acknowledgement_binding = _bind_directory(
-            acknowledgement_root, "acknowledgement root"
+        repository_binding, plan_binding, acknowledgement_binding = _bind_watch_roots(
+            interaction_plan_root,
+            acknowledgement_root,
         )
-        held.append(acknowledgement_binding)
+        held.extend((repository_binding, plan_binding, acknowledgement_binding))
         challenge_binding = _bind_directory(challenges_root, "challenges root")
         held.append(challenge_binding)
         receipt_binding = _bind_directory(receipts_root, "receipts root")
         held.append(receipt_binding)
         bindings = (
+            (repository_binding, "repository root"),
             (plan_binding, "interaction plan root"),
             (acknowledgement_binding, "acknowledgement root"),
             (challenge_binding, "challenges root"),

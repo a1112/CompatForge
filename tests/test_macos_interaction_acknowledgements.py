@@ -883,6 +883,151 @@ class AcknowledgementWatchTests(unittest.TestCase):
             ), self.assertRaises(SystemExit):
                 self.helper.parse_arguments(argv)
 
+    @unittest.skipUnless(os.name == "nt", "Windows native namespace contract")
+    def test_windows_native_namespace_paths_are_rejected_before_path_construction(self) -> None:
+        native_paths = (
+            "\\\\?\\C:\\acknowledgements",
+            "\\\\.\\C:\\acknowledgements",
+            "\\??\\C:\\acknowledgements",
+            "\\\\?\\UNC\\server\\share",
+            "\\\\.\\UNC\\server\\share",
+            "\\??\\UNC\\server\\share",
+            "//?/C:/acknowledgements",
+            "//./C:/acknowledgements",
+            "\\\\?/C:\\acknowledgements",
+            "//?\\C:/acknowledgements",
+            "\\??/C:\\acknowledgements",
+        )
+        for raw in native_paths:
+            with self.subTest(raw=raw), mock.patch.object(
+                self.helper,
+                "Path",
+                side_effect=AssertionError("native path reached Path construction"),
+            ), self.assertRaisesRegex(
+                self.helper.argparse.ArgumentTypeError,
+                "^acknowledgement-root uses a forbidden Windows namespace$",
+            ):
+                self.helper._external_path(raw, "acknowledgement-root")
+
+    @unittest.skipUnless(os.name == "nt", "Windows native alias contract")
+    def test_normal_and_native_aliases_cannot_overlap_repository_or_each_other(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan_root = root / "plan"
+            acknowledgement_root = root / "acknowledgements"
+            plan_root.mkdir()
+            acknowledgement_root.mkdir()
+            repository_alias = "\\\\?\\" + str(ROOT)
+            plan_alias = "\\\\?\\" + str(plan_root)
+            invalid_cli = (
+                (repository_alias, str(acknowledgement_root)),
+                (str(plan_root), plan_alias),
+                (str(plan_root), str(plan_root)),
+            )
+            for plan, acknowledgements in invalid_cli:
+                with self.subTest(
+                    plan=plan,
+                    acknowledgements=acknowledgements,
+                ), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(
+                    SystemExit
+                ):
+                    self.helper.parse_arguments(
+                        [
+                            "--interaction-plan-root",
+                            plan,
+                            "--acknowledgement-root",
+                            acknowledgements,
+                        ]
+                    )
+
+            with self.assertRaisesRegex(
+                self.helper.AcknowledgementError,
+                "^watch root configuration is invalid$",
+            ):
+                self.helper.watch(
+                    Path(repository_alias),
+                    acknowledgement_root,
+                    input_fn=lambda _prompt: self.fail("repository alias prompted"),
+                )
+            with self.assertRaisesRegex(
+                self.helper.AcknowledgementError,
+                "^watch root configuration is invalid$",
+            ):
+                self.helper.watch(
+                    plan_root,
+                    Path(plan_alias),
+                    input_fn=lambda _prompt: self.fail("same-root alias prompted"),
+                )
+
+    def test_held_directory_identity_detects_same_and_ancestor_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child"
+            sibling = root / "sibling"
+            child.mkdir()
+            sibling.mkdir()
+            root_binding = self.helper._bind_directory(root, "root")
+            duplicate_binding = self.helper._bind_directory(root, "duplicate")
+            child_binding = self.helper._bind_directory(child, "child")
+            sibling_binding = self.helper._bind_directory(sibling, "sibling")
+            try:
+                self.assertTrue(
+                    self.helper._directory_bindings_overlap(
+                        root_binding, duplicate_binding
+                    )
+                )
+                self.assertTrue(
+                    self.helper._directory_bindings_overlap(root_binding, child_binding)
+                )
+                self.assertFalse(
+                    self.helper._directory_bindings_overlap(child_binding, sibling_binding)
+                )
+            finally:
+                for binding in (
+                    sibling_binding,
+                    child_binding,
+                    duplicate_binding,
+                    root_binding,
+                ):
+                    self.helper._close_directory(binding)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction boundary contract")
+    def test_repository_junction_alias_is_rejected_by_parse_and_direct_watch(self) -> None:
+        import _winapi
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository_alias = root / "repository-alias"
+            acknowledgement_root = root / "acknowledgements"
+            acknowledgement_root.mkdir()
+            (acknowledgement_root / "challenges").mkdir()
+            (acknowledgement_root / "receipts").mkdir()
+            _winapi.CreateJunction(str(ROOT), str(repository_alias))
+
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(
+                SystemExit
+            ):
+                self.helper.parse_arguments(
+                    [
+                        "--interaction-plan-root",
+                        str(repository_alias),
+                        "--acknowledgement-root",
+                        str(acknowledgement_root),
+                    ]
+                )
+            with self.assertRaisesRegex(
+                self.helper.AcknowledgementError,
+                "^interaction plan root is unsafe$",
+            ):
+                self.helper.watch(
+                    repository_alias,
+                    acknowledgement_root,
+                    input_fn=lambda _prompt: self.fail("unsafe junction prompted"),
+                    monotonic=lambda: 0.0,
+                    sleeper=lambda _seconds: self.fail("unsafe junction slept"),
+                    deadline_seconds=1.0,
+                )
+
     def test_direct_watch_cannot_bypass_external_root_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             plan_root, acknowledgement_root, _challenges, _receipts = self._roots(
@@ -1028,6 +1173,19 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "shadow_lambda = lambda bytes: bytes",
             "shadowed = [value for int in () for value in ()]",
             "match {}:\n    case {**str}:\n        pass",
+            "argparse.FileType('w')('evidence.json')",
+            "Path('evidence.json').chmod(0o600)",
+            "breakpoint()",
+            "help()",
+            "path_chmod = Path.chmod\npath_chmod(Path('evidence.json'), 0o600)",
+            "debug_hook = breakpoint\ndebug_hook()",
+            (
+                "path_chmod = Path.__dict__['chmod']\n"
+                "path_chmod(Path('evidence.json'), 0o600)"
+            ),
+            "Path.__dict__['write_text'](Path('evidence.json'), 'x')",
+            "__builtins__['breakpoint']()",
+            "__builtins__.__dict__['breakpoint']()",
         )
         for marker in forbidden:
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
@@ -1059,6 +1217,9 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "readonly_flag = os.O_RDONLY",
             "readonly_name = Path('evidence.json').name",
             "local_marker = 1\nlocal_marker = 2",
+            "safe_parser = argparse.ArgumentParser(add_help=False)",
+            "safe_stat = Path('evidence.json').stat()",
+            "safe_mapping = {'x': True}\nsafe_value = safe_mapping['x']",
         )
         for marker in allowed:
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
