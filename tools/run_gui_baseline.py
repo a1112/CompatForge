@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_COMMAND_SECONDS = 180
 WINDOW_APPEARANCE_SECONDS = 30
 INTERACTIVE_RUNTIME_MILLISECONDS = 60_000
-ACKNOWLEDGEMENT_WAIT_SECONDS = 5 * 60
+ACKNOWLEDGEMENT_WAIT_SECONDS = 60
 ACKNOWLEDGEMENT_POLL_SECONDS = 0.25
 MAX_DIAGNOSTICS = 16
 MAX_DIAGNOSTIC_CHARS = 4096
@@ -957,7 +957,7 @@ def observed_launch(
     screenshot_path: Path,
     title_tokens: tuple[str, ...],
     *,
-    on_window_observed: Callable[[subprocess.Popen[str]], None] | None = None,
+    on_window_observed: Callable[[subprocess.Popen[str], float], None] | None = None,
     timeout: int = MAX_COMMAND_SECONDS,
 ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], int | None]:
     """Keep the Core launch process alive while collecting visual evidence."""
@@ -975,59 +975,107 @@ def observed_launch(
         process.kill()
         raise AcceptanceError("GUI launch pipes were not created")
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    started = time.monotonic()
-    windows: dict[str, object] = {"available": False, "reason": "observation pending"}
-    shot: dict[str, object] = {"available": False, "path": str(screenshot_path)}
-    events: list[dict[str, object]] = []
-    root_process_id: int | None = None
-    next_observation = started
-    acknowledgement_hook_called = False
-    while process.poll() is None:
-        elapsed = time.monotonic() - started
-        for key, _mask in selector.select(timeout=0.1):
-            line = key.fileobj.readline()
-            if not line:
-                continue
-            event = parse_event_line(line, "GUI launch")
-            events.append(event)
-            if event.get("kind") == "started" and isinstance(event.get("processId"), int):
-                root_process_id = event["processId"]
-        now = time.monotonic()
-        if (
-            root_process_id is not None
-            and not windows.get("available")
-            and elapsed <= WINDOW_APPEARANCE_SECONDS
-            and now >= next_observation
-        ):
-            windows = observer(root_process_id, title_tokens)
-            if windows.get("available") is True:
-                if (
-                    on_window_observed is not None
-                    and not acknowledgement_hook_called
+    selector_registered = False
+    selector_closed = False
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        selector_registered = True
+        started = time.monotonic()
+        windows: dict[str, object] = {
+            "available": False,
+            "reason": "observation pending",
+        }
+        shot: dict[str, object] = {"available": False, "path": str(screenshot_path)}
+        events: list[dict[str, object]] = []
+        root_process_id: int | None = None
+        next_observation = started
+        acknowledgement_hook_called = False
+        while process.poll() is None:
+            elapsed = time.monotonic() - started
+            for key, _mask in selector.select(timeout=0.1):
+                line = key.fileobj.readline()
+                if not line:
+                    continue
+                event = parse_event_line(line, "GUI launch")
+                events.append(event)
+                if event.get("kind") == "started" and isinstance(
+                    event.get("processId"), int
                 ):
-                    acknowledgement_hook_called = True
-                    on_window_observed(process)
-                shot = screenshot(screenshot_path)
-            next_observation = now + 0.5
-        if elapsed >= timeout:
-            process.kill()
-            process.wait(timeout=10)
-            raise AcceptanceError("GUI launch exceeded the bounded observation timeout")
-        time.sleep(0.1)
-    selector.unregister(process.stdout)
-    selector.close()
-    for line in process.stdout.read().splitlines():
-        if line.strip():
-            events.append(parse_event_line(line, "GUI launch"))
-    stderr = process.stderr.read()
-    process.wait(timeout=10)
-    if process.returncode != 0:
-        detail = stderr.strip().splitlines()[-1] if stderr.strip() else "no stderr"
-        raise AcceptanceError(f"GUI launch failed: {detail}")
-    if not events:
-        raise AcceptanceError("GUI launch emitted no RuntimeEvent")
-    return events, windows, shot, root_process_id
+                    root_process_id = event["processId"]
+            now = time.monotonic()
+            if (
+                root_process_id is not None
+                and not windows.get("available")
+                and elapsed <= WINDOW_APPEARANCE_SECONDS
+                and now >= next_observation
+            ):
+                windows = observer(root_process_id, title_tokens)
+                if windows.get("available") is True:
+                    if (
+                        on_window_observed is not None
+                        and not acknowledgement_hook_called
+                    ):
+                        acknowledgement_hook_called = True
+                        hook_elapsed = time.monotonic() - started
+                        remaining_budget = min(
+                            float(ACKNOWLEDGEMENT_WAIT_SECONDS),
+                            max(0.0, float(timeout) - hook_elapsed),
+                            max(
+                                0.0,
+                                INTERACTIVE_RUNTIME_MILLISECONDS / 1000
+                                - hook_elapsed,
+                            ),
+                        )
+                        on_window_observed(process, remaining_budget)
+                    shot = screenshot(screenshot_path)
+                next_observation = now + 0.5
+            if elapsed >= timeout:
+                raise AcceptanceError(
+                    "GUI launch exceeded the bounded observation timeout"
+                )
+            time.sleep(0.1)
+        selector.unregister(process.stdout)
+        selector_registered = False
+        selector.close()
+        selector_closed = True
+        for line in process.stdout.read().splitlines():
+            if line.strip():
+                events.append(parse_event_line(line, "GUI launch"))
+        stderr = process.stderr.read()
+        process.wait(timeout=10)
+        if process.returncode != 0:
+            detail = stderr.strip().splitlines()[-1] if stderr.strip() else "no stderr"
+            raise AcceptanceError(f"GUI launch failed: {detail}")
+        if not events:
+            raise AcceptanceError("GUI launch emitted no RuntimeEvent")
+        return events, windows, shot, root_process_id
+    except BaseException as primary_error:
+        cleanup_error: BaseException | None = None
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+        except BaseException as error:
+            cleanup_error = error
+        try:
+            if selector_registered:
+                selector.unregister(process.stdout)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        try:
+            if not selector_closed:
+                selector.close()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            raise InteractionCleanupError("GUI launch cleanup failed") from primary_error
+        raise
 
 
 def status(events: list[dict[str, object]]) -> str:
@@ -1102,8 +1150,9 @@ def evaluate_live_interaction_outcome(
 ) -> None:
     """Apply process and desktop failures before acknowledgement failures."""
 
-    if checks is not None:
-        evidence["interactionChecks"] = checks
+    effective_checks = checks if interaction_error is None else None
+    if effective_checks is not None:
+        evidence["interactionChecks"] = effective_checks
     evaluate_application_outcome(
         evidence,
         app_id,
@@ -1111,7 +1160,7 @@ def evaluate_live_interaction_outcome(
         windows,
         shot,
         residual,
-        checks or {},
+        effective_checks or {},
     )
     if evidence.get("reasonCode") != "application-interaction-unverified":
         return
@@ -1549,6 +1598,26 @@ class InteractionSession:
                 self.challenge_binding, name, "challenge"
             )
             deadline = monotonic() + float(deadline_seconds)
+
+            def require_open_acceptance_boundary() -> float:
+                now = monotonic()
+                if now >= deadline:
+                    raise InteractionUnverifiedError(
+                        "application interaction acknowledgement timed out"
+                    )
+                if application_alive is not None:
+                    try:
+                        alive = application_alive()
+                    except Exception as error:
+                        raise InteractionUnverifiedError(
+                            "application closed before interaction acknowledgement"
+                        ) from error
+                    if alive is not True:
+                        raise InteractionUnverifiedError(
+                            "application closed before interaction acknowledgement"
+                        )
+                return now
+
             if wait_for_acknowledgement is not None:
                 callback_result = wait_for_acknowledgement(
                     dict(challenge), challenge_path, receipt_path
@@ -1569,11 +1638,7 @@ class InteractionSession:
                 self._assert_challenge_unchanged(
                     name, challenge_path, challenge, challenge_identity
                 )
-                now = monotonic()
-                if now >= deadline:
-                    raise InteractionUnverifiedError(
-                        "application interaction acknowledgement timed out"
-                    )
+                now = require_open_acceptance_boundary()
                 try:
                     protocol._relative_stat(self.receipt_binding, name)
                 except FileNotFoundError:
@@ -1594,24 +1659,7 @@ class InteractionSession:
                 challenge, acknowledgement
             )
 
-            def require_final_acceptance() -> None:
-                if monotonic() >= deadline:
-                    raise InteractionUnverifiedError(
-                        "application interaction acknowledgement timed out"
-                    )
-                if application_alive is not None:
-                    try:
-                        alive = application_alive()
-                    except Exception as error:
-                        raise InteractionUnverifiedError(
-                            "application closed before interaction acknowledgement"
-                        ) from error
-                    if alive is not True:
-                        raise InteractionUnverifiedError(
-                            "application closed before interaction acknowledgement"
-                        )
-
-            require_final_acceptance()
+            require_open_acceptance_boundary()
             self._consume_owned(
                 self.receipt_binding,
                 name,
@@ -1626,7 +1674,7 @@ class InteractionSession:
                 tolerate_substitution=False,
             )
             challenge_consumed = True
-            require_final_acceptance()
+            require_open_acceptance_boundary()
             return checks
         except InteractionIntegrityError:
             raise
@@ -2017,6 +2065,7 @@ def main() -> int:
 
                 def acknowledge_live_window(
                     process: subprocess.Popen[str],
+                    remaining_budget: float,
                 ) -> None:
                     if interaction_session is None:
                         return
@@ -2026,6 +2075,10 @@ def main() -> int:
                             raise InteractionUnverifiedError(
                                 "application closed before interaction acknowledgement"
                             )
+                        if remaining_budget <= 0:
+                            raise InteractionUnverifiedError(
+                                "application interaction acknowledgement timed out"
+                            )
                         interaction_state["checks"] = (
                             interaction_session.acknowledge_application(
                                 app_id=asset.app_id,
@@ -2034,6 +2087,10 @@ def main() -> int:
                                 asset_digest="sha256:" + asset.sha256,
                                 window_observed=True,
                                 application_alive=lambda: process.poll() is None,
+                                deadline_seconds=min(
+                                    float(ACKNOWLEDGEMENT_WAIT_SECONDS),
+                                    remaining_budget,
+                                ),
                             )
                         )
                     except (

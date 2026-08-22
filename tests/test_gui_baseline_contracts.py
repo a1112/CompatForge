@@ -920,6 +920,41 @@ struct RealCode;
                     (evidence["status"], evidence["reasonCode"]), expected
                 )
 
+    def test_complete_checks_cannot_override_any_interaction_error(self) -> None:
+        accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
+        complete_checks = {"fileList": True, "menus": True}
+        cases = (
+            (
+                self.baseline.InteractionUnverifiedError("unverified"),
+                ("unverified", "application-interaction-unverified"),
+            ),
+            (
+                self.baseline.InteractionInvalidError("invalid"),
+                ("failed", "application-interaction-invalid"),
+            ),
+            (
+                self.baseline.AcceptanceError("unexpected acknowledgement failure"),
+                ("unverified", "application-interaction-unverified"),
+            ),
+        )
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                evidence: dict[str, object] = {}
+                self.baseline.evaluate_live_interaction_outcome(
+                    evidence,
+                    "7zip",
+                    accepted_events,
+                    {"available": True},
+                    {"available": True},
+                    [],
+                    dict(complete_checks),
+                    error,
+                )
+                self.assertEqual(
+                    (evidence["status"], evidence["reasonCode"]), expected
+                )
+                self.assertNotIn("interactionChecks", evidence)
+
     def test_actual_installer_branches_fail_for_nonzero_or_missing_executable(self) -> None:
         accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
         nonzero_events = [{"kind": "exited", "exit": {"code": 5, "success": False}}]
@@ -1954,8 +1989,17 @@ struct RealCode;
             order.append("screenshot")
             return {"available": True}
 
-        def acknowledge(live_process: object) -> None:
+        hook_budgets: list[float] = []
+
+        def acknowledge(live_process: object, remaining_budget: float) -> None:
             observed_processes.append(live_process)
+            hook_budgets.append(remaining_budget)
+            self.assertGreater(remaining_budget, 0)
+            self.assertLessEqual(remaining_budget, 5)
+            self.assertLessEqual(
+                remaining_budget,
+                self.baseline.INTERACTIVE_RUNTIME_MILLISECONDS / 1000,
+            )
 
             def write_receipt(
                 challenge: dict[str, object],
@@ -2015,7 +2059,246 @@ struct RealCode;
         self.assertEqual(self.baseline.status(events), "accepted")
         self.assertTrue(windows["available"])
         self.assertTrue(shot["available"])
+        self.assertEqual(len(hook_budgets), 1)
         self.assertIsNotNone(observed_processes[0].poll())
+
+    def test_observed_launch_cleans_child_and_selector_when_live_hook_raises(self) -> None:
+        cases = (
+            (
+                "protocol",
+                lambda: self.baseline.InteractionInvalidError("invalid receipt"),
+                self.baseline.InteractionInvalidError,
+            ),
+            ("keyboard-interrupt", KeyboardInterrupt, KeyboardInterrupt),
+        )
+        for name, make_error, expected_error in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                prefix="compatforge-live-hook-cleanup-"
+            ) as temporary:
+                cleanup_calls: list[str] = []
+
+                class Output:
+                    def readline(self) -> str:
+                        return '{"kind":"started","processId":321}\n'
+
+                    def read(self) -> str:
+                        return ""
+
+                class Errors:
+                    def read(self) -> str:
+                        return ""
+
+                class Process:
+                    def __init__(self) -> None:
+                        self.stdout = Output()
+                        self.stderr = Errors()
+                        self.returncode: int | None = None
+                        self.killed = False
+
+                    def poll(self) -> int | None:
+                        return self.returncode
+
+                    def terminate(self) -> None:
+                        cleanup_calls.append("terminate")
+
+                    def wait(self, timeout: int) -> int:
+                        self.assert_timeout(timeout)
+                        cleanup_calls.append("wait")
+                        if not self.killed:
+                            raise subprocess.TimeoutExpired("compatforge", timeout)
+                        self.returncode = -9
+                        return -9
+
+                    @staticmethod
+                    def assert_timeout(timeout: int) -> None:
+                        if timeout != 10:
+                            raise AssertionError(f"unexpected timeout: {timeout}")
+
+                    def kill(self) -> None:
+                        cleanup_calls.append("kill")
+                        self.killed = True
+
+                process = Process()
+
+                class Selector:
+                    def __init__(self) -> None:
+                        self.closed = False
+                        self.unregistered = False
+
+                    def register(self, _stream: object, _events: object) -> None:
+                        return None
+
+                    def select(self, timeout: float) -> list[tuple[object, object]]:
+                        del timeout
+                        return [(type("Key", (), {"fileobj": process.stdout})(), None)]
+
+                    def unregister(self, _stream: object) -> None:
+                        self.unregistered = True
+
+                    def close(self) -> None:
+                        self.closed = True
+
+                selector = Selector()
+
+                def raise_from_hook(_process: object, _budget: float) -> None:
+                    raise make_error()
+
+                with (
+                    mock.patch.object(self.baseline.subprocess, "Popen", return_value=process),
+                    mock.patch.object(
+                        self.baseline.selectors,
+                        "DefaultSelector",
+                        return_value=selector,
+                    ),
+                    mock.patch.object(
+                        self.baseline,
+                        "observer",
+                        return_value={"available": True},
+                    ),
+                    self.assertRaises(expected_error),
+                ):
+                    self.baseline.observed_launch(
+                        ["/absolute/compatforge", "prepared-launch-terminate"],
+                        Path(temporary) / "window.png",
+                        ("7-Zip",),
+                        on_window_observed=raise_from_hook,
+                        timeout=5,
+                    )
+                self.assertEqual(
+                    cleanup_calls, ["terminate", "wait", "kill", "wait"]
+                )
+                self.assertTrue(process.killed)
+                self.assertTrue(selector.unregistered)
+                self.assertTrue(selector.closed)
+
+    def test_observed_launch_cleanup_failure_is_fatal_over_hook_error(self) -> None:
+        cleanup_calls: list[str] = []
+
+        class Output:
+            def readline(self) -> str:
+                return '{"kind":"started","processId":321}\n'
+
+        class Errors:
+            pass
+
+        class Process:
+            def __init__(self) -> None:
+                self.stdout = Output()
+                self.stderr = Errors()
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return None
+
+            def terminate(self) -> None:
+                cleanup_calls.append("terminate")
+
+            def wait(self, timeout: int) -> int:
+                cleanup_calls.append("wait")
+                raise subprocess.TimeoutExpired("compatforge", timeout)
+
+            def kill(self) -> None:
+                cleanup_calls.append("kill")
+
+        process = Process()
+
+        class Selector:
+            def register(self, _stream: object, _events: object) -> None:
+                return None
+
+            def select(self, timeout: float) -> list[tuple[object, object]]:
+                del timeout
+                return [(type("Key", (), {"fileobj": process.stdout})(), None)]
+
+            def unregister(self, _stream: object) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        def invalid_hook(_process: object, _budget: float) -> None:
+            raise self.baseline.InteractionInvalidError("invalid receipt")
+
+        with (
+            mock.patch.object(self.baseline.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                self.baseline.selectors, "DefaultSelector", return_value=Selector()
+            ),
+            mock.patch.object(
+                self.baseline, "observer", return_value={"available": True}
+            ),
+            self.assertRaises(self.baseline.InteractionCleanupError) as captured,
+        ):
+            self.baseline.observed_launch(
+                ["/absolute/compatforge", "prepared-launch-terminate"],
+                Path("/absolute/window.png"),
+                ("7-Zip",),
+                on_window_observed=invalid_hook,
+                timeout=5,
+            )
+        self.assertEqual(cleanup_calls, ["terminate", "wait", "kill", "wait"])
+        self.assertIsInstance(
+            captured.exception.__cause__, self.baseline.InteractionInvalidError
+        )
+
+    def test_ack_wait_polls_liveness_before_every_read_or_sleep(self) -> None:
+        cases = (
+            ("initially-dead", (False,), (False,), (), 0.0),
+            ("dies-during-wait", (True, False), (True, False), (0.25,), 0.25),
+        )
+        for name, liveness, expected_calls, expected_sleeps, expected_elapsed in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                prefix="compatforge-gui-ack-liveness-"
+            ) as temporary:
+                root = Path(temporary)
+                plan_path = root / "plans" / "plan.json"
+                acknowledgement_root = root / "ack"
+                plan_path.parent.mkdir()
+                (acknowledgement_root / "challenges").mkdir(parents=True)
+                (acknowledgement_root / "receipts").mkdir()
+                self.write_canonical_json(plan_path, self.interaction_plan())
+                session = self.baseline.open_interaction_session(
+                    plan_path, acknowledgement_root, "round-1", "crossover"
+                )
+                now = [0.0]
+                alive_values = iter(liveness)
+                alive_calls: list[bool] = []
+                sleeps: list[float] = []
+
+                def application_alive() -> bool:
+                    alive = next(alive_values)
+                    alive_calls.append(alive)
+                    return alive
+
+                def advance(seconds: float) -> None:
+                    sleeps.append(seconds)
+                    now[0] += seconds
+
+                try:
+                    with self.assertRaises(self.baseline.InteractionUnverifiedError):
+                        session.acknowledge_application(
+                            app_id="7zip",
+                            runtime_version="24.0",
+                            pack_digest="sha256:" + "a" * 64,
+                            asset_digest="sha256:" + "b" * 64,
+                            window_observed=True,
+                            nonce_source=lambda _size: "c" * 64,
+                            monotonic=lambda: now[0],
+                            sleeper=advance,
+                            application_alive=application_alive,
+                        )
+                finally:
+                    session.close()
+                self.assertEqual(tuple(alive_calls), expected_calls)
+                self.assertEqual(tuple(sleeps), expected_sleeps)
+                self.assertEqual(now[0], expected_elapsed)
+                self.assertLess(now[0], 1.0)
+
+    def test_ack_budget_cannot_outlive_interactive_application(self) -> None:
+        self.assertLessEqual(
+            self.baseline.ACKNOWLEDGEMENT_WAIT_SECONDS,
+            self.baseline.INTERACTIVE_RUNTIME_MILLISECONDS / 1000,
+        )
 
     def test_receipt_at_the_deadline_is_late_and_cannot_be_accepted(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-gui-ack-deadline-") as temporary:
@@ -2150,7 +2433,7 @@ struct RealCode;
             session = self.baseline.open_interaction_session(
                 plan_path, acknowledgement_root, "round-1", "crossover"
             )
-            process_liveness = iter((True, False))
+            process_liveness = iter((True, True, False))
             liveness_checks: list[bool] = []
 
             def write_receipt_before_exit(
@@ -2180,7 +2463,7 @@ struct RealCode;
                     )
             finally:
                 session.close()
-            self.assertEqual(liveness_checks, [True, False])
+            self.assertEqual(liveness_checks, [True, True, False])
             challenge = (
                 acknowledgement_root
                 / "challenges"
