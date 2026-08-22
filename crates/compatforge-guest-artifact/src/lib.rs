@@ -1,10 +1,14 @@
 //! Immutable, content-addressed storage for inspected Windows guest programs.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+mod pinned_platform;
 
 use compatforge_domain::{
     BottleExecutableBinding, ContractError, CpuArchitecture, GuestArtifactBinding, SCHEMA_VERSION_V1,
 };
+#[cfg(target_os = "macos")]
+use compatforge_inspect::inspect_file;
 use compatforge_inspect::{
     inspect_bytes, inspect_path, InspectionError, PeArchitecture, PeImageKind, PeInspectionReport, PeSubsystem,
     MAX_PE_FILE_BYTES,
@@ -12,11 +16,231 @@ use compatforge_inspect::{
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub const MAX_PINNED_EVIDENCE_BYTES: u64 = 1_048_576;
+
+#[cfg(any(target_os = "macos", test))]
+const PINNED_BOTTLE_ID: &str = "gui-sumatrapdf";
+#[cfg(target_os = "macos")]
+const PINNED_RELATIVE_DIRECTORIES: [&str; 6] = [
+    "bottles",
+    PINNED_BOTTLE_ID,
+    "prefix",
+    "drive_c",
+    "CompatForge",
+    "SumatraPDF",
+];
+#[cfg(any(target_os = "macos", test))]
+const PINNED_SOURCE_NAME: &str = "SumatraPDF.exe";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedEvidenceKind {
+    Inspection,
+    Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedEvidenceBinding {
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
+pub struct HeldExternalWorkRoot {
+    handle: Option<pinned_platform::DirectoryHandle>,
+    #[cfg(target_os = "macos")]
+    reviewed_path: PathBuf,
+}
+
+impl fmt::Debug for HeldExternalWorkRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HeldExternalWorkRoot { .. }")
+    }
+}
+
+impl HeldExternalWorkRoot {
+    /// Duplicate a caller-owned inherited directory descriptor without taking
+    /// ownership of the raw descriptor. A descriptor reused before validation
+    /// that satisfies the complete contract is not distinguishable.
+    pub fn duplicate_inherited(
+        raw_fd: i32,
+        reviewed_path: &Path,
+        forbidden_roots: &[&Path],
+    ) -> Result<Self, GuestArtifactError> {
+        #[cfg(target_os = "macos")]
+        if !reviewed_path.is_absolute()
+            || reviewed_path
+                .components()
+                .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+            || forbidden_roots.iter().any(|root| {
+                !root.is_absolute()
+                    || root
+                        .components()
+                        .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+                    || paths_lexically_overlap(reviewed_path, root)
+            })
+        {
+            return Err(GuestArtifactError::InvalidPinnedWorkRoot);
+        }
+        let handle = pinned_platform::duplicate_work_root(raw_fd, reviewed_path, forbidden_roots)
+            .map_err(map_work_root_error)?;
+        Ok(Self {
+            handle: Some(handle),
+            #[cfg(target_os = "macos")]
+            reviewed_path: reviewed_path.to_owned(),
+        })
+    }
+
+    pub fn create_unlinked_execution_file(&self) -> Result<File, GuestArtifactError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or(GuestArtifactError::PinnedUnsupportedPlatform)?;
+        let anonymous = pinned_platform::create_unlinked(handle).map_err(map_capture_error)?;
+        Ok(anonymous.into_file())
+    }
+
+    pub fn revalidate(&self) -> Result<(), GuestArtifactError> {
+        self.handle
+            .as_ref()
+            .ok_or(GuestArtifactError::PinnedUnsupportedPlatform)?
+            .revalidate()
+            .map_err(map_integrity_error)
+    }
+
+    #[cfg(all(test, not(target_os = "macos")))]
+    fn unsupported_test_value() -> Self {
+        Self { handle: None }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn create_unlinked_with_test_fault(
+        &self,
+        bytes: [u8; 16],
+        fault: pinned_platform::CreateTestFault,
+    ) -> Result<File, GuestArtifactError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or(GuestArtifactError::PinnedUnsupportedPlatform)?;
+        let anonymous =
+            pinned_platform::create_unlinked_with_test_fault(handle, bytes, fault).map_err(map_capture_error)?;
+        Ok(anonymous.into_file())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reject_overlap(&self, forbidden_roots: &[&Path]) -> Result<(), GuestArtifactError> {
+        if forbidden_roots
+            .iter()
+            .any(|root| paths_lexically_overlap(&self.reviewed_path, root))
+        {
+            return Err(GuestArtifactError::InvalidPinnedWorkRoot);
+        }
+        self.handle
+            .as_ref()
+            .ok_or(GuestArtifactError::PinnedUnsupportedPlatform)?
+            .reject_physical_overlap(forbidden_roots)
+            .map_err(map_work_root_error)
+    }
+}
+
+pub struct InheritedEvidenceFile {
+    kind: PinnedEvidenceKind,
+    handle: pinned_platform::EvidenceHandle,
+}
+
+impl fmt::Debug for InheritedEvidenceFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InheritedEvidenceFile")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InheritedEvidenceFile {
+    /// Duplicate a caller-owned inherited anonymous output without taking
+    /// ownership of the raw descriptor. A descriptor reused before validation
+    /// that satisfies the complete contract is not distinguishable.
+    pub fn duplicate_inherited(raw_fd: i32, kind: PinnedEvidenceKind) -> Result<Self, GuestArtifactError> {
+        let handle = pinned_platform::duplicate_evidence(raw_fd).map_err(map_evidence_error)?;
+        Ok(Self { kind, handle })
+    }
+
+    pub fn ensure_distinct(&self, other: &Self) -> Result<(), GuestArtifactError> {
+        if self.kind == other.kind || self.handle.same_identity(&other.handle) {
+            return Err(GuestArtifactError::InvalidPinnedEvidence);
+        }
+        Ok(())
+    }
+
+    pub fn write_canonical(&mut self, bytes: &[u8]) -> Result<PublishedEvidenceBinding, GuestArtifactError> {
+        validate_pinned_evidence_length(bytes.len() as u64)?;
+        self.handle.revalidate(0).map_err(map_evidence_error)?;
+        write_and_read_back_canonical(self.handle.file_mut(), bytes)?;
+        self.handle.revalidate(bytes.len() as u64).map_err(map_evidence_error)?;
+        Ok(PublishedEvidenceBinding {
+            byte_length: bytes.len() as u64,
+            sha256: digest_bytes(bytes),
+        })
+    }
+}
+
+pub struct PinnedBottleExecutable {
+    binding: BottleExecutableBinding,
+    inspection: PeInspectionReport,
+    execution: pinned_platform::AnonymousFile,
+    source: pinned_platform::SourceHandle,
+}
+
+impl fmt::Debug for PinnedBottleExecutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PinnedBottleExecutable { .. }")
+    }
+}
+
+impl PinnedBottleExecutable {
+    #[must_use]
+    pub fn binding(&self) -> &BottleExecutableBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub fn inspection(&self) -> &PeInspectionReport {
+        &self.inspection
+    }
+
+    pub fn duplicate_execution_file(&self) -> Result<File, GuestArtifactError> {
+        self.execution.duplicate().map_err(map_integrity_error)
+    }
+
+    pub fn revalidate(&self) -> Result<(), GuestArtifactError> {
+        self.source.revalidate().map_err(map_integrity_error)?;
+        self.execution
+            .revalidate(self.binding.size_bytes)
+            .map_err(map_integrity_error)?;
+        let source_digest = digest_open_file(
+            self.source.duplicate_source().map_err(map_integrity_error)?,
+            self.binding.size_bytes,
+        )?;
+        let execution_digest = digest_open_file(
+            self.execution.duplicate().map_err(map_integrity_error)?,
+            self.binding.size_bytes,
+        )?;
+        self.source.revalidate().map_err(map_integrity_error)?;
+        self.execution
+            .revalidate(self.binding.size_bytes)
+            .map_err(map_integrity_error)?;
+        if source_digest != self.binding.digest || execution_digest != self.binding.digest {
+            return Err(GuestArtifactError::PinnedIntegrityFailure);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedGuestArtifact {
@@ -130,6 +354,89 @@ impl GuestArtifactStore {
             .parent()
             .ok_or_else(|| GuestArtifactError::RelativeStorageRoot(self.root.clone()))?;
         verify_bottle_binding_contents(storage_root, binding)
+    }
+
+    pub fn pin_sumatra_bottle_executable(
+        &self,
+        bottle_id: &str,
+        source: &Path,
+        work_root: &HeldExternalWorkRoot,
+    ) -> Result<PinnedBottleExecutable, GuestArtifactError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (bottle_id, source, work_root);
+            Err(GuestArtifactError::PinnedUnsupportedPlatform)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let storage_root = self.root.parent().ok_or(GuestArtifactError::InvalidPinnedContract)?;
+            validate_pinned_sumatra_request(storage_root, bottle_id, source)?;
+            let bottle_root = storage_root.join("bottles").join(PINNED_BOTTLE_ID);
+            work_root.reject_overlap(&[storage_root, &bottle_root, source])?;
+            work_root.revalidate()?;
+            let work_handle = work_root
+                .handle
+                .as_ref()
+                .ok_or(GuestArtifactError::PinnedUnsupportedPlatform)?;
+            let relative_directories = PINNED_RELATIVE_DIRECTORIES
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&std::ffi::OsStr>>();
+            let mut held_source = pinned_platform::open_fixed_source(
+                storage_root,
+                &relative_directories,
+                std::ffi::OsStr::new(PINNED_SOURCE_NAME),
+            )
+            .map_err(map_capture_error)?;
+            let source_size = held_source.source_size().map_err(map_capture_error)?;
+            if source_size > MAX_PE_FILE_BYTES {
+                return Err(GuestArtifactError::PinnedCaptureFailed);
+            }
+
+            // The ordinary file has already been unlinked and revalidated with
+            // link count zero before this first source byte is read.
+            let mut execution = pinned_platform::create_unlinked(work_handle).map_err(map_capture_error)?;
+            copy_pinned_source(held_source.source_mut(), execution.file_mut(), source_size)?;
+            execution.revalidate(source_size).map_err(map_capture_error)?;
+            let inspection = inspect_file(execution.file_mut()).map_err(|_| GuestArtifactError::PinnedCaptureFailed)?;
+            validate_supported_inspection(&inspection).map_err(|_| GuestArtifactError::PinnedCaptureFailed)?;
+            if inspection.architecture != PeArchitecture::X86_64
+                || inspection.subsystem != PeSubsystem::WindowsGui
+                || inspection.file_size_bytes != source_size
+            {
+                return Err(GuestArtifactError::PinnedCaptureFailed);
+            }
+            execution
+                .file_mut()
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| GuestArtifactError::PinnedCaptureFailed)?;
+            let binding = BottleExecutableBinding {
+                bottle_id: PINNED_BOTTLE_ID.to_owned(),
+                digest: inspection.file_digest.clone(),
+                size_bytes: inspection.file_size_bytes,
+                path: source
+                    .to_str()
+                    .ok_or(GuestArtifactError::InvalidPinnedContract)?
+                    .to_owned(),
+                original_name: PINNED_SOURCE_NAME.to_owned(),
+                architecture: CpuArchitecture::X86_64,
+                image_kind: "executable".into(),
+                subsystem: "windowsGui".into(),
+                inspection_schema_version: SCHEMA_VERSION_V1.into(),
+            };
+            binding
+                .validate()
+                .map_err(|_| GuestArtifactError::PinnedCaptureFailed)?;
+            let pinned = PinnedBottleExecutable {
+                binding,
+                inspection,
+                execution,
+                source: held_source,
+            };
+            pinned.revalidate()?;
+            work_root.revalidate()?;
+            Ok(pinned)
+        }
     }
 
     fn object_path(&self, digest: &str) -> Result<PathBuf, GuestArtifactError> {
@@ -251,6 +558,185 @@ pub fn verify_in_place_binding_contents(binding: &BottleExecutableBinding) -> Re
         });
     }
     Ok(())
+}
+
+fn validate_pinned_evidence_length(length: u64) -> Result<(), GuestArtifactError> {
+    if !(1..=MAX_PINNED_EVIDENCE_BYTES).contains(&length) {
+        return Err(GuestArtifactError::InvalidPinnedEvidence);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_pinned_sumatra_request(
+    storage_root: &Path,
+    bottle_id: &str,
+    source: &Path,
+) -> Result<(), GuestArtifactError> {
+    if bottle_id != PINNED_BOTTLE_ID
+        || !storage_root.is_absolute()
+        || !source.is_absolute()
+        || source.to_str().is_none()
+        || storage_root.components().any(|component| {
+            !matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
+        || source.components().any(|component| {
+            !matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
+    {
+        return Err(GuestArtifactError::InvalidPinnedContract);
+    }
+    let expected = storage_root
+        .join("bottles")
+        .join(PINNED_BOTTLE_ID)
+        .join("prefix")
+        .join("drive_c")
+        .join("CompatForge")
+        .join("SumatraPDF")
+        .join(PINNED_SOURCE_NAME);
+    if source != expected {
+        return Err(GuestArtifactError::InvalidPinnedContract);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn paths_lexically_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn pinned_staging_name(bytes: [u8; 16]) -> String {
+    let mut value = String::with_capacity(54);
+    value.push_str(".compatforge-pinned-");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    value
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let mut value = String::with_capacity(71);
+    value.push_str("sha256:");
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        write!(value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    value
+}
+
+trait DurableIo: Read + Write + Seek {
+    fn truncate_zero(&mut self) -> io::Result<()>;
+    fn sync_durable(&mut self) -> io::Result<()>;
+}
+
+impl DurableIo for File {
+    fn truncate_zero(&mut self) -> io::Result<()> {
+        self.set_len(0)
+    }
+
+    fn sync_durable(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn copy_pinned_source<R: Read + Seek, W: DurableIo>(
+    source: &mut R,
+    execution: &mut W,
+    expected_size: u64,
+) -> Result<(), GuestArtifactError> {
+    source
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| execution.seek(SeekFrom::Start(0)))
+        .and_then(|_| execution.truncate_zero())
+        .map_err(|_| GuestArtifactError::PinnedCaptureFailed)?;
+    let copied = io::copy(&mut Read::by_ref(source).take(MAX_PE_FILE_BYTES + 1), execution)
+        .map_err(|_| GuestArtifactError::PinnedCaptureFailed)?;
+    if copied != expected_size || copied > MAX_PE_FILE_BYTES {
+        return Err(GuestArtifactError::PinnedCaptureFailed);
+    }
+    execution
+        .sync_durable()
+        .and_then(|_| execution.seek(SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|_| GuestArtifactError::PinnedCaptureFailed)
+}
+
+fn write_and_read_back_canonical<T: DurableIo>(io: &mut T, bytes: &[u8]) -> Result<(), GuestArtifactError> {
+    io.seek(SeekFrom::Start(0))
+        .and_then(|_| io.truncate_zero())
+        .and_then(|_| io.write_all(bytes))
+        .and_then(|_| io.sync_durable())
+        .and_then(|_| io.seek(SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|_| GuestArtifactError::PinnedEvidenceWriteFailed)?;
+    let mut readback = Vec::with_capacity(bytes.len());
+    Read::by_ref(io)
+        .take(MAX_PINNED_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut readback)
+        .map_err(|_| GuestArtifactError::PinnedEvidenceWriteFailed)?;
+    if readback != bytes {
+        return Err(GuestArtifactError::PinnedEvidenceWriteFailed);
+    }
+    io.seek(SeekFrom::Start(0))
+        .map(|_| ())
+        .map_err(|_| GuestArtifactError::PinnedEvidenceWriteFailed)
+}
+
+fn digest_open_file(mut file: File, expected_size: u64) -> Result<String, GuestArtifactError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(MAX_PE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
+    if bytes.len() as u64 != expected_size || bytes.len() as u64 > MAX_PE_FILE_BYTES {
+        return Err(GuestArtifactError::PinnedIntegrityFailure);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
+    Ok(digest_bytes(&bytes))
+}
+
+fn map_work_root_error(error: pinned_platform::PlatformError) -> GuestArtifactError {
+    match error {
+        pinned_platform::PlatformError::Unsupported => GuestArtifactError::PinnedUnsupportedPlatform,
+        pinned_platform::PlatformError::InvalidDescriptor => GuestArtifactError::InvalidPinnedDescriptor,
+        _ => GuestArtifactError::InvalidPinnedWorkRoot,
+    }
+}
+
+fn map_evidence_error(error: pinned_platform::PlatformError) -> GuestArtifactError {
+    match error {
+        pinned_platform::PlatformError::Unsupported => GuestArtifactError::PinnedUnsupportedPlatform,
+        pinned_platform::PlatformError::InvalidDescriptor => GuestArtifactError::InvalidPinnedDescriptor,
+        _ => GuestArtifactError::InvalidPinnedEvidence,
+    }
+}
+
+fn map_capture_error(error: pinned_platform::PlatformError) -> GuestArtifactError {
+    match error {
+        pinned_platform::PlatformError::Unsupported => GuestArtifactError::PinnedUnsupportedPlatform,
+        pinned_platform::PlatformError::InvalidDescriptor => GuestArtifactError::InvalidPinnedDescriptor,
+        _ => GuestArtifactError::PinnedCaptureFailed,
+    }
+}
+
+fn map_integrity_error(error: pinned_platform::PlatformError) -> GuestArtifactError {
+    match error {
+        pinned_platform::PlatformError::Unsupported => GuestArtifactError::PinnedUnsupportedPlatform,
+        pinned_platform::PlatformError::InvalidDescriptor => GuestArtifactError::InvalidPinnedDescriptor,
+        _ => GuestArtifactError::PinnedIntegrityFailure,
+    }
 }
 
 fn validate_bottle_path(storage_root: &Path, bottle_root: &Path, source: &Path) -> Result<(), GuestArtifactError> {
@@ -478,6 +964,14 @@ fn digest_file(path: &Path) -> Result<String, GuestArtifactError> {
 
 #[derive(Debug)]
 pub enum GuestArtifactError {
+    PinnedUnsupportedPlatform,
+    InvalidPinnedContract,
+    InvalidPinnedDescriptor,
+    InvalidPinnedWorkRoot,
+    InvalidPinnedEvidence,
+    PinnedCaptureFailed,
+    PinnedIntegrityFailure,
+    PinnedEvidenceWriteFailed,
     RelativeStorageRoot(PathBuf),
     RelativeSource(PathBuf),
     AmbiguousSource(PathBuf),
@@ -504,6 +998,16 @@ pub enum GuestArtifactError {
 impl fmt::Display for GuestArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PinnedUnsupportedPlatform => {
+                formatter.write_str("pinned Bottle execution is unsupported on this platform")
+            }
+            Self::InvalidPinnedContract => formatter.write_str("invalid pinned Bottle execution contract"),
+            Self::InvalidPinnedDescriptor => formatter.write_str("invalid pinned inherited descriptor"),
+            Self::InvalidPinnedWorkRoot => formatter.write_str("invalid pinned external work root"),
+            Self::InvalidPinnedEvidence => formatter.write_str("invalid pinned evidence file"),
+            Self::PinnedCaptureFailed => formatter.write_str("pinned Bottle executable capture failed"),
+            Self::PinnedIntegrityFailure => formatter.write_str("pinned Bottle executable integrity failure"),
+            Self::PinnedEvidenceWriteFailed => formatter.write_str("pinned evidence publication failed"),
             Self::RelativeStorageRoot(path) => write!(
                 formatter,
                 "guest artifact storage root must be absolute: {}",
@@ -713,5 +1217,562 @@ mod tests {
             Err(GuestArtifactError::NotRegularFile(_))
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pinned_evidence_contract_has_an_exact_closed_bound() {
+        assert_eq!(MAX_PINNED_EVIDENCE_BYTES, 1_048_576);
+        assert!(validate_pinned_evidence_length(1).is_ok());
+        assert!(validate_pinned_evidence_length(MAX_PINNED_EVIDENCE_BYTES).is_ok());
+        assert!(validate_pinned_evidence_length(0).is_err());
+        assert!(validate_pinned_evidence_length(MAX_PINNED_EVIDENCE_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn pinned_sumatra_contract_accepts_only_the_fixed_bottle_path() {
+        #[cfg(windows)]
+        let storage = Path::new("C:\\reviewed\\storage");
+        #[cfg(not(windows))]
+        let storage = Path::new("/reviewed/storage");
+        let fixed = storage.join("bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe");
+        assert!(validate_pinned_sumatra_request(storage, "gui-sumatrapdf", &fixed).is_ok());
+        assert!(validate_pinned_sumatra_request(storage, "gui-other", &fixed).is_err());
+        assert!(
+            validate_pinned_sumatra_request(storage, "gui-sumatrapdf", &fixed.with_file_name("Other.exe"),).is_err()
+        );
+        assert!(validate_pinned_sumatra_request(
+            storage,
+            "gui-sumatrapdf",
+            Path::new("CompatForge/SumatraPDF/SumatraPDF.exe"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pinned_names_are_fixed_lowercase_hex_without_disclosing_a_path() {
+        let bytes = [
+            0x00, 0x01, 0x0a, 0x0f, 0x10, 0x2f, 0x30, 0x4f, 0x50, 0x6f, 0x70, 0x8f, 0x90, 0xaf, 0xf0, 0xff,
+        ];
+        assert_eq!(
+            pinned_staging_name(bytes),
+            ".compatforge-pinned-00010a0f102f304f506f708f90aff0ff"
+        );
+    }
+
+    #[test]
+    fn lexical_overlap_rejects_same_ancestor_and_descendant_roots() {
+        let root = Path::new("/external/work");
+        assert!(paths_lexically_overlap(root, root));
+        assert!(paths_lexically_overlap(root, Path::new("/external/work/child")));
+        assert!(paths_lexically_overlap(Path::new("/external"), root));
+        assert!(!paths_lexically_overlap(root, Path::new("/external/worker")));
+        assert!(!paths_lexically_overlap(root, Path::new("/other/work")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn pinned_platform_is_rejected_before_any_path_access() {
+        let inaccessible = Path::new("Z:/this/path/must/not/be/accessed");
+        assert!(matches!(
+            HeldExternalWorkRoot::duplicate_inherited(3, inaccessible, &[inaccessible]),
+            Err(GuestArtifactError::PinnedUnsupportedPlatform)
+        ));
+        let store = GuestArtifactStore::new("relative-storage-that-must-not-be-accessed");
+        assert!(matches!(
+            store.pin_sumatra_bottle_executable(
+                "gui-sumatrapdf",
+                inaccessible,
+                &HeldExternalWorkRoot::unsupported_test_value(),
+            ),
+            Err(GuestArtifactError::PinnedUnsupportedPlatform)
+        ));
+    }
+
+    struct InjectedDurableIo {
+        cursor: io::Cursor<Vec<u8>>,
+        fail_truncate: bool,
+        fail_sync: bool,
+        fail_seek_call: Option<usize>,
+        seek_calls: usize,
+        stop_writing_after: Option<usize>,
+        written: usize,
+        corrupt_on_sync: bool,
+    }
+
+    impl InjectedDurableIo {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                cursor: io::Cursor::new(bytes),
+                fail_truncate: false,
+                fail_sync: false,
+                fail_seek_call: None,
+                seek_calls: 0,
+                stop_writing_after: None,
+                written: 0,
+                corrupt_on_sync: false,
+            }
+        }
+    }
+
+    impl Read for InjectedDurableIo {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl Write for InjectedDurableIo {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if let Some(limit) = self.stop_writing_after {
+                if self.written >= limit {
+                    return Ok(0);
+                }
+                let count = buffer.len().min(limit - self.written);
+                let written = self.cursor.write(&buffer[..count])?;
+                self.written += written;
+                Ok(written)
+            } else {
+                let written = self.cursor.write(buffer)?;
+                self.written += written;
+                Ok(written)
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for InjectedDurableIo {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.seek_calls += 1;
+            if self.fail_seek_call == Some(self.seek_calls) {
+                return Err(io::Error::other("injected seek failure"));
+            }
+            self.cursor.seek(position)
+        }
+    }
+
+    impl DurableIo for InjectedDurableIo {
+        fn truncate_zero(&mut self) -> io::Result<()> {
+            if self.fail_truncate {
+                return Err(io::Error::other("injected truncate failure"));
+            }
+            self.cursor.get_mut().clear();
+            Ok(())
+        }
+
+        fn sync_durable(&mut self) -> io::Result<()> {
+            if self.fail_sync {
+                return Err(io::Error::other("injected sync failure"));
+            }
+            if self.corrupt_on_sync {
+                if let Some(first) = self.cursor.get_mut().first_mut() {
+                    *first ^= 1;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pinned_capture_injections_reject_short_copy_write_sync_and_rewind() {
+        let mut exact_source = io::Cursor::new(b"abcd".to_vec());
+        let mut exact_execution = InjectedDurableIo::new(b"stale".to_vec());
+        copy_pinned_source(&mut exact_source, &mut exact_execution, 4).unwrap();
+        assert_eq!(exact_execution.cursor.get_ref(), b"abcd");
+        assert_eq!(exact_execution.cursor.position(), 0);
+
+        let mut short_source = io::Cursor::new(b"abc".to_vec());
+        assert!(matches!(
+            copy_pinned_source(&mut short_source, &mut InjectedDurableIo::new(Vec::new()), 4),
+            Err(GuestArtifactError::PinnedCaptureFailed)
+        ));
+
+        let mut source = io::Cursor::new(b"abcd".to_vec());
+        let mut short_write = InjectedDurableIo::new(Vec::new());
+        short_write.stop_writing_after = Some(2);
+        assert!(matches!(
+            copy_pinned_source(&mut source, &mut short_write, 4),
+            Err(GuestArtifactError::PinnedCaptureFailed)
+        ));
+
+        let mut source = io::Cursor::new(b"abcd".to_vec());
+        let mut sync_failure = InjectedDurableIo::new(Vec::new());
+        sync_failure.fail_sync = true;
+        assert!(matches!(
+            copy_pinned_source(&mut source, &mut sync_failure, 4),
+            Err(GuestArtifactError::PinnedCaptureFailed)
+        ));
+
+        let mut source = io::Cursor::new(b"abcd".to_vec());
+        let mut rewind_failure = InjectedDurableIo::new(Vec::new());
+        rewind_failure.fail_seek_call = Some(2);
+        assert!(matches!(
+            copy_pinned_source(&mut source, &mut rewind_failure, 4),
+            Err(GuestArtifactError::PinnedCaptureFailed)
+        ));
+    }
+
+    #[test]
+    fn pinned_evidence_injections_reject_truncate_write_sync_rewind_and_readback() {
+        let bytes = br#"{"recordType":"test"}"#;
+        let mut exact = InjectedDurableIo::new(b"stale bytes".to_vec());
+        exact.cursor.set_position(5);
+        write_and_read_back_canonical(&mut exact, bytes).unwrap();
+        assert_eq!(exact.cursor.get_ref(), bytes);
+        assert_eq!(exact.cursor.position(), 0);
+
+        let mut truncate_failure = InjectedDurableIo::new(Vec::new());
+        truncate_failure.fail_truncate = true;
+        assert!(write_and_read_back_canonical(&mut truncate_failure, bytes).is_err());
+
+        let mut short_write = InjectedDurableIo::new(Vec::new());
+        short_write.stop_writing_after = Some(2);
+        assert!(write_and_read_back_canonical(&mut short_write, bytes).is_err());
+
+        let mut sync_failure = InjectedDurableIo::new(Vec::new());
+        sync_failure.fail_sync = true;
+        assert!(write_and_read_back_canonical(&mut sync_failure, bytes).is_err());
+
+        let mut rewind_failure = InjectedDurableIo::new(Vec::new());
+        rewind_failure.fail_seek_call = Some(2);
+        assert!(write_and_read_back_canonical(&mut rewind_failure, bytes).is_err());
+
+        let mut corrupt_readback = InjectedDurableIo::new(Vec::new());
+        corrupt_readback.corrupt_on_sync = true;
+        assert!(write_and_read_back_canonical(&mut corrupt_readback, bytes).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    mod pinned_macos {
+        use super::*;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        struct Context {
+            root: PathBuf,
+            storage: PathBuf,
+            source: PathBuf,
+            work: PathBuf,
+        }
+
+        fn context(label: &str) -> Context {
+            let root = temp_root(label);
+            let storage = root.join("storage");
+            let source = storage.join("bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe");
+            let work = root.join("external-work");
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            fs::create_dir(&work).unwrap();
+            fs::write(&source, gui_fixture_bytes()).unwrap();
+            Context {
+                root,
+                storage,
+                source,
+                work,
+            }
+        }
+
+        fn held_work(context: &Context) -> (File, HeldExternalWorkRoot) {
+            let raw = File::open(&context.work).unwrap();
+            let held = HeldExternalWorkRoot::duplicate_inherited(
+                raw.as_raw_fd(),
+                &context.work,
+                &[&context.storage, &context.source],
+            )
+            .unwrap();
+            assert!(pinned_platform::descriptor_is_cloexec(raw.as_raw_fd()));
+            (raw, held)
+        }
+
+        fn create_output(root: &Path, label: &str) -> (PathBuf, File) {
+            let path = root.join(format!("{label}.json"));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC)
+                .open(&path)
+                .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            (path, file)
+        }
+
+        #[test]
+        fn captures_the_fixed_source_into_an_unlinked_lease_and_revalidates_it() {
+            let context = context("pinned-capture");
+            let (_raw_work, work) = held_work(&context);
+            let store = GuestArtifactStore::new(&context.storage);
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            assert_eq!(pinned.binding().bottle_id, PINNED_BOTTLE_ID);
+            assert_eq!(pinned.binding().path, context.source.to_string_lossy());
+            assert_eq!(pinned.binding().digest, pinned.inspection().file_digest);
+            let execution = pinned.duplicate_execution_file().unwrap();
+            let metadata = execution.metadata().unwrap();
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert!(pinned_platform::descriptor_is_cloexec(execution.as_raw_fd()));
+            pinned.revalidate().unwrap();
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn rejects_symlink_and_hardlink_source_entries() {
+            use std::os::unix::fs::symlink;
+
+            let context = context("pinned-source-links");
+            let (_raw_work, work) = held_work(&context);
+            let store = GuestArtifactStore::new(&context.storage);
+            let hardlink = context.root.join("source-hardlink.exe");
+            fs::hard_link(&context.source, &hardlink).unwrap();
+            assert!(matches!(
+                store.pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work),
+                Err(GuestArtifactError::PinnedCaptureFailed)
+            ));
+            fs::remove_file(&hardlink).unwrap();
+            let bytes = fs::read(&context.source).unwrap();
+            fs::remove_file(&context.source).unwrap();
+            let target = context.root.join("symlink-target.exe");
+            fs::write(&target, bytes).unwrap();
+            symlink(&target, &context.source).unwrap();
+            assert!(matches!(
+                store.pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work),
+                Err(GuestArtifactError::PinnedCaptureFailed)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn rejects_inspection_failure_after_unlinked_capture() {
+            let context = context("pinned-inspection-failure");
+            fs::write(&context.source, b"not a PE image").unwrap();
+            let (_raw_work, work) = held_work(&context);
+            let store = GuestArtifactStore::new(&context.storage);
+            assert!(matches!(
+                store.pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work),
+                Err(GuestArtifactError::PinnedCaptureFailed)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn detects_source_content_entry_and_ancestor_substitution() {
+            let context = context("pinned-source-drift");
+            let (_raw_work, work) = held_work(&context);
+            let store = GuestArtifactStore::new(&context.storage);
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            let mut bytes = fs::read(&context.source).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            fs::write(&context.source, &bytes).unwrap();
+            assert!(matches!(
+                pinned.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            drop(pinned);
+
+            fs::write(&context.source, gui_fixture_bytes()).unwrap();
+            let pinned = store
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            let compatforge = context
+                .storage
+                .join("bottles/gui-sumatrapdf/prefix/drive_c/CompatForge");
+            let moved = compatforge.with_file_name("CompatForge-moved");
+            fs::rename(&compatforge, &moved).unwrap();
+            fs::create_dir_all(context.source.parent().unwrap()).unwrap();
+            fs::write(&context.source, gui_fixture_bytes()).unwrap();
+            assert!(matches!(
+                pinned.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn detects_work_root_substitution_and_rejects_overlap() {
+            let context = context("pinned-work-drift");
+            let raw = File::open(&context.work).unwrap();
+            assert!(matches!(
+                HeldExternalWorkRoot::duplicate_inherited(raw.as_raw_fd(), &context.work, &[&context.work]),
+                Err(GuestArtifactError::InvalidPinnedWorkRoot)
+            ));
+            let held = HeldExternalWorkRoot::duplicate_inherited(
+                raw.as_raw_fd(),
+                &context.work,
+                &[&context.storage, &context.source],
+            )
+            .unwrap();
+            let moved = context.work.with_file_name("external-work-moved");
+            fs::rename(&context.work, &moved).unwrap();
+            fs::create_dir(&context.work).unwrap();
+            assert!(matches!(
+                held.revalidate(),
+                Err(GuestArtifactError::PinnedIntegrityFailure)
+            ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn evidence_is_unlinked_distinct_bounded_and_offset_independent() {
+            let context = context("pinned-evidence");
+            let (inspection_path, mut inspection_raw) = create_output(&context.work, "inspection");
+            let (plan_path, plan_raw) = create_output(&context.work, "plan");
+            fs::remove_file(&inspection_path).unwrap();
+            fs::remove_file(&plan_path).unwrap();
+            inspection_raw.seek(SeekFrom::Start(7)).unwrap();
+            let mut inspection =
+                InheritedEvidenceFile::duplicate_inherited(inspection_raw.as_raw_fd(), PinnedEvidenceKind::Inspection)
+                    .unwrap();
+            let plan =
+                InheritedEvidenceFile::duplicate_inherited(plan_raw.as_raw_fd(), PinnedEvidenceKind::Plan).unwrap();
+            assert!(pinned_platform::descriptor_is_cloexec(inspection_raw.as_raw_fd()));
+            assert!(pinned_platform::descriptor_is_cloexec(plan_raw.as_raw_fd()));
+            inspection.ensure_distinct(&plan).unwrap();
+            let bytes = vec![b'x'; MAX_PINNED_EVIDENCE_BYTES as usize];
+            let binding = inspection.write_canonical(&bytes).unwrap();
+            assert_eq!(binding.byte_length, MAX_PINNED_EVIDENCE_BYTES);
+            assert_eq!(binding.sha256, digest_bytes(&bytes));
+            assert!(matches!(
+                inspection.write_canonical(&vec![b'x'; MAX_PINNED_EVIDENCE_BYTES as usize + 1]),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+            assert_eq!(inspection_raw.metadata().unwrap().nlink(), 0);
+            inspection_raw.seek(SeekFrom::Start(0)).unwrap();
+            let mut readback = Vec::new();
+            inspection_raw.read_to_end(&mut readback).unwrap();
+            assert_eq!(readback, bytes);
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn evidence_rejects_alias_link_size_mode_and_status_flag_mutants() {
+            let context = context("pinned-evidence-mutants");
+            let (alias_path, alias_raw) = create_output(&context.work, "alias");
+            fs::remove_file(&alias_path).unwrap();
+            let inspection =
+                InheritedEvidenceFile::duplicate_inherited(alias_raw.as_raw_fd(), PinnedEvidenceKind::Inspection)
+                    .unwrap();
+            let alias =
+                InheritedEvidenceFile::duplicate_inherited(alias_raw.as_raw_fd(), PinnedEvidenceKind::Plan).unwrap();
+            assert!(matches!(
+                inspection.ensure_distinct(&alias),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+
+            let (linked_path, linked) = create_output(&context.work, "linked");
+            assert!(matches!(
+                InheritedEvidenceFile::duplicate_inherited(linked.as_raw_fd(), PinnedEvidenceKind::Plan),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+            fs::remove_file(linked_path).unwrap();
+
+            let (nonempty_path, mut nonempty) = create_output(&context.work, "nonempty");
+            nonempty.write_all(b"x").unwrap();
+            fs::remove_file(nonempty_path).unwrap();
+            assert!(matches!(
+                InheritedEvidenceFile::duplicate_inherited(nonempty.as_raw_fd(), PinnedEvidenceKind::Plan),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+
+            let (mode_path, mode) = create_output(&context.work, "mode");
+            fs::set_permissions(&mode_path, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::remove_file(mode_path).unwrap();
+            assert!(matches!(
+                InheritedEvidenceFile::duplicate_inherited(mode.as_raw_fd(), PinnedEvidenceKind::Plan),
+                Err(GuestArtifactError::InvalidPinnedEvidence)
+            ));
+
+            for (label, read, write, append) in [
+                ("read-only", true, false, false),
+                ("write-only", false, true, false),
+                ("append", true, false, true),
+            ] {
+                let path = context.work.join(label);
+                fs::write(&path, b"").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                let file = OpenOptions::new()
+                    .read(read)
+                    .write(write)
+                    .append(append)
+                    .custom_flags(libc::O_CLOEXEC)
+                    .open(&path)
+                    .unwrap();
+                fs::remove_file(&path).unwrap();
+                assert!(matches!(
+                    InheritedEvidenceFile::duplicate_inherited(file.as_raw_fd(), PinnedEvidenceKind::Plan),
+                    Err(GuestArtifactError::InvalidPinnedEvidence)
+                ));
+            }
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn inherited_wrappers_reject_stdio_closed_and_wrong_descriptor_kinds() {
+            let context = context("pinned-descriptor-mutants");
+            assert!(InheritedEvidenceFile::duplicate_inherited(0, PinnedEvidenceKind::Inspection).is_err());
+            assert!(HeldExternalWorkRoot::duplicate_inherited(1, &context.work, &[&context.storage]).is_err());
+
+            let closed = File::open(&context.source).unwrap();
+            let closed_fd = closed.as_raw_fd();
+            drop(closed);
+            assert!(InheritedEvidenceFile::duplicate_inherited(closed_fd, PinnedEvidenceKind::Plan).is_err());
+
+            let directory = File::open(&context.work).unwrap();
+            assert!(
+                InheritedEvidenceFile::duplicate_inherited(directory.as_raw_fd(), PinnedEvidenceKind::Inspection,)
+                    .is_err()
+            );
+            let regular = File::open(&context.source).unwrap();
+            assert!(
+                HeldExternalWorkRoot::duplicate_inherited(regular.as_raw_fd(), &context.work, &[&context.storage],)
+                    .is_err()
+            );
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn ordinary_file_trust_boundary_does_not_claim_acl_capable_window_protection() {
+            // This assertion is deliberately narrow: the inode is mode 0600,
+            // single-link before unlink, and zero-link afterwards. It does not
+            // claim protection from a directory-search-capable principal that
+            // opens the random name between successful openat and unlinkat.
+            let context = context("pinned-trust-boundary");
+            let (_raw_work, work) = held_work(&context);
+            let random = [0x7a; 16];
+            let staging_path = context.work.join(pinned_staging_name(random));
+            fs::write(&staging_path, b"pre-created collision").unwrap();
+            assert!(matches!(
+                work.create_unlinked_with_test_fault(random, pinned_platform::CreateTestFault::None),
+                Err(GuestArtifactError::PinnedCaptureFailed)
+            ));
+            fs::remove_file(&staging_path).unwrap();
+            for fault in [
+                pinned_platform::CreateTestFault::NonzeroBeforeInitialCheck,
+                pinned_platform::CreateTestFault::RemoveBeforeUnlink,
+                pinned_platform::CreateTestFault::NonzeroAfterUnlink,
+            ] {
+                assert!(matches!(
+                    work.create_unlinked_with_test_fault(random, fault),
+                    Err(GuestArtifactError::PinnedCaptureFailed)
+                ));
+                if staging_path.exists() {
+                    fs::remove_file(&staging_path).unwrap();
+                }
+            }
+            let file = work
+                .create_unlinked_with_test_fault(random, pinned_platform::CreateTestFault::None)
+                .unwrap();
+            let metadata = file.metadata().unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!(metadata.len(), 0);
+            assert!(matches!(File::open(&staging_path), Err(error) if error.kind() == io::ErrorKind::NotFound));
+            fs::remove_dir_all(context.root).unwrap();
+        }
     }
 }
