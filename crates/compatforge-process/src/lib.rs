@@ -1609,6 +1609,7 @@ mod tests {
         Vec<u8>,
         PathBuf,
         PathBuf,
+        PathBuf,
     ) {
         use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot};
         use std::io::Write;
@@ -1638,10 +1639,11 @@ mod tests {
 
         let output = root.join("child-bytes.bin");
         let arguments = root.join("child-arguments.txt");
+        let gate = root.join("child-read-gate");
         let reviewed_wine = root.join("reviewed-wine");
         let mut wine = std::fs::File::create(&reviewed_wine).unwrap();
         wine.write_all(
-            b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$COMPATFORGE_PINNED_ARGUMENTS\"\n/bin/cat \"$3\" > \"$COMPATFORGE_PINNED_OUTPUT\"\n",
+            b"#!/bin/sh\nwhile [ ! -f \"$COMPATFORGE_PINNED_GATE\" ]; do :; done\nprintf '%s\\n' \"$@\" > \"$COMPATFORGE_PINNED_ARGUMENTS\"\n/bin/cat \"$3\" > \"$COMPATFORGE_PINNED_OUTPUT\"\n",
         )
         .unwrap();
         wine.sync_all().unwrap();
@@ -1662,8 +1664,11 @@ mod tests {
             "COMPATFORGE_PINNED_ARGUMENTS".into(),
             arguments.to_string_lossy().into_owned(),
         );
+        plan.process
+            .environment
+            .insert("COMPATFORGE_PINNED_GATE".into(), gate.to_string_lossy().into_owned());
         plan.bottle_executable = Some(pinned.binding().clone());
-        (root, pinned, plan, gui_bytes, output, arguments)
+        (root, pinned, plan, gui_bytes, output, arguments, gate)
     }
 
     #[cfg(target_os = "macos")]
@@ -1671,7 +1676,7 @@ mod tests {
     fn pinned_process_owned_duplicate_is_rewound_inheritable_and_caller_lease_stays_valid() {
         use std::os::fd::AsRawFd;
 
-        let (root, pinned, _plan, _bytes, _output, _arguments) = macos_pinned_fixture("owned-duplicate");
+        let (root, pinned, _plan, _bytes, _output, _arguments, _gate) = macos_pinned_fixture("owned-duplicate");
         let execution = ProcessOwnedPinnedExecution::duplicate(&pinned).unwrap();
         let descriptor = execution.file.as_raw_fd();
         // SAFETY: `descriptor` belongs to the live `execution` file and lseek
@@ -1693,9 +1698,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_start_inherits_only_the_process_duplicate_and_closes_the_parent_copy() {
-        let (root, pinned, plan, bytes, output, arguments) = macos_pinned_fixture("start");
+        let (root, pinned, plan, bytes, output, arguments, gate) = macos_pinned_fixture("start");
         let handle = ProcessSupervisor::start_pinned_bottle(&plan, &pinned).unwrap();
         pinned.revalidate().unwrap();
+        std::fs::write(gate, b"revalidation-complete").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while (!output.exists() || !arguments.exists()) && Instant::now() < deadline {

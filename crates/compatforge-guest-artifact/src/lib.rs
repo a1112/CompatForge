@@ -753,19 +753,51 @@ fn write_and_read_back_canonical<T: DurableIo>(io: &mut T, bytes: &[u8]) -> Resu
         .map_err(|_| GuestArtifactError::PinnedEvidenceWriteFailed)
 }
 
-fn digest_open_file(mut file: File, expected_size: u64) -> Result<String, GuestArtifactError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
-    Read::by_ref(&mut file)
-        .take(MAX_PE_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
-    if bytes.len() as u64 != expected_size || bytes.len() as u64 > MAX_PE_FILE_BYTES {
+fn digest_open_file(file: File, expected_size: u64) -> Result<String, GuestArtifactError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::FileExt;
+
+        digest_positioned_reader(expected_size, |buffer, offset| file.read_at(buffer, offset))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (file, expected_size);
+        Err(GuestArtifactError::PinnedUnsupportedPlatform)
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn digest_positioned_reader(
+    expected_size: u64,
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> Result<String, GuestArtifactError> {
+    if expected_size > MAX_PE_FILE_BYTES {
         return Err(GuestArtifactError::PinnedIntegrityFailure);
     }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
+    let read_limit = expected_size + 1;
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    while offset < read_limit {
+        let remaining = usize::try_from((read_limit - offset).min(buffer.len() as u64))
+            .map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
+        let count =
+            read_at(&mut buffer[..remaining], offset).map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?;
+        if count == 0 {
+            break;
+        }
+        if count > remaining {
+            return Err(GuestArtifactError::PinnedIntegrityFailure);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        offset = offset
+            .checked_add(u64::try_from(count).map_err(|_| GuestArtifactError::PinnedIntegrityFailure)?)
+            .ok_or(GuestArtifactError::PinnedIntegrityFailure)?;
+    }
+    if offset != expected_size {
+        return Err(GuestArtifactError::PinnedIntegrityFailure);
+    }
     Ok(digest_bytes(&bytes))
 }
 
@@ -1506,6 +1538,92 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_digest_revalidation_preserves_a_shared_file_offset() {
+        let root = temp_root("pinned-positioned-digest");
+        let path = root.join("execution.bin");
+        let bytes = (0_u8..64).collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut shared = file.try_clone().unwrap();
+        shared.seek(SeekFrom::Start(17)).unwrap();
+
+        assert_eq!(
+            digest_open_file(file, bytes.len() as u64).unwrap(),
+            digest_bytes(&bytes)
+        );
+        assert_eq!(shared.stream_position().unwrap(), 17);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn positioned_digest_loops_over_short_reads_and_requires_exact_eof() {
+        fn read_chunk(data: &[u8], buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+            let offset = usize::try_from(offset).unwrap();
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let count = (data.len() - offset).min(buffer.len()).min(2);
+            buffer[..count].copy_from_slice(&data[offset..offset + count]);
+            Ok(count)
+        }
+
+        let exact = b"abcdef";
+        let mut offsets = Vec::new();
+        let digest = digest_positioned_reader(exact.len() as u64, |buffer, offset| {
+            offsets.push(offset);
+            read_chunk(exact, buffer, offset)
+        })
+        .unwrap();
+        assert_eq!(digest, digest_bytes(exact));
+        assert_eq!(offsets, [0, 2, 4, 6]);
+
+        assert!(matches!(
+            digest_positioned_reader(7, |buffer, offset| read_chunk(exact, buffer, offset)),
+            Err(GuestArtifactError::PinnedIntegrityFailure)
+        ));
+        assert!(matches!(
+            digest_positioned_reader(5, |buffer, offset| read_chunk(exact, buffer, offset)),
+            Err(GuestArtifactError::PinnedIntegrityFailure)
+        ));
+        assert!(matches!(
+            digest_positioned_reader(MAX_PE_FILE_BYTES + 1, |_buffer, _offset| {
+                panic!("oversize input must be rejected before reading")
+            }),
+            Err(GuestArtifactError::PinnedIntegrityFailure)
+        ));
+        assert!(matches!(
+            digest_positioned_reader(1, |_buffer, _offset| Err(io::Error::other("injected read failure"))),
+            Err(GuestArtifactError::PinnedIntegrityFailure)
+        ));
+    }
+
+    #[test]
+    fn positioned_digest_exposes_changed_bytes_to_the_digest_binding() {
+        let stable = b"abcdef";
+        let changed = b"abXdef";
+        let observed = digest_positioned_reader(stable.len() as u64, |buffer, offset| {
+            let offset = usize::try_from(offset).unwrap();
+            if offset >= stable.len() {
+                return Ok(0);
+            }
+            let data = if offset == 0 {
+                stable.as_slice()
+            } else {
+                changed.as_slice()
+            };
+            let count = (data.len() - offset).min(buffer.len()).min(2);
+            buffer[..count].copy_from_slice(&data[offset..offset + count]);
+            Ok(count)
+        })
+        .unwrap();
+
+        assert_ne!(observed, digest_bytes(stable));
+        assert_eq!(observed, digest_bytes(b"abXdef"));
+    }
+
+    #[cfg(target_os = "macos")]
     mod pinned_macos {
         use super::*;
         use std::os::fd::AsRawFd;
@@ -1577,6 +1695,24 @@ mod tests {
             assert_eq!(metadata.mode() & 0o777, 0o600);
             assert!(pinned_platform::descriptor_is_cloexec(execution.as_raw_fd()));
             pinned.revalidate().unwrap();
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn full_pinned_revalidation_does_not_move_the_shared_execution_offset() {
+            let context = context("pinned-revalidate-offset");
+            let (_raw_work, work) = held_work(&context);
+            let pinned = GuestArtifactStore::new(&context.storage)
+                .pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work)
+                .unwrap();
+            let mut execution = pinned.duplicate_execution_file().unwrap();
+            execution.seek(SeekFrom::Start(17)).unwrap();
+
+            pinned.revalidate().unwrap();
+
+            assert_eq!(execution.stream_position().unwrap(), 17);
+            drop(execution);
+            drop(pinned);
             fs::remove_dir_all(context.root).unwrap();
         }
 
