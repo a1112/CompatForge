@@ -1395,6 +1395,10 @@ mod tests {
             ]),
         ];
         for arguments in invalid {
+            assert!(
+                parse_prepared_command(&arguments).is_none(),
+                "invalid pinned argv reached the private parser variant: {arguments:?}"
+            );
             assert_eq!(
                 run_arguments(&arguments).unwrap_err().to_string(),
                 PINNED_SUMATRAPDF_FAILURE
@@ -1460,6 +1464,10 @@ mod tests {
                 "9",
                 milliseconds,
             ]);
+            assert!(
+                parse_prepared_command(&arguments).is_none(),
+                "invalid pinned duration reached the private parser variant: {milliseconds}"
+            );
             assert_eq!(
                 run_arguments(&arguments).unwrap_err().to_string(),
                 PINNED_SUMATRAPDF_FAILURE
@@ -1496,6 +1504,10 @@ mod tests {
                 descriptors[2],
                 "1000",
             ]);
+            assert!(
+                parse_prepared_command(&arguments).is_none(),
+                "invalid pinned descriptors reached the private parser variant: {name}"
+            );
             assert_eq!(
                 run_arguments(&arguments).unwrap_err().to_string(),
                 PINNED_SUMATRAPDF_FAILURE,

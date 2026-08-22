@@ -781,6 +781,46 @@ struct RealCode;
             r'"pinned SumatraPDF launch failed"',
         )
 
+    def test_pinned_macos_production_wires_every_work_root_revalidation(self) -> None:
+        source = rust_without_comments(
+            (ROOT / "apps" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
+        )
+        implementation = source.index(
+            'impl ClosedPinnedSession for MacOsClosedPinnedSession<\'_> {'
+        )
+
+        def method_body(name: str, next_name: str) -> str:
+            start = source.index(f"    fn {name}(", implementation)
+            end = source.index(f"\n    fn {next_name}(", start)
+            return source[start:end]
+
+        root_check = (
+            "self.work_root()?.revalidate().map_err(|_| PinnedSessionError)?;"
+        )
+        publish = method_body("publish_evidence", "start_pinned")
+        root_positions = [
+            match.start() for match in re.finditer(re.escape(root_check), publish)
+        ]
+        self.assertEqual(len(root_positions), 4)
+        inspection_write = publish.index(".write_canonical(&inspection_bytes)")
+        plan_write = publish.index(".write_canonical(&plan_bytes)")
+        self.assertLess(root_positions[0], inspection_write)
+        self.assertLess(inspection_write, root_positions[1])
+        self.assertLess(root_positions[1], root_positions[2])
+        self.assertLess(root_positions[2], plan_write)
+        self.assertLess(plan_write, root_positions[3])
+
+        start = method_body("start_pinned", "post_spawn_revalidate")
+        self.assertEqual(start.count(root_check), 1)
+        self.assertLess(
+            start.index(root_check),
+            start.index("ProcessSupervisor::start_pinned_bottle"),
+        )
+
+        finalize = method_body("finalize_session", "evidence_receipt")
+        self.assertEqual(finalize.count("self.work_root()?.revalidate()"), 1)
+        self.assertIn(".map_err(|_| PinnedSessionError)", finalize)
+
     def test_application_grid_and_function_switches_are_stable(self) -> None:
         frontend = (DESKTOP / "src" / "main.ts").read_text(encoding="utf-8")
         for label in (
