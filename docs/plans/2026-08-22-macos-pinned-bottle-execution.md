@@ -24,7 +24,8 @@ Assert that serialized `LaunchPlan`, `LaunchRequest`, `BottleExecutableBinding`,
 ```text
 prepared-pinned-sumatrapdf-launch-terminate \
   <config.json> <fixed-logical-executable> <request.json> \
-  <external-work-root> <inherited-work-root-fd> <milliseconds>
+  <external-work-root> <inherited-work-root-fd> \
+  <inherited-inspection-fd> <inherited-plan-fd> <milliseconds>
 ```
 
 Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary-Bottle uses. Pin the future command to:
@@ -34,14 +35,19 @@ Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary
 - architecture `x86_64`;
 - logical suffix `CompatForge/SumatraPDF/SumatraPDF.exe`;
 - no guest arguments; and
-- a pre-created empty external work root, owned by the effective user with mode `0700`, held for the
-  full session and used for both the unlinked execution file and fixed create-new inspection/plan
-  output names; the numeric descriptor must be inherited by the CLI, must resolve to that exact
-  path identity, and is never echoed.
+- the already-bound repository-external work root, owned by the effective user and held for the full
+  session; its numeric descriptor must be inherited by the CLI, must resolve to that exact path
+  identity, and is never echoed; and
+- two distinct inherited descriptors for Python-created, already-unlinked, empty mode-`0600`
+  inspection and plan outputs.
+
+All descriptor arguments use canonical unsigned decimal, are greater than `2`, fit in `i32`, are
+pairwise distinct, and name live descriptors of the required type. Reject signs, whitespace,
+leading zeroes, closed/reused descriptors, `0/1/2`, duplicates, and option-shaped values.
 
 **Step 2: Run RED**
 
-```bash
+```powershell
 cargo test -p compatforge-domain -p compatforge-cli --all-targets --locked pinned
 & '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 ```
@@ -54,7 +60,7 @@ Parse the command into a private enum variant, but return a fixed unsupported/no
 
 **Step 4: Run GREEN and commit**
 
-```bash
+```powershell
 cargo test -p compatforge-domain -p compatforge-cli --all-targets --locked
 & '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 git add crates/compatforge-domain/src/lib.rs apps/cli/src/main.rs tests/test_gui_baseline_contracts.py
@@ -115,18 +121,19 @@ Define an opaque, non-serializable `PinnedBottleExecutable` containing:
 
 Tests prove component-by-component `openat(O_NOFOLLOW)` capture, reparse/symlink/hardlink rejection, same/ancestor substitution detection, and exact fixed path containment.
 
-Add a safe opaque `HeldExternalWorkRoot` that binds a caller-created real directory with a held
-descriptor. Require effective-user ownership, exact mode `0700`, emptiness, no symlink/reparse, and
-lexical plus physical non-overlap with the storage root, Bottle root, source, Runtime roots, and
+Add a safe opaque `HeldExternalWorkRoot` that duplicates the inherited descriptor for the existing
+Python-bound work root. Require effective-user ownership, no symlink/reparse, exact path identity,
+and lexical plus physical non-overlap with the storage root, Bottle root, source, Runtime roots, and
 other CLI-known writable roots. The Python integration contract separately proves repository
-externality because the CLI has no repository-root input. The safe wrapper exposes only fixed-name
-create-new publication, canonical readback, identity revalidation, and unlinked-file capture;
-callers never receive its raw descriptor. Pin the safe surface before implementation:
+externality because the CLI has no repository-root input. Add an `InheritedEvidenceFile` wrapper for
+each already-unlinked Python output. Pin the safe surface before implementation:
 
 ```rust
-pub enum PinnedEvidenceFile {
-    Inspection, // pinned-inspection.json
-    Plan,       // pinned-plan.json
+pub const MAX_PINNED_EVIDENCE_BYTES: u64 = 1_048_576;
+
+pub enum PinnedEvidenceKind {
+    Inspection,
+    Plan,
 }
 
 pub struct PublishedEvidenceBinding {
@@ -135,28 +142,34 @@ pub struct PublishedEvidenceBinding {
 }
 
 impl HeldExternalWorkRoot {
-    pub fn from_inherited(
+    pub fn duplicate_inherited(
         raw_fd: i32,
         reviewed_path: &Path,
         forbidden_roots: &[&Path],
     ) -> Result<Self, GuestArtifactError>;
     pub fn create_unlinked_execution_file(&self) -> Result<File, GuestArtifactError>;
-    pub fn publish_canonical(
-        &self,
-        kind: PinnedEvidenceFile,
+    pub fn revalidate(&self) -> Result<(), GuestArtifactError>;
+}
+
+impl InheritedEvidenceFile {
+    pub fn duplicate_inherited(
+        raw_fd: i32,
+        kind: PinnedEvidenceKind,
+    ) -> Result<Self, GuestArtifactError>;
+    pub fn write_canonical(
+        &mut self,
         bytes: &[u8],
     ) -> Result<PublishedEvidenceBinding, GuestArtifactError>;
-    pub fn read_canonical(
-        &self,
-        kind: PinnedEvidenceFile,
-    ) -> Result<Vec<u8>, GuestArtifactError>;
-    pub fn revalidate(&self) -> Result<(), GuestArtifactError>;
 }
 ```
 
-Do not expose a method accepting a caller-selected filename or absolute output path, and do not
-expose a raw-descriptor accessor. `from_inherited` consumes the inherited descriptor on success and
-closes it on every failure; the CLI must not reconstruct the directory by pathname.
+Both constructors reject raw descriptors `<= 2`, invalid/closed/reused descriptors, wrong kinds,
+and duplicate identities. They validate the live descriptor with `F_GETFD`, set `FD_CLOEXEC` on the
+raw inherited descriptor, then obtain their own `OwnedFd` with `F_DUPFD_CLOEXEC`; they never close or
+assume ownership of the raw input.
+Do not expose a caller-selected filename, absolute output path, raw-descriptor accessor, or
+`FromRawFd` call outside the audited platform module. The CLI must not reconstruct the work root or
+either output by pathname.
 
 On macOS, generate exactly 128 bits with `arc4random_buf`, encode them as a fixed 32-lowercase-hex
 suffix, and create `.compatforge-pinned-<suffix>` relative to the held work-root descriptor with
@@ -173,6 +186,11 @@ malicious directory-search-capable principal that guesses or enumerates the rand
 during the successful `openat`-to-`unlinkat` interval. Tests must still prove that pre-created names
 lose to `O_EXCL`, mode/owner checks are enforced without claiming they override ACL or filesystem
 configuration, and no pathname can acquire the inode after unlink.
+
+Test exact evidence bounds at `1_048_576` bytes accepted and `1_048_577` rejected, plus short write,
+wrong offset, nonzero initial size, linked file, descriptor reuse, input/output alias, and close/sync
+failures. Before any Wine spawn, assert that the raw inherited work/output descriptors and all owned
+duplicates have `FD_CLOEXEC`; only the dedicated execution duplicate may have it cleared.
 
 **Step 2: Run RED**
 
@@ -339,16 +357,17 @@ git commit -s -m "feat: supervise pinned SumatraPDF descriptors"
 The command must execute, in order:
 
 1. closed argument and platform validation;
-2. consume the inherited work-root descriptor, bind it to the supplied path, require the directory
-   is initially empty, and reject physical/lexical overlap with storage, Bottle, source, Runtime and
-   other CLI-known writable roots; the Python caller separately proves repository externality before
-   invoking the command;
+2. mark every raw inherited work/output descriptor `FD_CLOEXEC`, duplicate each with
+   `F_DUPFD_CLOEXEC`, bind the work-root duplicate to the supplied path, validate two distinct empty
+   unlinked output files, and reject physical/lexical root overlap with storage, Bottle, source,
+   Runtime and other CLI-known writable roots; the Python caller separately proves repository
+   externality before invoking the command;
 3. no-follow source capture into an ordinary file created and immediately unlinked relative to that
    held root;
 4. pinned prepare;
 5. pinned authorize;
-6. publish fixed-name inspection and plan files through `HeldExternalWorkRoot` create-new methods
-   plus canonical readback; and
+6. write bounded canonical inspection and plan bytes through the two `InheritedEvidenceFile`
+   duplicates, sync/rewind/readback, and retain their length/digest bindings; and
 7. pinned process start, immediate post-spawn source revalidation, and existing event supervision.
 
 Mutation tests replace or overwrite the logical path before final revalidation and assert integrity
@@ -374,29 +393,31 @@ stdout contains exactly one final compact canonical receipt line with fixed fiel
 {"outputs":[{"byteLength":123,"kind":"inspection","sha256":"sha256:<64-lower-hex>"},{"byteLength":456,"kind":"plan","sha256":"sha256:<64-lower-hex>"}],"recordType":"pinned-evidence-receipt","schemaVersion":1}
 ```
 
-Require literal output order `inspection`, then `plan`; bounded positive integer lengths; exact
-digest syntax; and no extra keys, non-event records, text, stderr, or receipt line. The receipt is
+Require literal output order `inspection`, then `plan`; byte lengths in `1..=1_048_576`; exact
+digest syntax; and no extra keys, non-event records, text, stderr, or extra receipt line. The receipt is
 mandatory and last. These digests bind the post-CLI Python readback, not the executable-content
 digest in the plan.
 
 **Step 3: Run RED**
 
-```bash
+```powershell
 cargo test -p compatforge-cli --all-targets --locked pinned
 & '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 ```
 
 **Step 4: Implement and run GREEN**
 
-Use only `HeldExternalWorkRoot` fixed-name create-new/no-follow output publication with canonical
-readback. Revalidate the held root before and after each publication and once more before returning
-the final session result. The CLI takes ownership only of its inherited descriptor duplicate; the
-Python parent keeps its original descriptor open. Do not add stdin, PATH, shell, ambient environment,
-network, or fallback behavior.
+Use only `InheritedEvidenceFile::write_canonical` for output and revalidate the held work root before
+and after each write and once more before returning the final session result. The CLI owns only its
+`F_DUPFD_CLOEXEC` duplicates; the Python parent keeps the originals open. Before Wine spawn, assert
+that the work-root and output raw/duplicate descriptors are close-on-exec and that the process
+command inherits only the dedicated unlinked execution descriptor. Do not add stdin, PATH, shell,
+ambient environment, network, or fallback behavior.
 
-```bash
+```powershell
 cargo test -p compatforge-cli --all-targets --locked
 cargo clippy -p compatforge-cli --all-targets --locked -- -D warnings
+& '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
 git add apps/cli tests/test_gui_baseline_contracts.py
 git commit -s -m "feat: launch a pinned SumatraPDF session"
 ```
@@ -480,31 +501,39 @@ Use exact app id `sumatrapdf`. Assert that Sumatra omits the separate GUI `inspe
 `prepared-plan` calls and instead invokes the single pinned session. 7-Zip and Notepad++ remain
 byte-compatible.
 
-The existing GUI `arguments.work_root` is already nonempty and is not the pinned root. For each
-Sumatra launch, create exactly one unique child directory beneath that already-bound external root
-using create-new semantics and explicit mode `0700`; open it no-follow, verify owner/mode/identity and
-emptiness, and keep the parent and child directory descriptors through subprocess completion,
-evidence verification, and cleanup. Pass the child descriptor with `pass_fds` and include its number
-only in the closed CLI argv; never include it in evidence or diagnostics.
+The existing GUI `arguments.work_root` is already nonempty; reuse its existing identity binding
+rather than requiring an empty root. Open it no-follow and keep the directory descriptor through
+subprocess completion and evidence verification. For each Sumatra launch, create two independent
+mode-`0600` output files relative to that descriptor under `secrets.token_hex(16)` names with
+`O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`, validate each empty regular single-link inode, immediately
+unlink each name, and require the same inode with `st_nlink == 0`. Pass the root and both output
+descriptors with `pass_fds` and include their three numbers only in the closed CLI argv; never include
+them or the temporary names in evidence or diagnostics. Retry a colliding name at most 16 times and
+apply the same documented directory-search-capable create-to-unlink trust boundary.
+
+Extend `observed_launch` with one explicit `pass_fds: tuple[int, ...] = ()` parameter. The pinned
+Sumatra call supplies exactly the three descriptors; every existing caller and every non-Sumatra app
+uses the empty default. Forward the tuple directly to `subprocess.Popen` with `close_fds=True`; do not
+copy ambient descriptors, use a shell, or derive the tuple from environment state.
 
 Preserve the existing RuntimeEvent JSONL observation and acknowledgement flow. After its terminal
-event, require exactly one final `pinned-evidence-receipt` record and no later line. Then open only
-`pinned-inspection.json` and `pinned-plan.json` fd-relative/no-follow, require regular single-link
-files and bounded canonical bytes, and compare exact byte length and SHA-256 before consuming either
-document. Revalidate the parent/child identities before and after both reads. An inode/path/root
-replacement, digest/size mismatch, extra/missing file, link/reparse, stdout drift, or cleanup failure
-is fatal. A replacement containing byte-identical canonical content is evidence-equivalent.
+event, require exactly one final `pinned-evidence-receipt` record and no later line. Then use only
+the original anonymous output descriptors: rewind, require the same zero-link regular identities,
+read at most `1_048_576 + 1` bytes each, reject `1_048_577`, and compare exact length and SHA-256
+before parsing either in-memory document. Revalidate the work-root identity before and after both
+reads. A descriptor alias/reuse/close, root replacement, digest/size mismatch, over-limit output,
+stdout drift, or close failure is fatal.
 
-Extend the work-tree allowlist only for the dedicated session directory and the two fixed filenames.
-On success remove only still-owned files and the still-owned empty child directory. On foreign
-substitution do not delete foreign bytes; raise the existing cleanup-fatal classification. Tests
-cover consecutive sessions and prove no stale file is reused.
+No output filename or session directory enters the work-tree allowlist because both outputs are
+unlinked before the CLI starts. Cleanup closes only the three parent descriptors after identity and
+evidence verification; it performs no pathname unlink. Tests cover consecutive sessions and prove
+no descriptor or stale byte buffer is reused.
 
 Reject naked-path fallback, wrong app id, wrong fixed path, missing output evidence, dynamic
 descriptor/path leakage, and pinned errors rewritten as ordinary accepted evidence. Add explicit
-mutants for the current nonempty work root being passed directly, omitted `pass_fds`, parent or child
-root swap, ACL/mode assumptions used as a substitute for digest verification, post-CLI output
-replacement, same-size content replacement, and premature descriptor close.
+mutants for omitted `pass_fds`, root swap, named output, failure to unlink before CLI, duplicate or
+stdio descriptor, output-fd substitution/reuse, same-size content mutation, `1_048_576`/
+`1_048_577` boundaries, missing final receipt, and premature descriptor close.
 
 **Step 2: Run RED**
 
@@ -552,8 +581,9 @@ pre-final-revalidation overwrite/path replacement, post-spawn source mutation, r
 create-before-unlink and zero-link failures, work-root substitution, descriptor inheritance/cleanup,
 naked fallback, and evidence-leak mutants. Confirm that the review does not claim protection against
 the explicitly excluded directory-search-capable create-to-unlink opener. Separately prove that
-post-CLI evidence replacement is detected by held-fd length/digest verification even when the writer
-has the same UID or ACL-granted directory access.
+post-receipt output mutation through a test-held duplicate descriptor is detected by length/digest
+verification, while making no claim about an attacker that wins the excluded create-to-unlink open
+and mutates bytes before the CLI computes its receipt.
 
 **Step 3: Commit verified documentation**
 
