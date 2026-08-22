@@ -270,6 +270,29 @@ struct RealCode;
         self.assertNotRegex(projected, r"\b(?:Command|env|PATH)\b")
         self.assertIn('"Command // string"', rust_without_comments(source))
 
+    def test_rust_code_projection_excludes_pinned_wiring_decoys(self) -> None:
+        root_check = (
+            "self.work_root()?.revalidate().map_err(|_| PinnedSessionError)?;"
+        )
+        decoys = f'''
+// {root_check}
+/* {root_check} */
+const TEXT: &str = "{root_check}";
+const RAW: &str = r#"{root_check}"#;
+const RAW_BYTES: &[u8] = br##"{root_check}"##;
+const BYTES: &[u8] = b"{root_check}";
+'''
+        self.assertNotIn(root_check, rust_code_only(decoys))
+
+        real_after_decoys = f'''
+/* {root_check} */ {root_check}
+const TEXT: &str = "{root_check}"; {root_check}
+const RAW: &str = r#"{root_check}"#; {root_check}
+const RAW_BYTES: &[u8] = br##"{root_check}"##; {root_check}
+const BYTES: &[u8] = b"{root_check}"; {root_check}
+'''
+        self.assertEqual(rust_code_only(real_after_decoys).count(root_check), 5)
+
     def test_fixed_official_asset_matrix_is_closed(self) -> None:
         self.assertEqual(
             [asset.app_id for asset in self.assets.ASSETS],
@@ -782,7 +805,7 @@ struct RealCode;
         )
 
     def test_pinned_macos_production_wires_every_work_root_revalidation(self) -> None:
-        source = rust_without_comments(
+        source = rust_code_only(
             (ROOT / "apps" / "cli" / "src" / "main.rs").read_text(encoding="utf-8")
         )
         implementation = source.index(
