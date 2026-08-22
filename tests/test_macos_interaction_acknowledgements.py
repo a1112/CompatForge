@@ -1186,6 +1186,8 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "Path.__dict__['write_text'](Path('evidence.json'), 'x')",
             "__builtins__['breakpoint']()",
             "__builtins__.__dict__['breakpoint']()",
+            "argparse._os.system('calc')",
+            "argparse._sys.modules['os'].system('calc')",
         )
         for marker in forbidden:
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
@@ -1218,6 +1220,8 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "readonly_name = Path('evidence.json').name",
             "local_marker = 1\nlocal_marker = 2",
             "safe_parser = argparse.ArgumentParser(add_help=False)",
+            "safe_type_error = argparse.ArgumentTypeError('safe')",
+            "safe_namespace = argparse.Namespace(value=True)",
             "safe_stat = Path('evidence.json').stat()",
             "safe_mapping = {'x': True}\nsafe_value = safe_mapping['x']",
         )

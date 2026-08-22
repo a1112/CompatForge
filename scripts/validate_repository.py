@@ -5006,6 +5006,11 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "get_last_error",
         "sizeof",
     }
+    allowed_argparse_attributes = {
+        "ArgumentParser",
+        "ArgumentTypeError",
+        "Namespace",
+    }
     allowed_kernel32_attributes = {
         "CloseHandle",
         "CreateFileW",
@@ -5345,7 +5350,7 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
             if (
                 isinstance(base, ast.Name)
                 and aliases.get(base.id) == "argparse"
-                and node.attr == "FileType"
+                and node.attr not in allowed_argparse_attributes
             ):
                 return True
             if isinstance(base, ast.Name) and base.id in dll_bindings:
