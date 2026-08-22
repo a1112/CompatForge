@@ -446,11 +446,13 @@ def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, ob
         if index > 0 and event["kind"] == "started":
             raise SpikeError("started RuntimeEvent was repeated")
         if kind == "started":
-            if type(event.get("processId")) is not int or event["processId"] <= 0:
+            if type(event.get("processId")) is not int or not 1 <= event["processId"] <= 2**32 - 1:
                 raise SpikeError("started RuntimeEvent process is invalid")
             process_id = event["processId"]  # type: ignore[assignment]
         elif "processId" in event and (
-            type(event["processId"]) is not int or event["processId"] <= 0 or event["processId"] != process_id
+            type(event["processId"]) is not int
+            or not 1 <= event["processId"] <= 2**32 - 1
+            or event["processId"] != process_id
         ):
             raise SpikeError("RuntimeEvent process identity changed")
         if json.dumps(event, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8") != lines[index]:
@@ -461,7 +463,8 @@ def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, ob
             if type(exit_value) is not dict or tuple(exit_value) not in (("code", "success"), ("success",)):
                 raise SpikeError("terminal RuntimeEvent is invalid")
             if type(exit_value["success"]) is not bool or (
-                "code" in exit_value and type(exit_value["code"]) is not int
+                "code" in exit_value
+                and (type(exit_value["code"]) is not int or not -(2**31) <= exit_value["code"] <= 2**31 - 1)
             ):
                 raise SpikeError("terminal RuntimeEvent is invalid")
             terminal_seen = True

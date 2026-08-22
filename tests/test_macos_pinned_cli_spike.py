@@ -310,6 +310,22 @@ class _FakeBoundary:
             event["message"] = None
         elif self.event_mutant == "explicit-null-exit-code":
             exited["exit"]["code"] = None  # type: ignore[index]
+        elif self.event_mutant == "process-id-bool":
+            event["processId"] = True
+        elif self.event_mutant == "process-id-max":
+            event["processId"] = 2**32 - 1
+        elif self.event_mutant == "process-id-overflow":
+            event["processId"] = 2**32
+        elif self.event_mutant == "exit-code-bool":
+            exited["exit"]["code"] = True  # type: ignore[index]
+        elif self.event_mutant == "exit-code-max":
+            exited["exit"]["code"] = 2**31 - 1  # type: ignore[index]
+        elif self.event_mutant == "exit-code-min":
+            exited["exit"]["code"] = -(2**31)  # type: ignore[index]
+        elif self.event_mutant == "exit-code-positive-overflow":
+            exited["exit"]["code"] = 2**31  # type: ignore[index]
+        elif self.event_mutant == "exit-code-negative-overflow":
+            exited["exit"]["code"] = -(2**31) - 1  # type: ignore[index]
         if self.receipt_mutant == "missing":
             records = [event, exited]
         elif self.receipt_mutant == "not-last":
@@ -513,6 +529,11 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             ("event_mutant", "sequence-bool"),
             ("event_mutant", "explicit-null-message"),
             ("event_mutant", "explicit-null-exit-code"),
+            ("event_mutant", "process-id-bool"),
+            ("event_mutant", "process-id-overflow"),
+            ("event_mutant", "exit-code-bool"),
+            ("event_mutant", "exit-code-positive-overflow"),
+            ("event_mutant", "exit-code-negative-overflow"),
             ("receipt_mutant", "missing"),
             ("receipt_mutant", "not-last"),
             ("receipt_mutant", "digest"),
@@ -526,6 +547,13 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             setattr(boundary, field, value)
             with self.subTest(field=field, value=value), self.assertRaises(spike.SpikeError):
                 spike.run_spike_document(self.manifest, boundary)
+
+    def test_runtime_event_integer_boundaries_are_accepted(self) -> None:
+        for value in ("process-id-max", "exit-code-max", "exit-code-min"):
+            boundary = _FakeBoundary(self.manifest, self.inputs)
+            boundary.event_mutant = value
+            with self.subTest(value=value):
+                self.assertEqual(spike.run_spike_document(self.manifest, boundary), ["crossover", "whisky"])
 
     def test_output_bound_canonical_readback_and_close_failure_are_fatal(self) -> None:
         for field in ("oversized_output", "close_failure"):

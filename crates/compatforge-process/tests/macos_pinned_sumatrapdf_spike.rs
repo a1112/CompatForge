@@ -16,25 +16,76 @@ trait WindowProbeProcess {
     fn wait(&mut self) -> Result<(), &'static str>;
 }
 
+trait WindowProbeBudget {
+    fn probe_time_remaining(&mut self) -> bool;
+    fn cleanup_time_remaining(&mut self) -> bool;
+    fn pause_probe(&mut self);
+    fn pause_cleanup(&mut self);
+}
+
 fn supervise_window_probe(
     process: &mut impl WindowProbeProcess,
-    mut before_deadline: impl FnMut() -> bool,
-    mut pause: impl FnMut(),
+    budget: &mut impl WindowProbeBudget,
 ) -> Result<bool, &'static str> {
+    if !budget.probe_time_remaining() {
+        return stop_window_probe(process, budget, "window probe timed out", false);
+    }
     loop {
-        match process.try_wait_success() {
+        let poll = process.try_wait_success();
+        if !budget.probe_time_remaining() {
+            return stop_window_probe(process, budget, "window probe timed out", matches!(poll, Ok(Some(_))));
+        }
+        match poll {
             Ok(Some(success)) => return Ok(success),
-            Ok(None) if before_deadline() => pause(),
-            Ok(None) => return stop_window_probe(process, "window probe timed out"),
-            Err(_) => return stop_window_probe(process, "window probe failed"),
+            Ok(None) => {}
+            Err(_) => return stop_window_probe(process, budget, "window probe failed", false),
+        }
+        budget.pause_probe();
+        if !budget.probe_time_remaining() {
+            return stop_window_probe(process, budget, "window probe timed out", false);
         }
     }
 }
 
-fn stop_window_probe(process: &mut impl WindowProbeProcess, failure: &'static str) -> Result<bool, &'static str> {
-    let _kill_result = process.kill();
-    process.wait().map_err(|_| "window probe cleanup failed")?;
-    Err(failure)
+fn stop_window_probe(
+    process: &mut impl WindowProbeProcess,
+    budget: &mut impl WindowProbeBudget,
+    failure: &'static str,
+    already_ready: bool,
+) -> Result<bool, &'static str> {
+    if already_ready {
+        return if process.wait().is_err() {
+            Err("window probe cleanup failed")
+        } else {
+            Err(failure)
+        };
+    }
+
+    let mut cleanup_failed = process.kill().is_err();
+    if !budget.cleanup_time_remaining() {
+        return Err("window probe cleanup failed");
+    }
+    loop {
+        match process.try_wait_success() {
+            Ok(Some(_)) => {
+                cleanup_failed |= process.wait().is_err();
+                return if cleanup_failed {
+                    Err("window probe cleanup failed")
+                } else {
+                    Err(failure)
+                };
+            }
+            Ok(None) => {}
+            Err(_) => cleanup_failed = true,
+        }
+        if !budget.cleanup_time_remaining() {
+            return Err("window probe cleanup failed");
+        }
+        budget.pause_cleanup();
+        if !budget.cleanup_time_remaining() {
+            return Err("window probe cleanup failed");
+        }
+    }
 }
 
 fn run_spike_phase(driver: &mut impl PhaseDriver, mutate_after_start: bool) -> Result<(), &'static str> {
@@ -61,7 +112,7 @@ fn run_spike_phase(driver: &mut impl PhaseDriver, mutate_after_start: bool) -> R
 
 #[cfg(target_os = "macos")]
 mod real {
-    use super::{run_spike_phase, supervise_window_probe, PhaseDriver, WindowProbeProcess};
+    use super::{run_spike_phase, supervise_window_probe, PhaseDriver, WindowProbeBudget, WindowProbeProcess};
     use compatforge_domain::{CoreConfig, CpuArchitecture, ExecutableMode, LaunchRequest};
     use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot, PinnedBottleExecutable};
     use compatforge_orchestrator::PreparedLaunch;
@@ -82,6 +133,7 @@ mod real {
     const MAX_MANIFEST_BYTES: u64 = 1_048_576;
     const WINDOW_TIMEOUT: Duration = Duration::from_secs(60);
     const WINDOW_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    const WINDOW_PROBE_CLEANUP_RESERVE: Duration = Duration::from_secs(1);
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
     const MAX_WINDOW_OUTPUT_BYTES: u64 = 1_048_576;
 
@@ -719,6 +771,29 @@ mod real {
         }
     }
 
+    struct RealWindowProbeBudget {
+        probe_deadline: Instant,
+        total_deadline: Instant,
+    }
+
+    impl WindowProbeBudget for RealWindowProbeBudget {
+        fn probe_time_remaining(&mut self) -> bool {
+            Instant::now() < self.probe_deadline
+        }
+
+        fn cleanup_time_remaining(&mut self) -> bool {
+            Instant::now() < self.total_deadline
+        }
+
+        fn pause_probe(&mut self) {
+            sleep_before(self.probe_deadline, Duration::from_millis(25));
+        }
+
+        fn pause_cleanup(&mut self) {
+            sleep_before(self.total_deadline, Duration::from_millis(25));
+        }
+    }
+
     fn sleep_before(deadline: Instant, interval: Duration) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
@@ -727,7 +802,10 @@ mod real {
     }
 
     fn window_visible(deadline: Instant) -> Result<bool, &'static str> {
-        if Instant::now() >= deadline {
+        let probe_deadline = deadline
+            .checked_sub(WINDOW_PROBE_CLEANUP_RESERVE)
+            .ok_or("window probe timed out")?;
+        if Instant::now() >= probe_deadline {
             return Err("window probe timed out");
         }
         let script = r#"tell application "System Events"
@@ -749,13 +827,16 @@ end tell"#;
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| "window probe failed")?;
-        let success = supervise_window_probe(
-            &mut child,
-            || Instant::now() < deadline,
-            || sleep_before(deadline, Duration::from_millis(25)),
-        )?;
+        let mut budget = RealWindowProbeBudget {
+            probe_deadline,
+            total_deadline: deadline,
+        };
+        let success = supervise_window_probe(&mut child, &mut budget)?;
         if !success {
             return Err("window probe failed");
+        }
+        if Instant::now() >= deadline {
+            return Err("window probe timed out");
         }
         let stdout = child.stdout.take().ok_or("window probe output is unavailable")?;
         let mut bytes = Vec::new();
@@ -765,6 +846,9 @@ end tell"#;
             .map_err(|_| "window probe output is invalid")?;
         if bytes.len() as u64 > MAX_WINDOW_OUTPUT_BYTES {
             return Err("window probe output is invalid");
+        }
+        if Instant::now() >= deadline {
+            return Err("window probe timed out");
         }
         let titles = String::from_utf8(bytes).map_err(|_| "window probe output is invalid")?;
         Ok(titles
@@ -784,8 +868,47 @@ fn real_apple_silicon_crossover_and_whisky_pinned_sumatrapdf_spike() {
 mod tests {
     use super::*;
 
+    struct ScriptedWindowProbeBudget {
+        probe_checks: Vec<bool>,
+        probe_index: usize,
+        cleanup_checks: Vec<bool>,
+        cleanup_index: usize,
+    }
+
+    impl ScriptedWindowProbeBudget {
+        fn new(probe_checks: &[bool], cleanup_checks: &[bool]) -> Self {
+            Self {
+                probe_checks: probe_checks.to_vec(),
+                probe_index: 0,
+                cleanup_checks: cleanup_checks.to_vec(),
+                cleanup_index: 0,
+            }
+        }
+
+        fn next(values: &[bool], index: &mut usize) -> bool {
+            let value = values.get(*index).copied().unwrap_or(false);
+            *index += 1;
+            value
+        }
+    }
+
+    impl WindowProbeBudget for ScriptedWindowProbeBudget {
+        fn probe_time_remaining(&mut self) -> bool {
+            Self::next(&self.probe_checks, &mut self.probe_index)
+        }
+
+        fn cleanup_time_remaining(&mut self) -> bool {
+            Self::next(&self.cleanup_checks, &mut self.cleanup_index)
+        }
+
+        fn pause_probe(&mut self) {}
+
+        fn pause_cleanup(&mut self) {}
+    }
+
     struct HungWindowProbe {
         polls: usize,
+        killed: bool,
         kill_calls: usize,
         wait_calls: usize,
     }
@@ -793,7 +916,31 @@ mod tests {
     impl WindowProbeProcess for HungWindowProbe {
         fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
             self.polls += 1;
-            Ok(None)
+            Ok(self.killed.then_some(false))
+        }
+
+        fn kill(&mut self) -> Result<(), &'static str> {
+            self.killed = true;
+            self.kill_calls += 1;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> Result<(), &'static str> {
+            self.wait_calls += 1;
+            Ok(())
+        }
+    }
+
+    struct DeadlineRaceWindowProbe {
+        polls: usize,
+        kill_calls: usize,
+        wait_calls: usize,
+    }
+
+    impl WindowProbeProcess for DeadlineRaceWindowProbe {
+        fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
+            self.polls += 1;
+            Ok((self.polls == 2).then_some(true))
         }
 
         fn kill(&mut self) -> Result<(), &'static str> {
@@ -804,6 +951,41 @@ mod tests {
         fn wait(&mut self) -> Result<(), &'static str> {
             self.wait_calls += 1;
             Ok(())
+        }
+    }
+
+    struct CleanupWindowProbe {
+        poll_results: Vec<Result<Option<bool>, &'static str>>,
+        polls: usize,
+        kill_fails: bool,
+        kill_calls: usize,
+        wait_fails: bool,
+        wait_calls: usize,
+    }
+
+    impl WindowProbeProcess for CleanupWindowProbe {
+        fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
+            let result = self.poll_results.get(self.polls).copied().unwrap_or(Ok(None));
+            self.polls += 1;
+            result
+        }
+
+        fn kill(&mut self) -> Result<(), &'static str> {
+            self.kill_calls += 1;
+            if self.kill_fails {
+                Err("injected kill failure")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait(&mut self) -> Result<(), &'static str> {
+            self.wait_calls += 1;
+            if self.wait_fails {
+                Err("injected wait failure")
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -894,22 +1076,91 @@ mod tests {
     fn hung_window_probe_is_killed_and_reaped_at_its_deadline() {
         let mut probe = HungWindowProbe {
             polls: 0,
+            killed: false,
             kill_calls: 0,
             wait_calls: 0,
         };
-        let mut deadline_checks = 0;
+        let mut budget = ScriptedWindowProbeBudget::new(&[true, true, false], &[true]);
 
-        let result = supervise_window_probe(
-            &mut probe,
-            || {
-                deadline_checks += 1;
-                deadline_checks < 2
-            },
-            || {},
-        );
+        let result = supervise_window_probe(&mut probe, &mut budget);
 
         assert_eq!(result, Err("window probe timed out"));
         assert_eq!(probe.polls, 2);
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 1);
+    }
+
+    #[test]
+    fn ready_probe_after_pause_crosses_deadline_is_timed_out_and_cleaned() {
+        let mut probe = DeadlineRaceWindowProbe {
+            polls: 0,
+            kill_calls: 0,
+            wait_calls: 0,
+        };
+        let mut budget = ScriptedWindowProbeBudget::new(&[true, true, false], &[true]);
+
+        let result = supervise_window_probe(&mut probe, &mut budget);
+
+        assert_eq!(result, Err("window probe timed out"));
+        assert_eq!(probe.polls, 2);
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 1);
+    }
+
+    #[test]
+    fn failed_kill_never_enters_unbounded_wait_before_reap() {
+        let mut probe = CleanupWindowProbe {
+            poll_results: vec![Ok(None), Ok(None)],
+            polls: 0,
+            kill_fails: true,
+            kill_calls: 0,
+            wait_fails: false,
+            wait_calls: 0,
+        };
+        let mut budget = ScriptedWindowProbeBudget::new(&[true, true, false], &[true, true, false]);
+
+        let result = supervise_window_probe(&mut probe, &mut budget);
+
+        assert_eq!(result, Err("window probe cleanup failed"));
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 0);
+    }
+
+    #[test]
+    fn cleanup_poll_failure_overrides_probe_timeout_after_bounded_reap() {
+        let mut probe = CleanupWindowProbe {
+            poll_results: vec![Ok(None), Err("injected poll failure"), Ok(Some(false))],
+            polls: 0,
+            kill_fails: false,
+            kill_calls: 0,
+            wait_fails: false,
+            wait_calls: 0,
+        };
+        let mut budget = ScriptedWindowProbeBudget::new(&[true, true, false], &[true, true, true]);
+
+        let result = supervise_window_probe(&mut probe, &mut budget);
+
+        assert_eq!(result, Err("window probe cleanup failed"));
+        assert_eq!(probe.polls, 3);
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 1);
+    }
+
+    #[test]
+    fn wait_failure_after_deadline_ready_race_has_cleanup_precedence() {
+        let mut probe = CleanupWindowProbe {
+            poll_results: vec![Ok(None), Ok(Some(true))],
+            polls: 0,
+            kill_fails: false,
+            kill_calls: 0,
+            wait_fails: true,
+            wait_calls: 0,
+        };
+        let mut budget = ScriptedWindowProbeBudget::new(&[true, true, false], &[true]);
+
+        let result = supervise_window_probe(&mut probe, &mut budget);
+
+        assert_eq!(result, Err("window probe cleanup failed"));
         assert_eq!(probe.kill_calls, 1);
         assert_eq!(probe.wait_calls, 1);
     }
