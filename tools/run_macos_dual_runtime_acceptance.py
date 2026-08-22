@@ -64,6 +64,7 @@ GUI_FAILURE_RELATIONS = {
     "desktop-window-unobserved": ("failed", "desktop"),
     "application-install-failed": ("failed", "application"),
     "application-interaction-unverified": ("unverified", "application"),
+    "application-interaction-invalid": ("failed", "application"),
     "application-content-verification-failed": ("failed", "application"),
     "cleanup-residual-processes": ("failed", "cleanup"),
     "cleanup-termination-failed": ("failed", "cleanup"),
@@ -217,6 +218,7 @@ class AcceptancePaths:
     work_root: Path
     interaction_plan_root: Path
     acknowledgement_root: Path
+    interaction_plan_sources: dict[str, SourceBinding]
     allow_network: bool
     bindings: dict[str, PathBinding]
 
@@ -424,6 +426,12 @@ def _revalidate_binding(binding: PathBinding, field: str) -> None:
 def _revalidate_bindings(paths: AcceptancePaths) -> None:
     for field, binding in paths.bindings.items():
         _revalidate_binding(binding, field)
+    try:
+        current = _validate_interaction_root(paths.interaction_plan_root)
+    except AcceptanceError as error:
+        raise IntegrityError("interaction plan content or layout changed") from error
+    if current != paths.interaction_plan_sources:
+        raise IntegrityError("interaction plan content or layout changed")
 
 
 def _refresh_root_bindings(paths: AcceptancePaths) -> None:
@@ -438,6 +446,44 @@ def _refresh_root_bindings(paths: AcceptancePaths) -> None:
 
 def _overlaps(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
+
+
+def _physical_path_locator(
+    path: Path,
+) -> tuple[tuple[NodeIdentity, tuple[str, ...]], ...]:
+    anchors: list[tuple[NodeIdentity, tuple[str, ...]]] = []
+    for component in (path, *path.parents):
+        try:
+            metadata = component.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AcceptanceError("path identity could not be captured") from error
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+            raise AcceptanceError("path has an unsafe path component")
+        try:
+            remaining = path.relative_to(component).parts
+        except ValueError as error:
+            raise AcceptanceError("path identity could not be captured") from error
+        if os.name == "nt":
+            remaining = tuple(part.casefold() for part in remaining)
+        anchors.append((_node_identity(metadata), tuple(remaining)))
+    if not anchors:
+        raise AcceptanceError("path identity could not be captured")
+    return tuple(anchors)
+
+
+def _physical_paths_overlap(left: Path, right: Path) -> bool:
+    left_anchors = _physical_path_locator(left)
+    right_anchors = _physical_path_locator(right)
+    for left_identity, left_tail in left_anchors:
+        for right_identity, right_tail in right_anchors:
+            if left_identity != right_identity:
+                continue
+            common = min(len(left_tail), len(right_tail))
+            if left_tail[:common] == right_tail[:common]:
+                return True
+    return False
 
 
 def _regular_executable(path: Path, field: str) -> None:
@@ -598,8 +644,10 @@ def _bounded_entries(root: Path, limit: int, label: str) -> list[Path]:
     return entries
 
 
-def _read_interaction_plan(path: Path, round_id: str, runtime_id: str) -> None:
-    _binding, payload = _read_bound_source(
+def _read_interaction_plan(
+    path: Path, round_id: str, runtime_id: str
+) -> SourceBinding:
+    binding, payload = _read_bound_source(
         path, "interaction plan", max_bytes=MAX_JSON_BYTES
     )
     try:
@@ -619,14 +667,16 @@ def _read_interaction_plan(path: Path, round_id: str, runtime_id: str) -> None:
     ).encode("utf-8")
     if payload != canonical:
         raise AcceptanceError("interaction plan bytes are non-canonical")
+    return binding
 
 
-def _validate_interaction_root(root: Path) -> None:
+def _validate_interaction_root(root: Path) -> dict[str, SourceBinding]:
     if not root.is_dir():
         raise AcceptanceError("interaction-plan-root must be a directory")
     entries = _bounded_entries(root, len(ROUNDS), "interaction plan root")
     if len(entries) != len(ROUNDS) or {entry.name for entry in entries} != set(ROUNDS):
         raise AcceptanceError("interaction plan layout is incomplete or contains extras")
+    sources: dict[str, SourceBinding] = {}
     for round_id in ROUNDS:
         round_root = root / round_id
         _reject_unsafe_components(round_root, "interaction plan")
@@ -639,9 +689,11 @@ def _validate_interaction_root(root: Path) -> None:
         if len(round_entries) != len(expected) or {entry.name for entry in round_entries} != expected:
             raise AcceptanceError("interaction plan layout is incomplete or contains extras")
         for runtime_id in RUNTIME_IDS:
-            _read_interaction_plan(
+            name = f"{round_id}/{runtime_id}.json"
+            sources[name] = _read_interaction_plan(
                 round_root / f"{runtime_id}.json", round_id, runtime_id
             )
+    return sources
 
 
 def _validate_acknowledgement_root(root: Path) -> None:
@@ -700,15 +752,25 @@ def preflight(
     ]
     for tool, field in zip(tools, ("compatforge-cli", "desktop-app", "cc")):
         _regular_executable(tool, field)
-    if len(set(tools)) != len(tools):
-        raise AcceptanceError("tool paths must be distinct")
+    for index, left in enumerate(tools):
+        if any(
+            _overlaps(left, right) or _physical_paths_overlap(left, right)
+            for right in tools[index + 1 :]
+        ):
+            raise AcceptanceError("tool paths must be distinct")
     for root in roots:
-        if _overlaps(root, repository):
+        if _overlaps(root, repository) or _physical_paths_overlap(root, repository):
             raise AcceptanceError("acceptance roots must be outside the repository")
-        if any(_overlaps(root, tool) for tool in tools):
+        if any(
+            _overlaps(root, tool) or _physical_paths_overlap(root, tool)
+            for tool in tools
+        ):
             raise AcceptanceError("acceptance roots overlap a tool path")
     for index, left in enumerate(roots):
-        if any(_overlaps(left, right) for right in roots[index + 1 :]):
+        if any(
+            _overlaps(left, right) or _physical_paths_overlap(left, right)
+            for right in roots[index + 1 :]
+        ):
             raise AcceptanceError("acceptance roots overlap")
 
     cache_root = resolved["cache-root"]
@@ -729,7 +791,9 @@ def preflight(
     for name in ("challenges", "receipts"):
         field = f"acknowledgement-{name}"
         bindings[field] = _capture_binding(resolved["acknowledgement-root"] / name, field)
-    _validate_interaction_root(resolved["interaction-plan-root"])
+    interaction_plan_sources = _validate_interaction_root(
+        resolved["interaction-plan-root"]
+    )
     _validate_acknowledgement_root(resolved["acknowledgement-root"])
     for field, binding in bindings.items():
         _revalidate_binding(binding, field)
@@ -744,6 +808,7 @@ def preflight(
         work_root=resolved["work-root"],
         interaction_plan_root=resolved["interaction-plan-root"],
         acknowledgement_root=resolved["acknowledgement-root"],
+        interaction_plan_sources=interaction_plan_sources,
         allow_network=arguments.allow_network is True,
         bindings=bindings,
     )

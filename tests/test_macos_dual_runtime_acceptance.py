@@ -3760,18 +3760,81 @@ raise SystemExit(1)
             )
 
         if os.name == "nt":
-            namespace = self._argv()
-            namespace[namespace.index("--acknowledgement-root") + 1] = (
-                "\\\\?\\" + str(self.acknowledgements)
-            )
-            with self.assertRaisesRegex(
-                acceptance.AcceptanceError, "non-traversing path"
+            for raw in (
+                "\\\\?\\C:\\acknowledgements",
+                "\\\\.\\C:\\acknowledgements",
+                "\\??\\C:\\acknowledgements",
+                "\\\\?\\UNC\\localhost\\c$\\acknowledgements",
+                "//?/C:/acknowledgements",
+                "\\??/C:\\acknowledgements",
             ):
-                acceptance.preflight(
-                    acceptance.parse_arguments(namespace),
-                    host_system="Darwin",
-                    host_machine="arm64",
-                )
+                with self.subTest(raw=raw), self.assertRaisesRegex(
+                    acceptance.AcceptanceError, "non-traversing path"
+                ):
+                    acceptance._absolute(raw, "acknowledgement-root")
+
+    def test_physical_overlap_detects_nonexistent_ancestor_aliases_but_not_siblings(self) -> None:
+        future = self.external / "future"
+        self.assertTrue(
+            acceptance._physical_paths_overlap(future, future / "nested")
+        )
+        self.assertFalse(
+            acceptance._physical_paths_overlap(
+                self.external / "future-a", self.external / "future-b"
+            )
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows physical alias probes")
+    def test_windows_local_unc_and_junction_aliases_are_rejected(self) -> None:
+        local_parent = self.external
+        drive = local_parent.drive.rstrip(":").lower()
+        relative = str(local_parent)[3:].replace("/", "\\")
+        unc_parent = Path(f"\\\\localhost\\{drive}$\\{relative}")
+        if not unc_parent.is_dir():
+            self.skipTest("localhost administrative share is unavailable")
+
+        unc_plan = unc_parent / self.interactions.name
+        self.assertTrue(acceptance._physical_paths_overlap(self.interactions, unc_plan))
+        existing_alias = self._argv()
+        existing_alias[existing_alias.index("--acknowledgement-root") + 1] = str(
+            unc_plan
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "overlap"):
+            acceptance.preflight(
+                acceptance.parse_arguments(existing_alias),
+                host_system="Darwin",
+                host_machine="arm64",
+            )
+
+        missing_local = local_parent / "future-runtime-store"
+        missing_unc = unc_parent / "future-runtime-store"
+        self.assertTrue(
+            acceptance._physical_paths_overlap(missing_local, missing_unc)
+        )
+        aliased = self._argv()
+        aliased[aliased.index("--runtime-store-root") + 1] = str(missing_local)
+        aliased[aliased.index("--storage-root") + 1] = str(missing_unc)
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "overlap"):
+            acceptance.preflight(
+                acceptance.parse_arguments(aliased),
+                host_system="Darwin",
+                host_machine="arm64",
+            )
+
+        import _winapi
+
+        junction = self.external / "acknowledgement-junction"
+        _winapi.CreateJunction(str(self.acknowledgements), str(junction))
+        junction_argv = self._argv()
+        junction_argv[junction_argv.index("--acknowledgement-root") + 1] = str(
+            junction
+        )
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "unsafe path component"):
+            acceptance.preflight(
+                acceptance.parse_arguments(junction_argv),
+                host_system="Darwin",
+                host_machine="arm64",
+            )
 
     def test_orchestration_has_exact_order_argv_layout_and_one_discovery(self) -> None:
         calls: list[tuple[list[str], dict[str, object]]] = []
@@ -4374,6 +4437,64 @@ raise SystemExit(1)
             (original_parent / "sentinel").read_text(encoding="utf-8"), "unchanged"
         )
 
+    def test_same_length_mtime_restored_plan_mutation_is_integrity_fatal(self) -> None:
+        target = self.interactions / "round-1" / "crossover.json"
+        original = target.read_bytes()
+        self.assertIn(b'"menus"', original)
+        before = target.stat()
+        calls = 0
+
+        def runner(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal calls
+            calls += 1
+            if argv[-1] == "--all":
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps(self._discovery()), ""
+                )
+            target.write_bytes(original.replace(b'"menus"', b'"menuX"', 1))
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps(self._console_summary("crossover")), ""
+            )
+
+        with self.assertRaisesRegex(acceptance.IntegrityError, "interaction plan"):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=runner,
+                launcher=lambda *_args, **_kwargs: FinishedDesktopProcess(),
+                waiter=lambda _process, _timeout: 0,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertEqual(calls, 2)
+        self.assertFalse((self.work / "summary.json").exists())
+
+    def test_added_plan_record_before_projection_is_integrity_fatal(self) -> None:
+        original_comparison = acceptance.build_round_comparison
+        extra = self.interactions / "foreign.json"
+
+        def mutate_before_projection(rounds: object):
+            result = original_comparison(rounds)
+            extra.write_text("{}", encoding="utf-8")
+            return result
+
+        with mock.patch.object(
+            acceptance, "build_round_comparison", side_effect=mutate_before_projection
+        ), self.assertRaisesRegex(acceptance.IntegrityError, "interaction plan"):
+            acceptance.orchestrate(
+                self._arguments(),
+                runner=self._successful_runner,
+                launcher=lambda *_args, **_kwargs: FinishedDesktopProcess(),
+                waiter=lambda _process, _timeout: 0,
+                host_system="Darwin",
+                host_machine="arm64",
+                printer=lambda _line: None,
+            )
+        self.assertTrue(extra.is_file())
+        self.assertFalse((self.work / "summary.json").exists())
+        self.assertFalse((self.work / "comparison.json").exists())
+
     def test_cache_symlink_swap_and_tool_mutation_fail_before_the_next_child(self) -> None:
         original_cache = self.external / "cache-original"
         victim = self.external / "cache-victim"
@@ -4758,6 +4879,90 @@ raise SystemExit(1)
             activated["receipt"]["activated"] = True
             with self.subTest(runtime_id=runtime_id, case="activated-optional-true"):
                 acceptance._project_gui(activated, descriptor)
+
+    def test_invalid_acknowledgement_relation_is_literal_and_preserved(self) -> None:
+        self.assertEqual(
+            acceptance.GUI_FAILURE_RELATIONS["application-interaction-invalid"],
+            ("failed", "application"),
+        )
+        descriptor = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )[0]
+        child = self._gui_summary("crossover")
+        child["applications"][0] = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "appId": "7zip",
+            "status": "failed",
+            "failureClass": "application",
+            "reasonCode": "application-interaction-invalid",
+            "cleanup": True,
+        }
+        _receipt, applications = acceptance._project_gui(child, descriptor)
+        self.assertEqual(
+            applications[0],
+            {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "appId": "7zip",
+                "status": "failed",
+                "failureClass": "application",
+                "reasonCode": "application-interaction-invalid",
+                "cleanup": True,
+            },
+        )
+
+        def runner(
+            argv: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            if argv[-1] == "--all":
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps(self._discovery()), ""
+                )
+            if Path(argv[3]).name == "run_macos_headless_preview.py":
+                pack_id = argv[argv.index("--pack-id") + 1]
+                runtime_id = "crossover" if "crossover" in pack_id else "whisky"
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps(self._console_summary(runtime_id)), ""
+                )
+            runtime_id = argv[argv.index("--runtime-id") + 1]
+            failed = self._gui_summary(runtime_id)
+            failed["applications"][0] = {
+                "schemaVersion": "1",
+                "runtimeId": runtime_id,
+                "appId": "7zip",
+                "status": "failed",
+                "failureClass": "application",
+                "reasonCode": "application-interaction-invalid",
+                "cleanup": True,
+            }
+            return subprocess.CompletedProcess(argv, 1, json.dumps(failed), "")
+
+        summary = acceptance.orchestrate(
+            self._arguments(),
+            runner=runner,
+            launcher=lambda *_args, **_kwargs: FinishedDesktopProcess(),
+            waiter=lambda _process, _timeout: 0,
+            host_system="Darwin",
+            host_machine="arm64",
+            printer=lambda _line: None,
+        )
+        self.assertEqual(summary["status"], "failed")
+        invalid_results = [
+            runtime["applications"][1]
+            for round_entry in summary["rounds"]
+            for runtime in round_entry["runtimes"]
+        ]
+        self.assertEqual(len(invalid_results), 4)
+        self.assertTrue(
+            all(
+                result["reasonCode"] == "application-interaction-invalid"
+                and result["status"] == "failed"
+                and result["failureClass"] == "application"
+                for result in invalid_results
+            )
+        )
+        self.assertNotIn("gui-summary-invalid", json.dumps(summary))
 
     def test_real_provider_receipt_shape_projects_through_gui_compact_summary(self) -> None:
         runtime_id = "crossover"
