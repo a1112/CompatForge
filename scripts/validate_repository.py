@@ -4979,10 +4979,12 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "O_NONBLOCK",
         "O_RDONLY",
         "O_WRONLY",
+        "SEEK_SET",
         "close",
         "fsencode",
         "fstat",
         "fsync",
+        "lseek",
         "name",
         "open",
         "read",
@@ -5347,6 +5349,10 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
             if isinstance(base, ast.Name) and aliases.get(base.id) == "ctypes":
                 if node.attr not in allowed_ctypes_attributes:
                     return True
+                if node.attr in {"CDLL", "WinDLL"}:
+                    parent = parents.get(node)
+                    if not isinstance(parent, ast.Call) or parent.func is not node:
+                        return True
             if (
                 isinstance(base, ast.Name)
                 and aliases.get(base.id) == "argparse"
@@ -5442,6 +5448,16 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
                 for argument in node.args
             ):
                 return True
+        if (
+            isinstance(base, ast.Name)
+            and aliases.get(base.id) == "os"
+            and node.func.attr == "lseek"
+            and (
+                scope(node) != "_invalidate_descriptor_if_owned"
+                or ast.unparse(node) != "os.lseek(descriptor, 0, os.SEEK_SET)"
+            )
+        ):
+            return True
     return False
 
 

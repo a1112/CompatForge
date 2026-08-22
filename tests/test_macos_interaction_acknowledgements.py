@@ -540,7 +540,7 @@ class AcknowledgementWatchTests(unittest.TestCase):
                 self.helper.read_acknowledgement(target), acknowledgement
             )
 
-    def test_failed_directory_sync_removes_the_published_receipt(self) -> None:
+    def test_failed_directory_sync_invalidates_the_published_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "receipt.json"
@@ -557,10 +557,144 @@ class AcknowledgementWatchTests(unittest.TestCase):
                 ):
                     self.helper.write_acknowledgement(target, acknowledgement)
 
-            self.assertFalse(target.exists())
-            self.assertEqual(tuple(root.iterdir()), ())
+            self.assertTrue(target.exists())
+            with self.assertRaises(self.helper.AcknowledgementError):
+                self.helper.read_acknowledgement(target)
 
-    def test_failed_validation_unlinks_owned_final_even_when_it_was_hardlinked(self) -> None:
+    def test_interrupt_at_first_created_file_fstat_invalidates_staging_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "receipt.json"
+            acknowledgement = self.helper.make_acknowledgement(self._challenge_for(0))
+            binding = self.helper._bind_directory(root, "acknowledgement parent")
+            original_open = self.helper._relative_open
+            original_fstat = self.helper.os.fstat
+            created_descriptor: list[int] = []
+            interrupted = [False]
+
+            def remember_created_descriptor(*args: object, **kwargs: object) -> int:
+                descriptor = original_open(*args, **kwargs)
+                created_descriptor.append(descriptor)
+                return descriptor
+
+            def interrupt_first_created_fstat(descriptor: int) -> os.stat_result:
+                if descriptor in created_descriptor and not interrupted[0]:
+                    interrupted[0] = True
+                    raise KeyboardInterrupt
+                return original_fstat(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_relative_open",
+                        side_effect=remember_created_descriptor,
+                    ),
+                    mock.patch.object(
+                        self.helper.os,
+                        "fstat",
+                        side_effect=interrupt_first_created_fstat,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        self.helper.AcknowledgementError,
+                        "^operator cancelled acknowledgement$",
+                    ):
+                        self.helper.write_acknowledgement(
+                            target, acknowledgement, binding
+                        )
+            finally:
+                self.helper._close_directory(binding)
+
+            self.assertTrue(interrupted[0])
+            tombstones = tuple(root.iterdir())
+            self.assertEqual(len(tombstones), 1)
+            self.assertEqual(tombstones[0].read_bytes(), b"!")
+
+    def test_sync_failure_does_not_use_unsafe_path_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "receipt.json"
+            acknowledgement = self.helper.make_acknowledgement(self._challenge_for(0))
+
+            unlink = mock.Mock(side_effect=OSError("injected unlink failure"))
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_sync_directory",
+                    side_effect=OSError("injected directory sync failure"),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_relative_unlink",
+                    unlink,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    self.helper.AcknowledgementError,
+                    "^acknowledgement file could not be created safely$",
+                ):
+                    self.helper.write_acknowledgement(target, acknowledgement)
+
+            unlink.assert_not_called()
+            self.assertTrue(target.exists())
+            with self.assertRaises(self.helper.AcknowledgementError):
+                self.helper.read_acknowledgement(target)
+
+    def test_cleanup_namespace_substitution_preserves_foreign_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "receipt.json"
+            displaced = root / "owned-receipt.json"
+            foreign_payload = b"foreign inode must survive unchanged"
+            acknowledgement = self.helper.make_acknowledgement(self._challenge_for(0))
+            original_open = self.helper._relative_open
+            original_unlink = self.helper._relative_unlink
+            substituted = [False]
+
+            def substitute_before_open(
+                binding: object, name: str, flags: int, mode: int = 0o600
+            ) -> int:
+                if name == target.name and not substituted[0]:
+                    target.replace(displaced)
+                    target.write_bytes(foreign_payload)
+                    substituted[0] = True
+                return original_open(binding, name, flags, mode)
+
+            def substitute_before_unlink(binding: object, name: str) -> None:
+                if name == target.name and not substituted[0]:
+                    target.replace(displaced)
+                    target.write_bytes(foreign_payload)
+                    substituted[0] = True
+                original_unlink(binding, name)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_sync_directory",
+                    side_effect=OSError("injected directory sync failure"),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_relative_open",
+                    side_effect=substitute_before_open,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_relative_unlink",
+                    side_effect=substitute_before_unlink,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    self.helper.AcknowledgementError,
+                    "^acknowledgement cleanup failed safely$",
+                ):
+                    self.helper.write_acknowledgement(target, acknowledgement)
+
+            self.assertTrue(substituted[0])
+            self.assertEqual(target.read_bytes(), foreign_payload)
+
+    def test_failed_validation_invalidates_owned_hardlinked_inode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "receipt.json"
@@ -583,11 +717,12 @@ class AcknowledgementWatchTests(unittest.TestCase):
                 ):
                     self.helper.write_acknowledgement(target, acknowledgement)
 
-            self.assertFalse(target.exists())
+            self.assertTrue(target.is_file())
             self.assertTrue(attacker_link.is_file())
-            self.assertEqual(
-                self.helper.read_acknowledgement(attacker_link), acknowledgement
-            )
+            with self.assertRaises(self.helper.AcknowledgementError):
+                self.helper.read_acknowledgement(target)
+            with self.assertRaises(self.helper.AcknowledgementError):
+                self.helper.read_acknowledgement(attacker_link)
 
     def test_bound_directory_blocks_or_detects_mid_write_namespace_substitution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -631,7 +766,9 @@ class AcknowledgementWatchTests(unittest.TestCase):
                         self.helper.read_acknowledgement(target), acknowledgement
                     )
                 else:
-                    self.assertEqual(tuple(displaced.iterdir()), ())
+                    tombstones = tuple(displaced.iterdir())
+                    self.assertEqual(len(tombstones), 1)
+                    self.assertEqual(tombstones[0].read_bytes(), b"!")
                     self.assertEqual(tuple(receipts.iterdir()), ())
             finally:
                 self.helper._close_directory(binding)
@@ -663,10 +800,9 @@ class AcknowledgementWatchTests(unittest.TestCase):
                         input_fn=lambda _prompt: "yes",
                     )
             self.assertEqual(target.read_bytes(), attacker)
-            self.assertEqual(
-                {path.name for path in receipts.iterdir()},
-                {name},
-            )
+            tombstones = tuple(path for path in receipts.iterdir() if path != target)
+            self.assertEqual(len(tombstones), 1)
+            self.assertTrue(tombstones[0].read_bytes().startswith(b"!"))
 
     @unittest.skipUnless(os.name == "nt", "Windows reparse contract")
     def test_windows_directory_binding_rejects_reparse_points(self) -> None:
@@ -715,7 +851,9 @@ class AcknowledgementWatchTests(unittest.TestCase):
                     )
             self.assertFalse((receipts / name).exists())
             self.assertTrue((challenges / name).is_file())
-            self.assertEqual(tuple(receipts.iterdir()), ())
+            tombstones = tuple(receipts.iterdir())
+            self.assertEqual(len(tombstones), 1)
+            self.assertEqual(tombstones[0].read_bytes(), b"!")
 
     def test_watch_timeout_uses_injected_clock_and_bounded_polling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1188,6 +1326,16 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "__builtins__.__dict__['breakpoint']()",
             "argparse._os.system('calc')",
             "argparse._sys.modules['os'].system('calc')",
+            (
+                "def _mutant(loader=ctypes.WinDLL):\n"
+                "    return loader('kernel32').WinExec('calc', 0)\n"
+                "_mutant()"
+            ),
+            (
+                "def _mutant(loader=ctypes.CDLL):\n"
+                "    return loader(None).system(b'calc')\n"
+                "_mutant()"
+            ),
         )
         for marker in forbidden:
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
@@ -1222,6 +1370,7 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "safe_parser = argparse.ArgumentParser(add_help=False)",
             "safe_type_error = argparse.ArgumentTypeError('safe')",
             "safe_namespace = argparse.Namespace(value=True)",
+            "def safe_default(value=ctypes.c_int(1).value):\n    return value",
             "safe_stat = Path('evidence.json').stat()",
             "safe_mapping = {'x': True}\nsafe_value = safe_mapping['x']",
         )

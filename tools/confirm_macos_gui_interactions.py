@@ -629,25 +629,64 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
-def _remove_relative_if_owned(
+def _invalidate_descriptor_if_owned(
     binding: DirectoryBinding,
     name: str,
     identity: tuple[int, int, int],
-) -> None:
+    descriptor: int,
+) -> bool:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or _node_identity(opened) != identity:
+        return False
     try:
         current = _relative_stat(binding, name)
-    except OSError:
-        return
+    except FileNotFoundError:
+        current_is_owned = False
+    else:
+        current_is_owned = (
+            stat.S_ISREG(current.st_mode)
+            and not stat.S_ISLNK(current.st_mode)
+            and not _is_reparse(current)
+            and _node_identity(current) == identity
+        )
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.write(descriptor, b"!") != 1:
+        raise OSError("cleanup invalidation failed")
+    os.fsync(descriptor)
+    final = os.fstat(descriptor)
+    if _node_identity(final) != identity:
+        return False
+    try:
+        after = _relative_stat(binding, name)
+    except FileNotFoundError:
+        return False
+    return current_is_owned and _node_identity(after) == identity
+
+
+def _invalidate_relative_if_owned(
+    binding: DirectoryBinding,
+    name: str,
+    identity: tuple[int, int, int],
+) -> bool:
+    try:
+        entry = _relative_stat(binding, name)
+    except FileNotFoundError:
+        return True
     if (
-        stat.S_ISREG(current.st_mode)
-        and not stat.S_ISLNK(current.st_mode)
-        and not _is_reparse(current)
-        and _node_identity(current) == identity
+        not stat.S_ISREG(entry.st_mode)
+        or stat.S_ISLNK(entry.st_mode)
+        or _is_reparse(entry)
+        or _node_identity(entry) != identity
     ):
-        try:
-            _relative_unlink(binding, name)
-        except OSError:
-            pass
+        return False
+    flags = os.O_WRONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_BINARY | _O_NONBLOCK
+    descriptor = _relative_open(binding, name, flags)
+    try:
+        return _invalidate_descriptor_if_owned(
+            binding, name, identity, descriptor
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _atomic_publish(
@@ -754,7 +793,17 @@ def _write_new_file(
         else:
             raise FileExistsError
         descriptor = _relative_open(binding, staged_name, flags, 0o600)
-        opened = os.fstat(descriptor)
+        try:
+            opened = os.fstat(descriptor)
+        except BaseException:
+            try:
+                cleanup_entry = os.fstat(descriptor)
+            except OSError:
+                pass
+            else:
+                if stat.S_ISREG(cleanup_entry.st_mode):
+                    identity = _node_identity(cleanup_entry)
+            raise
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             _fail(f"{label} file is unsafe")
         identity = _node_identity(opened)
@@ -779,6 +828,19 @@ def _write_new_file(
             _fail(f"{label} file identity changed")
         _atomic_publish(binding, staged_name, path.name)
         published = True
+        descriptor = _relative_open(
+            binding,
+            path.name,
+            os.O_WRONLY | _O_CLOEXEC | _O_NOFOLLOW | _O_BINARY | _O_NONBLOCK,
+        )
+        reopened = os.fstat(descriptor)
+        reopened_entry = _relative_stat(binding, path.name)
+        if (
+            not stat.S_ISREG(reopened.st_mode)
+            or _node_identity(reopened) != identity
+            or _node_identity(reopened_entry) != identity
+        ):
+            _fail(f"{label} file identity changed")
         _sync_directory(binding)
         final = _relative_stat(binding, path.name)
         _revalidate_directory(binding, f"{label} parent")
@@ -803,17 +865,51 @@ def _write_new_file(
     except BaseException as error:
         failure = (error, None)
     finally:
-        if descriptor is not None:
+        cleanup_error: OSError | None = None
+        if failure is not None and identity is None and descriptor is not None:
             try:
-                os.close(descriptor)
+                cleanup_entry = os.fstat(descriptor)
             except OSError:
                 pass
-        if failure is not None and identity is not None:
-            _remove_relative_if_owned(binding, staged_name, identity)
-            if published:
-                _remove_relative_if_owned(binding, path.name, identity)
+            else:
+                if stat.S_ISREG(cleanup_entry.st_mode):
+                    identity = _node_identity(cleanup_entry)
+        if descriptor is not None:
+            if failure is not None and identity is not None:
+                try:
+                    neutralized = _invalidate_descriptor_if_owned(
+                        binding,
+                        path.name if published else staged_name,
+                        identity,
+                        descriptor,
+                    )
+                except OSError as error:
+                    cleanup_error = error
+                else:
+                    if not neutralized:
+                        cleanup_error = OSError("owned cleanup target changed")
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if failure is not None:
+                    cleanup_error = error
+        elif failure is not None and identity is not None:
+            try:
+                neutralized = _invalidate_relative_if_owned(
+                    binding, path.name if published else staged_name, identity
+                )
+            except OSError as error:
+                cleanup_error = error
+            else:
+                if not neutralized:
+                    cleanup_error = OSError("owned cleanup target changed")
         if owned_directory:
             _close_directory(binding)
+        if cleanup_error is not None:
+            failure = (
+                AcknowledgementError(f"{label} cleanup failed safely"),
+                cleanup_error,
+            )
     if failure is not None:
         error, cause = failure
         if cause is not None:
