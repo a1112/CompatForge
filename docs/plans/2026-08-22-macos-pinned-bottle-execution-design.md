@@ -109,7 +109,7 @@ context.
   descriptor into the Wine child, rebuilds the complete Wine argument vector, and retains the
   logical path in policy evidence.
 - `compatforge-cli` exposes a closed acceptance-only prepared command that performs capture,
-  inspection, planning, authorization, held-work-root evidence publication, and launch within one
+  inspection, planning, authorization, anonymous-output-fd evidence writing, and launch within one
   process so the lease never has to be serialized or reopened. It accepts only Bottle id
   `gui-sumatrapdf`, the fixed relative executable location, `BottleInPlace`, x86-64, and no guest
   arguments.
@@ -191,7 +191,8 @@ Required RED/GREEN coverage includes:
   documented and no test claims a stronger guarantee from mode bits alone;
 - anonymous execution bytes remain the initially captured digest;
 - child receives the inherited descriptor and never the naked fixed path;
-- descriptor is closed on every preparation, spawn, timeout, and cleanup failure;
+- descriptor ownership is released on every preparation, spawn, timeout, and cleanup path; RAII
+  guarantees a close attempt without claiming `OwnedFd::drop` reports success;
 - persisted plan/full evidence contain only their existing authorized logical paths;
 - CLI-to-Python output-fd substitution, duplicate/closed/stdin/stdout/stderr fd, digest/size mismatch,
   over-limit bytes, directory-path substitution, ACL-capable create-to-unlink opener boundary, and

@@ -108,6 +108,7 @@ git commit -s -m "feat: inspect held PE files"
 - Modify: `crates/compatforge-guest-artifact/src/lib.rs`
 - Create: `crates/compatforge-guest-artifact/src/pinned_platform.rs`
 - Modify: `crates/compatforge-guest-artifact/Cargo.toml`
+- Modify: `Cargo.lock`
 
 **Step 1: Add RED platform and capture tests**
 
@@ -235,11 +236,18 @@ spawn cannot redirect those bytes and is reported by post-spawn integrity revali
 **Step 5: Run GREEN and commit**
 
 ```bash
+cargo check -p compatforge-guest-artifact --all-targets --offline
+git diff -- Cargo.lock
 cargo test -p compatforge-guest-artifact --all-targets --locked
 cargo clippy -p compatforge-guest-artifact --all-targets --locked -- -D warnings
-git add crates/compatforge-guest-artifact
+git add crates/compatforge-guest-artifact Cargo.lock
 git commit -s -m "feat: pin SumatraPDF Bottle bytes"
 ```
+
+The unlocked offline check is the only lock refresh. Before the locked gates, require the lock diff
+to add only the expected `libc` dependency edge to the existing workspace
+`compatforge-guest-artifact` package; reject new registry packages, version changes, or unrelated
+workspace edges.
 
 ### Task 4: Prepare and authorize only with the same lease
 
@@ -300,6 +308,7 @@ git commit -s -m "feat: authorize pinned Bottle leases"
 **Files:**
 - Modify: `crates/compatforge-process/src/lib.rs`
 - Modify: `crates/compatforge-process/Cargo.toml`
+- Modify: `Cargo.lock`
 
 **Step 1: Add RED command/ownership tests**
 
@@ -345,11 +354,16 @@ Non-macOS calls return a stable unsupported-platform error before spawning. No r
 **Step 4: Run GREEN and commit**
 
 ```bash
+cargo check -p compatforge-process --all-targets --offline
+git diff -- Cargo.lock
 cargo test -p compatforge-process --all-targets --locked
 cargo clippy -p compatforge-process --all-targets --locked -- -D warnings
-git add crates/compatforge-process
+git add crates/compatforge-process Cargo.lock
 git commit -s -m "feat: supervise pinned SumatraPDF descriptors"
 ```
+
+Require the lock diff to add only the existing workspace `libc` edge to `compatforge-process`; no
+registry package, version, or unrelated workspace edge may change.
 
 ### Task 6: Complete one closed CLI capture-to-launch session
 
@@ -357,6 +371,7 @@ git commit -s -m "feat: supervise pinned SumatraPDF descriptors"
 - Modify: `apps/cli/src/main.rs`
 - Modify: `apps/cli/Cargo.toml`
 - Modify: `tests/test_gui_baseline_contracts.py`
+- Modify: `Cargo.lock`
 
 **Step 1: Add RED orchestration tests**
 
@@ -426,26 +441,41 @@ only then compute the returned binding. It must not depend on the incoming share
 provides the close attempt; do not map an unobservable `OwnedFd::drop` result into a claimed error.
 
 ```powershell
+cargo check -p compatforge-cli --all-targets --offline
+git diff -- Cargo.lock
 cargo test -p compatforge-cli --all-targets --locked
 cargo clippy -p compatforge-cli --all-targets --locked -- -D warnings
 & '<python-3.12>' -S -B -m unittest tests.test_gui_baseline_contracts -v
-git add apps/cli tests/test_gui_baseline_contracts.py
+git add apps/cli tests/test_gui_baseline_contracts.py Cargo.lock
 git commit -s -m "feat: launch a pinned SumatraPDF session"
 ```
+
+Require the lock diff to add only the local `compatforge-guest-artifact` edge to the existing
+`compatforge-cli` package; reject new registry packages, version changes, or unrelated edges.
 
 ### Task 7: Stop for the real macOS Wine spike
 
 **Files:**
 - Modify: `crates/compatforge-process/Cargo.toml`
+- Modify: `Cargo.lock`
 - Create: `crates/compatforge-process/tests/macos_pinned_sumatrapdf_spike.rs`
 - Create: `tests/macos_pinned_cli_spike.py`
 - Create: `tests/test_macos_pinned_cli_spike.py`
-- Create: `docs/testing/macos-pinned-sumatrapdf-spike.md` only as a local handoff until redacted
-  evidence exists
+- Create after both real Runtimes pass: `docs/testing/macos-pinned-sumatrapdf-spike.md`
 
 **Step 1: Add the complete test-only CLI handoff driver**
 
 `tests/macos_pinned_cli_spike.py` accepts exactly `--manifest <external-canonical-json>` on macOS.
+The manifest is canonical JSON with no duplicate or extra keys and exactly this closed shape:
+
+```json
+{"cli":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"runtimes":[{"config":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"logicalExecutable":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"mutationPayload":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"request":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"runtimeId":"crossover","workRoot":"<absolute>"},{"config":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"logicalExecutable":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"mutationPayload":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"request":{"path":"<absolute>","sha256":"sha256:<64-lower-hex>"},"runtimeId":"whisky","workRoot":"<absolute>"}],"schemaVersion":1,"timeoutMilliseconds":60000,"windowTitleTokens":["SumatraPDF"]}
+```
+
+Require the literal Runtime order, timeout and window token. Bind every input with no-follow regular
+file identity, bounded size and the supplied digest before launch and revalidate it after each run.
+The CLI path must equal the just-built artifact selected in Step 3; the two work roots must be
+external, distinct, held, and physically non-overlapping with all input/storage/Bottle/Runtime roots.
 For each CrossOver/Whisky record it opens the reviewed existing work root, creates two independent
 `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC` mode-`0600` output files, immediately unlinks them, and
 invokes the exact closed CLI with
@@ -459,7 +489,7 @@ extra fd, named output, read-only/write-only/append output, seek-before-child-ex
 receipt order, bound/digest mismatch, path leak, and close-failure mutants. The real driver is
 test-only and is not called by default CI or `run_gui_baseline.py`.
 
-**Step 2: Add the deterministic post-spawn Rust harness**
+**Step 2: Add the deterministic post-spawn Rust harness and run host gates**
 
 Add `compatforge-orchestrator` as a dev-dependency only; this does not change the production
 dependency graph. Create host-independent fake-process ordering tests in the integration-test file
@@ -483,13 +513,35 @@ The harness must have two explicit phases per Runtime:
 Add host-independent fake-process tests for this ordering before running the ignored test. The
 production command must contain no corresponding hook or environment branch.
 
+Refresh only the expected local dev-dependency edge, run both new host-independent suites, and
+commit the permanent harness before touching a commercial Runtime:
+
+```bash
+cargo check -p compatforge-process --all-targets --offline
+git diff -- Cargo.lock
+python3.12 -S -B -m unittest tests.test_macos_pinned_cli_spike -v
+cargo test -p compatforge-process --test macos_pinned_sumatrapdf_spike --locked
+git add Cargo.lock crates/compatforge-process/Cargo.toml \
+  crates/compatforge-process/tests/macos_pinned_sumatrapdf_spike.rs \
+  tests/macos_pinned_cli_spike.py tests/test_macos_pinned_cli_spike.py
+git commit -s -m "test: add pinned macOS CLI spike"
+```
+
+Require the lock diff to add only the local `compatforge-orchestrator` dev-dependency edge to
+`compatforge-process`; reject new registry packages, version changes, or unrelated edges.
+
 **Step 3: Build and run the exact branch on Apple Silicon**
 
-Build the CLI with the existing locked toolchain. First use the Python driver to run the complete
+Build the CLI into one explicit external target directory with the existing locked offline toolchain.
+Set the manifest `cli.path` to that exact artifact and `cli.sha256` to its freshly computed digest.
+First use the Python driver to run the complete
 closed CLI fd handoff against a stable fixed SumatraPDF asset in both CrossOver and Whisky. Then run
 the ignored Rust harness against a dedicated disposable copy:
 
 ```bash
+export CARGO_TARGET_DIR=/private/.../compatforge-pinned-target
+cargo build -p compatforge-cli --locked --offline
+test "$(python3.12 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cli"]["path"])' /private/.../pinned-spike.json)" = "$CARGO_TARGET_DIR/debug/compatforge-cli"
 python3.12 -S -B -m tests.macos_pinned_cli_spike \
   --manifest /private/.../pinned-spike.json
 COMPATFORGE_PINNED_SPIKE_INPUT=/private/.../pinned-spike.json \
@@ -516,6 +568,13 @@ phase complete.
 If both pass, record only redacted Runtime-id/window/cleanup results and continue. Never record the
 manifest path, source path, work root, random staging name, or descriptor number. The production
 acknowledgement path is verified after runner integration in Task 8.
+
+Create the redacted handoff document only after both Runtimes pass, then commit it separately:
+
+```bash
+git add docs/testing/macos-pinned-sumatrapdf-spike.md
+git commit -s -m "docs: record pinned macOS Wine spike"
+```
 
 ### Task 8: Select the pinned session only for SumatraPDF
 
