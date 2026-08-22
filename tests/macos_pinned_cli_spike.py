@@ -52,7 +52,6 @@ _EVENT_BASE_KEYS = (
     "elapsedMilliseconds",
     "kind",
 )
-_EVENT_OPTIONAL_KEYS = ("processId", "output", "exit", "message")
 _EVENT_KINDS = {
     "started",
     "terminate-requested",
@@ -178,7 +177,12 @@ def _validate_manifest(value: object) -> dict[str, object]:
     cli_path = manifest["cli"]["path"]  # type: ignore[index]
     if PurePosixPath(cli_path).name != "compatforge-cli":
         raise SpikeError("CLI artifact is invalid")
-    if manifest["schemaVersion"] != 1 or manifest["timeoutMilliseconds"] != 60_000:
+    if (
+        type(manifest["schemaVersion"]) is not int
+        or manifest["schemaVersion"] != 1
+        or type(manifest["timeoutMilliseconds"]) is not int
+        or manifest["timeoutMilliseconds"] != 60_000
+    ):
         raise SpikeError("manifest constants are invalid")
     if manifest["windowTitleTokens"] != ["SumatraPDF"]:
         raise SpikeError("window token is invalid")
@@ -236,6 +240,28 @@ def _absolute_json_paths(raw: bytes) -> set[str]:
     return paths
 
 
+def _runtime_protected_roots(raw: bytes) -> set[str]:
+    value = _parse_json(raw, "Runtime config", MAX_INPUT_BYTES)
+    if type(value) is not dict or type(value.get("runtimeBindings")) is not list or not value["runtimeBindings"]:
+        raise SpikeError("Runtime config bindings are invalid")
+    protected: set[str] = set()
+    for binding in value["runtimeBindings"]:
+        if type(binding) is not dict:
+            raise SpikeError("Runtime config binding is invalid")
+        executable = binding.get("executable")
+        wineserver = binding.get("wineserverExecutable")
+        paths = [executable]
+        if wineserver is not None:
+            paths.append(wineserver)
+        for candidate in paths:
+            path = _closed_absolute_path(candidate, "Runtime executable")
+            parent = str(PurePosixPath(path).parent)
+            if parent == "/":
+                raise SpikeError("Runtime executable root is invalid")
+            protected.add(parent)
+    return protected
+
+
 def _bind_manifest_inputs(
     manifest: dict[str, object],
     boundary: object,
@@ -269,6 +295,8 @@ def _bind_manifest_inputs(
         forbidden.add(path)
         if label in ("config", "request"):
             forbidden.update(_absolute_json_paths(binding.payload))
+        if label == "config":
+            forbidden.update(_runtime_protected_roots(binding.payload))
     return bindings, runtime_values, forbidden
 
 
@@ -291,11 +319,11 @@ def _validate_work_roots(
     for runtime in runtime_values:
         root = _closed_absolute_path(runtime["workRoot"], "work root")
         canonical = boundary.resolve_canonical(root, directory=True)
-        if canonical != root or _paths_overlap(root, repository_root):
+        if canonical != root or boundary.paths_physically_overlap(root, repository_root):
             raise SpikeError("work root is not external")
-        if any(_paths_overlap(root, protected) for protected in resolved_forbidden):
+        if any(boundary.paths_physically_overlap(root, protected) for protected in resolved_forbidden):
             raise SpikeError("work root overlaps reviewed input")
-        if any(_paths_overlap(root, other) for other in roots):
+        if any(boundary.paths_physically_overlap(root, other) for other in roots):
             raise SpikeError("work roots overlap")
         roots.append(root)
     return roots
@@ -351,15 +379,6 @@ def _observe_window(process: object, tokens: tuple[str, ...], timeout_seconds: f
     raise SpikeError("window observation timed out")
 
 
-def _ordered_event(value: dict[str, object]) -> bool:
-    keys = tuple(value)
-    if keys[: len(_EVENT_BASE_KEYS)] != _EVENT_BASE_KEYS:
-        return False
-    suffix = keys[len(_EVENT_BASE_KEYS) :]
-    expected_suffix = tuple(key for key in _EVENT_OPTIONAL_KEYS if key in value)
-    return suffix == expected_suffix
-
-
 def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, object]]:
     if not raw or len(raw) > MAX_TRANSCRIPT_BYTES or not raw.endswith(b"\n"):
         raise SpikeError("CLI transcript is invalid")
@@ -373,7 +392,11 @@ def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, ob
         raise SpikeError("CLI transcript is incomplete")
     values = [_parse_json(line, "CLI record", MAX_TRANSCRIPT_BYTES) for line in lines]
     receipt = _require_keys(values[-1], ("outputs", "recordType", "schemaVersion"), "receipt")
-    if receipt["recordType"] != "pinned-evidence-receipt" or receipt["schemaVersion"] != 1:
+    if (
+        receipt["recordType"] != "pinned-evidence-receipt"
+        or type(receipt["schemaVersion"]) is not int
+        or receipt["schemaVersion"] != 1
+    ):
         raise SpikeError("receipt is invalid")
     if _canonical_json(receipt) != lines[-1]:
         raise SpikeError("receipt is not canonical")
@@ -382,21 +405,30 @@ def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, ob
     previous_elapsed = -1
     process_id: int | None = None
     for index, event_value in enumerate(values[:-1]):
-        event = _require_keys(
-            event_value,
-            tuple(sorted(set(_EVENT_BASE_KEYS + _EVENT_OPTIONAL_KEYS).intersection(event_value))),
-            "RuntimeEvent",
-        )
-        if not _ordered_event(event) or terminal_seen:
+        if type(event_value) is not dict:
+            raise SpikeError("RuntimeEvent shape is invalid")
+        event = event_value
+        kind = event.get("kind")
+        expected_keys = {
+            "started": _EVENT_BASE_KEYS + ("processId",),
+            "terminate-requested": _EVENT_BASE_KEYS + ("processId", "message"),
+            "timed-out": _EVENT_BASE_KEYS + ("processId", "message"),
+            "grace-period-expired": _EVENT_BASE_KEYS + ("processId", "message"),
+            "wine-server-stop-requested": _EVENT_BASE_KEYS + ("message",),
+            "exited": _EVENT_BASE_KEYS + ("exit",),
+        }.get(kind)
+        if expected_keys is None or tuple(event) != expected_keys or terminal_seen:
             raise SpikeError("RuntimeEvent order is invalid")
         if (
             event.get("schemaVersion") != "1"
             or event.get("requestId") != "pinned-sumatrapdf"
+            or type(event.get("sequence")) is not int
+            or not 0 <= event["sequence"] <= 2**64 - 1
             or event.get("sequence") != index
             or type(event.get("elapsedMilliseconds")) is not int
+            or not 0 <= event["elapsedMilliseconds"] <= 2**64 - 1
             or event["elapsedMilliseconds"] < previous_elapsed
-            or event.get("kind") not in _EVENT_KINDS
-            or "output" in event
+            or kind not in _EVENT_KINDS
         ):
             raise SpikeError("RuntimeEvent is invalid")
         expected_message = {
@@ -407,32 +439,32 @@ def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, ob
             "wine-server-stop-requested": "stopping wineserver",
             "exited": None,
         }[event["kind"]]
-        if event.get("message") != expected_message:
+        if ("message" in event) != (expected_message is not None) or event.get("message") != expected_message:
             raise SpikeError("RuntimeEvent message changed")
         if index == 0 and event["kind"] != "started":
             raise SpikeError("started RuntimeEvent is missing")
         if index > 0 and event["kind"] == "started":
             raise SpikeError("started RuntimeEvent was repeated")
-        if index == 0:
+        if kind == "started":
             if type(event.get("processId")) is not int or event["processId"] <= 0:
                 raise SpikeError("started RuntimeEvent process is invalid")
             process_id = event["processId"]  # type: ignore[assignment]
-        elif event.get("processId") != process_id:
+        elif "processId" in event and (
+            type(event["processId"]) is not int or event["processId"] <= 0 or event["processId"] != process_id
+        ):
             raise SpikeError("RuntimeEvent process identity changed")
         if json.dumps(event, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8") != lines[index]:
             raise SpikeError("RuntimeEvent changed shape")
         previous_elapsed = event["elapsedMilliseconds"]  # type: ignore[assignment]
-        if event["kind"] == "exited":
+        if kind == "exited":
             exit_value = event.get("exit")
-            if type(exit_value) is not dict or tuple(sorted(exit_value)) != ("code", "success"):
+            if type(exit_value) is not dict or tuple(exit_value) not in (("code", "success"), ("success",)):
                 raise SpikeError("terminal RuntimeEvent is invalid")
-            if type(exit_value["success"]) is not bool or not (
-                exit_value["code"] is None or type(exit_value["code"]) is int
+            if type(exit_value["success"]) is not bool or (
+                "code" in exit_value and type(exit_value["code"]) is not int
             ):
                 raise SpikeError("terminal RuntimeEvent is invalid")
             terminal_seen = True
-        elif "exit" in event:
-            raise SpikeError("nonterminal RuntimeEvent has exit state")
         events.append(event)
     if not terminal_seen or events[-1]["kind"] != "exited":
         raise SpikeError("terminal RuntimeEvent is missing")
@@ -679,6 +711,21 @@ class SystemBoundary:
         if not directory and not stat.S_ISREG(metadata.st_mode):
             raise SpikeError("reviewed file is invalid")
         return resolved
+
+    @staticmethod
+    def paths_physically_overlap(left: str, right: str) -> bool:
+        if _paths_overlap(left, right):
+            return True
+        left_path = Path(left)
+        right_path = Path(right)
+        try:
+            if os.path.samefile(left_path, right_path):
+                return True
+            if any(os.path.samefile(parent, right_path) for parent in left_path.parents):
+                return True
+            return any(os.path.samefile(left_path, parent) for parent in right_path.parents)
+        except OSError:
+            return False
 
     def _read_bound_file(self, path: str, expected_sha256: str | None) -> FileBinding:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK

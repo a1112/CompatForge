@@ -10,6 +10,33 @@ trait PhaseDriver {
     fn require_clean(&mut self) -> Result<(), &'static str>;
 }
 
+trait WindowProbeProcess {
+    fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str>;
+    fn kill(&mut self) -> Result<(), &'static str>;
+    fn wait(&mut self) -> Result<(), &'static str>;
+}
+
+fn supervise_window_probe(
+    process: &mut impl WindowProbeProcess,
+    mut before_deadline: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> Result<bool, &'static str> {
+    loop {
+        match process.try_wait_success() {
+            Ok(Some(success)) => return Ok(success),
+            Ok(None) if before_deadline() => pause(),
+            Ok(None) => return stop_window_probe(process, "window probe timed out"),
+            Err(_) => return stop_window_probe(process, "window probe failed"),
+        }
+    }
+}
+
+fn stop_window_probe(process: &mut impl WindowProbeProcess, failure: &'static str) -> Result<bool, &'static str> {
+    let _kill_result = process.kill();
+    process.wait().map_err(|_| "window probe cleanup failed")?;
+    Err(failure)
+}
+
 fn run_spike_phase(driver: &mut impl PhaseDriver, mutate_after_start: bool) -> Result<(), &'static str> {
     driver.capture()?;
     driver.prepare()?;
@@ -34,7 +61,7 @@ fn run_spike_phase(driver: &mut impl PhaseDriver, mutate_after_start: bool) -> R
 
 #[cfg(target_os = "macos")]
 mod real {
-    use super::{run_spike_phase, PhaseDriver};
+    use super::{run_spike_phase, supervise_window_probe, PhaseDriver, WindowProbeProcess};
     use compatforge_domain::{CoreConfig, CpuArchitecture, ExecutableMode, LaunchRequest};
     use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot, PinnedBottleExecutable};
     use compatforge_orchestrator::PreparedLaunch;
@@ -46,7 +73,7 @@ mod real {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Component, Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -54,7 +81,9 @@ mod real {
     const MAX_INPUT_BYTES: u64 = 134_217_728;
     const MAX_MANIFEST_BYTES: u64 = 1_048_576;
     const WINDOW_TIMEOUT: Duration = Duration::from_secs(60);
+    const WINDOW_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+    const MAX_WINDOW_OUTPUT_BYTES: u64 = 1_048_576;
 
     #[derive(Clone)]
     struct BoundFile {
@@ -246,7 +275,7 @@ mod real {
         }
 
         fn start(&mut self) -> Result<(), &'static str> {
-            if window_visible()? {
+            if window_visible(Instant::now() + WINDOW_PROBE_TIMEOUT)? {
                 return Err("matching window already exists");
             }
             let handle = ProcessSupervisor::start_pinned_bottle(self.prepared()?.plan(), self.pinned()?)
@@ -273,10 +302,10 @@ mod real {
                 if handle.is_finished() {
                     return Err("managed process exited before window observation");
                 }
-                if window_visible()? {
+                if window_visible(deadline)? {
                     return Ok(());
                 }
-                thread::sleep(Duration::from_millis(250));
+                sleep_before(deadline, Duration::from_millis(250));
             }
             Err("SumatraPDF window was not observed")
         }
@@ -302,11 +331,14 @@ mod real {
                 return Err("managed process remains live");
             }
             let deadline = Instant::now() + CLEANUP_TIMEOUT;
-            while window_visible()? && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(100));
-            }
-            if window_visible()? {
-                return Err("SumatraPDF window remains after cleanup");
+            loop {
+                if Instant::now() >= deadline {
+                    return Err("SumatraPDF window remains after cleanup");
+                }
+                if !window_visible(deadline)? {
+                    break;
+                }
+                sleep_before(deadline, Duration::from_millis(100));
             }
             if self.mutated {
                 self.restore_source()?;
@@ -671,7 +703,33 @@ mod real {
         format!("sha256:{:x}", digest.finalize())
     }
 
-    fn window_visible() -> Result<bool, &'static str> {
+    impl WindowProbeProcess for Child {
+        fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
+            self.try_wait()
+                .map(|status| status.map(|status| status.success()))
+                .map_err(|_| "window probe failed")
+        }
+
+        fn kill(&mut self) -> Result<(), &'static str> {
+            Child::kill(self).map_err(|_| "window probe cleanup failed")
+        }
+
+        fn wait(&mut self) -> Result<(), &'static str> {
+            Child::wait(self).map(|_| ()).map_err(|_| "window probe cleanup failed")
+        }
+    }
+
+    fn sleep_before(deadline: Instant, interval: Duration) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            thread::sleep(interval.min(remaining));
+        }
+    }
+
+    fn window_visible(deadline: Instant) -> Result<bool, &'static str> {
+        if Instant::now() >= deadline {
+            return Err("window probe timed out");
+        }
         let script = r#"tell application "System Events"
 set resultText to {}
 repeat with p in (every application process whose background only is false)
@@ -683,18 +741,32 @@ end repeat
 set AppleScript's text item delimiters to linefeed
 return resultText as text
 end tell"#;
-        let output = Command::new("/usr/bin/osascript")
+        let mut child = Command::new("/usr/bin/osascript")
             .args(["-e", script])
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output()
+            .spawn()
             .map_err(|_| "window probe failed")?;
-        if !output.status.success() {
+        let success = supervise_window_probe(
+            &mut child,
+            || Instant::now() < deadline,
+            || sleep_before(deadline, Duration::from_millis(25)),
+        )?;
+        if !success {
             return Err("window probe failed");
         }
-        let titles = String::from_utf8(output.stdout).map_err(|_| "window probe output is invalid")?;
+        let stdout = child.stdout.take().ok_or("window probe output is unavailable")?;
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_WINDOW_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "window probe output is invalid")?;
+        if bytes.len() as u64 > MAX_WINDOW_OUTPUT_BYTES {
+            return Err("window probe output is invalid");
+        }
+        let titles = String::from_utf8(bytes).map_err(|_| "window probe output is invalid")?;
         Ok(titles
             .lines()
             .any(|title| title.to_ascii_lowercase().contains("sumatrapdf")))
@@ -711,6 +783,29 @@ fn real_apple_silicon_crossover_and_whisky_pinned_sumatrapdf_spike() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HungWindowProbe {
+        polls: usize,
+        kill_calls: usize,
+        wait_calls: usize,
+    }
+
+    impl WindowProbeProcess for HungWindowProbe {
+        fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
+            self.polls += 1;
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> Result<(), &'static str> {
+            self.kill_calls += 1;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> Result<(), &'static str> {
+            self.wait_calls += 1;
+            Ok(())
+        }
+    }
 
     struct FakePhase {
         actions: Vec<&'static str>,
@@ -793,6 +888,30 @@ mod tests {
             self.clean = self.terminated;
             self.clean.then_some(()).ok_or("residual process")
         }
+    }
+
+    #[test]
+    fn hung_window_probe_is_killed_and_reaped_at_its_deadline() {
+        let mut probe = HungWindowProbe {
+            polls: 0,
+            kill_calls: 0,
+            wait_calls: 0,
+        };
+        let mut deadline_checks = 0;
+
+        let result = supervise_window_probe(
+            &mut probe,
+            || {
+                deadline_checks += 1;
+                deadline_checks < 2
+            },
+            || {},
+        );
+
+        assert_eq!(result, Err("window probe timed out"));
+        assert_eq!(probe.polls, 2);
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 1);
     }
 
     #[test]

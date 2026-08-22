@@ -5,8 +5,10 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 
 from tests import macos_pinned_cli_spike as spike
 
@@ -135,12 +137,16 @@ class _FakeBoundary:
         self.oversized_output = False
         self.post_spawn_identity_drift = False
         self.post_spawn_linked_output = False
+        self.physical_overlaps: set[frozenset[str]] = set()
         self.inspection_bytes = _canonical({"architecture": "x86_64", "kind": "inspection"})
         self.plan_bytes = _canonical({"process": {"arguments": ["logical"]}, "schemaVersion": "1"})
 
     def resolve_canonical(self, path: str, *, directory: bool) -> str:
         del directory
         return path
+
+    def paths_physically_overlap(self, left: str, right: str) -> bool:
+        return spike._paths_overlap(left, right) or frozenset((left, right)) in self.physical_overlaps
 
     def bind_input(self, path: str, expected_sha256: str, label: str) -> spike.FileBinding:
         del label
@@ -272,7 +278,6 @@ class _FakeBoundary:
             "sequence": 1,
             "elapsedMilliseconds": 10,
             "kind": "exited",
-            "processId": 4242,
             "exit": {"code": 0, "success": True},
         }
         receipt = {
@@ -297,6 +302,14 @@ class _FakeBoundary:
         elif self.event_mutant == "no-start":
             event["kind"] = "terminate-requested"
             event["message"] = "termination requested"
+        elif self.event_mutant == "elapsed-negative":
+            event["elapsedMilliseconds"] = -1
+        elif self.event_mutant == "sequence-bool":
+            exited["sequence"] = True
+        elif self.event_mutant == "explicit-null-message":
+            event["message"] = None
+        elif self.event_mutant == "explicit-null-exit-code":
+            exited["exit"]["code"] = None  # type: ignore[index]
         if self.receipt_mutant == "missing":
             records = [event, exited]
         elif self.receipt_mutant == "not-last":
@@ -309,6 +322,8 @@ class _FakeBoundary:
             receipt["outputs"].reverse()  # type: ignore[union-attr]
         elif self.receipt_mutant == "extra-key":
             receipt["unexpected"] = True
+        elif self.receipt_mutant == "schema-bool":
+            receipt["schemaVersion"] = True
         return b"".join(_compact(record) + b"\n" for record in records)
 
     def _allocate_descriptor(self, value: _Descriptor) -> int:
@@ -325,7 +340,12 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             "/private/target/debug/compatforge-cli": b"compatforge-cli",
             "/private/inputs/crossover-config.json": _canonical(
                 {
-                    "runtime": "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
+                    "runtimeBindings": [
+                        {
+                            "executable": "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
+                            "wineserverExecutable": "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wineserver",
+                        }
+                    ],
                     "storageRoot": "/private/storage",
                 }
             ),
@@ -334,7 +354,12 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             "/private/inputs/crossover-request.json": _canonical({"requestId": "pinned-sumatrapdf"}),
             "/private/inputs/whisky-config.json": _canonical(
                 {
-                    "runtime": "/Applications/Whisky.app/Contents/Frameworks/Wine/bin/wine64",
+                    "runtimeBindings": [
+                        {
+                            "executable": "/Applications/Whisky.app/Contents/Frameworks/Wine/bin/wine64",
+                            "wineserverExecutable": "/Applications/Whisky.app/Contents/Frameworks/Wine/bin/wineserver",
+                        }
+                    ],
                     "storageRoot": "/private/storage",
                 }
             ),
@@ -384,6 +409,9 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
         wrong_timeout = copy.deepcopy(self.manifest)
         wrong_timeout["timeoutMilliseconds"] = 59999
         mutants.append(_canonical(wrong_timeout))
+        boolean_schema = copy.deepcopy(self.manifest)
+        boolean_schema["schemaVersion"] = True
+        mutants.append(_canonical(boolean_schema))
         mutants.append(json.dumps(self.manifest, indent=2).encode("utf-8"))
         mutants.append(_canonical(self.manifest).replace(b'"schemaVersion":1', b'"schemaVersion":1,"schemaVersion":1'))
         for mutant in mutants:
@@ -481,12 +509,17 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             ("event_mutant", "path-leak"),
             ("event_mutant", "wrong-message"),
             ("event_mutant", "no-start"),
+            ("event_mutant", "elapsed-negative"),
+            ("event_mutant", "sequence-bool"),
+            ("event_mutant", "explicit-null-message"),
+            ("event_mutant", "explicit-null-exit-code"),
             ("receipt_mutant", "missing"),
             ("receipt_mutant", "not-last"),
             ("receipt_mutant", "digest"),
             ("receipt_mutant", "size"),
             ("receipt_mutant", "order"),
             ("receipt_mutant", "extra-key"),
+            ("receipt_mutant", "schema-bool"),
         )
         for field, value in cases:
             boundary = _FakeBoundary(self.manifest, self.inputs)
@@ -528,6 +561,47 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             with self.assertRaises(spike.SpikeError):
                 spike.run_spike_document(mutant, boundary)
             self.assertEqual(boundary.commands, [])
+
+    def test_runtime_binary_roots_reject_descendants_and_physical_aliases_but_not_siblings(self) -> None:
+        runtime_parent = "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin"
+
+        descendant = copy.deepcopy(self.manifest)
+        descendant["runtimes"][0]["workRoot"] = runtime_parent + "/work"  # type: ignore[index]
+        boundary = _FakeBoundary(descendant, self.inputs)
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(descendant, boundary)
+        self.assertEqual(boundary.commands, [])
+
+        alias = copy.deepcopy(self.manifest)
+        alias_root = alias["runtimes"][0]["workRoot"]  # type: ignore[index]
+        boundary = _FakeBoundary(alias, self.inputs)
+        boundary.physical_overlaps.add(frozenset((alias_root, runtime_parent)))
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(alias, boundary)
+        self.assertEqual(boundary.commands, [])
+
+        sibling = copy.deepcopy(self.manifest)
+        sibling["runtimes"][0]["workRoot"] = runtime_parent.rsplit("/", 1)[0] + "/work"  # type: ignore[index]
+        boundary = _FakeBoundary(sibling, self.inputs)
+        self.assertEqual(spike.run_spike_document(sibling, boundary), ["crossover", "whisky"])
+
+    def test_system_overlap_probe_detects_directory_symlink_alias_when_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            protected = Path(temporary, "runtime-bin")
+            protected.mkdir()
+            alias = Path(temporary, "runtime-bin-alias")
+            try:
+                alias.symlink_to(protected, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlink is unavailable: {error}")
+
+            self.assertTrue(spike.SystemBoundary.paths_physically_overlap(str(alias), str(protected)))
+            self.assertFalse(
+                spike.SystemBoundary.paths_physically_overlap(
+                    str(Path(temporary, "external-a")),
+                    str(Path(temporary, "external-b")),
+                )
+            )
 
     def test_every_input_digest_is_bound_before_launch(self) -> None:
         mutant = copy.deepcopy(self.manifest)
