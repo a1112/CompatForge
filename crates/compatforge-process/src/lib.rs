@@ -1130,23 +1130,60 @@ trait NaturalIdleCommand {
     fn interrupt_and_reap(&mut self) -> io::Result<()>;
 }
 
+trait NaturalIdleCleanupSteps {
+    fn poll_for_exit(&mut self) -> io::Result<bool>;
+    fn kill_for_cleanup(&mut self) -> io::Result<()>;
+    fn wait_for_reap_bounded(&mut self) -> io::Result<()>;
+}
+
+fn interrupt_and_reap_natural_idle<C: NaturalIdleCleanupSteps>(command: &mut C) -> io::Result<()> {
+    let poll_error = match command.poll_for_exit() {
+        Ok(true) => return Ok(()),
+        Ok(false) => None,
+        Err(error) => Some(error),
+    };
+    let kill_error = command.kill_for_cleanup().err();
+    let wait_error = command.wait_for_reap_bounded().err();
+    if let Some(error) = wait_error.or(kill_error).or(poll_error) {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+impl NaturalIdleCleanupSteps for Child {
+    fn poll_for_exit(&mut self) -> io::Result<bool> {
+        self.try_wait().map(|status| status.is_some())
+    }
+
+    fn kill_for_cleanup(&mut self) -> io::Result<()> {
+        self.kill()
+    }
+
+    fn wait_for_reap_bounded(&mut self) -> io::Result<()> {
+        let deadline = Instant::now() + WINE_SERVER_COMMAND_TIMEOUT;
+        loop {
+            match self.try_wait()? {
+                Some(_) => return Ok(()),
+                None if Instant::now() >= deadline => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "wineserver -w cleanup did not reap within the cleanup deadline",
+                    ));
+                }
+                None => thread::sleep(PROCESS_POLL_INTERVAL),
+            }
+        }
+    }
+}
+
 impl NaturalIdleCommand for Child {
     fn try_wait_success(&mut self) -> io::Result<Option<bool>> {
         self.try_wait().map(|status| status.map(|status| status.success()))
     }
 
     fn interrupt_and_reap(&mut self) -> io::Result<()> {
-        if self.try_wait()?.is_some() {
-            return Ok(());
-        }
-        if let Err(kill_error) = self.kill() {
-            return if self.try_wait()?.is_some() {
-                Ok(())
-            } else {
-                Err(kill_error)
-            };
-        }
-        self.wait().map(|_| ())
+        interrupt_and_reap_natural_idle(self)
     }
 }
 
@@ -2120,6 +2157,127 @@ mod tests {
         assert_eq!(command.polls, 1);
         assert!(interrupted.load(Ordering::Acquire));
         assert!(command.reaped);
+    }
+
+    #[derive(Clone, Copy)]
+    enum CleanupPoll {
+        Running,
+        Exited,
+        Error(&'static str),
+    }
+
+    struct FakeNaturalIdleCleanupSteps {
+        poll: CleanupPoll,
+        kill_error: Option<&'static str>,
+        wait_error: Option<&'static str>,
+        poll_calls: usize,
+        kill_calls: usize,
+        wait_calls: usize,
+    }
+
+    impl NaturalIdleCleanupSteps for FakeNaturalIdleCleanupSteps {
+        fn poll_for_exit(&mut self) -> io::Result<bool> {
+            self.poll_calls += 1;
+            match self.poll {
+                CleanupPoll::Running => Ok(false),
+                CleanupPoll::Exited => Ok(true),
+                CleanupPoll::Error(message) => Err(io::Error::other(message)),
+            }
+        }
+
+        fn kill_for_cleanup(&mut self) -> io::Result<()> {
+            self.kill_calls += 1;
+            self.kill_error.map_or(Ok(()), |message| Err(io::Error::other(message)))
+        }
+
+        fn wait_for_reap_bounded(&mut self) -> io::Result<()> {
+            self.wait_calls += 1;
+            self.wait_error.map_or(Ok(()), |message| Err(io::Error::other(message)))
+        }
+    }
+
+    fn cleanup_steps(
+        poll: CleanupPoll,
+        kill_error: Option<&'static str>,
+        wait_error: Option<&'static str>,
+    ) -> FakeNaturalIdleCleanupSteps {
+        FakeNaturalIdleCleanupSteps {
+            poll,
+            kill_error,
+            wait_error,
+            poll_calls: 0,
+            kill_calls: 0,
+            wait_calls: 0,
+        }
+    }
+
+    #[test]
+    fn natural_idle_cleanup_does_not_kill_or_wait_an_already_reaped_child() {
+        let mut steps = cleanup_steps(CleanupPoll::Exited, None, None);
+
+        interrupt_and_reap_natural_idle(&mut steps).unwrap();
+
+        assert_eq!((steps.poll_calls, steps.kill_calls, steps.wait_calls), (1, 0, 0));
+    }
+
+    #[test]
+    fn natural_idle_cleanup_waits_once_after_kill_failure() {
+        let mut steps = cleanup_steps(CleanupPoll::Running, Some("kill failed"), None);
+
+        let error = interrupt_and_reap_natural_idle(&mut steps).unwrap_err();
+
+        assert_eq!(error.to_string(), "kill failed");
+        assert_eq!((steps.poll_calls, steps.kill_calls, steps.wait_calls), (1, 1, 1));
+    }
+
+    #[test]
+    fn natural_idle_cleanup_wait_failure_has_best_effort_precedence() {
+        let mut steps = cleanup_steps(CleanupPoll::Running, Some("kill failed"), Some("wait failed"));
+
+        let error = interrupt_and_reap_natural_idle(&mut steps).unwrap_err();
+
+        assert_eq!(error.to_string(), "wait failed");
+        assert_eq!((steps.poll_calls, steps.kill_calls, steps.wait_calls), (1, 1, 1));
+    }
+
+    struct PersistentPollFailureCommand {
+        outer_poll_calls: usize,
+        cleanup: FakeNaturalIdleCleanupSteps,
+    }
+
+    impl NaturalIdleCommand for PersistentPollFailureCommand {
+        fn try_wait_success(&mut self) -> io::Result<Option<bool>> {
+            self.outer_poll_calls += 1;
+            Err(io::Error::other("outer poll failed"))
+        }
+
+        fn interrupt_and_reap(&mut self) -> io::Result<()> {
+            interrupt_and_reap_natural_idle(&mut self.cleanup)
+        }
+    }
+
+    #[test]
+    fn persistent_natural_idle_poll_error_still_attempts_kill_and_bounded_wait() {
+        let mut command = PersistentPollFailureCommand {
+            outer_poll_calls: 0,
+            cleanup: cleanup_steps(CleanupPoll::Error("cleanup poll failed"), None, None),
+        };
+
+        let error = wait_for_natural_idle_command(&mut command, &AtomicBool::new(false), || {
+            panic!("persistent poll failure must enter cleanup immediately");
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "cleanup poll failed");
+        assert_eq!(command.outer_poll_calls, 1);
+        assert_eq!(
+            (
+                command.cleanup.poll_calls,
+                command.cleanup.kill_calls,
+                command.cleanup.wait_calls,
+            ),
+            (1, 1, 1)
+        );
     }
 
     fn collect_until_exit(handle: &LaunchHandle, deadline: Instant) -> Vec<RuntimeEvent> {
