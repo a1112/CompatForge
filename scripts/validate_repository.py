@@ -7,6 +7,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import ast
+import builtins
 import hashlib
 import importlib.util
 import json
@@ -412,6 +414,30 @@ MACOS_ACCEPTANCE_REVIEWED_PATHS = (
     "examples/macos-dual-runtime-interactions.json",
     "tests/test_macos_dual_runtime_acceptance.py",
     "tools/run_macos_dual_runtime_acceptance.py",
+)
+MACOS_ACKNOWLEDGEMENT_REVIEWED_PATHS = (
+    "tests/test_macos_interaction_acknowledgements.py",
+    "tools/confirm_macos_gui_interactions.py",
+)
+MACOS_ACKNOWLEDGEMENT_MAX_SOURCE_BYTES = 256 * 1024
+MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS = frozenset(
+    {
+        "argparse",
+        "__future__",
+        "collections",
+        "ctypes",
+        "dataclasses",
+        "hashlib",
+        "json",
+        "msvcrt",
+        "os",
+        "pathlib",
+        "re",
+        "secrets",
+        "stat",
+        "sys",
+        "time",
+    }
 )
 MACOS_ACCEPTANCE_GUIDE = "docs/guides/macos-local-dual-runtime-acceptance.md"
 MACOS_ACCEPTANCE_INTERACTIONS = "examples/macos-dual-runtime-interactions.json"
@@ -4699,6 +4725,705 @@ def validate_macos_acceptance_surface() -> list[str]:
     return errors
 
 
+def _macos_acknowledgement_is_reparse(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & marker) or bool(getattr(metadata, "st_reparse_tag", 0))
+
+
+def _macos_acknowledgement_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _macos_acknowledgement_source(relative: str, role: str) -> str:
+    path = ROOT / relative
+    components: list[tuple[Path, tuple[int, int, int]]] = []
+    for component in reversed((path, *path.parents)):
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            raise ValueError(f"macOS acknowledgement {role} is unsafe") from error
+        if stat.S_ISLNK(metadata.st_mode) or _macos_acknowledgement_is_reparse(metadata):
+            raise ValueError(f"macOS acknowledgement {role} is unsafe")
+        if component != path and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"macOS acknowledgement {role} is unsafe")
+        components.append(
+            (
+                component,
+                (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)),
+            )
+        )
+
+    entry = path.lstat()
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_nlink != 1
+        or entry.st_size <= 0
+    ):
+        raise ValueError(f"macOS acknowledgement {role} is unsafe")
+    if entry.st_size > MACOS_ACKNOWLEDGEMENT_MAX_SOURCE_BYTES:
+        raise ValueError(f"macOS acknowledgement {role} exceeds its source byte bound")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor: int | None = None
+    native_handle: object | None = None
+    try:
+        if os.name == "nt":
+            native_handle = _VALIDATOR_CREATE_FILE(
+                str(path),
+                0x80000000 | 0x0080,
+                0x00000001,
+                None,
+                3,
+                0x00200000 | 0x08000000,
+                None,
+            )
+            if native_handle == _VALIDATOR_INVALID_HANDLE:
+                raise ValueError(f"macOS acknowledgement {role} is unsafe")
+            descriptor = msvcrt.open_osfhandle(
+                int(native_handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            )
+            native_handle = None
+        else:
+            descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(opened.st_mode)
+            or _macos_acknowledgement_is_reparse(opened)
+            or opened.st_nlink != 1
+            or _macos_acknowledgement_identity(opened)
+            != _macos_acknowledgement_identity(entry)
+        ):
+            raise ValueError(f"macOS acknowledgement {role} is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while total < opened.st_size:
+            chunk = os.read(descriptor, min(4096, opened.st_size - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        final = os.fstat(descriptor)
+        after = path.lstat()
+        for component, expected in components:
+            current = component.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or _macos_acknowledgement_is_reparse(current)
+                or (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode))
+                != expected
+            ):
+                raise ValueError(
+                    f"macOS acknowledgement {role} identity changed"
+                )
+        if (
+            total != opened.st_size
+            or final.st_nlink != 1
+            or after.st_nlink != 1
+            or _macos_acknowledgement_identity(final)
+            != _macos_acknowledgement_identity(opened)
+            or _macos_acknowledgement_identity(after)
+            != _macos_acknowledgement_identity(opened)
+        ):
+            raise ValueError(f"macOS acknowledgement {role} identity changed")
+        try:
+            return b"".join(chunks).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"macOS acknowledgement {role} is not valid UTF-8"
+            ) from error
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(f"macOS acknowledgement {role} is unsafe") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if native_handle is not None:
+            _VALIDATOR_CLOSE_HANDLE(native_handle)
+
+
+def _macos_acknowledgement_expression_uses_root(node: ast.AST) -> bool:
+    return any(
+        isinstance(nested, ast.Name) and nested.id == "ROOT"
+        for nested in ast.walk(node)
+    )
+
+
+def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
+    try:
+        tree = ast.parse(source, filename="<macos-acknowledgement-helper>")
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return True
+
+    aliases: dict[str, str] = {}
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    def scope(node: ast.AST) -> str | None:
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+            current = parents.get(current)
+        return None
+
+    allowed_from_imports = {
+        "__future__": {"annotations"},
+        "collections.abc": {"Callable"},
+        "ctypes": {"wintypes"},
+        "dataclasses": {"dataclass"},
+        "pathlib": {"Path"},
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                root = imported.name.split(".", 1)[0]
+                if root not in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS:
+                    return True
+                aliases[imported.asname or root] = imported.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module is None:
+                return True
+            root = node.module.split(".", 1)[0]
+            allowed_names = allowed_from_imports.get(node.module, set())
+            if (
+                root not in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS
+                or any(imported.name not in allowed_names for imported in node.names)
+            ):
+                return True
+            for imported in node.names:
+                aliases[imported.asname or imported.name] = (
+                    f"{node.module}.{imported.name}"
+                )
+
+    forbidden_builtins = {
+        "__import__",
+        "compile",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    }
+    forbidden_os_attributes = {"environ", "get_exec_path", "getenv", "popen", "system"}
+    mutating_methods = {
+        "hardlink_to",
+        "mkdir",
+        "open",
+        "rename",
+        "replace",
+        "rmdir",
+        "symlink_to",
+        "touch",
+        "unlink",
+        "write_bytes",
+        "write_text",
+    }
+    mutating_os_calls = {
+        "link",
+        "mkdir",
+        "open",
+        "remove",
+        "rename",
+        "replace",
+        "rmdir",
+        "symlink",
+        "unlink",
+    }
+    forbidden_module_names = {"http", "requests", "shutil", "socket", "subprocess", "urllib"}
+    allowed_mutating_scopes = {
+        "open": {"_bind_directory", "_relative_open"},
+        "unlink": {"_relative_unlink"},
+    }
+    allowed_os_attributes = {
+        "O_CREAT",
+        "O_BINARY",
+        "O_CLOEXEC",
+        "O_DIRECTORY",
+        "O_EXCL",
+        "O_NOINHERIT",
+        "O_NOFOLLOW",
+        "O_NONBLOCK",
+        "O_RDONLY",
+        "O_WRONLY",
+        "close",
+        "fsencode",
+        "fstat",
+        "fsync",
+        "name",
+        "open",
+        "read",
+        "stat",
+        "stat_result",
+        "unlink",
+        "write",
+    }
+    allowed_ctypes_attributes = {
+        "CDLL",
+        "Structure",
+        "WinDLL",
+        "byref",
+        "c_char_p",
+        "c_int",
+        "c_ubyte",
+        "c_uint",
+        "c_ulonglong",
+        "c_void_p",
+        "get_errno",
+        "get_last_error",
+        "sizeof",
+    }
+    allowed_kernel32_attributes = {
+        "CloseHandle",
+        "CreateFileW",
+        "GetFileInformationByHandleEx",
+        "MoveFileExW",
+    }
+    native_function_bindings = {
+        "CloseHandle": "_CLOSE_HANDLE",
+        "CreateFileW": "_CREATE_FILE",
+        "GetFileInformationByHandleEx": "_GET_FILE_INFORMATION",
+        "MoveFileExW": "_MOVE_FILE",
+    }
+
+    def qualified_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            base = aliases.get(node.value.id, node.value.id)
+            return f"{base}.{node.attr}"
+        return None
+
+    dll_bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+        ):
+            constructor = qualified_name(node.value.func)
+            if constructor in ("ctypes.CDLL", "ctypes.WinDLL"):
+                dll_bindings[node.targets[0].id] = constructor
+
+    allowed_native_calls = {
+        (
+            "_atomic_publish",
+            "rename(binding.handle, os.fsencode(staged_name), binding.handle, "
+            "os.fsencode(final_name), flag)",
+        ),
+        (
+            "_atomic_publish",
+            "_MOVE_FILE(str(binding.path / staged_name), "
+            "str(binding.path / final_name), _MOVEFILE_WRITE_THROUGH)",
+        ),
+        (
+            "_bind_directory",
+            "_CREATE_FILE(str(path), _FILE_READ_ATTRIBUTES, "
+            "_FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING, "
+            "_FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS, None)",
+        ),
+        (
+            "_bind_directory",
+            "_GET_FILE_INFORMATION(handle, _FILE_ATTRIBUTE_TAG_INFO_CLASS, "
+            "ctypes.byref(attributes), ctypes.sizeof(attributes))",
+        ),
+        (
+            "_bind_directory",
+            "_GET_FILE_INFORMATION(handle, _FILE_ID_INFO_CLASS, "
+            "ctypes.byref(file_id), ctypes.sizeof(file_id))",
+        ),
+        ("_bind_directory", "_CLOSE_HANDLE(handle)"),
+        ("_close_directory", "_CLOSE_HANDLE(binding.handle)"),
+        (
+            "_revalidate_directory",
+            "_GET_FILE_INFORMATION(binding.handle, _FILE_ATTRIBUTE_TAG_INFO_CLASS, "
+            "ctypes.byref(attributes), ctypes.sizeof(attributes))",
+        ),
+        (
+            "_revalidate_directory",
+            "_GET_FILE_INFORMATION(binding.handle, _FILE_ID_INFO_CLASS, "
+            "ctypes.byref(file_id), ctypes.sizeof(file_id))",
+        ),
+    }
+    native_names = set(native_function_bindings.values())
+
+    critical_name_assignments = {
+        "ROOT": ["Path(__file__).resolve().parents[1]"],
+        "_O_CLOEXEC": ["os.O_CLOEXEC", "0"],
+        "_O_NOFOLLOW": ["os.O_NOFOLLOW", "0"],
+        "_O_BINARY": ["os.O_BINARY", "0"],
+        "_O_NONBLOCK": ["os.O_NONBLOCK", "0"],
+        "_O_NOINHERIT": ["os.O_NOINHERIT", "0"],
+        "_O_DIRECTORY": ["os.O_DIRECTORY", "0"],
+        "_FILE_READ_ATTRIBUTES": ["128"],
+        "_FILE_SHARE_READ": ["1"],
+        "_FILE_SHARE_WRITE": ["2"],
+        "_OPEN_EXISTING": ["3"],
+        "_FILE_ATTRIBUTE_REPARSE_POINT": ["1024"],
+        "_FILE_FLAG_OPEN_REPARSE_POINT": ["2097152"],
+        "_FILE_FLAG_BACKUP_SEMANTICS": ["33554432"],
+        "_FILE_ATTRIBUTE_TAG_INFO_CLASS": ["9"],
+        "_FILE_ID_INFO_CLASS": ["18"],
+        "_MOVEFILE_WRITE_THROUGH": ["8"],
+        "_INVALID_HANDLE_VALUE": ["ctypes.c_void_p(-1).value"],
+        "_KERNEL32": ["ctypes.WinDLL('kernel32', use_last_error=True)"],
+        "_CREATE_FILE": ["_KERNEL32.CreateFileW"],
+        "_GET_FILE_INFORMATION": ["_KERNEL32.GetFileInformationByHandleEx"],
+        "_CLOSE_HANDLE": ["_KERNEL32.CloseHandle"],
+        "_MOVE_FILE": ["_KERNEL32.MoveFileExW"],
+        "library": ["ctypes.CDLL(None, use_errno=True)"],
+        "flag": ["1", "4", "0"],
+    }
+    critical_name_assignments = {
+        name: [
+            (
+                "_atomic_publish" if name in {"library", "flag"} else None,
+                expression,
+            )
+            for expression in expressions
+        ]
+        for name, expressions in critical_name_assignments.items()
+    }
+    actual_name_assignments = {name: [] for name in critical_name_assignments}
+    expected_attribute_assignments = sorted(
+        (
+            "_CREATE_FILE.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, "
+            "wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, "
+            "wintypes.HANDLE)",
+            "_CREATE_FILE.restype = wintypes.HANDLE",
+            "_GET_FILE_INFORMATION.argtypes = (wintypes.HANDLE, ctypes.c_int, "
+            "ctypes.c_void_p, wintypes.DWORD)",
+            "_GET_FILE_INFORMATION.restype = wintypes.BOOL",
+            "_CLOSE_HANDLE.argtypes = (wintypes.HANDLE,)",
+            "_CLOSE_HANDLE.restype = wintypes.BOOL",
+            "_MOVE_FILE.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, "
+            "wintypes.DWORD)",
+            "_MOVE_FILE.restype = wintypes.BOOL",
+            "rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, "
+            "ctypes.c_char_p, ctypes.c_uint)",
+            "rename.restype = ctypes.c_int",
+        )
+    )
+    actual_attribute_assignments: list[str] = []
+    actual_subscript_assignments: list[tuple[str | None, str]] = []
+    protected_assignment_names = (
+        set(aliases)
+        | set(critical_name_assignments)
+        | forbidden_builtins
+        | native_names
+        | {"rename"}
+    )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if target.id in actual_name_assignments:
+                        actual_name_assignments[target.id].append(
+                            (scope(node), ast.unparse(node.value))
+                        )
+                    elif target.id in set(aliases) | forbidden_builtins:
+                        return True
+                elif isinstance(target, ast.Attribute):
+                    actual_attribute_assignments.append(ast.unparse(node))
+                elif isinstance(target, ast.Subscript):
+                    actual_subscript_assignments.append((scope(node), ast.unparse(node)))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            target = node.target
+            if isinstance(target, (ast.Attribute, ast.Subscript)) or (
+                isinstance(target, ast.Name) and target.id in protected_assignment_names
+            ):
+                return True
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, (ast.Attribute, ast.Subscript)) or (
+                    isinstance(target, ast.Name)
+                    and target.id in protected_assignment_names
+                ):
+                    return True
+    if any(
+        sorted(actual_name_assignments[name]) != sorted(expected)
+        for name, expected in critical_name_assignments.items()
+    ):
+        return True
+    if sorted(actual_attribute_assignments) != expected_attribute_assignments:
+        return True
+    if actual_subscript_assignments != [
+        ("close", "value[key] = nested"),
+    ]:
+        return True
+
+    builtin_names = frozenset(dir(builtins))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id in builtin_names
+        ):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in builtin_names:
+                return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            positional = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+            if any(argument.arg in builtin_names for argument in positional):
+                return True
+            if arguments.vararg is not None and arguments.vararg.arg in builtin_names:
+                return True
+            if arguments.kwarg is not None and arguments.kwarg.arg in builtin_names:
+                return True
+        if isinstance(node, ast.alias):
+            bound = node.asname or node.name.split(".", 1)[0]
+            if bound in builtin_names:
+                return True
+        if isinstance(node, ast.ExceptHandler) and node.name in builtin_names:
+            return True
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in builtin_names:
+            return True
+        if isinstance(node, ast.MatchMapping) and node.rest in builtin_names:
+            return True
+
+    def allowed_native_name_use(node: ast.Name) -> bool:
+        parent = parents.get(node)
+        if node.id in dll_bindings:
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                return False
+            assignment = parents.get(parent)
+            if not isinstance(assignment, ast.Assign) or assignment.value is not parent:
+                return False
+            if len(assignment.targets) != 1 or not isinstance(
+                assignment.targets[0], ast.Name
+            ):
+                return False
+            if node.id == "_KERNEL32":
+                return (
+                    native_function_bindings.get(parent.attr)
+                    == assignment.targets[0].id
+                    and scope(node) is None
+                )
+            return (
+                node.id == "library"
+                and parent.attr in {"renameat2", "renameatx_np"}
+                and assignment.targets[0].id == "rename"
+                and scope(node) == "_atomic_publish"
+            )
+        if node.id in native_names or node.id == "rename":
+            if (
+                node.id == "rename"
+                and isinstance(parent, ast.Compare)
+                and ast.unparse(parent) == "rename is None"
+                and scope(parent) == "_atomic_publish"
+            ):
+                return True
+            if isinstance(parent, ast.Call) and parent.func is node:
+                return (scope(parent), ast.unparse(parent)) in allowed_native_calls
+            if isinstance(parent, ast.Attribute) and parent.value is node:
+                assignment = parents.get(parent)
+                return (
+                    parent.attr in {"argtypes", "restype"}
+                    and isinstance(assignment, ast.Assign)
+                    and assignment.targets == [parent]
+                    and (
+                        (node.id in native_names and scope(node) is None)
+                        or (node.id == "rename" and scope(node) == "_atomic_publish")
+                    )
+                )
+            return False
+        return True
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.NamedExpr):
+            return True
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Name) and (
+                node.value.id in dll_bindings
+                or node.value.id in set(native_function_bindings.values())
+                or aliases.get(node.value.id) in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS
+            ):
+                return True
+            if (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id in dll_bindings
+            ):
+                targets = node.targets
+                if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                    return True
+                if node.value.value.id == "_KERNEL32":
+                    if native_function_bindings.get(node.value.attr) != targets[0].id:
+                        return True
+                elif not (
+                    node.value.value.id == "library"
+                    and scope(node) == "_atomic_publish"
+                    and targets[0].id == "rename"
+                    and node.value.attr in {"renameat2", "renameatx_np"}
+                ):
+                    return True
+        if isinstance(node, ast.Name) and node.id in forbidden_module_names:
+            return True
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and not allowed_native_name_use(node)
+        ):
+            return True
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute):
+            module = node.value.value
+            if (
+                isinstance(module, ast.Name)
+                and aliases.get(module.id) in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS
+                and not (aliases.get(module.id) == "sys" and node.value.attr == "argv")
+            ):
+                return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if _macos_acknowledgement_expression_uses_root(node):
+                return True
+        if isinstance(node, ast.Attribute):
+            base = node.value
+            if (
+                isinstance(base, ast.Call)
+                and qualified_name(base.func) in ("ctypes.CDLL", "ctypes.WinDLL")
+            ):
+                return True
+            if isinstance(base, ast.Name) and aliases.get(base.id) == "os":
+                if node.attr not in allowed_os_attributes:
+                    return True
+            if isinstance(base, ast.Name) and aliases.get(base.id) == "ctypes":
+                if node.attr not in allowed_ctypes_attributes:
+                    return True
+            if isinstance(base, ast.Name) and base.id in dll_bindings:
+                kernel32_attribute = (
+                    dll_bindings[base.id] == "ctypes.WinDLL"
+                    and base.id == "_KERNEL32"
+                    and node.attr in allowed_kernel32_attributes
+                )
+                posix_rename_attribute = (
+                    dll_bindings[base.id] == "ctypes.CDLL"
+                    and base.id == "library"
+                    and scope(node) == "_atomic_publish"
+                    and node.attr in {"renameat2", "renameatx_np"}
+                )
+                if not kernel32_attribute and not posix_rename_attribute:
+                    return True
+            if (
+                isinstance(base, ast.Name)
+                and aliases.get(base.id) == "os"
+                and node.attr in forbidden_os_attributes
+            ):
+                return True
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+        ):
+            target = node.args[0]
+            attribute = node.args[1]
+            if aliases.get(target.id) in {"os", "ctypes"} or target.id in dll_bindings:
+                if not isinstance(attribute, ast.Constant) or not isinstance(
+                    attribute.value, str
+                ):
+                    return True
+                if aliases.get(target.id) == "os" and not attribute.value.startswith(
+                    "O_"
+                ):
+                    return True
+                if (
+                    aliases.get(target.id) == "ctypes"
+                    and attribute.value not in allowed_ctypes_attributes
+                ):
+                    return True
+                if target.id in dll_bindings and (
+                    dll_bindings[target.id] != "ctypes.CDLL"
+                    or scope(node) != "_atomic_publish"
+                    or attribute.value not in {"renameat2", "renameatx_np"}
+                ):
+                    return True
+        if isinstance(node.func, ast.Name) and node.func.id in forbidden_builtins:
+            return True
+        constructor = qualified_name(node.func)
+        if constructor in ("ctypes.CDLL", "ctypes.WinDLL"):
+            if constructor == "ctypes.CDLL":
+                if (
+                    scope(node) != "_atomic_publish"
+                    or not node.args
+                    or not isinstance(node.args[0], ast.Constant)
+                    or node.args[0].value is not None
+                ):
+                    return True
+            elif (
+                scope(node) is not None
+                or not node.args
+                or not isinstance(node.args[0], ast.Constant)
+                or node.args[0].value != "kernel32"
+            ):
+                return True
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        base = node.func.value
+        if node.func.attr in mutating_methods:
+            if not (isinstance(base, ast.Name) and aliases.get(base.id) == "os"):
+                if node.func.attr != "unlink" or scope(node) != "_relative_unlink":
+                    return True
+                if _macos_acknowledgement_expression_uses_root(node.func.value):
+                    return True
+        if (
+            isinstance(base, ast.Name)
+            and aliases.get(base.id) == "os"
+            and node.func.attr in mutating_os_calls
+        ):
+            allowed = allowed_mutating_scopes.get(node.func.attr, set())
+            if scope(node) not in allowed or any(
+                _macos_acknowledgement_expression_uses_root(argument)
+                for argument in node.args
+            ):
+                return True
+    return False
+
+
+def validate_macos_acknowledgement_surface() -> list[str]:
+    """Bind the interactive helper to a narrow, reviewed local capability set."""
+
+    errors: list[str] = []
+    sources: dict[str, str] = {}
+    for relative, role in zip(
+        MACOS_ACKNOWLEDGEMENT_REVIEWED_PATHS,
+        ("tests", "helper"),
+    ):
+        try:
+            sources[role] = _macos_acknowledgement_source(relative, role)
+        except (OSError, ValueError, UnicodeError) as error:
+            errors.append(str(error))
+    helper = sources.get("helper")
+    if helper is not None and _macos_acknowledgement_forbidden_capability(helper):
+        errors.append(
+            "macOS acknowledgement helper uses a forbidden side-effect capability"
+        )
+    return errors
+
+
 def main() -> int:
     errors = (
         validate_macwin_asset_migration()
@@ -4710,6 +5435,7 @@ def main() -> int:
         + validate_pe_inspection_fixture()
         + validate_macos_preview_binary_hygiene()
         + validate_macos_acceptance_surface()
+        + validate_macos_acknowledgement_surface()
         + validate_macos_acceptance_docs()
     )
     if errors:
