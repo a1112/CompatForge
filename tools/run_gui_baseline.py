@@ -14,18 +14,24 @@ import json
 import os
 import platform
 import re
+import secrets
 import selectors
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_COMMAND_SECONDS = 180
 WINDOW_APPEARANCE_SECONDS = 30
 INTERACTIVE_RUNTIME_MILLISECONDS = 60_000
+ACKNOWLEDGEMENT_WAIT_SECONDS = 5 * 60
+ACKNOWLEDGEMENT_POLL_SECONDS = 0.25
 MAX_DIAGNOSTICS = 16
 MAX_DIAGNOSTIC_CHARS = 4096
 MAX_COMPACT_DEPTH = 8
@@ -61,6 +67,7 @@ FAILURE_CLASS_BY_REASON_CODE = {
     "desktop-window-unobserved": "desktop",
     "application-install-failed": "application",
     "application-interaction-unverified": "application",
+    "application-interaction-invalid": "application",
     "application-content-verification-failed": "application",
     "cleanup-residual-processes": "cleanup",
     "cleanup-termination-failed": "cleanup",
@@ -86,6 +93,7 @@ STATUS_BY_REASON_CODE = {
     "desktop-window-unobserved": "failed",
     "application-install-failed": "failed",
     "application-interaction-unverified": "unverified",
+    "application-interaction-invalid": "failed",
     "application-content-verification-failed": "failed",
     "cleanup-residual-processes": "failed",
     "cleanup-termination-failed": "failed",
@@ -111,6 +119,7 @@ FAILURE_REASON_BY_STAGE = {
     "desktop-window": "desktop-window-unobserved",
     "installer-launch": "application-install-failed",
     "application-interaction": "application-interaction-unverified",
+    "application-interaction-invalid": "application-interaction-invalid",
     "application-content": "application-content-verification-failed",
     "cleanup-residual": "cleanup-residual-processes",
     "cleanup-termination": "cleanup-termination-failed",
@@ -144,6 +153,22 @@ class NetworkUnavailableError(AcceptanceError):
 
 
 class AssetFetchError(AcceptanceError):
+    pass
+
+
+class InteractionUnverifiedError(AcceptanceError):
+    pass
+
+
+class InteractionInvalidError(AcceptanceError):
+    pass
+
+
+class InteractionIntegrityError(AcceptanceError):
+    pass
+
+
+class InteractionCleanupError(AcceptanceError):
     pass
 
 
@@ -187,11 +212,22 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--accept-interactive",
         action="store_true",
-        help="promote non-empty window/screenshot evidence after manual GUI behavior checks",
+        help="create post-window challenges for explicit operator acknowledgement",
     )
     value.add_argument(
-        "--interaction-evidence",
-        help="absolute JSON record of the required per-application manual checks",
+        "--interaction-plan",
+        action=UniqueValueAction,
+        help="absolute read-only JSON plan naming the required interactions",
+    )
+    value.add_argument(
+        "--acknowledgement-root",
+        action=UniqueValueAction,
+        help="absolute external root containing challenges and receipts",
+    )
+    value.add_argument(
+        "--round-id",
+        choices=("round-1", "round-2"),
+        action=UniqueValueAction,
     )
     return value
 
@@ -208,6 +244,28 @@ def validate_runtime_selection(arguments: argparse.Namespace) -> str | None:
     if all(provided) and any(not isinstance(value, str) or not value for value in explicit):
         raise AcceptanceError("explicit Runtime quartet values must be non-empty")
     return arguments.runtime_id
+
+
+def validate_interaction_selection(
+    arguments: argparse.Namespace,
+    runtime_id: str | None,
+) -> None:
+    fields = (
+        arguments.interaction_plan,
+        arguments.acknowledgement_root,
+        arguments.round_id,
+    )
+    if arguments.accept_interactive:
+        if any(value is None for value in fields):
+            raise AcceptanceError(
+                "--accept-interactive requires interaction-plan, acknowledgement-root and round-id"
+            )
+        if runtime_id not in RUNTIME_IDS:
+            raise AcceptanceError("--accept-interactive requires an explicit Runtime identity")
+    elif any(value is not None for value in fields):
+        raise AcceptanceError(
+            "interaction-plan, acknowledgement-root and round-id require --accept-interactive"
+        )
 
 
 def failure_class(reason_code: str) -> str:
@@ -582,7 +640,8 @@ def validate_compact_summary(value: object) -> None:
             required = set(REQUIRED_INTERACTIONS[app_id])
             _require_exact_keys(interactions, required, set(), "compact interaction checks")
             for checked in interactions.values():
-                _require_bool(checked, "compact interaction check")
+                if _require_bool(checked, "compact interaction check") is not True:
+                    raise AcceptanceError("compact interaction check must be true")
         for field in ("installerExit", "exit"):
             if field in application:
                 _validate_exit_projection(application[field], f"compact application {field}")
@@ -647,13 +706,15 @@ def compact_summary(
             projected["reasonCode"] = reason_code
         interactions = application.get("interactionChecks")
         required_interactions = REQUIRED_INTERACTIONS.get(application.get("appId"))
-        if isinstance(interactions, dict) and required_interactions is not None:
-            unknown = set(interactions).difference(required_interactions)
-            if unknown or any(not isinstance(checked, bool) for checked in interactions.values()):
+        if interactions is not None:
+            if not isinstance(interactions, dict) or required_interactions is None:
                 raise AcceptanceError("application interaction checks are invalid")
-            projected["interactionChecks"] = {
-                name: interactions.get(name) is True for name in required_interactions
-            }
+            if (
+                set(interactions) != set(required_interactions)
+                or any(interactions.get(name) is not True for name in required_interactions)
+            ):
+                raise AcceptanceError("application interaction checks are invalid")
+            projected["interactionChecks"] = dict(interactions)
         for source_key, target_key in (("installerExit", "installerExit"), ("exit", "exit")):
             compact_exit = _compact_exit(application.get(source_key))
             if compact_exit is not None:
@@ -1144,29 +1205,428 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def interaction_evidence(path: Path | None, accept_interactive: bool) -> dict[str, dict[str, bool]]:
-    if not accept_interactive:
-        if path is not None:
-            raise AcceptanceError("--interaction-evidence requires --accept-interactive")
-        return {}
-    if path is None:
-        raise AcceptanceError("--accept-interactive requires --interaction-evidence")
+def _acknowledgement_protocol():  # type: ignore[no-untyped-def]
+    import confirm_macos_gui_interactions  # type: ignore[import-not-found]
+
+    return confirm_macos_gui_interactions
+
+
+def _interaction_failure(error: BaseException) -> AcceptanceError:
+    message = str(error)
+    if "cleanup" in message:
+        return InteractionCleanupError("application interaction cleanup failed")
+    if "root identity changed" in message or "parent identity changed" in message:
+        return InteractionIntegrityError("application interaction root identity changed")
+    return InteractionInvalidError("application interaction acknowledgement is invalid")
+
+
+def read_interaction_plan(
+    path: Path,
+    round_id: str,
+    runtime_id: str,
+    directory: object | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    protocol = _acknowledgement_protocol()
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise AcceptanceError("interaction evidence is not readable JSON") from error
-    if not isinstance(value, dict) or value.get("schemaVersion") != "1":
-        raise AcceptanceError("interaction evidence must use schemaVersion 1")
+        raw = protocol._read_file(path, "interaction plan", directory)
+        value = protocol._parse_json(raw, "interaction plan")
+        if raw != protocol._canonical_bytes(value, "interaction plan"):
+            raise InteractionInvalidError("interaction plan bytes are non-canonical")
+    except InteractionInvalidError:
+        raise
+    except (protocol.AcknowledgementError, OSError) as error:
+        raise InteractionInvalidError("interaction plan is invalid") from error
+    if (
+        type(value) is not dict
+        or set(value) != {"schemaVersion", "roundId", "runtimeId", "applications"}
+        or value["schemaVersion"] != "1"
+        or value["roundId"] != round_id
+        or value["runtimeId"] != runtime_id
+    ):
+        raise InteractionInvalidError("interaction plan is invalid")
     applications = value.get("applications")
-    if not isinstance(applications, dict):
-        raise AcceptanceError("interaction evidence omitted applications")
-    result: dict[str, dict[str, bool]] = {}
+    if type(applications) is not dict or set(applications) != set(REQUIRED_INTERACTIONS):
+        raise InteractionInvalidError("interaction plan is invalid")
+    result: dict[str, dict[str, list[str]]] = {}
     for app_id, required in REQUIRED_INTERACTIONS.items():
-        checks = applications.get(app_id)
-        if not isinstance(checks, dict) or any(checks.get(name) is not True for name in required):
-            raise AcceptanceError(f"interaction evidence is incomplete for {app_id}")
-        result[app_id] = {name: True for name in required}
+        application = applications.get(app_id)
+        if (
+            type(application) is not dict
+            or set(application) != {"requiredChecks"}
+            or type(application["requiredChecks"]) is not list
+            or application["requiredChecks"] != list(required)
+        ):
+            raise InteractionInvalidError("interaction plan is invalid")
+        result[app_id] = {"requiredChecks": list(required)}
     return result
+
+
+@dataclass(slots=True)
+class InteractionSession:
+    plan_path: Path
+    acknowledgement_root: Path
+    round_id: str
+    runtime_id: str
+    plan: dict[str, dict[str, list[str]]]
+    bindings: tuple[object, ...]
+    closed: bool = False
+
+    @property
+    def challenge_binding(self) -> object:
+        return self.bindings[3]
+
+    @property
+    def receipt_binding(self) -> object:
+        return self.bindings[4]
+
+    def _revalidate(self) -> None:
+        if self.closed:
+            raise InteractionIntegrityError("application interaction session is closed")
+        protocol = _acknowledgement_protocol()
+        labels = (
+            "repository root",
+            "interaction plan root",
+            "acknowledgement root",
+            "challenges root",
+            "receipts root",
+        )
+        try:
+            for binding, label in zip(self.bindings, labels):
+                protocol._revalidate_directory(binding, label)
+        except protocol.AcknowledgementError as error:
+            raise InteractionIntegrityError(
+                "application interaction root identity changed"
+            ) from error
+
+    def _entry_identity(self, binding: object, name: str, label: str) -> tuple[int, int, int, int, int]:
+        protocol = _acknowledgement_protocol()
+        try:
+            metadata = protocol._relative_stat(binding, name)
+        except OSError as error:
+            raise InteractionInvalidError(
+                "application interaction acknowledgement is invalid"
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or protocol._is_reparse(metadata)
+            or metadata.st_nlink != 1
+        ):
+            raise InteractionInvalidError(f"{label} entry is invalid")
+        return protocol._file_identity(metadata)
+
+    def _entry_absent(self, binding: object, name: str) -> None:
+        protocol = _acknowledgement_protocol()
+        self._revalidate()
+        try:
+            protocol._relative_stat(binding, name)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise InteractionInvalidError(
+                "application interaction acknowledgement is invalid"
+            ) from error
+        raise InteractionInvalidError("application interaction acknowledgement is invalid")
+
+    def _assert_challenge_unchanged(
+        self,
+        name: str,
+        path: Path,
+        challenge: dict[str, object],
+        identity: tuple[int, int, int, int, int],
+    ) -> None:
+        protocol = _acknowledgement_protocol()
+        try:
+            if (
+                self._entry_identity(self.challenge_binding, name, "challenge")
+                != identity
+                or protocol.read_challenge(path, self.challenge_binding)
+                != challenge
+            ):
+                raise InteractionInvalidError(
+                    "application interaction challenge is invalid"
+                )
+        except protocol.AcknowledgementError as error:
+            raise InteractionInvalidError(
+                "application interaction challenge is invalid"
+            ) from error
+
+    def _consume_owned(
+        self,
+        binding: object,
+        name: str,
+        identity: tuple[int, int, int, int, int],
+        *,
+        tolerate_substitution: bool,
+    ) -> None:
+        protocol = _acknowledgement_protocol()
+        try:
+            self._revalidate()
+            metadata = protocol._relative_stat(binding, name)
+            current = protocol._file_identity(metadata)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or protocol._is_reparse(metadata)
+                or metadata.st_nlink != 1
+                or current != identity
+            ):
+                if tolerate_substitution:
+                    return
+                raise InteractionCleanupError("application interaction cleanup failed")
+            invalidated = protocol._invalidate_relative_if_owned(
+                binding, name, identity[:3]
+            )
+            if not invalidated:
+                if tolerate_substitution:
+                    return
+                raise InteractionCleanupError("application interaction cleanup failed")
+            protocol._sync_directory(binding)
+            try:
+                final = protocol._relative_stat(binding, name)
+            except OSError as error:
+                raise InteractionCleanupError(
+                    "application interaction cleanup failed"
+                ) from error
+            if (
+                not stat.S_ISREG(final.st_mode)
+                or stat.S_ISLNK(final.st_mode)
+                or protocol._is_reparse(final)
+                or final.st_nlink != 1
+                or protocol._node_identity(final) != identity[:3]
+                or final.st_size != identity[3]
+                or protocol._read_file(
+                    binding.path / name,
+                    "consumed interaction",
+                    binding,
+                )[:1]
+                != b"!"
+            ):
+                raise InteractionCleanupError("application interaction cleanup failed")
+            self._revalidate()
+        except InteractionIntegrityError:
+            raise
+        except InteractionCleanupError:
+            raise
+        except OSError as error:
+            raise InteractionCleanupError("application interaction cleanup failed") from error
+
+    def acknowledge_application(
+        self,
+        *,
+        app_id: str,
+        runtime_version: str,
+        pack_digest: str,
+        asset_digest: str,
+        window_observed: bool,
+        nonce_source: Callable[[int], str] = secrets.token_hex,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+        deadline_seconds: float = ACKNOWLEDGEMENT_WAIT_SECONDS,
+        wait_for_acknowledgement: (
+            Callable[[dict[str, object], Path, Path], bool | None] | None
+        ) = None,
+    ) -> dict[str, bool]:
+        if window_observed is not True:
+            return {}
+        if (
+            app_id not in REQUIRED_INTERACTIONS
+            or type(deadline_seconds) not in (int, float)
+            or isinstance(deadline_seconds, bool)
+            or not 0 < deadline_seconds <= ACKNOWLEDGEMENT_WAIT_SECONDS
+            or not callable(nonce_source)
+            or not callable(monotonic)
+            or not callable(sleeper)
+            or (
+                wait_for_acknowledgement is not None
+                and not callable(wait_for_acknowledgement)
+            )
+        ):
+            raise InteractionInvalidError("application interaction request is invalid")
+        protocol = _acknowledgement_protocol()
+        name = f"{self.round_id}--{self.runtime_id}--{app_id}.json"
+        challenge_path = self.acknowledgement_root / "challenges" / name
+        receipt_path = self.acknowledgement_root / "receipts" / name
+        challenge_identity: tuple[int, int, int, int, int] | None = None
+        receipt_identity: tuple[int, int, int, int, int] | None = None
+        challenge_consumed = False
+        receipt_consumed = False
+        try:
+            self._entry_absent(self.challenge_binding, name)
+            self._entry_absent(self.receipt_binding, name)
+            challenge = protocol.make_challenge(
+                round_id=self.round_id,
+                runtime_id=self.runtime_id,
+                runtime_version=runtime_version,
+                app_id=app_id,
+                pack_digest=pack_digest,
+                asset_digest=asset_digest,
+                nonce_source=nonce_source,
+            )
+            if challenge["requiredChecks"] != self.plan[app_id]["requiredChecks"]:
+                raise InteractionInvalidError("application interaction plan is invalid")
+            protocol.write_challenge(
+                challenge_path, challenge, self.challenge_binding
+            )
+            challenge_identity = self._entry_identity(
+                self.challenge_binding, name, "challenge"
+            )
+            deadline = monotonic() + float(deadline_seconds)
+            if wait_for_acknowledgement is not None:
+                callback_result = wait_for_acknowledgement(
+                    dict(challenge), challenge_path, receipt_path
+                )
+                self._assert_challenge_unchanged(
+                    name, challenge_path, challenge, challenge_identity
+                )
+                if callback_result is False:
+                    raise InteractionUnverifiedError(
+                        "application interaction was not acknowledged"
+                    )
+                if callback_result is not None and callback_result is not True:
+                    raise InteractionInvalidError(
+                        "application interaction acknowledgement is invalid"
+                    )
+            while True:
+                self._revalidate()
+                self._assert_challenge_unchanged(
+                    name, challenge_path, challenge, challenge_identity
+                )
+                try:
+                    protocol._relative_stat(self.receipt_binding, name)
+                except FileNotFoundError:
+                    now = monotonic()
+                    if now >= deadline:
+                        raise InteractionUnverifiedError(
+                            "application interaction acknowledgement timed out"
+                        )
+                    sleeper(min(ACKNOWLEDGEMENT_POLL_SECONDS, deadline - now))
+                    continue
+                except OSError as error:
+                    raise InteractionInvalidError(
+                        "application interaction acknowledgement is invalid"
+                    ) from error
+                break
+            receipt_identity = self._entry_identity(
+                self.receipt_binding, name, "acknowledgement"
+            )
+            acknowledgement = protocol.read_acknowledgement(
+                receipt_path, self.receipt_binding
+            )
+            checks = protocol.validate_acknowledgement(
+                challenge, acknowledgement
+            )
+            self._consume_owned(
+                self.receipt_binding,
+                name,
+                receipt_identity,
+                tolerate_substitution=False,
+            )
+            receipt_consumed = True
+            self._consume_owned(
+                self.challenge_binding,
+                name,
+                challenge_identity,
+                tolerate_substitution=False,
+            )
+            challenge_consumed = True
+            return checks
+        except InteractionIntegrityError:
+            raise
+        except InteractionCleanupError:
+            raise
+        except InteractionUnverifiedError:
+            if challenge_identity is not None and not challenge_consumed:
+                self._consume_owned(
+                    self.challenge_binding,
+                    name,
+                    challenge_identity,
+                    tolerate_substitution=False,
+                )
+            raise
+        except (InteractionInvalidError, protocol.AcknowledgementError, OSError) as error:
+            converted = (
+                error
+                if isinstance(error, InteractionInvalidError)
+                else _interaction_failure(error)
+            )
+            if receipt_identity is not None and not receipt_consumed:
+                self._consume_owned(
+                    self.receipt_binding,
+                    name,
+                    receipt_identity,
+                    tolerate_substitution=True,
+                )
+            if challenge_identity is not None and not challenge_consumed:
+                self._consume_owned(
+                    self.challenge_binding,
+                    name,
+                    challenge_identity,
+                    tolerate_substitution=True,
+                )
+            raise converted from error
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        protocol = _acknowledgement_protocol()
+        for binding in reversed(self.bindings):
+            protocol._close_directory(binding)
+        self.closed = True
+
+
+def open_interaction_session(
+    plan_path: Path,
+    acknowledgement_root: Path,
+    round_id: str,
+    runtime_id: str,
+) -> InteractionSession:
+    protocol = _acknowledgement_protocol()
+    if (
+        not isinstance(plan_path, Path)
+        or not isinstance(acknowledgement_root, Path)
+        or round_id not in ("round-1", "round-2")
+        or runtime_id not in RUNTIME_IDS
+        or not plan_path.is_absolute()
+        or not protocol._is_external_root(plan_path.parent)
+        or not protocol._is_external_root(acknowledgement_root)
+    ):
+        raise InteractionIntegrityError("application interaction roots are invalid")
+    held: list[object] = []
+    try:
+        repository, plan_root, acknowledgement = protocol._bind_watch_roots(
+            plan_path.parent, acknowledgement_root
+        )
+        held.extend((repository, plan_root, acknowledgement))
+        challenges = protocol._bind_directory(
+            acknowledgement_root / "challenges", "challenges root"
+        )
+        held.append(challenges)
+        receipts = protocol._bind_directory(
+            acknowledgement_root / "receipts", "receipts root"
+        )
+        held.append(receipts)
+        plan = read_interaction_plan(
+            plan_path, round_id, runtime_id, plan_root
+        )
+        return InteractionSession(
+            plan_path,
+            acknowledgement_root,
+            round_id,
+            runtime_id,
+            plan,
+            tuple(held),
+        )
+    except InteractionInvalidError:
+        for binding in reversed(held):
+            protocol._close_directory(binding)
+        raise
+    except protocol.AcknowledgementError as error:
+        for binding in reversed(held):
+            protocol._close_directory(binding)
+        raise InteractionIntegrityError(
+            "application interaction roots are invalid"
+        ) from error
 
 
 def installed_executable(asset, bottle_root: Path) -> Path:  # type: ignore[no-untyped-def]
@@ -1213,14 +1673,26 @@ def fetch_asset(arguments: argparse.Namespace, app_id: str) -> Path:
 
 
 def main() -> int:
+    interaction_session: InteractionSession | None = None
     try:
         arguments = parser().parse_args()
         runtime_id = validate_runtime_selection(arguments)
+        validate_interaction_selection(arguments, runtime_id)
         arguments.compatforge_cli = absolute(arguments.compatforge_cli, "compatforge-cli")
         arguments.cache_root = absolute(arguments.cache_root, "cache-root", external=True)
         arguments.runtime_store = absolute(arguments.runtime_store, "runtime-store", external=True)
         arguments.storage_root = absolute(arguments.storage_root, "storage-root", external=True)
         arguments.work_root = absolute(arguments.work_root, "work-root", external=True)
+        if arguments.interaction_plan is not None:
+            arguments.interaction_plan = absolute(
+                arguments.interaction_plan, "interaction-plan", external=True
+            )
+        if arguments.acknowledgement_root is not None:
+            arguments.acknowledgement_root = absolute(
+                arguments.acknowledgement_root,
+                "acknowledgement-root",
+                external=True,
+            )
         arguments.work_root.mkdir(parents=True, exist_ok=True)
         if any(arguments.work_root.iterdir()):
             raise AcceptanceError("work-root must be empty")
@@ -1250,13 +1722,6 @@ def main() -> int:
                 "Rosetta x86_64 execution is unavailable",
             )
         explicit = [arguments.wine_root, arguments.wine, arguments.wineserver, arguments.version]
-        evidence_path = (
-            absolute(arguments.interaction_evidence, "interaction-evidence", external=True)
-            if arguments.interaction_evidence
-            else None
-        )
-        manual_checks = interaction_evidence(evidence_path, arguments.accept_interactive)
-
         request = {
             "schemaVersion": "1",
             "runtimeStoreRoot": str(arguments.runtime_store),
@@ -1309,6 +1774,13 @@ def main() -> int:
         supervisor["maximumRuntimeMilliseconds"] = 120_000  # type: ignore[index]
         write_json(context_path, context)
         write_json(arguments.work_root / "bootstrap-receipt.json", receipt)
+        if arguments.accept_interactive:
+            interaction_session = open_interaction_session(
+                arguments.interaction_plan,
+                arguments.acknowledgement_root,
+                arguments.round_id,
+                runtime_id,
+            )
 
         from download_gui_assets import ASSETS, asset_for  # type: ignore[import-not-found]
 
@@ -1321,6 +1793,7 @@ def main() -> int:
                 "schemaVersion": "1",
                 "runtimeId": runtime_id,
                 "appId": asset.app_id,
+                "assetSha256": asset.sha256,
                 "bottleId": bottle_id,
                 "cleanup": False,
             }
@@ -1447,17 +1920,56 @@ def main() -> int:
                 evidence["exit"] = exit_observation(events)
                 evidence["windows"] = windows
                 evidence["screenshot"] = shot
-                evidence["interactionChecks"] = manual_checks.get(asset.app_id, {})
                 evidence["residualProcesses"] = process_snapshot(str(bottle_root), process_group_id)
-                evaluate_application_outcome(
-                    evidence,
-                    asset.app_id,
-                    events,
-                    windows,
-                    shot,
-                    evidence["residualProcesses"],
-                    evidence["interactionChecks"],
+                can_acknowledge = (
+                    interaction_session is not None
+                    and not evidence["residualProcesses"]
+                    and status(events) == "accepted"
+                    and windows.get("available") is True
+                    and shot.get("available") is True
                 )
+                if can_acknowledge:
+                    try:
+                        checks = interaction_session.acknowledge_application(
+                            app_id=asset.app_id,
+                            runtime_version=receipt["version"],
+                            pack_digest=receipt["packDigest"],
+                            asset_digest="sha256:" + asset.sha256,
+                            window_observed=True,
+                        )
+                    except InteractionUnverifiedError:
+                        apply_stage_outcome(
+                            evidence,
+                            "application-interaction",
+                            diagnostic="required application interactions were not acknowledged",
+                        )
+                    except InteractionInvalidError:
+                        apply_stage_outcome(
+                            evidence,
+                            "application-interaction-invalid",
+                            diagnostic="application interaction acknowledgement was invalid",
+                        )
+                    else:
+                        evidence["interactionChecks"] = checks
+                        evaluate_application_outcome(
+                            evidence,
+                            asset.app_id,
+                            events,
+                            windows,
+                            shot,
+                            evidence["residualProcesses"],
+                            checks,
+                        )
+                else:
+                    evaluate_application_outcome(
+                        evidence,
+                        asset.app_id,
+                        events,
+                        windows,
+                        shot,
+                        evidence["residualProcesses"],
+                        {},
+                    )
             except NetworkUnavailableError as error:
                 apply_stage_outcome(
                     evidence,
@@ -1470,6 +1982,8 @@ def main() -> int:
                     "asset-fetch",
                     diagnostic=str(error),
                 )
+            except (InteractionIntegrityError, InteractionCleanupError):
+                raise
             except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
                 apply_stage_outcome(
                     evidence,
@@ -1505,6 +2019,9 @@ def main() -> int:
     except (AcceptanceError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ImportError) as error:
         print(f"compatforge-gui-baseline: {error}", file=sys.stderr)
         return 1
+    finally:
+        if interaction_session is not None:
+            interaction_session.close()
 
 
 if __name__ == "__main__":

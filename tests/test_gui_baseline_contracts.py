@@ -7,6 +7,7 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ASSET_TOOL = ROOT / "tools" / "download_gui_assets.py"
 BASELINE_TOOL = ROOT / "tools" / "run_gui_baseline.py"
+ACKNOWLEDGEMENT_TOOL = ROOT / "tools" / "confirm_macos_gui_interactions.py"
 DESKTOP = ROOT / "apps" / "desktop"
 TAURI = DESKTOP / "src-tauri"
 
@@ -161,6 +163,7 @@ class GuiBaselineContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.assets = load_tool(ASSET_TOOL)
+        cls.acknowledgements = load_tool(ACKNOWLEDGEMENT_TOOL)
         cls.baseline = load_tool(BASELINE_TOOL)
 
     @staticmethod
@@ -189,6 +192,39 @@ class GuiBaselineContractTests(unittest.TestCase):
             ],
             "supervisor": {},
         }
+
+    @staticmethod
+    def interaction_plan(round_id: str = "round-1", runtime_id: str = "crossover") -> dict[str, object]:
+        return {
+            "schemaVersion": "1",
+            "roundId": round_id,
+            "runtimeId": runtime_id,
+            "applications": {
+                app_id: {"requiredChecks": list(checks)}
+                for app_id, checks in (
+                    ("7zip", ("fileList", "menus")),
+                    ("sumatrapdf", ("mainWindow", "openDialog")),
+                    (
+                        "notepad-plus-plus",
+                        ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+                    ),
+                )
+            },
+        }
+
+    @staticmethod
+    def write_canonical_json(path: Path, value: object) -> None:
+        path.write_bytes(
+            (
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
 
     def test_rust_code_projection_removes_comment_and_string_decoys(self) -> None:
         source = """
@@ -476,6 +512,7 @@ struct RealCode;
             "desktop-window-unobserved": "failed",
             "application-install-failed": "failed",
             "application-interaction-unverified": "unverified",
+            "application-interaction-invalid": "failed",
             "application-content-verification-failed": "failed",
             "cleanup-residual-processes": "failed",
             "cleanup-termination-failed": "failed",
@@ -1515,10 +1552,6 @@ struct RealCode;
                 "reason": "window tool failed under C:\\Users\\developer\\acceptance",
                 "cleanupError": "/Users/developer/acceptance/bottle is busy",
                 "cleanup": True,
-                "interactionChecks": {
-                    "fileList": True,
-                    "menus": False,
-                },
                 "exit": {"present": True, "code": 0, "success": True, "path": "/private/tmp/log"},
                 "windows": {"available": False, "reason": "/Users/developer denied access"},
                 "screenshot": {"available": False, "path": "/Users/developer/7zip.png"},
@@ -1544,7 +1577,6 @@ struct RealCode;
                     "failureClass": "desktop",
                     "reasonCode": "desktop-window-unobserved",
                     "cleanup": True,
-                    "interactionChecks": {"fileList": True, "menus": False},
                     "exit": {"present": True, "code": 0, "success": True},
                     "windowAvailable": False,
                     "screenshotAvailable": False,
@@ -1578,7 +1610,11 @@ struct RealCode;
                 self.baseline.compact_summary({**receipt, **mutation}, applications)
 
         unsafe_application = json.loads(json.dumps(applications))
-        unsafe_application[0]["interactionChecks"]["/Users/developer/secret"] = True
+        unsafe_application[0]["interactionChecks"] = {
+            "fileList": True,
+            "menus": True,
+            "/Users/developer/secret": True,
+        }
         with self.assertRaises(self.baseline.AcceptanceError):
             self.baseline.compact_summary(receipt, unsafe_application)
         nested_application_id = json.loads(json.dumps(applications))
@@ -1626,7 +1662,11 @@ struct RealCode;
 
         compact_mutants = []
         nested_key = json.loads(json.dumps(expected))
-        nested_key["applications"][0]["interactionChecks"]["/Users/developer/secret"] = True
+        nested_key["applications"][0]["interactionChecks"] = {
+            "fileList": True,
+            "menus": True,
+            "/Users/developer/secret": True,
+        }
         compact_mutants.append(nested_key)
         unknown_nested = json.loads(json.dumps(expected))
         unknown_nested["receipt"]["activated"] = {"/Users/developer/secret": True}
@@ -1645,31 +1685,400 @@ struct RealCode;
         source = BASELINE_TOOL.read_text(encoding="utf-8")
         self.assertEqual(source.count("results.append(evidence)"), 1)
 
-    def test_acceptance_requires_complete_structured_interaction_evidence(self) -> None:
-        with self.assertRaises(self.baseline.AcceptanceError):
-            self.baseline.interaction_evidence(None, True)
-        with tempfile.TemporaryDirectory(prefix="compatforge-interactions-") as temporary:
-            path = Path(temporary) / "interactions.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schemaVersion": "1",
-                        "applications": {
-                            "7zip": {"fileList": True, "menus": True},
-                            "sumatrapdf": {"mainWindow": True, "openDialog": True},
-                            "notepad-plus-plus": {
-                                "open": True,
-                                "edit": True,
-                                "saveUtf8Chinese": True,
-                                "rereadMatches": True,
-                            },
-                        },
-                    }
-                ),
-                encoding="utf-8",
+    def test_interactive_cli_requires_the_new_closed_acknowledgement_boundary(self) -> None:
+        common = [
+            "--compatforge-cli",
+            "C:\\tools\\compatforge.exe",
+            "--cache-root",
+            "C:\\acceptance\\cache",
+            "--runtime-store",
+            "C:\\acceptance\\runtime-store",
+            "--storage-root",
+            "C:\\acceptance\\storage",
+            "--work-root",
+            "C:\\acceptance\\work",
+            "--runtime-id",
+            "crossover",
+            "--wine-root",
+            "C:\\Runtimes\\selected",
+            "--wine",
+            "bin/wine",
+            "--wineserver",
+            "bin/wineserver",
+            "--version",
+            "24.0",
+        ]
+        interactive = [
+            *common,
+            "--accept-interactive",
+            "--interaction-plan",
+            "C:\\acceptance\\plans\\round-1-crossover.json",
+            "--acknowledgement-root",
+            "C:\\acceptance\\acknowledgements",
+            "--round-id",
+            "round-1",
+        ]
+        arguments = self.baseline.parser().parse_args(interactive)
+        self.baseline.validate_interaction_selection(arguments, "crossover")
+        self.assertEqual(arguments.round_id, "round-1")
+
+        for omitted in ("--interaction-plan", "--acknowledgement-root", "--round-id"):
+            mutant = interactive.copy()
+            index = mutant.index(omitted)
+            del mutant[index : index + 2]
+            with self.subTest(omitted=omitted), self.assertRaises(self.baseline.AcceptanceError):
+                parsed = self.baseline.parser().parse_args(mutant)
+                self.baseline.validate_interaction_selection(parsed, "crossover")
+
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.baseline.parser().parse_args(
+                [*common, "--accept-interactive", "--interaction-evidence", "C:\\old.json"]
             )
-            checks = self.baseline.interaction_evidence(path, True)
-            self.assertTrue(checks["notepad-plus-plus"]["rereadMatches"])
+
+    def test_interaction_plan_is_closed_canonical_and_cannot_prefill_truth_claims(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-interaction-plan-") as temporary:
+            root = Path(temporary)
+            path = root / "round-1-crossover.json"
+            plan = self.interaction_plan()
+            self.write_canonical_json(path, plan)
+            self.assertEqual(
+                self.baseline.read_interaction_plan(path, "round-1", "crossover"),
+                plan["applications"],
+            )
+
+            mutants = []
+            prefilled = json.loads(json.dumps(plan))
+            prefilled["applications"]["7zip"] = {"fileList": True, "menus": True}
+            mutants.append(prefilled)
+            unknown = json.loads(json.dumps(plan))
+            unknown["accepted"] = True
+            mutants.append(unknown)
+            wrong_round = json.loads(json.dumps(plan))
+            wrong_round["roundId"] = "round-2"
+            mutants.append(wrong_round)
+            wrong_runtime = json.loads(json.dumps(plan))
+            wrong_runtime["runtimeId"] = "whisky"
+            mutants.append(wrong_runtime)
+            for index, mutant in enumerate(mutants):
+                with self.subTest(index=index):
+                    self.write_canonical_json(path, mutant)
+                    with self.assertRaises(self.baseline.InteractionInvalidError):
+                        self.baseline.read_interaction_plan(path, "round-1", "crossover")
+
+            path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+            with self.assertRaises(self.baseline.InteractionInvalidError):
+                self.baseline.read_interaction_plan(path, "round-1", "crossover")
+
+    def test_challenge_is_post_window_and_deterministic_callback_never_reads_stdin(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-ack-") as temporary:
+            root = Path(temporary)
+            plan_path = root / "plans" / "round-1-crossover.json"
+            acknowledgement_root = root / "acknowledgements"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+            callback_calls: list[str] = []
+
+            def acknowledge(challenge: dict[str, object], challenge_path: Path, receipt_path: Path) -> bool:
+                callback_calls.append(challenge["appId"])
+                self.assertTrue(challenge_path.is_file())
+                self.assertFalse(receipt_path.exists())
+                self.acknowledgements.write_acknowledgement(
+                    receipt_path,
+                    self.acknowledgements.make_acknowledgement(challenge),
+                )
+                return True
+
+            try:
+                self.assertEqual(
+                    session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=False,
+                        nonce_source=lambda _size: "c" * 64,
+                        wait_for_acknowledgement=acknowledge,
+                    ),
+                    {},
+                )
+                self.assertEqual(callback_calls, [])
+                self.assertEqual(list((acknowledgement_root / "challenges").iterdir()), [])
+                checks = session.acknowledge_application(
+                    app_id="7zip",
+                    runtime_version="24.0",
+                    pack_digest="sha256:" + "a" * 64,
+                    asset_digest="sha256:" + "b" * 64,
+                    window_observed=True,
+                    nonce_source=lambda _size: "c" * 64,
+                    wait_for_acknowledgement=acknowledge,
+                )
+            finally:
+                session.close()
+            self.assertEqual(checks, {"fileList": True, "menus": True})
+            self.assertEqual(callback_calls, ["7zip"])
+            self.assertTrue(
+                (acknowledgement_root / "challenges" / "round-1--crossover--7zip.json")
+                .read_bytes()
+                .startswith(b"!"),
+            )
+            self.assertTrue(
+                (acknowledgement_root / "receipts" / "round-1--crossover--7zip.json")
+                .read_bytes()
+                .startswith(b"!"),
+            )
+
+    def test_acknowledgement_binds_every_identity_digest_nonce_and_check(self) -> None:
+        mutations = (
+            ("roundId", "round-2"),
+            ("runtimeId", "whisky"),
+            ("runtimeVersion", "25.0"),
+            ("packDigest", "sha256:" + "d" * 64),
+            ("assetDigest", "sha256:" + "e" * 64),
+            ("nonce", "f" * 64),
+            ("challengeDigest", "sha256:" + "0" * 64),
+        )
+        variants: list[tuple[str, object]] = list(mutations) + [("appId", "sumatrapdf"), ("checkSet", None)]
+        for field, replacement in variants:
+            with self.subTest(field=field), tempfile.TemporaryDirectory(
+                prefix="compatforge-gui-ack-binding-"
+            ) as temporary:
+                root = Path(temporary)
+                plan_path = root / "plans" / "plan.json"
+                acknowledgement_root = root / "ack"
+                plan_path.parent.mkdir()
+                (acknowledgement_root / "challenges").mkdir(parents=True)
+                (acknowledgement_root / "receipts").mkdir()
+                self.write_canonical_json(plan_path, self.interaction_plan())
+                session = self.baseline.open_interaction_session(
+                    plan_path, acknowledgement_root, "round-1", "crossover"
+                )
+
+                def wrong_receipt(
+                    challenge: dict[str, object], _challenge_path: Path, receipt_path: Path
+                ) -> bool:
+                    acknowledgement = self.acknowledgements.make_acknowledgement(challenge)
+                    if field == "appId":
+                        acknowledgement["appId"] = replacement
+                        acknowledgement["requiredChecks"] = list(
+                            self.acknowledgements.REQUIRED_CHECKS[replacement]
+                        )
+                        acknowledgement["interactionChecks"] = {
+                            check: True for check in acknowledgement["requiredChecks"]
+                        }
+                    elif field == "checkSet":
+                        acknowledgement["interactionChecks"].pop("menus")
+                    else:
+                        acknowledgement[field] = replacement
+                    receipt_path.write_bytes(
+                        json.dumps(
+                            acknowledgement,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
+                    return True
+
+                try:
+                    with self.assertRaises(self.baseline.InteractionInvalidError):
+                        session.acknowledge_application(
+                            app_id="7zip",
+                            runtime_version="24.0",
+                            pack_digest="sha256:" + "a" * 64,
+                            asset_digest="sha256:" + "b" * 64,
+                            window_observed=True,
+                            nonce_source=lambda _size: "c" * 64,
+                            wait_for_acknowledgement=wrong_receipt,
+                        )
+                finally:
+                    session.close()
+
+    def test_prefilled_replayed_unsafe_negative_and_timeout_receipts_fail_closed(self) -> None:
+        for variant in (
+            "prefilled",
+            "hardlink",
+            "substituted-challenge",
+            "substituted-challenge-timeout",
+            "replay-round",
+            "replay-application",
+            "callback-integer",
+            "negative",
+            "timeout",
+        ):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(
+                prefix="compatforge-gui-ack-failure-"
+            ) as temporary:
+                root = Path(temporary)
+                plan_path = root / "plans" / "plan.json"
+                acknowledgement_root = root / "ack"
+                challenges = acknowledgement_root / "challenges"
+                receipts = acknowledgement_root / "receipts"
+                plan_path.parent.mkdir()
+                challenges.mkdir(parents=True)
+                receipts.mkdir()
+                self.write_canonical_json(plan_path, self.interaction_plan())
+                name = "round-1--crossover--7zip.json"
+                if variant == "prefilled":
+                    receipts.joinpath(name).write_bytes(b"{}\n")
+                session = self.baseline.open_interaction_session(
+                    plan_path, acknowledgement_root, "round-1", "crossover"
+                )
+                now = [0.0]
+
+                def wait(
+                    challenge: dict[str, object], challenge_path: Path, receipt_path: Path
+                ) -> bool:
+                    if variant == "negative":
+                        return False
+                    if variant == "callback-integer":
+                        return 1  # type: ignore[return-value]
+                    if variant == "hardlink":
+                        victim = root / "victim.json"
+                        victim.write_bytes(
+                            self.acknowledgements.encode_acknowledgement(
+                                self.acknowledgements.make_acknowledgement(challenge)
+                            )
+                        )
+                        os.link(victim, receipt_path)
+                    elif variant in (
+                        "substituted-challenge",
+                        "substituted-challenge-timeout",
+                    ):
+                        challenge_path.unlink()
+                        self.acknowledgements.write_challenge(
+                            challenge_path,
+                            self.acknowledgements.make_challenge(
+                                round_id="round-1",
+                                runtime_id="crossover",
+                                runtime_version="24.0",
+                                app_id="7zip",
+                                pack_digest="sha256:" + "a" * 64,
+                                asset_digest="sha256:" + "b" * 64,
+                                nonce_source=lambda _size: "d" * 64,
+                            ),
+                        )
+                        if variant == "substituted-challenge":
+                            self.acknowledgements.write_acknowledgement(
+                                receipt_path,
+                                self.acknowledgements.make_acknowledgement(challenge),
+                            )
+                    elif variant in ("replay-round", "replay-application"):
+                        replay_app = (
+                            "sumatrapdf" if variant == "replay-application" else "7zip"
+                        )
+                        replay = self.acknowledgements.make_challenge(
+                            round_id=(
+                                "round-2" if variant == "replay-round" else "round-1"
+                            ),
+                            runtime_id="crossover",
+                            runtime_version="24.0",
+                            app_id=replay_app,
+                            pack_digest="sha256:" + "a" * 64,
+                            asset_digest="sha256:" + "b" * 64,
+                            nonce_source=lambda _size: "d" * 64,
+                        )
+                        self.acknowledgements.write_acknowledgement(
+                            receipt_path,
+                            self.acknowledgements.make_acknowledgement(replay),
+                        )
+                    return True
+
+                def sleep(seconds: float) -> None:
+                    now[0] += seconds
+
+                expected = (
+                    self.baseline.InteractionUnverifiedError
+                    if variant in ("negative", "timeout")
+                    else self.baseline.InteractionInvalidError
+                )
+                try:
+                    with self.assertRaises(expected):
+                        session.acknowledge_application(
+                            app_id="7zip",
+                            runtime_version="24.0",
+                            pack_digest="sha256:" + "a" * 64,
+                            asset_digest="sha256:" + "b" * 64,
+                            window_observed=True,
+                            nonce_source=lambda _size: "c" * 64,
+                            monotonic=lambda: now[0],
+                            sleeper=sleep,
+                            deadline_seconds=0.1,
+                            wait_for_acknowledgement=None if variant == "timeout" else wait,
+                        )
+                finally:
+                    session.close()
+
+    def test_interaction_integrity_and_cleanup_failures_are_fatal(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-ack-fatal-") as temporary:
+            root = Path(temporary)
+            plan_path = root / "plans" / "plan.json"
+            acknowledgement_root = root / "ack"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+            try:
+                with mock.patch.object(
+                    self.acknowledgements,
+                    "_revalidate_directory",
+                    side_effect=self.acknowledgements.AcknowledgementError(
+                        "acknowledgement root identity changed"
+                    ),
+                ), self.assertRaises(self.baseline.InteractionIntegrityError):
+                    session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=True,
+                    )
+            finally:
+                session.close()
+
+        with tempfile.TemporaryDirectory(prefix="compatforge-gui-ack-cleanup-") as temporary:
+            root = Path(temporary)
+            plan_path = root / "plans" / "plan.json"
+            acknowledgement_root = root / "ack"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+
+            def acknowledge(challenge: dict[str, object], _challenge: Path, receipt: Path) -> bool:
+                self.acknowledgements.write_acknowledgement(
+                    receipt, self.acknowledgements.make_acknowledgement(challenge)
+                )
+                return True
+
+            try:
+                with mock.patch.object(
+                    self.acknowledgements,
+                    "_invalidate_relative_if_owned",
+                    side_effect=OSError("denied"),
+                ), self.assertRaises(self.baseline.InteractionCleanupError):
+                    session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=True,
+                        nonce_source=lambda _size: "c" * 64,
+                        wait_for_acknowledgement=acknowledge,
+                    )
+            finally:
+                session.close()
 
     def test_residual_process_check_uses_the_launch_process_group(self) -> None:
         with mock.patch.object(
