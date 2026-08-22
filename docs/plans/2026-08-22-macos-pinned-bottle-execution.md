@@ -24,7 +24,7 @@ Assert that serialized `LaunchPlan`, `LaunchRequest`, `BottleExecutableBinding`,
 ```text
 prepared-pinned-sumatrapdf-launch-terminate \
   <config.json> <fixed-logical-executable> <request.json> \
-  <inspection-output.json> <plan-output.json> <milliseconds>
+  <external-work-root> <milliseconds>
 ```
 
 Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary-Bottle uses. Pin the future command to:
@@ -34,7 +34,7 @@ Reject missing, extra, option-shaped, relative, combined, non-macOS, or ordinary
 - architecture `x86_64`;
 - logical suffix `CompatForge/SumatraPDF/SumatraPDF.exe`;
 - no guest arguments; and
-- create-new inspection/plan outputs.
+- a held external work root with fixed create-new inspection/plan output names.
 
 **Step 2: Run RED**
 
@@ -110,7 +110,7 @@ Define an opaque, non-serializable `PinnedBottleExecutable` containing:
 
 Tests prove component-by-component `openat(O_NOFOLLOW)` capture, reparse/symlink/hardlink rejection, same/ancestor substitution detection, and exact fixed path containment.
 
-Create the execution staging entry with `create_new`, unlink it immediately, assert `nlink == 0`, and only then copy source bytes. Add injected tests for directory enumeration, attempted hardlink, retained foreign write handle, unlink failure, short copy, sync, rewind, and inspection failures.
+On macOS, create the execution object with `shm_open` under a 256-bit `arc4random_buf` name, call `shm_unlink` immediately, and copy no source byte until anonymity is confirmed. Darwin exposes no filesystem directory entry for the object. The name must never be logged, serialized, or returned. Add injected tests for name-collision retry bounds, random-source failure, unlink failure, short copy, sync, rewind, and inspection failures.
 
 **Step 2: Run RED**
 
@@ -120,7 +120,7 @@ cargo test -p compatforge-guest-artifact --all-targets --locked pinned
 
 **Step 3: Implement the audited platform boundary**
 
-Replace crate-wide `forbid(unsafe_code)` with `deny(unsafe_op_in_unsafe_fn)`. Confine all unsafe calls to `pinned_platform.rs`, with one safety comment per call. Use `openat`, `fstatat`, `unlinkat`, `fstat`, and `fcntl` only; expose safe RAII wrappers to the rest of the crate.
+Replace crate-wide `forbid(unsafe_code)` with `deny(unsafe_op_in_unsafe_fn)`. Confine all unsafe calls to `pinned_platform.rs`, with one safety comment per call. Use only `openat`, `fstatat`, `fstat`, `fcntl`, `arc4random_buf`, `shm_open`, and `shm_unlink`; expose safe RAII wrappers to the rest of the crate. Reference Apple's documented no-visible-filesystem-entry shared-memory behavior in the safety contract.
 
 The Windows implementation is a fixed unsupported-platform branch plus pure helper tests. It must compile without accessing a source path.
 
@@ -134,7 +134,7 @@ pub fn pin_sumatra_bottle_executable(
 ) -> Result<PinnedBottleExecutable, GuestArtifactError>;
 ```
 
-Require `gui-sumatrapdf` and the fixed relative path. Revalidate every held identity and the source link count before returning and on each later lease boundary. The anonymous digest/size/inspection are the binding of record.
+Require `gui-sumatrapdf` and the fixed relative path. Revalidate every held identity, link count, size, ctime/mtime, and a fresh digest of the held source before returning and at every pre-spawn lease boundary. A mutation observed by final revalidation rejects with zero child creation. The anonymous digest/size/inspection are the execution binding of record; mutation after successful spawn cannot redirect those bytes and is reported by post-spawn integrity revalidation.
 
 **Step 5: Run GREEN and commit**
 
@@ -270,14 +270,14 @@ The command must execute, in order:
 2. no-follow lease capture;
 3. pinned prepare;
 4. pinned authorize;
-5. canonical create-new inspection and plan evidence publication;
+5. bind the supplied external work root, reject physical/lexical overlap with storage, Bottle and source, then publish fixed-name inspection and plan files with fd-relative `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` plus canonical readback; the Python caller separately proves the root is external to the repository before invoking the command;
 6. pinned process start and existing event supervision.
 
-Mutation tests replace or overwrite the logical path after capture and assert the emitted plan/inspection still describe the anonymous lease and the child consumes only the lease bytes.
+Mutation tests replace or overwrite the logical path before final revalidation and assert integrity failure with zero child creation. A separate post-spawn hook changes the source and proves the already-created child still consumes only anonymous bytes before the integrity shutdown path runs.
 
 **Step 2: Add stable error mapping tests**
 
-Every open, component, capture, unlink, copy, sync, inspect, authorize, evidence-write, descriptor, spawn, and cleanup error maps to one fixed `compatforge-cli: pinned SumatraPDF launch failed\n` message. Assert stdout, stderr, inspection/plan outputs, full evidence, and compact evidence contain no storage path, temp path, source path, developer path, or descriptor number.
+Every open, component, capture, unlink, copy, sync, inspect, authorize, evidence-write, descriptor, spawn, and cleanup error maps to one fixed `compatforge-cli: pinned SumatraPDF launch failed\n` message. Errors, stdout and compact evidence contain no storage, source, work, developer, shared-memory or descriptor detail. Canonical plan and external full evidence may retain only the authorized logical Bottle/Runtime/storage paths already present in an ordinary `LaunchPlan`; neither may contain descriptor numbers, shared-memory names, anonymous paths, or temporary paths.
 
 **Step 3: Run RED**
 
@@ -288,7 +288,7 @@ cargo test -p compatforge-cli --all-targets --locked pinned
 
 **Step 4: Implement and run GREEN**
 
-Use create-new/no-follow output publication with canonical readback. Do not add stdin, PATH, shell, ambient environment, network, or fallback behavior.
+Use held-parent fd-relative create-new/no-follow output publication with canonical readback. Revalidate the external work root before and after each publication. Do not add stdin, PATH, shell, ambient environment, network, or fallback behavior.
 
 ```bash
 cargo test -p compatforge-cli --all-targets --locked
@@ -304,7 +304,7 @@ git commit -s -m "feat: launch a pinned SumatraPDF session"
 
 **Step 1: Build the exact branch on Apple Silicon**
 
-Build the CLI with the existing locked toolchain and run only the closed pinned command against the fixed SumatraPDF asset in CrossOver and Whisky. Keep the source pathname present for logical identity but mutate it after capture through the test hook; the launched window must still come from the anonymous digest.
+Build the CLI with the existing locked toolchain and run only the closed pinned command against the fixed SumatraPDF asset in CrossOver and Whisky. Keep the source pathname stable through final lease revalidation. After the child is successfully created, mutate the source through the focused hook; the launched window must still come from the anonymous digest and the post-spawn integrity path must close the run.
 
 **Step 2: Verify both Runtimes**
 
@@ -313,7 +313,6 @@ For CrossOver and Whisky independently require:
 - the Wine child inherits the descriptor;
 - `start.exe /unix /dev/fd/<n>` opens the Sumatra window;
 - the expected title is observed;
-- the post-window acknowledgement succeeds;
 - source overwrite/substitution does not change executed bytes; and
 - zero residual process and cleanup failures.
 
@@ -321,7 +320,7 @@ For CrossOver and Whisky independently require:
 
 If either Runtime fails, stop and revise the design. Do not integrate the command into `run_gui_baseline.py`, do not fall back to pathname execution, and do not claim Task 4 complete.
 
-If both pass, record only redacted command/result evidence and continue.
+If both pass, record only redacted descriptor/window/cleanup evidence and continue. The production acknowledgement path is verified after runner integration in Task 8.
 
 ### Task 8: Select the pinned session only for SumatraPDF
 
@@ -379,7 +378,7 @@ Run all acknowledgement, GUI, dual-Runtime, stable headless, validator, converte
 
 **Step 2: Independent reviews**
 
-Require specification and quality reviews to both report `C0 / I0 / M0`. Replay initial capture, same-inode overwrite, pathname replacement during every boundary, staging hardlink/write-handle attempts, descriptor inheritance/cleanup, naked fallback, and evidence-leak mutants.
+Require specification and quality reviews to both report `C0 / I0 / M0`. Replay initial capture, pre-final-revalidation overwrite/path replacement, post-spawn source mutation, shared-memory randomness/anonymity failures, work-root substitution, descriptor inheritance/cleanup, naked fallback, and evidence-leak mutants.
 
 **Step 3: Commit verified documentation**
 
