@@ -652,6 +652,7 @@ mod macos {
             let raw = fstat_fd(self.raw_fd)?;
             let current = fstat_fd(self.file.as_raw_fd())?;
             let raw_status = status_flags(self.raw_fd)?;
+            let current_status = status_flags(self.file.as_raw_fd())?;
             let expected = self.identity.get();
             if !full_identity_and_cloexec_match(
                 expected.snapshot(),
@@ -667,6 +668,8 @@ mod macos {
                 || u64::try_from(raw.size).map_err(|_| PlatformError::InvalidEvidence)? != expected_size
                 || raw_status & libc::O_ACCMODE != libc::O_RDWR
                 || raw_status & libc::O_APPEND != 0
+                || current_status & libc::O_ACCMODE != libc::O_RDWR
+                || current_status & libc::O_APPEND != 0
                 || current.owner != expected.owner
                 || current.permissions() != 0o600
                 || current.links != 0
@@ -682,6 +685,7 @@ mod macos {
             let current = fstat_fd(self.file.as_raw_fd())?;
             let previous = self.identity.get();
             let raw_status = status_flags(self.raw_fd)?;
+            let current_status = status_flags(self.file.as_raw_fd())?;
             if !previous.same_object(raw)
                 || !full_identity_and_cloexec_match(
                     raw.snapshot(),
@@ -695,6 +699,8 @@ mod macos {
                 || u64::try_from(raw.size).map_err(|_| PlatformError::InvalidEvidence)? != expected_size
                 || raw_status & libc::O_ACCMODE != libc::O_RDWR
                 || raw_status & libc::O_APPEND != 0
+                || current_status & libc::O_ACCMODE != libc::O_RDWR
+                || current_status & libc::O_APPEND != 0
             {
                 return Err(PlatformError::InvalidEvidence);
             }

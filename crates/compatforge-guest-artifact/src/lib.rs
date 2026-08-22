@@ -231,6 +231,23 @@ impl InheritedEvidenceFile {
         })
     }
 
+    /// Revalidate both the caller-owned descriptor and this wrapper's owned
+    /// duplicate against the exact bytes published earlier.
+    pub fn revalidate_binding(&mut self, binding: &PublishedEvidenceBinding) -> Result<(), GuestArtifactError> {
+        validate_pinned_evidence_length(binding.byte_length)?;
+        self.handle
+            .revalidate(binding.byte_length)
+            .map_err(map_evidence_error)?;
+        let actual = read_published_evidence_digest(self.handle.file_mut(), binding.byte_length)?;
+        self.handle
+            .revalidate(binding.byte_length)
+            .map_err(map_evidence_error)?;
+        if actual != binding.sha256 {
+            return Err(GuestArtifactError::InvalidPinnedEvidence);
+        }
+        Ok(())
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     fn clear_raw_cloexec_for_test(&self) {
         self.handle.clear_raw_cloexec_for_test();
@@ -751,6 +768,27 @@ fn write_and_read_back_canonical<T: DurableIo>(io: &mut T, bytes: &[u8]) -> Resu
     io.seek(SeekFrom::Start(0))
         .map(|_| ())
         .map_err(|_| GuestArtifactError::PinnedEvidenceWriteFailed)
+}
+
+fn read_published_evidence_digest<T: Read + Seek>(
+    io: &mut T,
+    expected_size: u64,
+) -> Result<String, GuestArtifactError> {
+    validate_pinned_evidence_length(expected_size)?;
+    io.seek(SeekFrom::Start(0))
+        .map_err(|_| GuestArtifactError::InvalidPinnedEvidence)?;
+    let mut readback =
+        Vec::with_capacity(usize::try_from(expected_size).map_err(|_| GuestArtifactError::InvalidPinnedEvidence)?);
+    Read::by_ref(io)
+        .take(MAX_PINNED_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut readback)
+        .map_err(|_| GuestArtifactError::InvalidPinnedEvidence)?;
+    io.seek(SeekFrom::Start(0))
+        .map_err(|_| GuestArtifactError::InvalidPinnedEvidence)?;
+    if readback.len() as u64 != expected_size {
+        return Err(GuestArtifactError::InvalidPinnedEvidence);
+    }
+    Ok(digest_bytes(&readback))
 }
 
 fn digest_open_file(file: File, expected_size: u64) -> Result<String, GuestArtifactError> {
@@ -2041,6 +2079,32 @@ mod tests {
                 evidence.write_canonical(b"{}"),
                 Err(GuestArtifactError::InvalidPinnedEvidence)
             ));
+            fs::remove_dir_all(context.root).unwrap();
+        }
+
+        #[test]
+        fn published_evidence_revalidation_rejects_each_raw_and_owned_cloexec_drift() {
+            let context = context("pinned-published-evidence-cloexec-drift");
+            for (label, kind, clear_owned) in [
+                ("inspection-raw", PinnedEvidenceKind::Inspection, false),
+                ("inspection-owned", PinnedEvidenceKind::Inspection, true),
+                ("plan-raw", PinnedEvidenceKind::Plan, false),
+                ("plan-owned", PinnedEvidenceKind::Plan, true),
+            ] {
+                let (path, raw) = create_output(&context.work, label);
+                fs::remove_file(path).unwrap();
+                let mut evidence = InheritedEvidenceFile::duplicate_inherited(raw.as_raw_fd(), kind).unwrap();
+                let binding = evidence.write_canonical(b"{\"schemaVersion\":1}").unwrap();
+                if clear_owned {
+                    evidence.clear_owned_cloexec_for_test();
+                } else {
+                    evidence.clear_raw_cloexec_for_test();
+                }
+                assert!(matches!(
+                    evidence.revalidate_binding(&binding),
+                    Err(GuestArtifactError::InvalidPinnedEvidence)
+                ));
+            }
             fs::remove_dir_all(context.root).unwrap();
         }
 

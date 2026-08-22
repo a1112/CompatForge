@@ -835,8 +835,13 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
         start = method_body("start_pinned", "post_spawn_revalidate")
         self.assertEqual(start.count(root_check), 1)
+        self.assertEqual(start.count(".revalidate_binding("), 2)
         self.assertLess(
             start.index(root_check),
+            start.index("ProcessSupervisor::start_pinned_bottle"),
+        )
+        self.assertLess(
+            start.rindex(".revalidate_binding("),
             start.index("ProcessSupervisor::start_pinned_bottle"),
         )
 

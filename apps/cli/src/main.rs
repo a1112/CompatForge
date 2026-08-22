@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 
 const PINNED_SUMATRAPDF_FAILURE: &str = "pinned SumatraPDF launch failed";
 const PINNED_SUMATRAPDF_DIAGNOSTIC: &[u8] = b"compatforge-cli: pinned SumatraPDF launch failed\n";
+#[cfg(any(target_os = "macos", test))]
+const PINNED_RUNTIME_REQUEST_ID: &str = "pinned-sumatrapdf";
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -471,6 +473,7 @@ where
 struct TimedPinnedHandle {
     handle: LaunchHandle,
     started: Instant,
+    cleanup_wait: Duration,
 }
 
 #[cfg(target_os = "macos")]
@@ -560,6 +563,7 @@ impl ClosedPinnedSession for MacOsClosedPinnedSession<'_> {
         config.validate().map_err(|_| PinnedSessionError)?;
         request.validate().map_err(|_| PinnedSessionError)?;
         if request.bottle_id != "gui-sumatrapdf"
+            || request.request_id != PINNED_RUNTIME_REQUEST_ID
             || request.executable.mode != ExecutableMode::BottleInPlace
             || request.executable.architecture != CpuArchitecture::X86_64
             || request.executable.path != self.logical_executable_path
@@ -672,12 +676,37 @@ impl ClosedPinnedSession for MacOsClosedPinnedSession<'_> {
     }
 
     fn start_pinned(&mut self) -> Result<Self::Handle, PinnedSessionError> {
+        let (inspection_binding, plan_binding) = {
+            let receipt = self.receipt.as_ref().ok_or(PinnedSessionError)?;
+            (
+                PublishedEvidenceBinding {
+                    byte_length: receipt.outputs[0].byte_length,
+                    sha256: receipt.outputs[0].sha256.clone(),
+                },
+                PublishedEvidenceBinding {
+                    byte_length: receipt.outputs[1].byte_length,
+                    sha256: receipt.outputs[1].sha256.clone(),
+                },
+            )
+        };
+        self.inspection_output
+            .as_mut()
+            .ok_or(PinnedSessionError)?
+            .revalidate_binding(&inspection_binding)
+            .map_err(|_| PinnedSessionError)?;
+        self.plan_output
+            .as_mut()
+            .ok_or(PinnedSessionError)?
+            .revalidate_binding(&plan_binding)
+            .map_err(|_| PinnedSessionError)?;
         self.work_root()?.revalidate().map_err(|_| PinnedSessionError)?;
         let handle = ProcessSupervisor::start_pinned_bottle(self.prepared()?.plan(), self.pinned()?)
             .map_err(|_| PinnedSessionError)?;
+        let cleanup_wait = Duration::from_millis(self.prepared()?.plan().lifecycle.termination_grace_milliseconds);
         Ok(TimedPinnedHandle {
             handle,
             started: Instant::now(),
+            cleanup_wait,
         })
     }
 
@@ -686,12 +715,17 @@ impl ClosedPinnedSession for MacOsClosedPinnedSession<'_> {
     }
 
     fn shutdown_integrity_failure(&mut self, timed: Self::Handle) -> Result<(), PinnedSessionError> {
-        timed.handle.terminate().map_err(|_| PinnedSessionError)?;
-        drain_pinned_integrity_shutdown(&timed.handle)
+        let termination = timed.handle.terminate().map_err(|_| PinnedSessionError);
+        let cleanup = drain_pinned_integrity_shutdown(&timed.handle, timed.cleanup_wait);
+        if termination.is_err() || cleanup.is_err() {
+            Err(PinnedSessionError)
+        } else {
+            Ok(())
+        }
     }
 
     fn supervise_pinned(&mut self, timed: Self::Handle) -> Result<Vec<Vec<u8>>, PinnedSessionError> {
-        collect_pinned_runtime_events(&timed.handle, timed.started, self.terminate_after)
+        collect_pinned_runtime_events(&timed.handle, timed.started, self.terminate_after, timed.cleanup_wait)
     }
 
     fn finalize_session(&mut self) -> Result<(), PinnedSessionError> {
@@ -731,56 +765,124 @@ fn canonical_pinned_json<T: Serialize>(value: &T) -> Result<Vec<u8>, PinnedSessi
     serde_json::to_vec(&canonicalize_json(&value)).map_err(|_| PinnedSessionError)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn event_json_line(event: &compatforge_domain::RuntimeEvent) -> Result<Vec<u8>, PinnedSessionError> {
     let mut line = serde_json::to_vec(event).map_err(|_| PinnedSessionError)?;
     line.push(b'\n');
     Ok(line)
 }
 
+#[cfg(any(target_os = "macos", test))]
+trait PinnedRuntimeHandle {
+    fn next_event(&self, timeout: Duration) -> EventPoll;
+    fn terminate(&self) -> Result<(), PinnedSessionError>;
+    fn is_finished(&self) -> bool;
+    fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), PinnedSessionError>;
+}
+
 #[cfg(target_os = "macos")]
-fn collect_pinned_runtime_events(
-    handle: &LaunchHandle,
+impl PinnedRuntimeHandle for LaunchHandle {
+    fn next_event(&self, timeout: Duration) -> EventPoll {
+        LaunchHandle::next_event(self, timeout)
+    }
+
+    fn terminate(&self) -> Result<(), PinnedSessionError> {
+        LaunchHandle::terminate(self).map_err(|_| PinnedSessionError)
+    }
+
+    fn is_finished(&self) -> bool {
+        LaunchHandle::is_finished(self)
+    }
+
+    fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), PinnedSessionError> {
+        LaunchHandle::terminate_and_wait(self, graceful_wait).map_err(|_| PinnedSessionError)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn collect_pinned_runtime_events<H: PinnedRuntimeHandle>(
+    handle: &H,
     started: Instant,
     terminate_after: Duration,
+    cleanup_wait: Duration,
 ) -> Result<Vec<Vec<u8>>, PinnedSessionError> {
     let mut events = Vec::new();
     let mut termination_requested = false;
+    let mut failed = false;
+    let mut cleanup_deadline = None;
     loop {
         if !termination_requested && started.elapsed() >= terminate_after {
-            handle.terminate().map_err(|_| PinnedSessionError)?;
             termination_requested = true;
+            cleanup_deadline = Some(Instant::now() + cleanup_wait);
+            if handle.terminate().is_err() {
+                failed = true;
+            }
         }
-        match handle.next_event(Duration::from_millis(250)) {
+        if cleanup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = handle.terminate_and_wait(Duration::ZERO);
+            return Err(PinnedSessionError);
+        }
+        let poll_timeout = cleanup_deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(250))
+            })
+            .unwrap_or(Duration::from_millis(250));
+        match handle.next_event(poll_timeout) {
+            EventPoll::Event(event) if event.kind == RuntimeEventKind::Failed => {
+                failed = true;
+                if !termination_requested {
+                    termination_requested = true;
+                    cleanup_deadline = Some(Instant::now() + cleanup_wait);
+                    let _ = handle.terminate();
+                }
+            }
             EventPoll::Event(event) => {
                 let terminal = event.kind == RuntimeEventKind::Exited;
-                let failed = event.kind == RuntimeEventKind::Failed;
                 let success = event.exit.as_ref().is_some_and(|exit| exit.success);
-                events.push(event_json_line(&event)?);
+                if !failed {
+                    events.push(event_json_line(&event)?);
+                }
                 if terminal {
-                    return if success || termination_requested {
+                    let completion = handle.terminate_and_wait(cleanup_wait);
+                    return if completion.is_err() || !handle.is_finished() || failed {
+                        Err(PinnedSessionError)
+                    } else if success || termination_requested {
                         Ok(events)
                     } else {
                         Err(PinnedSessionError)
                     };
                 }
-                if failed {
-                    return Err(PinnedSessionError);
-                }
             }
             EventPoll::Timeout => {}
-            EventPoll::Closed => return Err(PinnedSessionError),
+            EventPoll::Closed => {
+                let _ = handle.terminate_and_wait(cleanup_wait);
+                return Err(PinnedSessionError);
+            }
         }
     }
 }
 
-#[cfg(target_os = "macos")]
-fn drain_pinned_integrity_shutdown(handle: &LaunchHandle) -> Result<(), PinnedSessionError> {
+#[cfg(any(target_os = "macos", test))]
+fn drain_pinned_integrity_shutdown<H: PinnedRuntimeHandle>(
+    handle: &H,
+    cleanup_wait: Duration,
+) -> Result<(), PinnedSessionError> {
+    let deadline = Instant::now() + cleanup_wait;
     let mut cleanup_failed = false;
     loop {
-        match handle.next_event(Duration::from_millis(250)) {
+        if Instant::now() >= deadline {
+            let _ = handle.terminate_and_wait(Duration::ZERO);
+            return Err(PinnedSessionError);
+        }
+        let poll_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        match handle.next_event(poll_timeout) {
             EventPoll::Event(event) if event.kind == RuntimeEventKind::Exited => {
-                return if cleanup_failed {
+                let completion = handle.terminate_and_wait(cleanup_wait);
+                return if completion.is_err() || !handle.is_finished() || cleanup_failed {
                     Err(PinnedSessionError)
                 } else {
                     Ok(())
@@ -788,7 +890,10 @@ fn drain_pinned_integrity_shutdown(handle: &LaunchHandle) -> Result<(), PinnedSe
             }
             EventPoll::Event(event) if event.kind == RuntimeEventKind::Failed => cleanup_failed = true,
             EventPoll::Event(_) | EventPoll::Timeout => {}
-            EventPoll::Closed => return Err(PinnedSessionError),
+            EventPoll::Closed => {
+                let _ = handle.terminate_and_wait(cleanup_wait);
+                return Err(PinnedSessionError);
+            }
         }
     }
 }
@@ -803,10 +908,52 @@ fn pinned_transcript_bytes(transcript: &PinnedSessionTranscript) -> Result<Vec<u
         .ok_or(PinnedSessionError)?;
     let mut output = Vec::with_capacity(total_length);
     for event in &transcript.events {
-        output.extend_from_slice(event);
+        output.extend_from_slice(&project_pinned_runtime_event_line(event)?);
     }
     output.extend_from_slice(&receipt);
     Ok(output)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn project_pinned_runtime_event_line(line: &[u8]) -> Result<Vec<u8>, PinnedSessionError> {
+    let payload = line.strip_suffix(b"\n").ok_or(PinnedSessionError)?;
+    let mut event: compatforge_domain::RuntimeEvent =
+        serde_json::from_slice(payload).map_err(|_| PinnedSessionError)?;
+    if event.schema_version != "1" || event.request_id != PINNED_RUNTIME_REQUEST_ID || event.output.is_some() {
+        return Err(PinnedSessionError);
+    }
+    let expected_message = match event.kind {
+        RuntimeEventKind::Started => None,
+        RuntimeEventKind::TerminateRequested => Some("termination requested"),
+        RuntimeEventKind::TimedOut => Some("maximum runtime exceeded"),
+        RuntimeEventKind::GracePeriodExpired => {
+            Some("graceful termination period expired; forcing process tree shutdown")
+        }
+        RuntimeEventKind::WineServerStopRequested => {
+            let prefix = event
+                .message
+                .as_deref()
+                .and_then(|message| message.strip_prefix("stopping wineserver for prefix "))
+                .ok_or(PinnedSessionError)?;
+            if !is_closed_macos_absolute_path(prefix) {
+                return Err(PinnedSessionError);
+            }
+            event.message = Some("stopping wineserver".into());
+            Some("stopping wineserver")
+        }
+        RuntimeEventKind::Exited => None,
+        RuntimeEventKind::Output | RuntimeEventKind::Failed => return Err(PinnedSessionError),
+    };
+    if event.message.as_deref() != expected_message || (event.kind == RuntimeEventKind::Exited) != event.exit.is_some()
+    {
+        return Err(PinnedSessionError);
+    }
+    let mut projected = serde_json::to_vec(&event).map_err(|_| PinnedSessionError)?;
+    projected.push(b'\n');
+    if event.kind != RuntimeEventKind::WineServerStopRequested && projected != line {
+        return Err(PinnedSessionError);
+    }
+    Ok(projected)
 }
 
 #[cfg(target_os = "macos")]
@@ -1519,6 +1666,7 @@ mod tests {
     #[derive(Default)]
     struct FakeClosedPinnedSession {
         order: Vec<&'static str>,
+        request_id: &'static str,
         source: Vec<u8>,
         captured: Vec<u8>,
         child_bytes: Vec<u8>,
@@ -1527,6 +1675,8 @@ mod tests {
         pre_spawn_mutation: Option<PreSpawnMutation>,
         source_identity: u64,
         captured_source_identity: u64,
+        evidence_descriptors_cloexec: [bool; 4],
+        pre_spawn_evidence_mutation: Option<EvidenceDescriptorMutation>,
     }
 
     #[derive(Clone, Copy)]
@@ -1535,11 +1685,32 @@ mod tests {
         Replacement,
     }
 
+    #[derive(Clone, Copy)]
+    enum EvidenceDescriptorMutation {
+        InspectionRaw,
+        InspectionOwned,
+        PlanRaw,
+        PlanOwned,
+    }
+
+    impl EvidenceDescriptorMutation {
+        fn index(self) -> usize {
+            match self {
+                Self::InspectionRaw => 0,
+                Self::InspectionOwned => 1,
+                Self::PlanRaw => 2,
+                Self::PlanOwned => 3,
+            }
+        }
+    }
+
     impl FakeClosedPinnedSession {
         fn stable() -> Self {
             Self {
+                request_id: "pinned-sumatrapdf",
                 source: b"captured SumatraPDF bytes".to_vec(),
                 source_identity: 17,
+                evidence_descriptors_cloexec: [true; 4],
                 ..Self::default()
             }
         }
@@ -1550,7 +1721,11 @@ mod tests {
 
         fn validate_closed_inputs(&mut self) -> Result<(), PinnedSessionError> {
             self.order.push("validate");
-            Ok(())
+            if self.request_id == PINNED_RUNTIME_REQUEST_ID {
+                Ok(())
+            } else {
+                Err(PinnedSessionError)
+            }
         }
 
         fn capture_source(&mut self) -> Result<(), PinnedSessionError> {
@@ -1582,12 +1757,18 @@ mod tests {
                 }
                 None => {}
             }
+            if let Some(mutation) = self.pre_spawn_evidence_mutation {
+                self.evidence_descriptors_cloexec[mutation.index()] = false;
+            }
             Ok(())
         }
 
         fn start_pinned(&mut self) -> Result<Self::Handle, PinnedSessionError> {
             self.order.push("start");
-            if self.source != self.captured || self.source_identity != self.captured_source_identity {
+            if self.source != self.captured
+                || self.source_identity != self.captured_source_identity
+                || self.evidence_descriptors_cloexec.contains(&false)
+            {
                 return Err(PinnedSessionError);
             }
             self.children_created += 1;
@@ -1612,7 +1793,11 @@ mod tests {
 
         fn supervise_pinned(&mut self, _handle: Self::Handle) -> Result<Vec<Vec<u8>>, PinnedSessionError> {
             self.order.push("supervise");
-            Ok(vec![b"{\"kind\":\"exited\"}\n".to_vec()])
+            Ok(vec![pinned_test_event_line(&pinned_test_runtime_event(
+                self.request_id,
+                RuntimeEventKind::Exited,
+                None,
+            ))])
         }
 
         fn finalize_session(&mut self) -> Result<(), PinnedSessionError> {
@@ -1652,7 +1837,14 @@ mod tests {
                 "finalize",
             ]
         );
-        assert_eq!(transcript.events, [b"{\"kind\":\"exited\"}\n".to_vec()]);
+        assert_eq!(
+            transcript.events,
+            [pinned_test_event_line(&pinned_test_runtime_event(
+                PINNED_RUNTIME_REQUEST_ID,
+                RuntimeEventKind::Exited,
+                None,
+            ))]
+        );
         assert_eq!(session.children_created, 1);
     }
 
@@ -1663,10 +1855,264 @@ mod tests {
         let output = String::from_utf8(pinned_transcript_bytes(&transcript).unwrap()).unwrap();
         let lines = output.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "{\"kind\":\"exited\"}");
+        assert!(lines[0].contains("\"kind\":\"exited\""));
         assert_eq!(lines[1].matches("pinned-evidence-receipt").count(), 1);
         assert!(lines[1].starts_with("{\"outputs\":[{\"byteLength\":123,\"kind\":\"inspection\""));
         assert!(lines[1].ends_with("\"recordType\":\"pinned-evidence-receipt\",\"schemaVersion\":1}"));
+    }
+
+    fn pinned_test_runtime_event(
+        request_id: &str,
+        kind: RuntimeEventKind,
+        message: Option<&str>,
+    ) -> compatforge_domain::RuntimeEvent {
+        compatforge_domain::RuntimeEvent {
+            schema_version: "1".into(),
+            request_id: request_id.into(),
+            sequence: 7,
+            elapsed_milliseconds: 11,
+            kind,
+            process_id: Some(41),
+            output: None,
+            exit: (kind == RuntimeEventKind::Exited).then_some(compatforge_domain::ProcessExit {
+                code: Some(0),
+                success: true,
+            }),
+            message: message.map(str::to_owned),
+        }
+    }
+
+    fn pinned_test_event_line(event: &compatforge_domain::RuntimeEvent) -> Vec<u8> {
+        let mut line = serde_json::to_vec(event).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn pinned_test_transcript(event: compatforge_domain::RuntimeEvent) -> PinnedSessionTranscript {
+        PinnedSessionTranscript {
+            events: vec![pinned_test_event_line(&event)],
+            receipt: PinnedEvidenceReceipt::new(
+                PublishedEvidenceBinding {
+                    byte_length: 123,
+                    sha256: format!("sha256:{}", "a".repeat(64)),
+                },
+                PublishedEvidenceBinding {
+                    byte_length: 456,
+                    sha256: format!("sha256:{}", "b".repeat(64)),
+                },
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn pinned_request_id_path_and_fd_leaks_are_rejected_before_spawn() {
+        for request_id in ["/private/host-secret", "fd-41"] {
+            let mut session = FakeClosedPinnedSession {
+                request_id,
+                ..FakeClosedPinnedSession::stable()
+            };
+            assert_eq!(run_closed_pinned_session(&mut session), Err(PinnedSessionError));
+            assert_eq!(session.children_created, 0);
+        }
+    }
+
+    #[test]
+    fn pinned_transcript_rejects_request_and_message_path_fd_or_temp_leaks() {
+        for event in [
+            pinned_test_runtime_event("/private/host-secret", RuntimeEventKind::Started, None),
+            pinned_test_runtime_event("fd-41", RuntimeEventKind::Started, None),
+            pinned_test_runtime_event(
+                "pinned-sumatrapdf",
+                RuntimeEventKind::TerminateRequested,
+                Some("/private/tmp/.compatforge-pinned-random fd-41"),
+            ),
+        ] {
+            assert_eq!(
+                pinned_transcript_bytes(&pinned_test_transcript(event)),
+                Err(PinnedSessionError)
+            );
+            assert_eq!(PinnedSessionError.to_string(), PINNED_SUMATRAPDF_FAILURE);
+        }
+    }
+
+    #[test]
+    fn pinned_transcript_redacts_wineserver_prefix_without_dropping_the_event() {
+        let transcript = pinned_test_transcript(pinned_test_runtime_event(
+            "pinned-sumatrapdf",
+            RuntimeEventKind::WineServerStopRequested,
+            Some("stopping wineserver for prefix /private/host-secret/fd-41"),
+        ));
+        let output = String::from_utf8(pinned_transcript_bytes(&transcript).unwrap()).unwrap();
+        assert!(!output.contains("/private/host-secret"));
+        assert!(!output.contains("fd-41"));
+        let event: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        assert_eq!(event["kind"], "wine-server-stop-requested");
+        assert_eq!(event["message"], "stopping wineserver");
+    }
+
+    #[test]
+    fn pinned_allowed_runtime_event_serialization_remains_byte_compatible() {
+        let event = pinned_test_runtime_event("pinned-sumatrapdf", RuntimeEventKind::Started, None);
+        let expected = pinned_test_event_line(&event);
+        let output = pinned_transcript_bytes(&pinned_test_transcript(event)).unwrap();
+        assert_eq!(&output[..expected.len()], expected);
+    }
+
+    struct FakePinnedRuntimeHandle {
+        polls: std::sync::Mutex<std::collections::VecDeque<EventPoll>>,
+        terminate_fails: bool,
+        completion_fails: bool,
+        terminate_calls: std::sync::atomic::AtomicUsize,
+        completion_calls: std::sync::atomic::AtomicUsize,
+        workers_active: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakePinnedRuntimeHandle {
+        fn new(polls: impl IntoIterator<Item = EventPoll>) -> Self {
+            Self {
+                polls: std::sync::Mutex::new(polls.into_iter().collect()),
+                terminate_fails: false,
+                completion_fails: false,
+                terminate_calls: std::sync::atomic::AtomicUsize::new(0),
+                completion_calls: std::sync::atomic::AtomicUsize::new(0),
+                workers_active: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl PinnedRuntimeHandle for FakePinnedRuntimeHandle {
+        fn next_event(&self, _timeout: Duration) -> EventPoll {
+            self.polls.lock().unwrap().pop_front().unwrap_or(EventPoll::Timeout)
+        }
+
+        fn terminate(&self) -> Result<(), PinnedSessionError> {
+            self.terminate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.terminate_fails {
+                Err(PinnedSessionError)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn is_finished(&self) -> bool {
+            !self.workers_active.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn terminate_and_wait(&self, _graceful_wait: Duration) -> Result<(), PinnedSessionError> {
+            self.completion_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.workers_active.store(false, std::sync::atomic::Ordering::SeqCst);
+            if self.completion_fails {
+                Err(PinnedSessionError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn pinned_failed_event() -> EventPoll {
+        EventPoll::Event(pinned_test_runtime_event(
+            PINNED_RUNTIME_REQUEST_ID,
+            RuntimeEventKind::Failed,
+            Some("cleanup failed at /private/host-secret/fd-41"),
+        ))
+    }
+
+    fn pinned_exited_event() -> EventPoll {
+        EventPoll::Event(pinned_test_runtime_event(
+            PINNED_RUNTIME_REQUEST_ID,
+            RuntimeEventKind::Exited,
+            None,
+        ))
+    }
+
+    #[test]
+    fn pinned_failed_event_waits_for_delayed_exit_and_worker_completion() {
+        let handle = FakePinnedRuntimeHandle::new([pinned_failed_event(), EventPoll::Timeout, pinned_exited_event()]);
+        assert_eq!(
+            collect_pinned_runtime_events(
+                &handle,
+                Instant::now(),
+                Duration::from_secs(60),
+                Duration::from_millis(10),
+            ),
+            Err(PinnedSessionError)
+        );
+        assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(handle.completion_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pinned_failed_only_closed_stream_completes_without_waiting_forever() {
+        let handle = FakePinnedRuntimeHandle::new([pinned_failed_event(), EventPoll::Closed]);
+        assert_eq!(
+            collect_pinned_runtime_events(
+                &handle,
+                Instant::now(),
+                Duration::from_secs(60),
+                Duration::from_millis(10),
+            ),
+            Err(PinnedSessionError)
+        );
+        assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(handle.completion_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pinned_terminate_and_cleanup_errors_still_join_before_return() {
+        for (terminate_fails, completion_fails) in [(true, false), (false, true)] {
+            let mut handle = FakePinnedRuntimeHandle::new([pinned_failed_event(), pinned_exited_event()]);
+            handle.terminate_fails = terminate_fails;
+            handle.completion_fails = completion_fails;
+            assert_eq!(
+                collect_pinned_runtime_events(
+                    &handle,
+                    Instant::now(),
+                    Duration::from_secs(60),
+                    Duration::from_millis(10),
+                ),
+                Err(PinnedSessionError)
+            );
+            assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(handle.completion_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn pinned_cleanup_deadline_is_bounded_and_joins_before_error() {
+        let handle = FakePinnedRuntimeHandle::new([EventPoll::Timeout]);
+        let started = Instant::now();
+        assert_eq!(
+            collect_pinned_runtime_events(&handle, started, Duration::ZERO, Duration::ZERO),
+            Err(PinnedSessionError)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(handle.completion_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pinned_success_waits_for_exit_and_worker_completion() {
+        let handle = FakePinnedRuntimeHandle::new([pinned_exited_event()]);
+        let events = collect_pinned_runtime_events(
+            &handle,
+            Instant::now(),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pinned_integrity_drain_failed_only_closed_is_bounded_and_joined() {
+        let handle = FakePinnedRuntimeHandle::new([pinned_failed_event(), EventPoll::Closed]);
+        assert_eq!(
+            drain_pinned_integrity_shutdown(&handle, Duration::from_millis(10)),
+            Err(PinnedSessionError)
+        );
+        assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -1679,6 +2125,23 @@ mod tests {
             assert_eq!(run_closed_pinned_session(&mut session), Err(PinnedSessionError));
             assert_eq!(session.children_created, 0);
             assert!(!session.shutdown);
+        }
+    }
+
+    #[test]
+    fn pinned_pre_spawn_evidence_cloexec_drift_creates_zero_children() {
+        for mutation in [
+            EvidenceDescriptorMutation::InspectionRaw,
+            EvidenceDescriptorMutation::InspectionOwned,
+            EvidenceDescriptorMutation::PlanRaw,
+            EvidenceDescriptorMutation::PlanOwned,
+        ] {
+            let mut session = FakeClosedPinnedSession {
+                pre_spawn_evidence_mutation: Some(mutation),
+                ..FakeClosedPinnedSession::stable()
+            };
+            assert_eq!(run_closed_pinned_session(&mut session), Err(PinnedSessionError));
+            assert_eq!(session.children_created, 0);
         }
     }
 

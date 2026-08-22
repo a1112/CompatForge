@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_FORCE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(16);
 const WINE_PREFIX_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 const EXECUTABLE_BUSY_RETRY_LIMIT: usize = 20;
 const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -318,6 +319,7 @@ fn supervise_command<G>(
     let root_exited = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
     let termination_started = Arc::new(AtomicBool::new(false));
+    let cleanup_failed = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
     let emitter = Arc::new(EventEmitter::new(plan.request_id.clone(), sender));
     let controller = Arc::new(TerminationController {
@@ -331,6 +333,10 @@ fn supervise_command<G>(
         grace_period: Duration::from_millis(plan.lifecycle.termination_grace_milliseconds),
         wine_session: wine_session.clone(),
         keep_alive_after_root_exit,
+        cleanup_failed: Arc::clone(&cleanup_failed),
+        force_cleanup_started: AtomicBool::new(false),
+        completion_lock: Mutex::new(()),
+        workers: Mutex::new(Vec::new()),
     });
 
     emitter.emit(RuntimeEventKind::Started, Some(process_id), None, None, None);
@@ -341,7 +347,7 @@ fn supervise_command<G>(
     if let Some(pipe) = stderr {
         output_readers.push(spawn_output_reader(pipe, OutputStream::Stderr, Arc::clone(&emitter)));
     }
-    spawn_exit_watcher(
+    let exit_watcher = spawn_exit_watcher(
         child,
         process_tree,
         ExitWatcherConfig {
@@ -352,15 +358,19 @@ fn supervise_command<G>(
             output_readers,
             termination_started: Arc::clone(&termination_started),
             keep_alive_after_root_exit,
+            cleanup_failed,
         },
     );
+    controller.register_worker(exit_watcher);
     if let Some(maximum_runtime) = plan.lifecycle.maximum_runtime_milliseconds {
-        spawn_timeout_watcher(
+        let timeout_watcher = spawn_timeout_watcher(
             Arc::downgrade(&controller),
             root_exited,
+            Arc::clone(&completed),
             keep_alive_after_root_exit,
             Duration::from_millis(maximum_runtime),
         );
+        controller.register_worker(timeout_watcher);
     }
 
     Ok(LaunchHandle {
@@ -632,6 +642,34 @@ impl LaunchHandle {
         self.controller.request_termination(TerminationReason::User)
     }
 
+    /// Terminate if still live, complete bounded forced cleanup when needed,
+    /// and join every supervisor worker before returning.
+    pub fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), ProcessError> {
+        let _completion_guard = lock_recover(&self.controller.completion_lock);
+        let termination_error = self.terminate().err();
+        let force_error = if self.controller.wait_until_completed(graceful_wait) {
+            None
+        } else {
+            self.controller.force_cleanup().err()
+        };
+        if !self
+            .controller
+            .wait_until_completed(SUPERVISOR_FORCE_COMPLETION_TIMEOUT)
+        {
+            let _ = self.controller.force_kill_and_reap();
+        }
+        let join_error = self.controller.join_workers().err();
+        if let Some(error) = join_error.or(force_error).or(termination_error) {
+            return Err(error);
+        }
+        if !self.is_finished() || self.controller.cleanup_failed.load(Ordering::Acquire) {
+            return Err(ProcessError::Terminate(io::Error::other(
+                "process cleanup did not complete successfully",
+            )));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.controller.completed.load(Ordering::Acquire)
@@ -662,6 +700,10 @@ struct TerminationController {
     grace_period: Duration,
     wine_session: Option<Arc<WineSession>>,
     keep_alive_after_root_exit: bool,
+    cleanup_failed: Arc<AtomicBool>,
+    force_cleanup_started: AtomicBool,
+    completion_lock: Mutex<()>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl TerminationController {
@@ -705,22 +747,51 @@ impl TerminationController {
         }
 
         let controller = Arc::clone(self);
-        thread::spawn(move || controller.escalate_after_grace());
+        let worker = thread::spawn(move || controller.escalate_after_grace());
+        self.register_worker(worker);
         Ok(())
     }
 
     fn escalate_after_grace(&self) {
         let deadline = Instant::now() + self.grace_period;
         while Instant::now() < deadline {
-            if self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit {
+            if self.completed.load(Ordering::Acquire)
+                || (self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit)
+            {
                 return;
             }
             thread::sleep(PROCESS_POLL_INTERVAL);
         }
-        if self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit {
+        if self.completed.load(Ordering::Acquire)
+            || (self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit)
+        {
             return;
         }
+        let _ = self.force_cleanup();
+    }
 
+    fn register_worker(&self, worker: thread::JoinHandle<()>) {
+        lock_recover(&self.workers).push(worker);
+    }
+
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
+        lock_recover(&self.workers).len()
+    }
+
+    fn wait_until_completed(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.completed.load(Ordering::Acquire) && Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+        }
+        self.completed.load(Ordering::Acquire)
+    }
+
+    fn force_cleanup(&self) -> Result<(), ProcessError> {
+        if self.force_cleanup_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         self.emitter.emit(
             RuntimeEventKind::GracePeriodExpired,
             Some(self.process_id),
@@ -728,6 +799,7 @@ impl TerminationController {
             None,
             Some("graceful termination period expired; forcing process tree shutdown".into()),
         );
+        let mut first_error = None;
         if let Some(wine_session) = &self.wine_session {
             if let Err(error) = wine_session.stop(&self.emitter) {
                 self.emitter.emit(
@@ -737,6 +809,7 @@ impl TerminationController {
                     None,
                     Some(format!("wineserver cleanup failed: {error}")),
                 );
+                first_error = Some(error);
             }
         }
         if let Err(error) = self.process_tree.force_kill() {
@@ -747,8 +820,51 @@ impl TerminationController {
                 None,
                 Some(format!("forced process-tree termination failed: {error}")),
             );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
             let mut child = lock_recover(&self.child);
             let _ = child.kill();
+        }
+        if let Some(error) = first_error {
+            self.cleanup_failed.store(true, Ordering::Release);
+            Err(ProcessError::Terminate(error))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn force_kill_and_reap(&self) -> Result<(), ProcessError> {
+        let tree_error = self.process_tree.force_kill().err();
+        let mut child = lock_recover(&self.child);
+        let kill_error = child.kill().err();
+        let wait_error = child.wait().err();
+        if let Some(error) = tree_error.or(kill_error).or(wait_error) {
+            self.cleanup_failed.store(true, Ordering::Release);
+            Err(ProcessError::Terminate(error))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn join_workers(&self) -> Result<(), ProcessError> {
+        let mut panicked = false;
+        loop {
+            let workers = std::mem::take(&mut *lock_recover(&self.workers));
+            if workers.is_empty() {
+                break;
+            }
+            for worker in workers {
+                panicked |= worker.join().is_err();
+            }
+        }
+        if panicked {
+            self.cleanup_failed.store(true, Ordering::Release);
+            Err(ProcessError::Terminate(io::Error::other(
+                "process supervisor worker panicked",
+            )))
+        } else {
+            Ok(())
         }
     }
 }
@@ -855,9 +971,14 @@ struct ExitWatcherConfig {
     output_readers: Vec<thread::JoinHandle<()>>,
     termination_started: Arc<AtomicBool>,
     keep_alive_after_root_exit: bool,
+    cleanup_failed: Arc<AtomicBool>,
 }
 
-fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::ProcessTree>, config: ExitWatcherConfig) {
+fn spawn_exit_watcher(
+    child: Arc<Mutex<Child>>,
+    process_tree: Arc<platform::ProcessTree>,
+    config: ExitWatcherConfig,
+) -> thread::JoinHandle<()> {
     let ExitWatcherConfig {
         root_exited,
         completed,
@@ -866,6 +987,7 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
         output_readers,
         termination_started,
         keep_alive_after_root_exit,
+        cleanup_failed,
     } = config;
     thread::spawn(move || {
         let result = loop {
@@ -881,6 +1003,7 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
         if keep_alive_after_root_exit {
             if let Some(wine_session) = wine_session.as_ref() {
                 if let Err(error) = wine_session.wait_until_idle() {
+                    cleanup_failed.store(true, Ordering::Release);
                     emitter.emit(
                         RuntimeEventKind::Failed,
                         None,
@@ -898,6 +1021,7 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
 
         if let Some(wine_session) = wine_session {
             if let Err(error) = wine_session.stop(&emitter) {
+                cleanup_failed.store(true, Ordering::Release);
                 emitter.emit(
                     RuntimeEventKind::Failed,
                     None,
@@ -908,6 +1032,7 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
             }
         }
         if let Err(error) = process_tree.force_kill() {
+            cleanup_failed.store(true, Ordering::Release);
             emitter.emit(
                 RuntimeEventKind::Failed,
                 None,
@@ -920,6 +1045,7 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
         // draining readers and publishing the terminal event.
         for output_reader in output_readers {
             if output_reader.join().is_err() {
+                cleanup_failed.store(true, Ordering::Release);
                 emitter.emit(
                     RuntimeEventKind::Failed,
                     None,
@@ -930,6 +1056,7 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
             }
         }
 
+        let wait_failed = result.is_err();
         match result {
             Ok(status) => emit_exit(&emitter, status),
             Err(error) => emitter.emit(
@@ -940,20 +1067,27 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, process_tree: Arc<platform::Proc
                 Some(format!("process wait failed: {error}")),
             ),
         }
+        if wait_failed {
+            cleanup_failed.store(true, Ordering::Release);
+        }
         completed.store(true, Ordering::Release);
-    });
+    })
 }
 
 fn spawn_timeout_watcher(
     controller: Weak<TerminationController>,
     root_exited: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
     keep_alive_after_root_exit: bool,
     maximum_runtime: Duration,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let deadline = Instant::now() + maximum_runtime;
         while Instant::now() < deadline {
-            if (root_exited.load(Ordering::Acquire) && !keep_alive_after_root_exit) || controller.strong_count() == 0 {
+            if completed.load(Ordering::Acquire)
+                || (root_exited.load(Ordering::Acquire) && !keep_alive_after_root_exit)
+                || controller.strong_count() == 0
+            {
                 return;
             }
             thread::sleep(PROCESS_POLL_INTERVAL);
@@ -961,7 +1095,7 @@ fn spawn_timeout_watcher(
         if let Some(controller) = controller.upgrade() {
             let _ = controller.request_termination(TerminationReason::Timeout);
         }
-    });
+    })
 }
 
 fn emit_exit(emitter: &EventEmitter, status: ExitStatus) {
@@ -1018,10 +1152,18 @@ impl WineSession {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            while !self.stop_completed.load(Ordering::Acquire) {
+            let deadline = Instant::now() + SUPERVISOR_FORCE_COMPLETION_TIMEOUT;
+            while !self.stop_completed.load(Ordering::Acquire) && Instant::now() < deadline {
                 thread::sleep(PROCESS_POLL_INTERVAL);
             }
-            return Ok(());
+            return if self.stop_completed.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "concurrent wineserver cleanup did not complete",
+                ))
+            };
         }
         emitter.emit(
             RuntimeEventKind::WineServerStopRequested,
@@ -1050,17 +1192,16 @@ impl WineSession {
     /// normally closing GUI application; an explicit termination request may
     /// still run `stop` concurrently and wake this rendezvous.
     fn wait_until_idle(&self) -> io::Result<()> {
-        let mut child = self.spawn_command("-w")?;
-        let status = child.wait()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!("wineserver -w exited with {status}")))
-        }
+        let child = self.spawn_command("-w")?;
+        Self::wait_for_command(child, "-w")
     }
 
     fn run_command(&self, argument: &str) -> io::Result<()> {
-        let mut child = self.spawn_command(argument)?;
+        let child = self.spawn_command(argument)?;
+        Self::wait_for_command(child, argument)
+    }
+
+    fn wait_for_command(mut child: Child, argument: &str) -> io::Result<()> {
         let deadline = Instant::now() + WINE_SERVER_COMMAND_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -1953,6 +2094,112 @@ mod tests {
             .iter()
             .any(|event| event.kind == RuntimeEventKind::TerminateRequested));
         assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+    }
+
+    #[test]
+    fn bounded_completion_joins_every_worker_after_terminal_exit() {
+        let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+
+        handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
+
+        assert!(handle.is_finished());
+        assert_eq!(handle.controller.worker_count(), 0);
+    }
+
+    #[test]
+    fn bounded_completion_forces_reaps_and_joins_a_live_process() {
+        let mut plan = helper_plan();
+        plan.lifecycle.termination_grace_milliseconds = 20;
+        let handle = ProcessSupervisor::start(&plan).unwrap();
+        assert!(matches!(
+            handle.next_event(Duration::from_secs(2)),
+            EventPoll::Event(RuntimeEvent {
+                kind: RuntimeEventKind::Started,
+                ..
+            })
+        ));
+        let started = Instant::now();
+
+        handle.terminate_and_wait(Duration::from_millis(1)).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(handle.is_finished());
+        assert_eq!(handle.controller.worker_count(), 0);
+    }
+
+    #[test]
+    fn bounded_completion_joins_timeout_and_escalation_workers() {
+        let mut plan = helper_plan();
+        plan.lifecycle.maximum_runtime_milliseconds = Some(20);
+        plan.lifecycle.termination_grace_milliseconds = 20;
+        let handle = ProcessSupervisor::start(&plan).unwrap();
+
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        assert!(events.iter().any(|event| event.kind == RuntimeEventKind::TimedOut));
+
+        handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
+
+        assert!(handle.is_finished());
+        assert_eq!(handle.controller.worker_count(), 0);
+    }
+
+    #[test]
+    fn bounded_completion_reports_worker_failure_after_joining_it() {
+        let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+        handle.controller.register_worker(thread::spawn(|| {
+            panic!("supervisor worker failure fixture");
+        }));
+
+        assert!(handle.terminate_and_wait(Duration::from_secs(1)).is_err());
+
+        assert!(handle.is_finished());
+        assert_eq!(handle.controller.worker_count(), 0);
+    }
+
+    #[test]
+    fn bounded_completion_joins_workers_registered_while_draining() {
+        let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+        let controller = Arc::clone(&handle.controller);
+        handle.controller.register_worker(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            controller.register_worker(thread::spawn(|| {}));
+        }));
+
+        handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
+
+        assert!(handle.is_finished());
+        assert_eq!(handle.controller.worker_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_bounded_completion_waits_for_the_active_join() {
+        let handle = Arc::new(ProcessSupervisor::start(&fixture_plan()).unwrap());
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+        let (release, released) = mpsc::channel();
+        handle.controller.register_worker(thread::spawn(move || {
+            released.recv().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        }));
+        let first_handle = Arc::clone(&handle);
+        let first = thread::spawn(move || first_handle.terminate_and_wait(Duration::from_secs(1)));
+        while handle.controller.worker_count() != 0 {
+            thread::yield_now();
+        }
+        release.send(()).unwrap();
+
+        let started = Instant::now();
+        handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        first.join().unwrap().unwrap();
+        assert_eq!(handle.controller.worker_count(), 0);
     }
 
     #[test]
