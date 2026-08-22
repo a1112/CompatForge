@@ -1496,6 +1496,7 @@ class InteractionSession:
         nonce_source: Callable[[int], str] = secrets.token_hex,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        application_alive: Callable[[], bool] | None = None,
         deadline_seconds: float = ACKNOWLEDGEMENT_WAIT_SECONDS,
         wait_for_acknowledgement: (
             Callable[[dict[str, object], Path, Path], bool | None] | None
@@ -1512,6 +1513,7 @@ class InteractionSession:
             or not callable(nonce_source)
             or not callable(monotonic)
             or not callable(sleeper)
+            or (application_alive is not None and not callable(application_alive))
             or (
                 wait_for_acknowledgement is not None
                 and not callable(wait_for_acknowledgement)
@@ -1591,6 +1593,25 @@ class InteractionSession:
             checks = protocol.validate_acknowledgement(
                 challenge, acknowledgement
             )
+
+            def require_final_acceptance() -> None:
+                if monotonic() >= deadline:
+                    raise InteractionUnverifiedError(
+                        "application interaction acknowledgement timed out"
+                    )
+                if application_alive is not None:
+                    try:
+                        alive = application_alive()
+                    except Exception as error:
+                        raise InteractionUnverifiedError(
+                            "application closed before interaction acknowledgement"
+                        ) from error
+                    if alive is not True:
+                        raise InteractionUnverifiedError(
+                            "application closed before interaction acknowledgement"
+                        )
+
+            require_final_acceptance()
             self._consume_owned(
                 self.receipt_binding,
                 name,
@@ -1605,12 +1626,20 @@ class InteractionSession:
                 tolerate_substitution=False,
             )
             challenge_consumed = True
+            require_final_acceptance()
             return checks
         except InteractionIntegrityError:
             raise
         except InteractionCleanupError:
             raise
         except InteractionUnverifiedError:
+            if receipt_identity is not None and not receipt_consumed:
+                self._consume_owned(
+                    self.receipt_binding,
+                    name,
+                    receipt_identity,
+                    tolerate_substitution=False,
+                )
             if challenge_identity is not None and not challenge_consumed:
                 self._consume_owned(
                     self.challenge_binding,
@@ -2004,6 +2033,7 @@ def main() -> int:
                                 pack_digest=receipt["packDigest"],
                                 asset_digest="sha256:" + asset.sha256,
                                 window_observed=True,
+                                application_alive=lambda: process.poll() is None,
                             )
                         )
                     except (

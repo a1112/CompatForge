@@ -2057,6 +2057,143 @@ struct RealCode;
             finally:
                 session.close()
 
+    def test_receipt_crossing_deadline_during_read_cannot_be_accepted(self) -> None:
+        cases = ((0.099, True), (0.1, False), (0.101, False))
+        for final_time, accepted in cases:
+            with self.subTest(final_time=final_time), tempfile.TemporaryDirectory(
+                prefix="compatforge-gui-ack-final-deadline-"
+            ) as temporary:
+                root = Path(temporary)
+                plan_path = root / "plans" / "plan.json"
+                acknowledgement_root = root / "ack"
+                plan_path.parent.mkdir()
+                (acknowledgement_root / "challenges").mkdir(parents=True)
+                (acknowledgement_root / "receipts").mkdir()
+                self.write_canonical_json(plan_path, self.interaction_plan())
+                session = self.baseline.open_interaction_session(
+                    plan_path, acknowledgement_root, "round-1", "crossover"
+                )
+                now = [0.0]
+                original_read = self.acknowledgements.read_acknowledgement
+
+                def write_receipt(
+                    challenge: dict[str, object], _challenge: Path, receipt: Path
+                ) -> bool:
+                    self.acknowledgements.write_acknowledgement(
+                        receipt,
+                        self.acknowledgements.make_acknowledgement(challenge),
+                    )
+                    now[0] = 0.099
+                    return True
+
+                def read_while_clock_advances(
+                    path: Path, binding: object
+                ) -> dict[str, object]:
+                    acknowledgement = original_read(path, binding)
+                    now[0] = final_time
+                    return acknowledgement
+
+                try:
+                    invocation = lambda: session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=True,
+                        nonce_source=lambda _size: "c" * 64,
+                        monotonic=lambda: now[0],
+                        sleeper=lambda seconds: now.__setitem__(
+                            0, now[0] + seconds
+                        ),
+                        deadline_seconds=0.1,
+                        wait_for_acknowledgement=write_receipt,
+                    )
+                    with mock.patch.object(
+                        self.acknowledgements,
+                        "read_acknowledgement",
+                        side_effect=read_while_clock_advances,
+                    ):
+                        if accepted:
+                            self.assertEqual(
+                                invocation(), {"fileList": True, "menus": True}
+                            )
+                        else:
+                            with self.assertRaises(
+                                self.baseline.InteractionUnverifiedError
+                            ):
+                                invocation()
+                    name = "round-1--crossover--7zip.json"
+                    self.assertTrue(
+                        (acknowledgement_root / "challenges" / name)
+                        .read_bytes()
+                        .startswith(b"!")
+                    )
+                    self.assertTrue(
+                        (acknowledgement_root / "receipts" / name)
+                        .read_bytes()
+                        .startswith(b"!")
+                    )
+                finally:
+                    session.close()
+
+    def test_process_exit_during_acknowledgement_cannot_accept_valid_receipt(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-gui-ack-process-exit-"
+        ) as temporary:
+            root = Path(temporary)
+            plan_path = root / "plans" / "plan.json"
+            acknowledgement_root = root / "ack"
+            plan_path.parent.mkdir()
+            (acknowledgement_root / "challenges").mkdir(parents=True)
+            (acknowledgement_root / "receipts").mkdir()
+            self.write_canonical_json(plan_path, self.interaction_plan())
+            session = self.baseline.open_interaction_session(
+                plan_path, acknowledgement_root, "round-1", "crossover"
+            )
+            process_liveness = iter((True, False))
+            liveness_checks: list[bool] = []
+
+            def write_receipt_before_exit(
+                challenge: dict[str, object], _challenge: Path, receipt: Path
+            ) -> bool:
+                self.acknowledgements.write_acknowledgement(
+                    receipt, self.acknowledgements.make_acknowledgement(challenge)
+                )
+                return True
+
+            def application_alive() -> bool:
+                alive = next(process_liveness)
+                liveness_checks.append(alive)
+                return alive
+
+            try:
+                with self.assertRaises(self.baseline.InteractionUnverifiedError):
+                    session.acknowledge_application(
+                        app_id="7zip",
+                        runtime_version="24.0",
+                        pack_digest="sha256:" + "a" * 64,
+                        asset_digest="sha256:" + "b" * 64,
+                        window_observed=True,
+                        nonce_source=lambda _size: "c" * 64,
+                        application_alive=application_alive,
+                        wait_for_acknowledgement=write_receipt_before_exit,
+                    )
+            finally:
+                session.close()
+            self.assertEqual(liveness_checks, [True, False])
+            challenge = (
+                acknowledgement_root
+                / "challenges"
+                / "round-1--crossover--7zip.json"
+            )
+            receipt = (
+                acknowledgement_root
+                / "receipts"
+                / "round-1--crossover--7zip.json"
+            )
+            self.assertTrue(challenge.read_bytes().startswith(b"!"))
+            self.assertTrue(receipt.read_bytes().startswith(b"!"))
+
     def test_accepted_compact_application_requires_literal_complete_checks(self) -> None:
         receipt = {
             "schemaVersion": "1",
