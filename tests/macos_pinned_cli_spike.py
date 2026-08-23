@@ -15,6 +15,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -25,8 +26,14 @@ MAX_MANIFEST_BYTES = 1_048_576
 MAX_INPUT_BYTES = 134_217_728
 MAX_EVIDENCE_BYTES = 1_048_576
 MAX_TRANSCRIPT_BYTES = 1_048_576
+MAX_PROCESS_STDOUT_BYTES = MAX_TRANSCRIPT_BYTES
+MAX_PROCESS_STDERR_BYTES = MAX_TRANSCRIPT_BYTES
+MAX_PROCESS_OUTPUT_BYTES = MAX_TRANSCRIPT_BYTES
 OUTPUT_NAME_ATTEMPTS = 16
 WINDOW_POLL_SECONDS = 0.25
+WINDOW_ABSENCE_SECONDS = 10.0
+PROCESS_POLL_SECONDS = 0.025
+PROCESS_TERMINATE_SECONDS = 1.0
 PROCESS_CLEANUP_SECONDS = 10.0
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MANIFEST_KEYS = (
@@ -359,24 +366,231 @@ def _validate_empty_output(binding: EvidenceFileBinding, boundary: object) -> No
         raise SpikeError("evidence descriptor is invalid")
 
 
+class SystemClock:
+    @staticmethod
+    def monotonic() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def sleep(seconds: float) -> None:
+        time.sleep(seconds)
+
+
+class _BoundedOutputCapture:
+    def __init__(
+        self,
+        stdout: object,
+        stderr: object,
+        *,
+        stdout_limit: int = MAX_PROCESS_STDOUT_BYTES,
+        stderr_limit: int = MAX_PROCESS_STDERR_BYTES,
+        combined_limit: int = MAX_PROCESS_OUTPUT_BYTES,
+    ) -> None:
+        if min(stdout_limit, stderr_limit, combined_limit) < 0:
+            raise SpikeError("CLI output bounds are invalid")
+        self._streams = (stdout, stderr)
+        try:
+            self._descriptors = tuple(self._make_nonblocking(stream) for stream in self._streams)
+        except SpikeError:
+            for stream in self._streams:
+                try:
+                    stream.close()
+                except BaseException:
+                    pass
+            raise
+        self._limits = (stdout_limit, stderr_limit)
+        self._combined_limit = combined_limit
+        self._buffers = (bytearray(), bytearray())
+        self._total = 0
+        self._lock = threading.Lock()
+        self._failed = threading.Event()
+        self._cancel = threading.Event()
+        self._closed = False
+        self._threads = tuple(
+            threading.Thread(
+                target=self._read_stream,
+                args=(index,),
+                name=f"compatforge-spike-output-{index}",
+            )
+            for index in range(2)
+        )
+        for thread in self._threads:
+            thread.start()
+
+    @staticmethod
+    def _make_nonblocking(stream: object) -> int | None:
+        try:
+            descriptor = stream.fileno()
+        except (AttributeError, OSError):
+            return None
+        if type(descriptor) is not int or descriptor < 0:
+            raise SpikeError("CLI output pipes are unavailable")
+        try:
+            os.set_blocking(descriptor, False)
+        except OSError as error:
+            raise SpikeError("CLI output pipes are unavailable") from error
+        return descriptor
+
+    def _read_stream(self, index: int) -> None:
+        stream = self._streams[index]
+        descriptor = self._descriptors[index]
+        local_limit = self._limits[index]
+        try:
+            while not self._failed.is_set() and not self._cancel.is_set():
+                try:
+                    chunk = os.read(descriptor, 65_536) if descriptor is not None else stream.read(65_536)
+                except BlockingIOError:
+                    self._cancel.wait(0.001)
+                    continue
+                if type(chunk) is not bytes:
+                    self._failed.set()
+                    return
+                if not chunk:
+                    return
+                with self._lock:
+                    local_allowance = max(0, local_limit + 1 - len(self._buffers[index]))
+                    combined_allowance = max(0, self._combined_limit + 1 - self._total)
+                    retained = min(len(chunk), local_allowance, combined_allowance)
+                    self._buffers[index].extend(chunk[:retained])
+                    self._total += retained
+                    if (
+                        retained != len(chunk)
+                        or len(self._buffers[index]) > local_limit
+                        or self._total > self._combined_limit
+                    ):
+                        self._failed.set()
+                        return
+        except BaseException:
+            self._failed.set()
+
+    @property
+    def readers_joined(self) -> bool:
+        return all(not thread.is_alive() for thread in self._threads)
+
+    def has_failed(self) -> bool:
+        return self._failed.is_set()
+
+    def _close_streams(self) -> bool:
+        if self._closed:
+            return True
+        closed = True
+        for stream in self._streams:
+            try:
+                stream.close()
+            except BaseException:
+                closed = False
+        self._closed = True
+        return closed
+
+    def _join(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        for thread in self._threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return self.readers_joined
+
+    def cleanup(self, timeout_seconds: float) -> None:
+        self._cancel.set()
+        joined = self._join(timeout_seconds)
+        closed = self._close_streams()
+        if not closed or not joined:
+            raise SpikeError("CLI output cleanup failed")
+
+    def finish(self, timeout_seconds: float) -> tuple[bytes, bytes]:
+        joined = self._join(timeout_seconds)
+        timed_out = not joined
+        if timed_out:
+            self._cancel.set()
+            joined = self._join(PROCESS_TERMINATE_SECONDS)
+        closed = self._close_streams()
+        if timed_out or not joined or not closed:
+            raise SpikeError("CLI output cleanup failed")
+        if self._failed.is_set():
+            raise SpikeError("CLI output capture failed")
+        return bytes(self._buffers[0]), bytes(self._buffers[1])
+
+
 def _terminate_process(process: object) -> None:
     try:
         if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=PROCESS_TERMINATE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if process.poll() is None:
             process.kill()
-        process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+        process.wait(timeout=PROCESS_CLEANUP_SECONDS - PROCESS_TERMINATE_SECONDS)
     except (OSError, subprocess.TimeoutExpired):
         raise SpikeError("child cleanup failed") from None
 
 
-def _observe_window(process: object, tokens: tuple[str, ...], timeout_seconds: float, boundary: object) -> None:
+def _finish_process_output(
+    process: object,
+    capture: _BoundedOutputCapture,
+    timeout_seconds: float,
+    clock: object,
+) -> tuple[bytes, bytes]:
+    deadline = clock.monotonic() + timeout_seconds
+    failure: SpikeError | None = None
+    while process.poll() is None:
+        if capture.has_failed():
+            failure = SpikeError("CLI output capture failed")
+            break
+        if clock.monotonic() >= deadline:
+            failure = SpikeError("CLI completion timed out")
+            break
+        clock.sleep(PROCESS_POLL_SECONDS)
+    if failure is not None:
+        cleanup_failed = False
+        try:
+            _terminate_process(process)
+        except SpikeError:
+            cleanup_failed = True
+        try:
+            capture.cleanup(PROCESS_CLEANUP_SECONDS)
+        except SpikeError:
+            cleanup_failed = True
+        if cleanup_failed:
+            raise SpikeError("child cleanup failed") from None
+        raise failure
+    try:
+        process.wait(timeout=PROCESS_CLEANUP_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            capture.cleanup(PROCESS_CLEANUP_SECONDS)
+        except SpikeError:
+            pass
+        raise SpikeError("child cleanup failed") from None
+    return capture.finish(PROCESS_CLEANUP_SECONDS)
+
+
+def _observe_window(
+    process: object,
+    capture: _BoundedOutputCapture,
+    tokens: tuple[str, ...],
+    timeout_seconds: float,
+    boundary: object,
+) -> None:
     deadline = boundary.monotonic() + timeout_seconds
     while boundary.monotonic() < deadline:
+        if capture.has_failed():
+            raise SpikeError("CLI output capture failed")
         if process.poll() is not None:
             raise SpikeError("child exited before window observation")
         if boundary.window_visible(tokens):
+            if capture.has_failed():
+                raise SpikeError("CLI output capture failed")
             return
         boundary.sleep(WINDOW_POLL_SECONDS)
     raise SpikeError("window observation timed out")
+
+
+def _require_window_absent(tokens: tuple[str, ...], boundary: object) -> None:
+    deadline = boundary.monotonic() + WINDOW_ABSENCE_SECONDS
+    while boundary.window_visible(tokens):
+        if boundary.monotonic() >= deadline:
+            raise SpikeError("matching window did not clear")
+        boundary.sleep(WINDOW_POLL_SECONDS)
 
 
 def _parse_transcript(raw: bytes, forbidden: Iterable[str]) -> list[dict[str, object]]:
@@ -570,16 +784,15 @@ def run_spike_document(
         bindings.setdefault(binding.path, binding)
         forbidden.add(binding.path)
     work_roots = _validate_work_roots(runtimes, forbidden, boundary)
-    if boundary.window_visible(("SumatraPDF",)):
-        raise SpikeError("a matching window already exists")
-
     cli_path = manifest["cli"]["path"]  # type: ignore[index]
     completed: list[str] = []
     for runtime, work_path in zip(runtimes, work_roots, strict=True):
         descriptors: list[int] = []
         process: object | None = None
+        capture: _BoundedOutputCapture | None = None
         primary_error: BaseException | None = None
         try:
+            _require_window_absent(("SumatraPDF",), boundary)
             work_root = boundary.open_work_root(work_path)
             descriptors.append(work_root.descriptor)
             boundary.revalidate_work_root(work_root)
@@ -626,13 +839,16 @@ def run_spike_document(
             if tuple(process.inherited_fds) != pass_fds:
                 _terminate_process(process)
                 raise SpikeError("descriptor inheritance is invalid")
+            stdout_stream, stderr_stream = process.take_output_streams()
+            capture = _BoundedOutputCapture(stdout_stream, stderr_stream)
             timeout_seconds = manifest["timeoutMilliseconds"] / 1000.0  # type: ignore[operator]
-            _observe_window(process, ("SumatraPDF",), timeout_seconds, boundary)
-            try:
-                stdout, stderr = process.communicate(timeout=timeout_seconds + PROCESS_CLEANUP_SECONDS)
-            except subprocess.TimeoutExpired:
-                _terminate_process(process)
-                raise SpikeError("CLI completion timed out") from None
+            _observe_window(process, capture, ("SumatraPDF",), timeout_seconds, boundary)
+            stdout, stderr = _finish_process_output(
+                process,
+                capture,
+                timeout_seconds + PROCESS_CLEANUP_SECONDS,
+                boundary,
+            )
             if process.returncode != 0 or stderr != b"" or type(stdout) is not bytes:
                 raise SpikeError("CLI process failed")
             receipt = _parse_transcript(
@@ -655,6 +871,16 @@ def run_spike_document(
                     _terminate_process(process)
                 except SpikeError:
                     primary_error = SpikeError("child cleanup failed")
+            if capture is not None:
+                try:
+                    capture.cleanup(PROCESS_CLEANUP_SECONDS)
+                except SpikeError:
+                    primary_error = SpikeError("child cleanup failed")
+        if process is not None:
+            try:
+                _require_window_absent(("SumatraPDF",), boundary)
+            except SpikeError as error:
+                primary_error = error
         try:
             _close_all(boundary, descriptors)
         except SpikeError as error:
@@ -678,8 +904,13 @@ class _SystemProcess:
     def poll(self) -> int | None:
         return self._process.poll()
 
-    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
-        return self._process.communicate(timeout=timeout)
+    def take_output_streams(self) -> tuple[object, object]:
+        if self._process.stdout is None or self._process.stderr is None:
+            raise SpikeError("CLI output pipes are unavailable")
+        return self._process.stdout, self._process.stderr
+
+    def terminate(self) -> None:
+        self._process.terminate()
 
     def kill(self) -> None:
         self._process.kill()

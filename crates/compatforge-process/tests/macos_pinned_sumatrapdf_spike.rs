@@ -1,3 +1,11 @@
+use std::io::Read;
+use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
+
 trait PhaseDriver {
     fn capture(&mut self) -> Result<(), &'static str>;
     fn prepare(&mut self) -> Result<(), &'static str>;
@@ -27,11 +35,25 @@ fn supervise_window_probe(
     process: &mut impl WindowProbeProcess,
     budget: &mut impl WindowProbeBudget,
 ) -> Result<bool, &'static str> {
+    supervise_window_probe_with_output_guard(process, budget, || Ok(()))
+}
+
+fn supervise_window_probe_with_output_guard(
+    process: &mut impl WindowProbeProcess,
+    budget: &mut impl WindowProbeBudget,
+    mut output_guard: impl FnMut() -> Result<(), &'static str>,
+) -> Result<bool, &'static str> {
+    if let Err(failure) = output_guard() {
+        return stop_window_probe(process, budget, failure, false);
+    }
     if !budget.probe_time_remaining() {
         return stop_window_probe(process, budget, "window probe timed out", false);
     }
     loop {
         let poll = process.try_wait_success();
+        if let Err(failure) = output_guard() {
+            return stop_window_probe(process, budget, failure, matches!(poll, Ok(Some(_))));
+        }
         if !budget.probe_time_remaining() {
             return stop_window_probe(process, budget, "window probe timed out", matches!(poll, Ok(Some(_))));
         }
@@ -44,6 +66,175 @@ fn supervise_window_probe(
         if !budget.probe_time_remaining() {
             return stop_window_probe(process, budget, "window probe timed out", false);
         }
+    }
+}
+
+fn start_window_probe_output<T>(
+    process: &mut impl WindowProbeProcess,
+    budget: &mut impl WindowProbeBudget,
+    start: impl FnOnce() -> Result<T, &'static str>,
+) -> Result<T, &'static str> {
+    match start() {
+        Ok(output) => Ok(output),
+        Err(failure) => match stop_window_probe(process, budget, failure, false) {
+            Err(cleanup_or_failure) => Err(cleanup_or_failure),
+            Ok(_) => Err(failure),
+        },
+    }
+}
+
+impl WindowProbeProcess for Child {
+    fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
+        self.try_wait()
+            .map(|status| status.map(|status| status.success()))
+            .map_err(|_| "window probe failed")
+    }
+
+    fn kill(&mut self) -> Result<(), &'static str> {
+        Child::kill(self).map_err(|_| "window probe cleanup failed")
+    }
+
+    fn wait(&mut self) -> Result<(), &'static str> {
+        Child::wait(self).map(|_| ()).map_err(|_| "window probe cleanup failed")
+    }
+}
+
+struct BoundedPipeCapture {
+    receiver: Receiver<Result<Vec<u8>, &'static str>>,
+    reader: Option<JoinHandle<()>>,
+    result: Option<Result<Vec<u8>, &'static str>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl BoundedPipeCapture {
+    fn start(input: impl Read + Send + 'static, maximum: usize) -> Result<Self, &'static str> {
+        Self::start_with_mode(input, maximum, false)
+    }
+
+    fn start_cancellable(input: impl Read + Send + 'static, maximum: usize) -> Result<Self, &'static str> {
+        Self::start_with_mode(input, maximum, true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_child_stdout(input: std::process::ChildStdout, maximum: usize) -> Result<Self, &'static str> {
+        use std::os::fd::AsRawFd;
+
+        let descriptor = input.as_raw_fd();
+        // SAFETY: fcntl only queries and updates status flags on this live, owned pipe descriptor.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags < 0 {
+            return Err("window probe output is unavailable");
+        }
+        // SAFETY: the descriptor remains owned by input and O_NONBLOCK is a valid additive status flag.
+        if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err("window probe output is unavailable");
+        }
+        Self::start_cancellable(input, maximum)
+    }
+
+    fn start_with_mode(
+        mut input: impl Read + Send + 'static,
+        maximum: usize,
+        cancellable: bool,
+    ) -> Result<Self, &'static str> {
+        let bound = maximum.checked_add(1).ok_or("window probe output is invalid")?;
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reader_cancel = Arc::clone(&cancel);
+        let reader = thread::Builder::new()
+            .name("compatforge-window-probe-output".to_owned())
+            .spawn(move || {
+                let result = (|| {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0_u8; 65_536];
+                    loop {
+                        if reader_cancel.load(Ordering::Acquire) {
+                            return Err("window probe cleanup failed");
+                        }
+                        let remaining = bound - bytes.len();
+                        let read_size = remaining.min(buffer.len());
+                        match input.read(&mut buffer[..read_size]) {
+                            Ok(0) => return Ok(bytes),
+                            Ok(count) => {
+                                bytes.extend_from_slice(&buffer[..count]);
+                                if bytes.len() > maximum {
+                                    return Err("window probe output is invalid");
+                                }
+                            }
+                            Err(error) if cancellable && error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Err(_) => return Err("window probe output is invalid"),
+                        }
+                    }
+                })();
+                let _send_result = sender.send(result);
+            })
+            .map_err(|_| "window probe output is unavailable")?;
+        Ok(Self {
+            receiver,
+            reader: Some(reader),
+            result: None,
+            cancel,
+        })
+    }
+
+    fn check(&mut self) -> Result<(), &'static str> {
+        if self.result.is_none() {
+            match self.receiver.try_recv() {
+                Ok(result) => self.result = Some(result),
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => {
+                    self.result = Some(Err("window probe cleanup failed"));
+                }
+            }
+        }
+        match self.result.as_ref() {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(failure)) => Err(*failure),
+            None => Ok(()),
+        }
+    }
+
+    fn finish_until(&mut self, deadline: Instant) -> Result<Vec<u8>, &'static str> {
+        if self.result.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.receiver.recv_timeout(remaining) {
+                Ok(result) => self.result = Some(result),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.cancel.store(true, Ordering::Release);
+                    if !self.join_reader() {
+                        return Err("window probe cleanup failed");
+                    }
+                    return Err("window probe cleanup failed");
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.result = Some(Err("window probe cleanup failed"));
+                }
+            }
+        }
+        if !self.join_reader() {
+            return Err("window probe cleanup failed");
+        }
+        self.result.take().ok_or("window probe cleanup failed")?
+    }
+
+    fn join_reader(&mut self) -> bool {
+        match self.reader.take() {
+            Some(reader) => reader.join().is_ok(),
+            None => true,
+        }
+    }
+
+    fn reader_joined(&self) -> bool {
+        self.reader.is_none()
+    }
+}
+
+impl Drop for BoundedPipeCapture {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        let _joined = self.join_reader();
     }
 }
 
@@ -112,7 +303,10 @@ fn run_spike_phase(driver: &mut impl PhaseDriver, mutate_after_start: bool) -> R
 
 #[cfg(target_os = "macos")]
 mod real {
-    use super::{run_spike_phase, supervise_window_probe, PhaseDriver, WindowProbeBudget, WindowProbeProcess};
+    use super::{
+        run_spike_phase, start_window_probe_output, supervise_window_probe_with_output_guard, BoundedPipeCapture,
+        PhaseDriver, WindowProbeBudget,
+    };
     use compatforge_domain::{CoreConfig, CpuArchitecture, ExecutableMode, LaunchRequest};
     use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot, PinnedBottleExecutable};
     use compatforge_orchestrator::PreparedLaunch;
@@ -124,7 +318,7 @@ mod real {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Component, Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -755,22 +949,6 @@ mod real {
         format!("sha256:{:x}", digest.finalize())
     }
 
-    impl WindowProbeProcess for Child {
-        fn try_wait_success(&mut self) -> Result<Option<bool>, &'static str> {
-            self.try_wait()
-                .map(|status| status.map(|status| status.success()))
-                .map_err(|_| "window probe failed")
-        }
-
-        fn kill(&mut self) -> Result<(), &'static str> {
-            Child::kill(self).map_err(|_| "window probe cleanup failed")
-        }
-
-        fn wait(&mut self) -> Result<(), &'static str> {
-            Child::wait(self).map(|_| ()).map_err(|_| "window probe cleanup failed")
-        }
-    }
-
     struct RealWindowProbeBudget {
         probe_deadline: Instant,
         total_deadline: Instant,
@@ -831,21 +1009,25 @@ end tell"#;
             probe_deadline,
             total_deadline: deadline,
         };
-        let success = supervise_window_probe(&mut child, &mut budget)?;
+        let stdout_result = child.stdout.take().ok_or("window probe output is unavailable");
+        let stdout = start_window_probe_output(&mut child, &mut budget, || stdout_result)?;
+        let output_result = BoundedPipeCapture::start_child_stdout(stdout, MAX_WINDOW_OUTPUT_BYTES as usize);
+        let mut output = start_window_probe_output(&mut child, &mut budget, || output_result)?;
+        let supervision = supervise_window_probe_with_output_guard(&mut child, &mut budget, || output.check());
+        let captured = output.finish_until(deadline);
+        let (success, bytes) = match (supervision, captured) {
+            (Err("window probe cleanup failed"), _) | (_, Err("window probe cleanup failed")) => {
+                return Err("window probe cleanup failed");
+            }
+            (Err(failure), _) => return Err(failure),
+            (Ok(_), Err(failure)) => return Err(failure),
+            (Ok(success), Ok(bytes)) => (success, bytes),
+        };
         if !success {
             return Err("window probe failed");
         }
         if Instant::now() >= deadline {
             return Err("window probe timed out");
-        }
-        let stdout = child.stdout.take().ok_or("window probe output is unavailable")?;
-        let mut bytes = Vec::new();
-        stdout
-            .take(MAX_WINDOW_OUTPUT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| "window probe output is invalid")?;
-        if bytes.len() as u64 > MAX_WINDOW_OUTPUT_BYTES {
-            return Err("window probe output is invalid");
         }
         if Instant::now() >= deadline {
             return Err("window probe timed out");
@@ -867,6 +1049,61 @@ fn real_apple_silicon_crossover_and_whisky_pinned_sumatrapdf_spike() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Error, ErrorKind, Read, Write};
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const OUTPUT_HELPER_VARIABLE: &str = "COMPATFORGE_WINDOW_OUTPUT_HELPER_BYTES";
+
+    struct HostWindowProbeBudget {
+        probe_deadline: Instant,
+        cleanup_deadline: Instant,
+    }
+
+    impl HostWindowProbeBudget {
+        fn new(probe: Duration, cleanup: Duration) -> Self {
+            let now = Instant::now();
+            Self {
+                probe_deadline: now + probe,
+                cleanup_deadline: now + cleanup,
+            }
+        }
+    }
+
+    impl WindowProbeBudget for HostWindowProbeBudget {
+        fn probe_time_remaining(&mut self) -> bool {
+            Instant::now() < self.probe_deadline
+        }
+
+        fn cleanup_time_remaining(&mut self) -> bool {
+            Instant::now() < self.cleanup_deadline
+        }
+
+        fn pause_probe(&mut self) {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        fn pause_cleanup(&mut self) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(Error::other("secret reader failure"))
+        }
+    }
+
+    struct WouldBlockReader;
+
+    impl Read for WouldBlockReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(Error::new(ErrorKind::WouldBlock, "not ready"))
+        }
+    }
 
     struct ScriptedWindowProbeBudget {
         probe_checks: Vec<bool>,
@@ -1088,6 +1325,142 @@ mod tests {
         assert_eq!(probe.polls, 2);
         assert_eq!(probe.kill_calls, 1);
         assert_eq!(probe.wait_calls, 1);
+    }
+
+    #[test]
+    fn bounded_window_output_capture_accepts_exact_and_rejects_cap_plus_one() {
+        let exact = vec![b'x'; 131_072];
+        let mut accepted = BoundedPipeCapture::start(Cursor::new(exact.clone()), exact.len())
+            .expect("the exact-bound reader must start");
+        assert_eq!(
+            accepted.finish_until(Instant::now() + Duration::from_secs(1)),
+            Ok(exact)
+        );
+
+        let mut rejected = BoundedPipeCapture::start(Cursor::new(vec![b'x'; 131_073]), 131_072)
+            .expect("the cap-plus-one reader must start");
+        assert_eq!(
+            rejected.finish_until(Instant::now() + Duration::from_secs(1)),
+            Err("window probe output is invalid")
+        );
+
+        let mut failed = BoundedPipeCapture::start(FailingReader, 131_072).expect("the injected reader must start");
+        assert_eq!(
+            failed.finish_until(Instant::now() + Duration::from_secs(1)),
+            Err("window probe output is invalid")
+        );
+    }
+
+    #[test]
+    fn nonblocking_window_reader_is_cancelled_and_joined_at_its_deadline() {
+        let mut capture = BoundedPipeCapture::start_cancellable(WouldBlockReader, 131_072)
+            .expect("the nonblocking reader must start");
+
+        assert_eq!(
+            capture.finish_until(Instant::now() + Duration::from_millis(20)),
+            Err("window probe cleanup failed")
+        );
+        assert!(capture.reader_joined());
+    }
+
+    #[test]
+    fn output_failure_kills_and_reaps_the_window_probe_within_cleanup_budget() {
+        let mut probe = HungWindowProbe {
+            polls: 0,
+            killed: false,
+            kill_calls: 0,
+            wait_calls: 0,
+        };
+        let mut budget = ScriptedWindowProbeBudget::new(&[true, true, true], &[true]);
+        let mut checks = 0;
+
+        let result = supervise_window_probe_with_output_guard(&mut probe, &mut budget, || {
+            checks += 1;
+            if checks == 2 {
+                Err("window probe output is invalid")
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(result, Err("window probe output is invalid"));
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 1);
+    }
+
+    #[test]
+    fn output_capture_start_failure_kills_and_reaps_the_window_probe() {
+        let mut probe = HungWindowProbe {
+            polls: 0,
+            killed: false,
+            kill_calls: 0,
+            wait_calls: 0,
+        };
+        let mut budget = ScriptedWindowProbeBudget::new(&[true], &[true]);
+
+        let result: Result<(), _> =
+            start_window_probe_output(&mut probe, &mut budget, || Err("window probe output is unavailable"));
+
+        assert_eq!(result, Err("window probe output is unavailable"));
+        assert_eq!(probe.kill_calls, 1);
+        assert_eq!(probe.wait_calls, 1);
+    }
+
+    #[test]
+    fn window_probe_output_helper() {
+        let Ok(byte_count) = std::env::var(OUTPUT_HELPER_VARIABLE) else {
+            return;
+        };
+        let byte_count = byte_count.parse::<usize>().expect("helper byte count must parse");
+        let bytes = vec![b'x'; byte_count];
+        std::io::stdout()
+            .write_all(&bytes)
+            .expect("helper output must be writable");
+        std::io::stdout().flush().expect("helper output must flush");
+    }
+
+    #[test]
+    fn real_local_probe_output_is_drained_concurrently_and_overflow_is_reaped() {
+        fn spawn_helper(byte_count: usize) -> std::process::Child {
+            Command::new(std::env::current_exe().expect("test executable must resolve"))
+                .args(["--exact", "tests::window_probe_output_helper", "--nocapture"])
+                .env(OUTPUT_HELPER_VARIABLE, byte_count.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("local output helper must spawn")
+        }
+
+        let mut accepted_child = spawn_helper(262_144);
+        let accepted_stdout = accepted_child.stdout.take().expect("helper stdout must be piped");
+        let mut accepted_capture = BoundedPipeCapture::start(accepted_stdout, 524_288).expect("capture must start");
+        let mut accepted_budget = HostWindowProbeBudget::new(Duration::from_secs(5), Duration::from_secs(6));
+        let accepted = supervise_window_probe_with_output_guard(&mut accepted_child, &mut accepted_budget, || {
+            accepted_capture.check()
+        });
+        let accepted_output = accepted_capture
+            .finish_until(Instant::now() + Duration::from_secs(1))
+            .expect("bounded helper output must finish");
+        assert_eq!(accepted, Ok(true));
+        assert!(accepted_output.iter().filter(|byte| **byte == b'x').count() >= 262_144);
+
+        let mut rejected_child = spawn_helper(262_144);
+        let rejected_stdout = rejected_child.stdout.take().expect("helper stdout must be piped");
+        let mut rejected_capture = BoundedPipeCapture::start(rejected_stdout, 65_536).expect("capture must start");
+        let mut rejected_budget = HostWindowProbeBudget::new(Duration::from_secs(5), Duration::from_secs(6));
+        let rejected = supervise_window_probe_with_output_guard(&mut rejected_child, &mut rejected_budget, || {
+            rejected_capture.check()
+        });
+        assert_eq!(rejected, Err("window probe output is invalid"));
+        assert_eq!(
+            rejected_capture.finish_until(Instant::now() + Duration::from_secs(1)),
+            Err("window probe output is invalid")
+        );
+        assert!(rejected_child
+            .try_wait()
+            .expect("reap status must be readable")
+            .is_some());
     }
 
     #[test]

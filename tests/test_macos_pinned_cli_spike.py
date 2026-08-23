@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,16 +66,20 @@ class _FakeProcess:
         self.inherited_fds = inherited_fds
         self.returncode: int | None = None
         self.killed = False
+        self.terminated = False
         self.waited = False
+        self.window_observed = False
+        self._streams_taken = False
 
     def poll(self) -> int | None:
+        if self.returncode is None and self.window_observed and not self.boundary.communication_timeout:
+            self.returncode = self.boundary.returncode
         return self.returncode
 
-    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
-        del timeout
-        if self.boundary.communication_timeout:
-            raise subprocess.TimeoutExpired(self.argv, 1)
-        self.returncode = self.boundary.returncode
+    def take_output_streams(self) -> tuple[object, object]:
+        if self._streams_taken:
+            raise spike.SpikeError("output streams already taken")
+        self._streams_taken = True
         inspection_fd, plan_fd = self.inherited_fds[-2:]
         inspection = self.boundary.inspection_bytes
         plan = self.boundary.plan_bytes
@@ -84,17 +93,19 @@ class _FakeProcess:
             self.boundary.descriptors[inspection_fd].identity = (7, 999_999)
         if self.boundary.post_spawn_linked_output:
             self.boundary.descriptors[plan_fd].nlink = 1
-        return self.boundary.transcript(inspection, plan), self.boundary.stderr
+        return io.BytesIO(self.boundary.transcript(inspection, plan)), io.BytesIO(self.boundary.stderr)
+
+    def terminate(self) -> None:
+        self.terminated = True
 
     def kill(self) -> None:
         self.killed = True
         self.returncode = -9
 
     def wait(self, timeout: float | None = None) -> int:
-        del timeout
         self.waited = True
         if self.returncode is None:
-            self.returncode = -9
+            raise subprocess.TimeoutExpired(self.argv, timeout)
         return self.returncode
 
 
@@ -119,6 +130,7 @@ class _FakeBoundary:
         self.seek_while_live = False
         self.window_probe_saw_live_process = False
         self.window_probe_calls = 0
+        self.clock = 0.0
         self.window_missing = False
         self.named_output = False
         self.output_access_mode = os.O_RDWR
@@ -236,14 +248,17 @@ class _FakeBoundary:
         self.window_probe_calls += 1
         if not self.processes or self.processes[-1].poll() is not None:
             return False
-        self.window_probe_saw_live_process = bool(self.processes and self.processes[-1].poll() is None)
-        return not self.window_missing and tokens == ("SumatraPDF",)
+        visible = not self.window_missing and tokens == ("SumatraPDF",)
+        if visible:
+            self.processes[-1].window_observed = True
+            self.window_probe_saw_live_process = True
+        return visible
 
     def sleep(self, seconds: float) -> None:
-        del seconds
+        self.clock += max(seconds, 1.0)
 
     def monotonic(self) -> float:
-        return float(self.window_probe_calls)
+        return self.clock
 
     def seek_descriptor(self, descriptor: int, offset: int) -> None:
         if self.processes and self.processes[-1].poll() is None:
@@ -413,6 +428,20 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             "workRoot": f"/private/work/{runtime_id}",
         }
 
+    @staticmethod
+    def _real_output_process(stdout_bytes: int, stderr_bytes: int, delay_seconds: float = 0.0) -> subprocess.Popen[bytes]:
+        script = (
+            "import os,sys,time;"
+            "out=int(sys.argv[1]);err=int(sys.argv[2]);delay=float(sys.argv[3]);"
+            "os.write(1,b'o'*out);os.write(2,b'e'*err);time.sleep(delay)"
+        )
+        return subprocess.Popen(
+            [sys.executable, "-S", "-B", "-c", script, str(stdout_bytes), str(stderr_bytes), str(delay_seconds)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def test_manifest_is_canonical_closed_and_literal(self) -> None:
         self.assertEqual(spike.parse_manifest_bytes(_canonical(self.manifest)), self.manifest)
         mutants: list[bytes] = []
@@ -476,6 +505,151 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
         self.assertFalse(boundary.seek_while_live)
         self.assertEqual(len(boundary.closed), 6)
         self.assertGreaterEqual(len(boundary.revalidated_inputs), 14)
+
+    def test_each_runtime_rejects_a_lingering_window_from_the_previous_run(self) -> None:
+        class LingeringWindowBoundary(_FakeBoundary):
+            def window_visible(self, tokens: tuple[str, ...]) -> bool:
+                self.window_probe_calls += 1
+                if not self.processes:
+                    return False
+                if self.processes[-1].poll() is None:
+                    self.window_probe_saw_live_process = True
+                return tokens == ("SumatraPDF",)
+
+        boundary = LingeringWindowBoundary(self.manifest, self.inputs)
+
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(self.manifest, boundary)
+
+        self.assertEqual(len(boundary.commands), 1)
+        self.assertGreater(boundary.window_probe_calls, 2)
+        self.assertLessEqual(boundary.window_probe_calls, 16)
+
+    def test_initial_and_cleanup_window_absence_checks_are_bounded(self) -> None:
+        class InitialWindowBoundary(_FakeBoundary):
+            def window_visible(self, tokens: tuple[str, ...]) -> bool:
+                self.window_probe_calls += 1
+                return tokens == ("SumatraPDF",)
+
+        initial = InitialWindowBoundary(self.manifest, self.inputs)
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(self.manifest, initial)
+        self.assertEqual(initial.commands, [])
+        self.assertGreater(initial.window_probe_calls, 1)
+        self.assertLessEqual(initial.window_probe_calls, 16)
+
+        class CleanupWindowBoundary(_FakeBoundary):
+            def window_visible(self, tokens: tuple[str, ...]) -> bool:
+                self.window_probe_calls += 1
+                if not self.processes:
+                    return False
+                return tokens == ("SumatraPDF",)
+
+        cleanup = CleanupWindowBoundary(self.manifest, self.inputs)
+        cleanup.communication_timeout = True
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(self.manifest, cleanup)
+        self.assertTrue(cleanup.processes[0].killed)
+        self.assertTrue(cleanup.processes[0].waited)
+        self.assertGreater(cleanup.window_probe_calls, 2)
+        self.assertLessEqual(cleanup.window_probe_calls, 17)
+
+    def test_real_subprocess_output_capture_enforces_stdout_stderr_and_combined_cap_plus_one(self) -> None:
+        limit = 131_072
+        cases = (
+            ("stdout-exact", limit, 0, limit, False),
+            ("stderr-exact", 0, limit, limit, False),
+            ("combined-exact", limit // 2, limit // 2, limit, False),
+            ("stdout-over", limit + 1, 0, limit * 2, True),
+            ("stderr-over", 0, limit + 1, limit * 2, True),
+            ("combined-over", limit // 2, limit // 2 + 1, limit, True),
+        )
+        for label, stdout_size, stderr_size, combined_limit, rejected in cases:
+            raw = self._real_output_process(stdout_size, stderr_size)
+            assert raw.stdout is not None and raw.stderr is not None
+            process = spike._SystemProcess(raw, ())
+            capture = spike._BoundedOutputCapture(
+                raw.stdout,
+                raw.stderr,
+                stdout_limit=limit,
+                stderr_limit=limit,
+                combined_limit=combined_limit,
+            )
+            with self.subTest(label=label):
+                if rejected:
+                    with self.assertRaises(spike.SpikeError):
+                        spike._finish_process_output(process, capture, 5.0, spike.SystemClock())
+                else:
+                    stdout, stderr = spike._finish_process_output(process, capture, 5.0, spike.SystemClock())
+                    self.assertEqual(len(stdout), stdout_size)
+                    self.assertEqual(len(stderr), stderr_size)
+                self.assertIsNotNone(raw.poll())
+                self.assertTrue(raw.stdout.closed)
+                self.assertTrue(raw.stderr.closed)
+                self.assertTrue(capture.readers_joined)
+
+    def test_output_timeout_and_reader_failure_terminate_reap_close_and_join_without_leaks(self) -> None:
+        class FailingReader:
+            def __init__(self, wrapped: object) -> None:
+                self.wrapped = wrapped
+
+            @property
+            def closed(self) -> bool:
+                return self.wrapped.closed  # type: ignore[no-any-return]
+
+            def read(self, maximum: int) -> bytes:
+                del maximum
+                raise OSError("secret reader detail")
+
+            def close(self) -> None:
+                self.wrapped.close()
+
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always", ResourceWarning)
+            timeout_raw = self._real_output_process(0, 0, 30.0)
+            assert timeout_raw.stdout is not None and timeout_raw.stderr is not None
+            timeout_process = spike._SystemProcess(timeout_raw, ())
+            timeout_capture = spike._BoundedOutputCapture(timeout_raw.stdout, timeout_raw.stderr)
+            with self.assertRaises(spike.SpikeError):
+                spike._finish_process_output(timeout_process, timeout_capture, 0.05, spike.SystemClock())
+            self.assertIsNotNone(timeout_raw.poll())
+            self.assertTrue(timeout_capture.readers_joined)
+            self.assertTrue(timeout_raw.stdout.closed)
+            self.assertTrue(timeout_raw.stderr.closed)
+
+            failure_raw = self._real_output_process(0, 0, 30.0)
+            assert failure_raw.stdout is not None and failure_raw.stderr is not None
+            failing_stdout = FailingReader(failure_raw.stdout)
+            failure_process = spike._SystemProcess(failure_raw, ())
+            failure_capture = spike._BoundedOutputCapture(failing_stdout, failure_raw.stderr)
+            with self.assertRaises(spike.SpikeError) as raised:
+                spike._finish_process_output(failure_process, failure_capture, 5.0, spike.SystemClock())
+            self.assertNotIn("secret", str(raised.exception))
+            self.assertIsNotNone(failure_raw.poll())
+            self.assertTrue(failure_capture.readers_joined)
+            self.assertTrue(failing_stdout.closed)
+            self.assertTrue(failure_raw.stderr.closed)
+
+            del timeout_process, timeout_capture, failure_process, failure_capture
+            gc.collect()
+        self.assertFalse([warning for warning in recorded if warning.category is ResourceWarning])
+
+    def test_open_nonblocking_pipe_reader_can_be_cancelled_and_joined_without_a_writer_eof(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        os.set_blocking(read_descriptor, False)
+        read_stream = os.fdopen(read_descriptor, "rb", buffering=0)
+        empty_stderr = io.BytesIO()
+        capture = spike._BoundedOutputCapture(read_stream, empty_stderr)
+        try:
+            time.sleep(0.02)
+            self.assertFalse(capture.has_failed())
+            started = time.monotonic()
+            capture.cleanup(0.2)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(capture.readers_joined)
+            self.assertTrue(read_stream.closed)
+        finally:
+            os.close(write_descriptor)
 
     def test_output_descriptors_are_anonymous_distinct_empty_mode_0600_rdwr_without_append(self) -> None:
         mutants = {
