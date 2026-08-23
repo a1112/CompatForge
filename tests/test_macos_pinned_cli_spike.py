@@ -9,11 +9,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 from tests import macos_pinned_cli_spike as spike
 
@@ -244,15 +246,15 @@ class _FakeBoundary:
         self.popen_options.append(options)
         return process
 
-    def window_visible(self, tokens: tuple[str, ...]) -> bool:
+    def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
         self.window_probe_calls += 1
         if not self.processes or self.processes[-1].poll() is not None:
-            return False
+            return spike.WindowProbeState.ABSENT
         visible = not self.window_missing and tokens == ("SumatraPDF",)
         if visible:
             self.processes[-1].window_observed = True
             self.window_probe_saw_live_process = True
-        return visible
+        return spike.WindowProbeState.PRESENT if visible else spike.WindowProbeState.ABSENT
 
     def sleep(self, seconds: float) -> None:
         self.clock += max(seconds, 1.0)
@@ -442,6 +444,41 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
+    @staticmethod
+    def _real_window_probe_process(
+        stdout_bytes: int,
+        stderr_bytes: int,
+        *,
+        token: bool = True,
+        returncode: int = 0,
+        delay_seconds: float = 0.0,
+    ) -> subprocess.Popen[bytes]:
+        script = (
+            "import os,sys,time;"
+            "out=int(sys.argv[1]);err=int(sys.argv[2]);token=sys.argv[3]=='1';"
+            "code=int(sys.argv[4]);delay=float(sys.argv[5]);"
+            "prefix=b'SumatraPDF\\n' if token else b'';"
+            "stdout=(prefix+b'x'*out)[:out];"
+            "os.write(1,stdout);os.write(2,b'e'*err);time.sleep(delay);sys.exit(code)"
+        )
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-S",
+                "-B",
+                "-c",
+                script,
+                str(stdout_bytes),
+                str(stderr_bytes),
+                "1" if token else "0",
+                str(returncode),
+                str(delay_seconds),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def test_manifest_is_canonical_closed_and_literal(self) -> None:
         self.assertEqual(spike.parse_manifest_bytes(_canonical(self.manifest)), self.manifest)
         mutants: list[bytes] = []
@@ -508,13 +545,17 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
 
     def test_each_runtime_rejects_a_lingering_window_from_the_previous_run(self) -> None:
         class LingeringWindowBoundary(_FakeBoundary):
-            def window_visible(self, tokens: tuple[str, ...]) -> bool:
+            def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
                 self.window_probe_calls += 1
                 if not self.processes:
-                    return False
+                    return spike.WindowProbeState.ABSENT
                 if self.processes[-1].poll() is None:
                     self.window_probe_saw_live_process = True
-                return tokens == ("SumatraPDF",)
+                return (
+                    spike.WindowProbeState.PRESENT
+                    if tokens == ("SumatraPDF",)
+                    else spike.WindowProbeState.ABSENT
+                )
 
         boundary = LingeringWindowBoundary(self.manifest, self.inputs)
 
@@ -527,9 +568,13 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
 
     def test_initial_and_cleanup_window_absence_checks_are_bounded(self) -> None:
         class InitialWindowBoundary(_FakeBoundary):
-            def window_visible(self, tokens: tuple[str, ...]) -> bool:
+            def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
                 self.window_probe_calls += 1
-                return tokens == ("SumatraPDF",)
+                return (
+                    spike.WindowProbeState.PRESENT
+                    if tokens == ("SumatraPDF",)
+                    else spike.WindowProbeState.ABSENT
+                )
 
         initial = InitialWindowBoundary(self.manifest, self.inputs)
         with self.assertRaises(spike.SpikeError):
@@ -539,11 +584,15 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
         self.assertLessEqual(initial.window_probe_calls, 16)
 
         class CleanupWindowBoundary(_FakeBoundary):
-            def window_visible(self, tokens: tuple[str, ...]) -> bool:
+            def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
                 self.window_probe_calls += 1
                 if not self.processes:
-                    return False
-                return tokens == ("SumatraPDF",)
+                    return spike.WindowProbeState.ABSENT
+                return (
+                    spike.WindowProbeState.PRESENT
+                    if tokens == ("SumatraPDF",)
+                    else spike.WindowProbeState.ABSENT
+                )
 
         cleanup = CleanupWindowBoundary(self.manifest, self.inputs)
         cleanup.communication_timeout = True
@@ -553,6 +602,238 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
         self.assertTrue(cleanup.processes[0].waited)
         self.assertGreater(cleanup.window_probe_calls, 2)
         self.assertLessEqual(cleanup.window_probe_calls, 17)
+
+    def test_failed_window_queries_are_fatal_at_initial_observation_and_postcleanup_gates(self) -> None:
+        class InitialFailureBoundary(_FakeBoundary):
+            def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
+                del tokens
+                self.window_probe_calls += 1
+                return spike.WindowProbeState.FAILED
+
+        initial = InitialFailureBoundary(self.manifest, self.inputs)
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(self.manifest, initial)
+        self.assertEqual(initial.commands, [])
+
+        class ObservationFailureBoundary(_FakeBoundary):
+            def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
+                del tokens
+                self.window_probe_calls += 1
+                if not self.processes:
+                    return spike.WindowProbeState.ABSENT
+                return spike.WindowProbeState.FAILED
+
+        observation = ObservationFailureBoundary(self.manifest, self.inputs)
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(self.manifest, observation)
+        self.assertTrue(observation.processes[0].killed)
+        self.assertTrue(observation.processes[0].waited)
+
+        class PostCleanupFailureBoundary(_FakeBoundary):
+            def probe_window(self, tokens: tuple[str, ...]) -> spike.WindowProbeState:
+                del tokens
+                self.window_probe_calls += 1
+                if not self.processes:
+                    return spike.WindowProbeState.ABSENT
+                if self.processes[-1].poll() is None:
+                    self.processes[-1].window_observed = True
+                    return spike.WindowProbeState.PRESENT
+                return spike.WindowProbeState.FAILED
+
+        postcleanup = PostCleanupFailureBoundary(self.manifest, self.inputs)
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(self.manifest, postcleanup)
+        self.assertEqual(len(postcleanup.commands), 1)
+
+    def test_window_probe_process_is_tristate_bounded_and_fail_closed(self) -> None:
+        limit = 65_536
+
+        def run_real(**options: object) -> tuple[spike.WindowProbeState, subprocess.Popen[bytes]]:
+            created: list[subprocess.Popen[bytes]] = []
+
+            def spawn() -> spike._SystemProcess:
+                raw = self._real_window_probe_process(**options)  # type: ignore[arg-type]
+                created.append(raw)
+                return spike._SystemProcess(raw, ())
+
+            state = spike._run_window_probe(
+                spawn,
+                ("SumatraPDF",),
+                timeout_seconds=0.25,
+                stdout_limit=limit,
+                stderr_limit=limit,
+                combined_limit=limit,
+            )
+            return state, created[0]
+
+        present, present_raw = run_real(stdout_bytes=limit, stderr_bytes=0)
+        self.assertIs(present, spike.WindowProbeState.PRESENT)
+        self.assertIsNotNone(present_raw.poll())
+        self.assertTrue(present_raw.stdout and present_raw.stdout.closed)
+        self.assertTrue(present_raw.stderr and present_raw.stderr.closed)
+
+        absent, absent_raw = run_real(stdout_bytes=limit, stderr_bytes=0, token=False)
+        self.assertIs(absent, spike.WindowProbeState.ABSENT)
+        self.assertIsNotNone(absent_raw.poll())
+
+        for label, options in (
+            ("stdout-over", {"stdout_bytes": limit + 1, "stderr_bytes": 0}),
+            ("stderr-over", {"stdout_bytes": 0, "stderr_bytes": limit + 1}),
+            ("nonzero", {"stdout_bytes": 0, "stderr_bytes": 0, "returncode": 1}),
+            ("timeout", {"stdout_bytes": 0, "stderr_bytes": 0, "delay_seconds": 30.0}),
+        ):
+            with self.subTest(label=label):
+                state, raw = run_real(**options)
+                self.assertIs(state, spike.WindowProbeState.FAILED)
+                self.assertIsNotNone(raw.poll())
+                self.assertTrue(raw.stdout and raw.stdout.closed)
+                self.assertTrue(raw.stderr and raw.stderr.closed)
+
+        def failed_spawn() -> spike._SystemProcess:
+            raise OSError("secret spawn failure")
+
+        self.assertIs(
+            spike._run_window_probe(failed_spawn, ("SumatraPDF",)),
+            spike.WindowProbeState.FAILED,
+        )
+
+        class FailingReader:
+            def read(self, maximum: int) -> bytes:
+                del maximum
+                raise OSError("secret reader failure")
+
+            def close(self) -> None:
+                pass
+
+        class ReaderFailureProcess:
+            inherited_fds: tuple[int, ...] = ()
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.polls = 0
+
+            def take_output_streams(self) -> tuple[object, object]:
+                return FailingReader(), io.BytesIO()
+
+            def poll(self) -> int | None:
+                self.polls += 1
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        self.assertIs(
+            spike._run_window_probe(lambda: ReaderFailureProcess(), ("SumatraPDF",)),
+            spike.WindowProbeState.FAILED,
+        )
+
+        class CompletedProbeProcess:
+            inherited_fds: tuple[int, ...] = ()
+
+            def __init__(self, stdout: bytes, stderr: bytes = b"") -> None:
+                self.returncode = 0
+                self.stdout = io.BytesIO(stdout)
+                self.stderr = io.BytesIO(stderr)
+
+            def take_output_streams(self) -> tuple[object, object]:
+                return self.stdout, self.stderr
+
+            def poll(self) -> int:
+                return self.returncode
+
+            def terminate(self) -> None:
+                raise AssertionError("completed fake must not be terminated")
+
+            def kill(self) -> None:
+                raise AssertionError("completed fake must not be killed")
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return self.returncode
+
+        fake_limit = 1_024
+        exact = b"SumatraPDF\n" + b"x" * (fake_limit - len(b"SumatraPDF\n"))
+        self.assertIs(
+            spike._run_window_probe(
+                lambda: CompletedProbeProcess(exact),
+                ("SumatraPDF",),
+                stdout_limit=fake_limit,
+                stderr_limit=fake_limit,
+                combined_limit=fake_limit,
+            ),
+            spike.WindowProbeState.PRESENT,
+        )
+        for stdout, stderr in (
+            (exact + b"x", b""),
+            (b"", b"e" * (fake_limit + 1)),
+            (b"\xff", b""),
+        ):
+            with self.subTest(fake_sizes=(len(stdout), len(stderr))):
+                self.assertIs(
+                    spike._run_window_probe(
+                        lambda stdout=stdout, stderr=stderr: CompletedProbeProcess(stdout, stderr),
+                        ("SumatraPDF",),
+                        stdout_limit=fake_limit,
+                        stderr_limit=fake_limit,
+                        combined_limit=fake_limit,
+                    ),
+                    spike.WindowProbeState.FAILED,
+                )
+
+    def test_window_probe_reader_start_failure_is_closed_and_reported_as_failed(self) -> None:
+        class StartFailureProcess:
+            inherited_fds: tuple[int, ...] = ()
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.stdout = io.BytesIO(b"SumatraPDF\n")
+                self.stderr = io.BytesIO()
+
+            def take_output_streams(self) -> tuple[object, object]:
+                return self.stdout, self.stderr
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired(("probe",), 1)
+                return self.returncode
+
+        process = StartFailureProcess()
+        original_start = spike.threading.Thread.start
+        starts = 0
+
+        def fail_second_start(thread: threading.Thread) -> None:
+            nonlocal starts
+            starts += 1
+            if starts == 2:
+                raise RuntimeError("secret thread start failure")
+            original_start(thread)
+
+        with mock.patch.object(spike.threading.Thread, "start", fail_second_start):
+            state = spike._run_window_probe(lambda: process, ("SumatraPDF",))
+
+        self.assertIs(state, spike.WindowProbeState.FAILED)
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
 
     def test_real_subprocess_output_capture_enforces_stdout_stderr_and_combined_cap_plus_one(self) -> None:
         limit = 131_072
@@ -849,6 +1130,8 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
         self.assertNotIn("urllib", source)
         self.assertNotIn("requests", source)
         self.assertNotIn("socket", source)
+        self.assertNotIn("subprocess.run", source)
+        self.assertNotIn(".communicate(", source)
 
 
 if __name__ == "__main__":

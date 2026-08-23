@@ -18,8 +18,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 MAX_MANIFEST_BYTES = 1_048_576
@@ -29,12 +30,16 @@ MAX_TRANSCRIPT_BYTES = 1_048_576
 MAX_PROCESS_STDOUT_BYTES = MAX_TRANSCRIPT_BYTES
 MAX_PROCESS_STDERR_BYTES = MAX_TRANSCRIPT_BYTES
 MAX_PROCESS_OUTPUT_BYTES = MAX_TRANSCRIPT_BYTES
+MAX_WINDOW_PROBE_STDOUT_BYTES = 65_536
+MAX_WINDOW_PROBE_STDERR_BYTES = 65_536
+MAX_WINDOW_PROBE_OUTPUT_BYTES = 65_536
 OUTPUT_NAME_ATTEMPTS = 16
 WINDOW_POLL_SECONDS = 0.25
 WINDOW_ABSENCE_SECONDS = 10.0
 PROCESS_POLL_SECONDS = 0.025
 PROCESS_TERMINATE_SECONDS = 1.0
 PROCESS_CLEANUP_SECONDS = 10.0
+WINDOW_PROBE_TIMEOUT_SECONDS = 10.0
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MANIFEST_KEYS = (
     "cli",
@@ -71,6 +76,12 @@ _EVENT_KINDS = {
 
 class SpikeError(RuntimeError):
     """A closed, path-free spike failure."""
+
+
+class WindowProbeState(Enum):
+    ABSENT = "absent"
+    PRESENT = "present"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -414,8 +425,22 @@ class _BoundedOutputCapture:
             )
             for index in range(2)
         )
-        for thread in self._threads:
-            thread.start()
+        started: list[threading.Thread] = []
+        try:
+            for thread in self._threads:
+                thread.start()
+                started.append(thread)
+        except (OSError, RuntimeError):
+            self._cancel.set()
+            deadline = time.monotonic() + PROCESS_TERMINATE_SECONDS
+            for thread in started:
+                thread.join(max(0.0, deadline - time.monotonic()))
+            self._close_streams()
+            deadline = time.monotonic() + PROCESS_TERMINATE_SECONDS
+            for thread in started:
+                if thread.is_alive():
+                    thread.join(max(0.0, deadline - time.monotonic()))
+            raise SpikeError("CLI output reader could not start") from None
 
     @staticmethod
     def _make_nonblocking(stream: object) -> int | None:
@@ -564,6 +589,61 @@ def _finish_process_output(
     return capture.finish(PROCESS_CLEANUP_SECONDS)
 
 
+def _run_window_probe(
+    spawn: Callable[[], object],
+    tokens: tuple[str, ...],
+    *,
+    timeout_seconds: float = WINDOW_PROBE_TIMEOUT_SECONDS,
+    stdout_limit: int = MAX_WINDOW_PROBE_STDOUT_BYTES,
+    stderr_limit: int = MAX_WINDOW_PROBE_STDERR_BYTES,
+    combined_limit: int = MAX_WINDOW_PROBE_OUTPUT_BYTES,
+) -> WindowProbeState:
+    process: object | None = None
+    capture: _BoundedOutputCapture | None = None
+    state = WindowProbeState.FAILED
+    cleanup_failed = False
+    try:
+        process = spawn()
+        stdout_stream, stderr_stream = process.take_output_streams()
+        capture = _BoundedOutputCapture(
+            stdout_stream,
+            stderr_stream,
+            stdout_limit=stdout_limit,
+            stderr_limit=stderr_limit,
+            combined_limit=combined_limit,
+        )
+        stdout, stderr = _finish_process_output(process, capture, timeout_seconds, SystemClock())
+        if process.returncode == 0 and stderr == b"":
+            try:
+                titles = stdout.decode("utf-8").splitlines()
+            except UnicodeError:
+                pass
+            else:
+                state = (
+                    WindowProbeState.PRESENT
+                    if any(token.casefold() in title.casefold() for title in titles for token in tokens)
+                    else WindowProbeState.ABSENT
+                )
+    except (OSError, SpikeError):
+        pass
+    if process is not None:
+        try:
+            live = process.poll() is None
+        except OSError:
+            live = True
+        if live:
+            try:
+                _terminate_process(process)
+            except SpikeError:
+                cleanup_failed = True
+    if capture is not None:
+        try:
+            capture.cleanup(PROCESS_CLEANUP_SECONDS)
+        except SpikeError:
+            cleanup_failed = True
+    return WindowProbeState.FAILED if cleanup_failed else state
+
+
 def _observe_window(
     process: object,
     capture: _BoundedOutputCapture,
@@ -577,7 +657,10 @@ def _observe_window(
             raise SpikeError("CLI output capture failed")
         if process.poll() is not None:
             raise SpikeError("child exited before window observation")
-        if boundary.window_visible(tokens):
+        probe = boundary.probe_window(tokens)
+        if type(probe) is not WindowProbeState or probe is WindowProbeState.FAILED:
+            raise SpikeError("window probe failed")
+        if probe is WindowProbeState.PRESENT:
             if capture.has_failed():
                 raise SpikeError("CLI output capture failed")
             return
@@ -587,7 +670,12 @@ def _observe_window(
 
 def _require_window_absent(tokens: tuple[str, ...], boundary: object) -> None:
     deadline = boundary.monotonic() + WINDOW_ABSENCE_SECONDS
-    while boundary.window_visible(tokens):
+    while True:
+        probe = boundary.probe_window(tokens)
+        if type(probe) is not WindowProbeState or probe is WindowProbeState.FAILED:
+            raise SpikeError("window probe failed")
+        if probe is WindowProbeState.ABSENT:
+            return
         if boundary.monotonic() >= deadline:
             raise SpikeError("matching window did not clear")
         boundary.sleep(WINDOW_POLL_SECONDS)
@@ -1174,7 +1262,7 @@ class SystemBoundary:
             raise SpikeError("CLI process could not start") from error
         return _SystemProcess(process, pass_fds)
 
-    def window_visible(self, tokens: tuple[str, ...]) -> bool:
+    def probe_window(self, tokens: tuple[str, ...]) -> WindowProbeState:
         script = (
             'tell application "System Events"\n'
             "set resultText to {}\n"
@@ -1188,21 +1276,20 @@ class SystemBoundary:
             "return resultText as text\n"
             "end tell"
         )
-        try:
-            result = subprocess.run(
+        def spawn() -> _SystemProcess:
+            process = subprocess.Popen(
                 ["/usr/bin/osascript", "-e", script],
-                check=False,
+                close_fds=True,
+                cwd=None,
                 env={},
+                shell=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        if result.returncode != 0:
-            return False
-        return any(token.casefold() in title.casefold() for title in result.stdout.splitlines() for token in tokens)
+            return _SystemProcess(process, ())
+
+        return _run_window_probe(spawn, tokens)
 
     @staticmethod
     def sleep(seconds: float) -> None:

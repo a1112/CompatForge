@@ -1054,7 +1054,11 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    const OUTPUT_HELPER_VARIABLE: &str = "COMPATFORGE_WINDOW_OUTPUT_HELPER_BYTES";
+    const OUTPUT_HELPER_BYTE_COUNT: usize = 262_144;
+    const OUTPUT_HELPER_MAX_BYTES: usize = 262_144;
+    const OUTPUT_HELPER_CHUNK_BYTES: usize = 8_192;
+    const _: () = assert!(OUTPUT_HELPER_BYTE_COUNT <= OUTPUT_HELPER_MAX_BYTES);
+    const _: () = assert!(OUTPUT_HELPER_BYTE_COUNT % OUTPUT_HELPER_CHUNK_BYTES == 0);
 
     struct HostWindowProbeBudget {
         probe_deadline: Instant,
@@ -1407,24 +1411,37 @@ mod tests {
     }
 
     #[test]
-    fn window_probe_output_helper() {
-        let Ok(byte_count) = std::env::var(OUTPUT_HELPER_VARIABLE) else {
-            return;
-        };
-        let byte_count = byte_count.parse::<usize>().expect("helper byte count must parse");
-        let bytes = vec![b'x'; byte_count];
-        std::io::stdout()
-            .write_all(&bytes)
-            .expect("helper output must be writable");
+    fn harness_reads_only_the_reviewed_manifest_environment_variable() {
+        let source = include_str!("macos_pinned_sumatrapdf_spike.rs");
+        let manifest_variable = concat!("COMPATFORGE_PINNED_", "SPIKE_INPUT");
+        let forbidden_helper_variable = concat!("COMPATFORGE_WINDOW_", "OUTPUT_HELPER_BYTES");
+
+        assert_eq!(source.matches(manifest_variable).count(), 1);
+        assert!(!source.contains(forbidden_helper_variable));
+    }
+
+    #[test]
+    #[ignore = "invoked explicitly by the bounded local pipe backpressure test"]
+    fn window_probe_fixed_output_helper() {
+        let chunk = [b'x'; OUTPUT_HELPER_CHUNK_BYTES];
+        for _ in 0..OUTPUT_HELPER_BYTE_COUNT / OUTPUT_HELPER_CHUNK_BYTES {
+            std::io::stdout()
+                .write_all(&chunk)
+                .expect("helper output must be writable");
+        }
         std::io::stdout().flush().expect("helper output must flush");
     }
 
     #[test]
     fn real_local_probe_output_is_drained_concurrently_and_overflow_is_reaped() {
-        fn spawn_helper(byte_count: usize) -> std::process::Child {
+        fn spawn_helper() -> std::process::Child {
             Command::new(std::env::current_exe().expect("test executable must resolve"))
-                .args(["--exact", "tests::window_probe_output_helper", "--nocapture"])
-                .env(OUTPUT_HELPER_VARIABLE, byte_count.to_string())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::window_probe_fixed_output_helper",
+                    "--nocapture",
+                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -1432,7 +1449,7 @@ mod tests {
                 .expect("local output helper must spawn")
         }
 
-        let mut accepted_child = spawn_helper(262_144);
+        let mut accepted_child = spawn_helper();
         let accepted_stdout = accepted_child.stdout.take().expect("helper stdout must be piped");
         let mut accepted_capture = BoundedPipeCapture::start(accepted_stdout, 524_288).expect("capture must start");
         let mut accepted_budget = HostWindowProbeBudget::new(Duration::from_secs(5), Duration::from_secs(6));
@@ -1443,9 +1460,9 @@ mod tests {
             .finish_until(Instant::now() + Duration::from_secs(1))
             .expect("bounded helper output must finish");
         assert_eq!(accepted, Ok(true));
-        assert!(accepted_output.iter().filter(|byte| **byte == b'x').count() >= 262_144);
+        assert!(accepted_output.iter().filter(|byte| **byte == b'x').count() >= OUTPUT_HELPER_BYTE_COUNT);
 
-        let mut rejected_child = spawn_helper(262_144);
+        let mut rejected_child = spawn_helper();
         let rejected_stdout = rejected_child.stdout.take().expect("helper stdout must be piped");
         let mut rejected_capture = BoundedPipeCapture::start(rejected_stdout, 65_536).expect("capture must start");
         let mut rejected_budget = HostWindowProbeBudget::new(Duration::from_secs(5), Duration::from_secs(6));
