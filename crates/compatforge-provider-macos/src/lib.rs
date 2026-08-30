@@ -15,7 +15,7 @@ use compatforge_domain::{
 use compatforge_runtime::{sha256_digest_bytes, RejectAllSignatures, RuntimePackStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -155,6 +155,14 @@ struct DiscoveredWine {
     wine: String,
     wineserver: String,
     version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalWineCandidate {
+    source: &'static str,
+    root: PathBuf,
+    wine: &'static str,
+    wineserver: &'static str,
 }
 
 impl MacOsProviderConfig {
@@ -399,13 +407,9 @@ impl MacOsProviderSet {
         canonicalize_report(&mut report);
         report.validate()?;
 
-        let runtime_binding = wine_evidence.map(|evidence| RuntimeBinding {
-            provider_id: runtime.provider_id.clone(),
-            pack_id: runtime.pack_id.clone(),
-            pack_digest: runtime.pack_digest.clone(),
-            executable: evidence.wine_path.to_string_lossy().into_owned(),
-            wineserver_executable: Some(evidence.wineserver_path.to_string_lossy().into_owned()),
-            environment: [
+        let runtime_binding = wine_evidence.map(|evidence| {
+            let wineserver = evidence.wineserver_path.to_string_lossy().into_owned();
+            let mut environment: BTreeMap<String, String> = [
                 ("COMPATFORGE_RUNTIME_PACK".into(), runtime.pack_id.clone()),
                 ("COMPATFORGE_RUNTIME_PACK_DIGEST".into(), runtime.pack_digest.clone()),
                 (
@@ -417,10 +421,22 @@ impl MacOsProviderSet {
                     runtime.wineserver.digest.clone(),
                 ),
                 ("WINEDEBUG".into(), "-all".into()),
+                ("WINESERVER".into(), wineserver.clone()),
             ]
             .into_iter()
-            .collect(),
-            working_directory: None,
+            .collect();
+            if let Some(path) = interactive_wine_dll_path(&evidence.wine_path) {
+                environment.insert("WINEDLLPATH".into(), path.to_string_lossy().into_owned());
+            }
+            RuntimeBinding {
+                provider_id: runtime.provider_id.clone(),
+                pack_id: runtime.pack_id.clone(),
+                pack_digest: runtime.pack_digest.clone(),
+                executable: evidence.wine_path.to_string_lossy().into_owned(),
+                wineserver_executable: Some(wineserver),
+                environment,
+                working_directory: None,
+            }
         });
 
         Ok(MacOsProviderSnapshot {
@@ -554,24 +570,49 @@ fn discover_local_wine(
     command: &dyn ProbeCommand,
 ) -> Result<DiscoveredWine, MacOsBootstrapError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut candidates = Vec::new();
-    let mut add = |source: &str, root: PathBuf, wine: &str, wineserver: &str| {
-        candidates.push((source.to_owned(), root, wine.to_owned(), wineserver.to_owned()));
-    };
-    add(
-        "crossover-app",
-        PathBuf::from("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"),
-        "bin/wine",
-        "bin/wineserver",
-    );
-    if let Some(home) = &home {
-        add(
-            "crossover-app",
-            home.join("Applications/CrossOver.app/Contents/SharedSupport/CrossOver"),
-            "bin/wine",
-            "bin/wineserver",
-        );
+    let candidates = local_wine_candidates(home.as_deref());
+    for candidate in candidates {
+        if let Ok(discovered) = verify_discovered_candidate(
+            candidate.source,
+            &candidate.root,
+            candidate.wine,
+            candidate.wineserver,
+            "",
+            command,
+        ) {
+            return Ok(discovered);
+        }
     }
+    let _ = host_report;
+    Err(MacOsBootstrapError::DiscoveryFailed)
+}
+
+fn local_wine_candidates(home: Option<&Path>) -> Vec<LocalWineCandidate> {
+    let mut candidates = Vec::new();
+    let mut add = |source: &'static str, root: PathBuf, wine: &'static str, wineserver: &'static str| {
+        candidates.push(LocalWineCandidate {
+            source,
+            root,
+            wine,
+            wineserver,
+        });
+    };
+
+    for app_root in [
+        Some(PathBuf::from(
+            "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver",
+        )),
+        home.map(|home| home.join("Applications/CrossOver.app/Contents/SharedSupport/CrossOver")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        // CrossOver's wineloader is the supported launcher entrypoint. Keep
+        // the legacy wine wrapper immediately after it for older installs.
+        add("crossover-app", app_root.clone(), "bin/wineloader", "bin/wineserver");
+        add("crossover-app", app_root, "bin/wine", "bin/wineserver");
+    }
+
     add(
         "whisky-app",
         PathBuf::from("/Applications/Whisky.app/Contents/Resources/Libraries/Wine"),
@@ -584,7 +625,7 @@ fn discover_local_wine(
         "bin/wine64",
         "bin/wineserver",
     );
-    if let Some(home) = &home {
+    if let Some(home) = home {
         add(
             "whisky-app",
             home.join("Applications/Whisky.app/Contents/Resources/Libraries/Wine"),
@@ -610,6 +651,7 @@ fn discover_local_wine(
             "bin/wineserver",
         );
     }
+
     let development_refs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../Mac-Win/refs");
     for build in [
         "Whisky-wow64-game-build",
@@ -623,14 +665,7 @@ fn discover_local_wine(
             "server/wineserver",
         );
     }
-
-    for (source, root, wine, wineserver) in candidates {
-        if let Ok(discovered) = verify_discovered_candidate(&source, &root, &wine, &wineserver, "", command) {
-            return Ok(discovered);
-        }
-    }
-    let _ = host_report;
-    Err(MacOsBootstrapError::DiscoveryFailed)
+    candidates
 }
 
 fn verify_discovered_candidate(
@@ -794,6 +829,16 @@ struct WineEvidence {
     wine_path: PathBuf,
     wineserver_path: PathBuf,
     used_rosetta: bool,
+}
+
+fn interactive_wine_dll_path(wine_path: &Path) -> Option<PathBuf> {
+    for ancestor in wine_path.ancestors() {
+        let candidate = ancestor.join("runtime/lib/wine/x86_64-unix");
+        if candidate.is_dir() {
+            return fs::canonicalize(candidate).ok();
+        }
+    }
+    None
 }
 
 fn probe_wine(
@@ -1668,5 +1713,49 @@ mod tests {
             Some(BTreeSet::from([CpuArchitecture::X86_64, CpuArchitecture::Arm64]))
         );
         assert_eq!(parse_mach_o_architectures(b"not-macho"), None);
+    }
+
+    #[test]
+    fn local_candidates_prefer_crossover_wineloader_with_legacy_fallback() {
+        let home = Path::new("/Users/compatforge-test");
+        let candidates = local_wine_candidates(Some(home));
+        let crossover: Vec<&LocalWineCandidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.source == "crossover-app")
+            .collect();
+
+        assert_eq!(crossover.len(), 4);
+        for pair in crossover.chunks_exact(2) {
+            assert_eq!(pair[0].root, pair[1].root);
+            assert_eq!(pair[0].wine, "bin/wineloader");
+            assert_eq!(pair[1].wine, "bin/wine");
+            assert_eq!(pair[0].wineserver, "bin/wineserver");
+            assert_eq!(pair[1].wineserver, "bin/wineserver");
+        }
+    }
+
+    #[test]
+    fn crossover_wineloader_is_a_verified_wine_entrypoint() {
+        let root = temporary_directory("crossover-wineloader");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let bytes = mach_o(CpuArchitecture::X86_64);
+        let wineloader = root.join("bin/wineloader");
+        let wineserver = root.join("bin/wineserver");
+        fs::write(&wineloader, &bytes).unwrap();
+        fs::write(&wineserver, &bytes).unwrap();
+        make_executable(&wineloader);
+        make_executable(&wineserver);
+        let command = SuccessfulCommand {
+            calls: AtomicUsize::new(0),
+        };
+
+        let discovered =
+            verify_discovered_candidate("crossover-app", &root, "bin/wineloader", "bin/wineserver", "", &command)
+                .unwrap();
+
+        assert_eq!(discovered.wine, "bin/wineloader");
+        assert_eq!(discovered.wineserver, "bin/wineserver");
+        assert_eq!(command.calls.load(Ordering::SeqCst), 2);
+        fs::remove_dir_all(root).unwrap();
     }
 }

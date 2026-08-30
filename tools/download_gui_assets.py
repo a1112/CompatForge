@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in downloader for the fixed GUI compatibility baseline installers.
+"""Opt-in downloader for the fixed GUI compatibility baseline assets.
 
 The cache must live outside the repository. Downloads are never attempted
 unless ``--allow-network`` is explicitly provided, and every response is
@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
+import socket
 import sys
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -58,12 +61,12 @@ BASELINE_ASSETS = (
     ),
     GuiAsset(
         "sumatrapdf",
-        "SumatraPDF 3.6.1",
-        "SumatraPDF-3.6.1-64-install.exe",
-        "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64-install.exe",
-        "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381",
-        ("-silent",),
-        "Program Files/SumatraPDF/SumatraPDF.exe",
+        "SumatraPDF 3.6.1 Portable",
+        "SumatraPDF-3.6.1-64.exe",
+        "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.exe",
+        "719f689b34f47be8ca105ce8484948474dafde0e106bab599e4a89326070c3d0",
+        (),
+        "CompatForge/SumatraPDF/SumatraPDF.exe",
         ("SumatraPDF",),
     ),
     GuiAsset(
@@ -235,6 +238,12 @@ class AssetError(Exception):
     pass
 
 
+class NetworkUnavailable(AssetError):
+    def __init__(self, diagnostic: str) -> None:
+        self.diagnostic = diagnostic
+        super().__init__("network unavailable")
+
+
 def asset_for(app_id: str) -> GuiAsset:
     for asset in ASSETS:
         if asset.app_id == app_id:
@@ -320,6 +329,23 @@ def fetch(asset: GuiAsset, cache_root: Path, allow_network: bool) -> Path:
             temporary.unlink()
 
 
+def fetch_classified(asset: GuiAsset, cache_root: Path, allow_network: bool) -> Path:
+    try:
+        return fetch(asset, cache_root, allow_network)
+    except urllib.error.HTTPError:
+        # An HTTP response proves the network path is available. Treat a
+        # deterministic server/content failure as an asset failure instead.
+        raise
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        ConnectionError,
+        socket.gaierror,
+        http.client.HTTPException,
+    ) as error:
+        raise NetworkUnavailable(str(error)) from error
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("command", choices=("list", "fetch"))
@@ -361,7 +387,7 @@ def main() -> int:
             return 0
         if arguments.app is None:
             raise AssetError("fetch requires an app id")
-        path = fetch(asset_for(arguments.app), cache_root, arguments.allow_network)
+        path = fetch_classified(asset_for(arguments.app), cache_root, arguments.allow_network)
         print(json.dumps({"appId": arguments.app, "path": str(path)}, ensure_ascii=False, sort_keys=True))
         return 0
     except (AssetError, OSError, urllib.error.URLError, ValueError) as error:

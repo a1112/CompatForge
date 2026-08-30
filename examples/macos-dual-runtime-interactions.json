@@ -1,0 +1,137 @@
+{
+  "records": [
+    {
+      "document": {
+        "applications": {
+          "7zip": {
+            "requiredChecks": [
+              "fileList",
+              "menus"
+            ]
+          },
+          "notepad-plus-plus": {
+            "requiredChecks": [
+              "open",
+              "edit",
+              "saveUtf8Chinese",
+              "cjkTextReadable",
+              "rereadMatches"
+            ]
+          },
+          "sumatrapdf": {
+            "requiredChecks": [
+              "mainWindow",
+              "openDialog"
+            ]
+          }
+        },
+        "roundId": "round-1",
+        "runtimeId": "crossover",
+        "schemaVersion": "1"
+      },
+      "planPath": "round-1/crossover.json",
+      "roundId": "round-1",
+      "runtimeId": "crossover"
+    },
+    {
+      "document": {
+        "applications": {
+          "7zip": {
+            "requiredChecks": [
+              "fileList",
+              "menus"
+            ]
+          },
+          "notepad-plus-plus": {
+            "requiredChecks": [
+              "open",
+              "edit",
+              "saveUtf8Chinese",
+              "cjkTextReadable",
+              "rereadMatches"
+            ]
+          },
+          "sumatrapdf": {
+            "requiredChecks": [
+              "mainWindow",
+              "openDialog"
+            ]
+          }
+        },
+        "roundId": "round-1",
+        "runtimeId": "whisky",
+        "schemaVersion": "1"
+      },
+      "planPath": "round-1/whisky.json",
+      "roundId": "round-1",
+      "runtimeId": "whisky"
+    },
+    {
+      "document": {
+        "applications": {
+          "7zip": {
+            "requiredChecks": [
+              "fileList",
+              "menus"
+            ]
+          },
+          "notepad-plus-plus": {
+            "requiredChecks": [
+              "open",
+              "edit",
+              "saveUtf8Chinese",
+              "cjkTextReadable",
+              "rereadMatches"
+            ]
+          },
+          "sumatrapdf": {
+            "requiredChecks": [
+              "mainWindow",
+              "openDialog"
+            ]
+          }
+        },
+        "roundId": "round-2",
+        "runtimeId": "crossover",
+        "schemaVersion": "1"
+      },
+      "planPath": "round-2/crossover.json",
+      "roundId": "round-2",
+      "runtimeId": "crossover"
+    },
+    {
+      "document": {
+        "applications": {
+          "7zip": {
+            "requiredChecks": [
+              "fileList",
+              "menus"
+            ]
+          },
+          "notepad-plus-plus": {
+            "requiredChecks": [
+              "open",
+              "edit",
+              "saveUtf8Chinese",
+              "cjkTextReadable",
+              "rereadMatches"
+            ]
+          },
+          "sumatrapdf": {
+            "requiredChecks": [
+              "mainWindow",
+              "openDialog"
+            ]
+          }
+        },
+        "roundId": "round-2",
+        "runtimeId": "whisky",
+        "schemaVersion": "1"
+      },
+      "planPath": "round-2/whisky.json",
+      "roundId": "round-2",
+      "runtimeId": "whisky"
+    }
+  ],
+  "schemaVersion": "1"
+}

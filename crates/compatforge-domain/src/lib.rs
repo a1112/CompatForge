@@ -1320,6 +1320,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pinned_launch_request_serialization_stays_byte_compatible() {
+        let request: LaunchRequest =
+            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&request).unwrap(),
+            br#"{"schemaVersion":"1","requestId":"018fe3cb-9d12-7b52-b334-1cce0e857fc9","bottleId":"7zip-default","recipeId":"7zip","executable":{"path":"C:\\Program Files\\7-Zip\\7zFM.exe","architecture":"x86_64","mode":"immutableArtifact"},"constraints":{"allowVirtualMachine":true,"allowRemote":true,"requiresKernelDriver":false,"requiresDirectX12":false,"networkPolicy":"allow"}}"#,
+        );
+    }
+
+    #[test]
+    fn pinned_bottle_executable_binding_serialization_stays_byte_compatible() {
+        let binding = BottleExecutableBinding {
+            bottle_id: "gui-sumatrapdf".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            size_bytes: 12_345,
+            path: r"C:\CompatForge\SumatraPDF\SumatraPDF.exe".into(),
+            original_name: "SumatraPDF.exe".into(),
+            architecture: CpuArchitecture::X86_64,
+            image_kind: "executable".into(),
+            subsystem: "windowsGui".into(),
+            inspection_schema_version: SCHEMA_VERSION_V1.into(),
+        };
+
+        assert_eq!(
+            serde_json::to_vec(&binding).unwrap(),
+            br#"{"bottleId":"gui-sumatrapdf","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sizeBytes":12345,"path":"C:\\CompatForge\\SumatraPDF\\SumatraPDF.exe","originalName":"SumatraPDF.exe","architecture":"x86_64","imageKind":"executable","subsystem":"windowsGui","inspectionSchemaVersion":"1"}"#,
+        );
+    }
+
+    #[test]
+    fn pinned_launch_plan_serialization_stays_byte_compatible() {
+        let plan: LaunchPlan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&plan).unwrap(),
+            br#"{"schemaVersion":"1","requestId":"018fe3cb-9d12-7b52-b334-1cce0e857fc9","runtime":{"provider":"wine","packId":"wine-linux-arm64-fex","packDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"translator":{"provider":"fex","version":"pack-pinned"},"graphics":{"backend":"dxvk","version":"pack-pinned"},"process":{"executable":"/opt/compatforge/runtime/bin/wine","arguments":["C:\\Program Files\\7-Zip\\7zFM.exe"],"environment":{"WINEPREFIX":"/var/lib/compatforge/bottles/7zip-default/prefix"},"workingDirectory":"/var/lib/compatforge/bottles/7zip-default"},"mounts":[{"source":"/home/example/Documents","destination":"/mnt/documents","access":"read-write"}],"sandbox":{"profile":"desktop","network":"allow"},"lifecycle":{"terminationGraceMilliseconds":3000,"maximumRuntimeMilliseconds":21600000,"wineserver":{"executable":"/opt/compatforge/runtime/bin/wineserver","prefix":"/var/lib/compatforge/bottles/7zip-default/prefix"}},"decisionTrace":["local Wine is available","x86_64 guest on ARM64 requires translation","FEX selected before Box64 and QEMU","DXVK selected for D3D8-11 capability"]}"#,
+        );
+    }
+
+    #[test]
     fn parses_checked_in_contract_examples() {
         let capability: CapabilityReport =
             serde_json::from_str(include_str!("../../../examples/capability-report.linux-arm64.json")).unwrap();

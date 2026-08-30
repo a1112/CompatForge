@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -16,11 +17,70 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTER = ROOT / "tools" / "register_macos_local_wine.py"
 HARNESS = ROOT / "tools" / "run_macos_headless_preview.py"
 DISCOVER = ROOT / "tools" / "discover_macos_wine.py"
+GUI_ASSETS = ROOT / "tools" / "download_gui_assets.py"
+PREPARE_INTERACTIVE = ROOT / "tools" / "prepare_macos_interactive_runtime.py"
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return f"sha256:{digest}"
+
+
+class MacOsInteractiveRuntimePreparationTests(unittest.TestCase):
+    def test_whisky_launcher_preserves_closed_pinned_descriptor_guests(self) -> None:
+        prepare = load_module("interactive_runtime_preparation", PREPARE_INTERACTIVE)
+        source = prepare.launcher_source(
+            Path("/runtime/bin/wine64"),
+            Path("/runtime/observer/CompatForgeWhiskyAcceptance.app"),
+            Path(
+                "/runtime/observer/CompatForgeWhiskyAcceptance.app/Contents/MacOS/wineloader"
+            ),
+            Path(
+                "/runtime/observer/CompatForgeWhiskyAcceptance.app/Contents/Info.plist"
+            ),
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+        )
+        self.assertIn('static const char prefix[] = "/dev/fd/";', source)
+        self.assertIn("return value > 2;", source)
+        self.assertIn(
+            "return launch_inherited_descriptor_guest(argc, argv);",
+            source,
+        )
+        self.assertIn("SCM_RIGHTS", source)
+        self.assertIn('open_argv[index++] = "--compatforge-receive-fd";', source)
+        self.assertIn("drive_c/windows/temp/compatforge-pinned-", source)
+        self.assertIn('const char *guest_name = "SumatraPDF.exe";', source)
+        self.assertNotIn("F_GETPATH", source)
+        self.assertIn("cleanup_owned_directory", source)
+        self.assertIn("remember_termination_signal", source)
+        self.assertLess(
+            source.index("return launch_inherited_descriptor_guest(argc, argv);"),
+            source.rindex('open_argv[i++] = "/usr/bin/open";'),
+        )
+
+    def test_whisky_observer_receives_and_preserves_transferred_descriptor(self) -> None:
+        prepare = load_module("interactive_runtime_observer", PREPARE_INTERACTIVE)
+        source = prepare.observer_launcher_source(
+            Path("/runtime/bin/wine64"), Path("/runtime/bin/wineserver")
+        )
+        self.assertIn('strcmp(argv[1], "--compatforge-receive-fd") == 0', source)
+        self.assertIn("recvmsg(socket_descriptor, &message, 0)", source)
+        self.assertIn("fcntl(descriptor, F_SETFD, 0)", source)
+        self.assertIn('snprintf(descriptor_path, sizeof(descriptor_path), "/dev/fd/%d"', source)
+        self.assertIn("symlink(descriptor_path, guest_path)", source)
+        self.assertIn("argv[1] = guest_path;", source)
+        self.assertIn("argv[argc - 2] = NULL;", source)
 
 
 class MacOsHeadlessPreviewRegistrationTests(unittest.TestCase):
@@ -38,6 +98,51 @@ class MacOsHeadlessPreviewRegistrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_gui_asset_contract_pins_sumatrapdf_inside_drive_c(self) -> None:
+        assets = load_module("headless_preview_gui_assets", GUI_ASSETS)
+        sumatra = assets.asset_for("sumatrapdf")
+        self.assertEqual(
+            (sumatra.install_args, sumatra.installed_executable),
+            (
+                (),
+                "CompatForge/SumatraPDF/SumatraPDF.exe",
+            ),
+        )
+
+    def test_sumatrapdf_fixed_lookup_runs_with_an_empty_child_environment(self) -> None:
+        bottle = self.root / "empty-environment" / "drive_c"
+        expected = bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe"
+        expected.parent.mkdir(parents=True)
+        expected.write_bytes(b"MZsumatra")
+        program = """
+import pathlib
+import sys
+sys.path.insert(0, sys.argv[1])
+import download_gui_assets
+import run_gui_baseline
+asset = download_gui_assets.asset_for("sumatrapdf")
+print(run_gui_baseline.installed_executable(asset, pathlib.Path(sys.argv[2])))
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-B",
+                "-c",
+                program,
+                str(ROOT / "tools"),
+                str(bottle),
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env={},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), expected)
 
     def run_register(self, output: Path, *extra: str) -> subprocess.CompletedProcess[str]:
         arguments = [
@@ -279,6 +384,20 @@ class MacOsHeadlessPreviewHarnessTests(unittest.TestCase):
         with self.assertRaises(self.module.AcceptanceError):
             self.module.resolve_wine(arguments)
 
+    def test_real_subprocess_mode_preserves_an_explicit_runtime(self) -> None:
+        source = HARNESS.read_text()
+        explicit_branch = source.index("if any(explicit_runtime):")
+        bootstrap_branch = source.index("elif runner is subprocess.run:")
+        self.assertLess(explicit_branch, bootstrap_branch)
+        self.assertIn(
+            "arguments = resolve_wine(arguments, runner)",
+            source[explicit_branch:bootstrap_branch],
+        )
+        self.assertIn(
+            "paths = validate(arguments, platform.system(), platform.machine())",
+            source[explicit_branch:bootstrap_branch],
+        )
+
     def test_mocked_harness_runs_the_exact_trust_chain_and_writes_redacted_summary(self) -> None:
         calls: list[list[str]] = []
         digest = "sha256:" + "a" * 64
@@ -432,6 +551,376 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def make_candidate(self, source: str, name: str):
+        root = self.root / name
+        (root / "bin").mkdir(parents=True)
+        macho = b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture"
+        for relative in ("bin/wine", "bin/wineserver"):
+            path = root / relative
+            path.write_bytes(macho)
+            path.chmod(0o700)
+        if source in {"whisky-app", "whisky-library"}:
+            for relative in self.module.WHISKY_GRAPHICS_COMPONENTS:
+                component = root / relative
+                component.parent.mkdir(parents=True, exist_ok=True)
+                component.write_bytes(b"graphics-driver-fixture")
+        return self.module.Candidate(source, root, "bin/wine", "bin/wineserver")
+
+    def test_whisky_requires_paired_x86_64_graphics_modules(self) -> None:
+        candidate = self.make_candidate("whisky-library", "whisky-graphics")
+        self.assertIsNotNone(self.module.verify_candidate(candidate, self.successful_runner))
+
+        for relative in self.module.WHISKY_GRAPHICS_COMPONENTS:
+            with self.subTest(relative=relative):
+                component = candidate.root / relative
+                payload = component.read_bytes()
+                component.unlink()
+                self.assertIsNone(
+                    self.module.verify_candidate(candidate, self.successful_runner)
+                )
+                component.write_bytes(payload)
+
+    @staticmethod
+    def successful_runner(argv, **_kwargs):
+        executable = Path(argv[0]).name
+        stdout = (
+            "wine-11.11\n"
+            if executable in {"wine", "wine64", "wineloader"}
+            else "Wine 11.11\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    def discover_all(self, candidates, runner):
+        # Windows does not preserve the executable bit used by the macOS-only
+        # verifier. Keep these enumeration tests focused on the closed candidate
+        # classification while the existing verifier tests own that invariant.
+        with mock.patch.object(self.module, "regular_executable", return_value=True):
+            return self.module.discover_all(candidates, runner=runner)
+
+    def test_runtime_id_is_a_closed_source_classification(self) -> None:
+        cases = (
+            ("crossover-app", "crossover"),
+            ("crossover-interactive-derived", "crossover"),
+            ("whisky-app", "whisky"),
+            ("whisky-library", "whisky"),
+            ("whisky-interactive-derived", "whisky"),
+            ("mac-win-development-build", None),
+            ("test", None),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                candidate = self.module.Candidate(source, self.root, "wine", "wineserver")
+                self.assertEqual(self.module.runtime_id(candidate), expected)
+
+    def test_known_candidates_prefer_closed_prepared_descriptors(self) -> None:
+        home = self.root / "prepared-home"
+        prepared = home / "Library/Caches/dev.compatforge/interactive-runtimes/crossover"
+        (prepared / "bin").mkdir(parents=True)
+        descriptor = {
+            "architecture": "x86_64",
+            "materializedRoot": str(prepared),
+            "runtimeId": "crossover",
+            "schemaVersion": "1",
+            "source": "crossover-interactive-derived",
+            "version": "25.1.1",
+            "wine": "bin/wine",
+            "wineserver": "bin/wineserver",
+        }
+        (prepared / "descriptor.json").write_text(
+            json.dumps(descriptor), encoding="utf-8"
+        )
+
+        candidates = self.module.known_candidates(home=home)
+
+        self.assertEqual(candidates[0].source, "crossover-interactive-derived")
+        self.assertEqual(candidates[0].root, prepared)
+        self.assertEqual(candidates[0].wine, "bin/wine")
+
+    def test_known_candidates_prioritize_crossover_wineloader_before_legacy_wine(self) -> None:
+        home = self.root / "home"
+        crossover = [
+            candidate
+            for candidate in self.module.known_candidates(home=home)
+            if candidate.source == "crossover-app"
+        ]
+
+        self.assertEqual(
+            [
+                (candidate.root, candidate.wine, candidate.wineserver)
+                for candidate in crossover
+            ],
+            [
+                (
+                    Path("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"),
+                    "bin/wineloader",
+                    "bin/wineserver",
+                ),
+                (
+                    Path("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"),
+                    "bin/wine",
+                    "bin/wineserver",
+                ),
+                (
+                    home / "Applications/CrossOver.app/Contents/SharedSupport/CrossOver",
+                    "bin/wineloader",
+                    "bin/wineserver",
+                ),
+                (
+                    home / "Applications/CrossOver.app/Contents/SharedSupport/CrossOver",
+                    "bin/wine",
+                    "bin/wineserver",
+                ),
+            ],
+        )
+
+    def test_known_crossover_layout_verifies_wineloader_and_preserves_legacy_fallback(self) -> None:
+        home = self.root / "home"
+        root = home / "Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
+        (root / "bin").mkdir(parents=True)
+        macho = b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture"
+        for relative in ("bin/wineloader", "bin/wineserver", "bin/wine"):
+            path = root / relative
+            path.write_bytes(macho)
+            path.chmod(0o700)
+
+        candidates = [
+            candidate
+            for candidate in self.module.known_candidates(home=home)
+            if candidate.root == root
+        ]
+        self.assertEqual(
+            [(candidate.wine, candidate.wineserver) for candidate in candidates],
+            [("bin/wineloader", "bin/wineserver"), ("bin/wine", "bin/wineserver")],
+        )
+        selected = self.module.verify_candidate(candidates[0], self.successful_runner)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["wine"], "bin/wineloader")
+
+        (root / "bin/wineloader").unlink()
+        selected = self.module.verify_candidate(candidates[1], self.successful_runner)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["wine"], "bin/wine")
+
+    def test_crossover_legacy_wine_script_wrapper_is_rejected(self) -> None:
+        root = self.root / "crossover-script-wrapper"
+        (root / "bin").mkdir(parents=True)
+        wrapper = root / "bin/wine"
+        wrapper.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o700)
+        wineserver = root / "bin/wineserver"
+        wineserver.write_bytes(
+            b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture"
+        )
+        wineserver.chmod(0o700)
+        candidate = self.module.Candidate(
+            "crossover-app", root, "bin/wine", "bin/wineserver"
+        )
+
+        self.assertIsNone(self.module.verify_candidate(candidate, self.successful_runner))
+
+    def test_crossover_wineloader_keeps_thin_x86_64_and_root_checks(self) -> None:
+        root = self.root / "crossover-invalid-architecture"
+        (root / "bin").mkdir(parents=True)
+        wineloader = root / "bin/wineloader"
+        wineloader.write_bytes(
+            b"\xcf\xfa\xed\xfe" + (0x0100_000C).to_bytes(4, "little") + b"fixture"
+        )
+        wineloader.chmod(0o700)
+        wineserver = root / "bin/wineserver"
+        wineserver.write_bytes(
+            b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture"
+        )
+        wineserver.chmod(0o700)
+        candidate = self.module.Candidate(
+            "crossover-app", root, "bin/wineloader", "bin/wineserver"
+        )
+        self.assertIsNone(self.module.verify_candidate(candidate, self.successful_runner))
+
+        wineloader.write_bytes(
+            b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture"
+        )
+        outside = self.root / "outside-wineloader"
+        outside.write_bytes(wineloader.read_bytes())
+        outside.chmod(0o700)
+        wineloader.unlink()
+        wineloader.symlink_to(outside)
+        self.assertIsNone(self.module.verify_candidate(candidate, self.successful_runner))
+
+    def test_discover_all_selects_first_verified_candidate_per_required_runtime(self) -> None:
+        invalid_crossover = self.make_candidate("crossover-app", "crossover-invalid-macho")
+        (invalid_crossover.root / invalid_crossover.wine).write_bytes(b"not-mach-o")
+        valid_crossover = self.make_candidate("crossover-app", "crossover-selected")
+        duplicate_crossover = self.make_candidate("crossover-app", "crossover-duplicate")
+
+        failed_whisky = self.make_candidate("whisky-app", "whisky-failed-version")
+        development_build = self.make_candidate("mac-win-development-build", "development-build")
+        valid_whisky = self.make_candidate("whisky-library", "whisky-selected")
+        duplicate_whisky = self.make_candidate("whisky-app", "whisky-duplicate")
+        calls: list[str] = []
+
+        def runner(argv, **kwargs):
+            calls.append(str(argv[0]))
+            if "whisky-failed-version" in str(argv[0]):
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="failed")
+            return self.successful_runner(argv, **kwargs)
+
+        result = self.discover_all(
+            (
+                invalid_crossover,
+                valid_crossover,
+                duplicate_crossover,
+                failed_whisky,
+                development_build,
+                valid_whisky,
+                duplicate_whisky,
+            ),
+            runner=runner,
+        )
+
+        self.assertEqual([item["runtimeId"] for item in result], ["crossover", "whisky"])
+        self.assertEqual(
+            [item["materializedRoot"] for item in result],
+            [str(valid_crossover.root.resolve()), str(valid_whisky.root.resolve())],
+        )
+        self.assertEqual(
+            [set(item) for item in result],
+            [
+                {
+                    "schemaVersion",
+                    "source",
+                    "materializedRoot",
+                    "wine",
+                    "wineserver",
+                    "version",
+                    "architecture",
+                    "runtimeId",
+                },
+                {
+                    "schemaVersion",
+                    "source",
+                    "materializedRoot",
+                    "wine",
+                    "wineserver",
+                    "version",
+                    "architecture",
+                    "runtimeId",
+                },
+            ],
+        )
+        serialized_calls = "\n".join(calls)
+        self.assertNotIn("crossover-invalid-macho", serialized_calls)
+        self.assertNotIn("crossover-duplicate", serialized_calls)
+        self.assertNotIn("development-build", serialized_calls)
+        self.assertNotIn("whisky-duplicate", serialized_calls)
+
+    def test_discover_all_rejects_symlink_escape_and_uses_later_verified_candidate(self) -> None:
+        escaping = self.make_candidate("crossover-app", "crossover-escaping")
+        outside = self.root / "outside-enumerator-wine"
+        outside.write_bytes((escaping.root / escaping.wine).read_bytes())
+        outside.chmod(0o700)
+        (escaping.root / escaping.wine).unlink()
+        (escaping.root / escaping.wine).symlink_to(outside)
+        valid_crossover = self.make_candidate("crossover-app", "crossover-after-escape")
+        valid_whisky = self.make_candidate("whisky-app", "whisky-for-escape")
+
+        result = self.discover_all(
+            (escaping, valid_crossover, valid_whisky), runner=self.successful_runner
+        )
+
+        self.assertEqual(
+            [item["materializedRoot"] for item in result],
+            [str(valid_crossover.root.resolve()), str(valid_whisky.root.resolve())],
+        )
+
+    def test_discover_all_requires_both_runtimes_and_excludes_development_builds(self) -> None:
+        crossover = self.make_candidate("crossover-app", "only-crossover")
+        whisky = self.make_candidate("whisky-app", "only-whisky")
+        development_build = self.make_candidate("mac-win-development-build", "only-development")
+        cases = (
+            (crossover,),
+            (whisky,),
+            (crossover, development_build),
+        )
+        for candidates in cases:
+            with self.subTest(sources=[candidate.source for candidate in candidates]):
+                with self.assertRaisesRegex(
+                    self.module.DiscoveryError, "^required Runtime is unavailable$"
+                ):
+                    self.discover_all(candidates, runner=self.successful_runner)
+
+    def test_discovery_cli_default_output_is_byte_compatible(self) -> None:
+        record = {
+            "schemaVersion": "1",
+            "source": "crossover-app",
+            "materializedRoot": "/runtime",
+            "wine": "bin/wine",
+            "wineserver": "bin/wineserver",
+            "version": "11.11",
+            "architecture": "x86_64",
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(self.module.sys, "argv", ["discover_macos_wine.py"]), mock.patch.object(
+            self.module, "discover", return_value=record
+        ), mock.patch.object(self.module.sys, "stdout", stdout), mock.patch.object(
+            self.module.sys, "stderr", stderr
+        ):
+            exit_code = self.module.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            stdout.getvalue(),
+            '{"architecture":"x86_64","materializedRoot":"/runtime","schemaVersion":"1","source":"crossover-app","version":"11.11","wine":"bin/wine","wineserver":"bin/wineserver"}\n',
+        )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_discovery_cli_all_output_is_closed_canonical_and_runtime_sorted(self) -> None:
+        records = [
+            {"runtimeId": "crossover", "schemaVersion": "1", "source": "crossover-app"},
+            {"runtimeId": "whisky", "schemaVersion": "1", "source": "whisky-app"},
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(self.module.sys, "argv", ["discover_macos_wine.py", "--all"]), mock.patch.object(
+            self.module, "discover_all", return_value=records
+        ) as discover_all, mock.patch.object(self.module.sys, "stdout", stdout), mock.patch.object(
+            self.module.sys, "stderr", stderr
+        ):
+            exit_code = self.module.main()
+
+        self.assertEqual(exit_code, 0)
+        discover_all.assert_called_once_with()
+        self.assertEqual(
+            stdout.getvalue(),
+            '{"runtimes":[{"runtimeId":"crossover","schemaVersion":"1","source":"crossover-app"},{"runtimeId":"whisky","schemaVersion":"1","source":"whisky-app"}],"schemaVersion":"1"}\n',
+        )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_discovery_cli_rejects_unknown_or_combined_arguments_without_leaking_input(self) -> None:
+        cases = (
+            ["--unknown", str(self.root)],
+            ["--all", "--unknown", str(self.root)],
+            ["--all=true"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    self.module.sys, "argv", ["discover_macos_wine.py", *arguments]
+                ), mock.patch.object(self.module.sys, "stdout", stdout), mock.patch.object(
+                    self.module.sys, "stderr", stderr
+                ):
+                    exit_code = self.module.main()
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "compatforge-wine-discovery: invalid command-line arguments\n",
+                )
+                self.assertNotIn(str(self.root), stderr.getvalue())
 
     def test_discovery_requires_thin_x86_64_and_successful_version_execution(self) -> None:
         calls: list[list[str]] = []

@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 compatforge-domain = { path = "../compatforge-domain" }
 compatforge-inspect = { path = "../compatforge-inspect" }
+libc.workspace = true
 sha2.workspace = true
 
 [lints]

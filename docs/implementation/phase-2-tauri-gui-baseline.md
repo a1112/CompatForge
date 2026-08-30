@@ -32,9 +32,11 @@ Tauri Rust Commands 直接调用 `compatforge-provider-macos`、`compatforge-ins
 
 ## GUI evidence
 
-`tools/download_gui_assets.py` 固定官方 URL、重定向主机、流式大小上限和 SHA-256，只有 `--allow-network` 才下载，缓存必须在仓库外。`tools/run_gui_baseline.py` 为 7-Zip、SumatraPDF、Notepad++ 各建独立 Bottle，先以 immutable installer 启动，再以 `bottleInPlace` 启动安装后的 EXE，并记录 inspection、LaunchPlan、RuntimeEvent、窗口/截图和清理。空白窗口或仅进程启动只能得到 `unverified`。
+`tools/download_gui_assets.py` 固定官方 URL、重定向主机、流式大小上限和 SHA-256，只有 `--allow-network` 才下载，缓存必须在仓库外。`tools/run_gui_baseline.py` 为 7-Zip、SumatraPDF、Notepad++ 各建独立 Bottle；7-Zip 与 Notepad++ 先以 immutable installer 安装，SumatraPDF 则把固定摘要的官方 portable 字节单次写入 Bottle 固定路径并做有界准备启动，随后三者均以 `bottleInPlace` 启动，并记录 inspection、LaunchPlan、RuntimeEvent、窗口/截图和清理。空白窗口或仅进程启动只能得到 `unverified`。
 
-真实窗口观察优先接受与 RuntimeEvent `started.processId` 相同进程组的目标标题，并在固定窗口出现期限内轮询；Wine GUI 脱离原始进程组时才使用全局标题回退。锁屏、Accessibility 或截图设施不可用归为 `test-infrastructure`，目标窗口在可观察桌面上缺失归为 `runtime-regression`，二者不再混写。整屏截图本身不构成通过证据。`--accept-interactive` 必须同时提供仓库外的 v2 `--interaction-evidence` JSON，其中包含闭集 human attestation、观察者、带时区时间和逐应用检查。目标进程残留或 Bottle 清理失败都会阻止 `accepted`。可重复使用 `--app <id>` 仅运行指定应用，以进行有界的兼容性实验。
+真实窗口观察优先接受与 RuntimeEvent `started.processId` 相同进程组的目标标题，并在固定窗口出现期限内轮询；macOS 优先使用 CoreGraphics 窗口列表取得窗口 ID，再用该 ID 截取目标窗口，只有在 Wine GUI 脱离原始进程组且仍绑定到已准备 Runtime 身份时才使用全局标题回退。锁屏、Accessibility 或截图设施不可用归为 `test-infrastructure`，目标窗口在可观察桌面上缺失归为 `runtime-regression`，二者不再混写。整屏截图本身不构成通过证据。SumatraPDF 的匿名 inspection/plan 输出位于独立的私有证据子目录，避免同轮截图改变其目录身份；CLI 逐条刷新 RuntimeEvent，并且只在所有工作线程与 Wine 清理完成后输出终端 receipt。
+
+双 Runtime 正式验收的 `--accept-interactive` 必须同时提供仓库外的交互计划、acknowledgement 根和 round ID，由第二终端逐项确认；扩展认证矩阵则可使用仓库外的 v2 `--interaction-evidence` JSON，包含闭集 human attestation、观察者、带时区时间和逐应用检查。两种证据模式互斥，静态 v2 证据不能替代双 Runtime 的实时 challenge/receipt。目标进程残留或 Bottle 清理失败都会阻止 `accepted`。可重复使用 `--app <id>` 仅运行指定应用，以进行有界的兼容性实验。
 
 ```json
 {
@@ -51,8 +53,8 @@ Tauri Rust Commands 直接调用 `compatforge-provider-macos`、`compatforge-ins
       "open": true,
       "edit": true,
       "saveUtf8Chinese": true,
-      "rereadMatches": true,
-      "cjkTextReadable": true
+      "cjkTextReadable": true,
+      "rereadMatches": true
     }
   }
 }

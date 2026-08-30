@@ -15,6 +15,10 @@ from typing import Callable, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 PROBE_TIMEOUT_SECONDS = 10
 MAX_MACHO_HEADER_BYTES = 64 * 1024
+WHISKY_GRAPHICS_COMPONENTS = (
+    "lib/wine/x86_64-windows/winemac.drv",
+    "lib/wine/x86_64-unix/winemac.drv.so",
+)
 
 
 class DiscoveryError(Exception):
@@ -32,21 +36,67 @@ class Candidate:
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def runtime_id(candidate: Candidate) -> str | None:
+    if candidate.source in ("crossover-app", "crossover-interactive-derived"):
+        return "crossover"
+    if candidate.source in ("whisky-app", "whisky-library", "whisky-interactive-derived"):
+        return "whisky"
+    return None
+
+
+def prepared_candidate(root: Path, identifier: str) -> Candidate | None:
+    descriptor_path = root / "descriptor.json"
+    try:
+        if descriptor_path.stat().st_size > 64 * 1024:
+            return None
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        expected_source = f"{identifier}-interactive-derived"
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("schemaVersion") != "1"
+            or descriptor.get("runtimeId") != identifier
+            or descriptor.get("source") != expected_source
+            or Path(descriptor.get("materializedRoot", "")).resolve(strict=True)
+            != root.resolve(strict=True)
+            or not isinstance(descriptor.get("wine"), str)
+            or not isinstance(descriptor.get("wineserver"), str)
+        ):
+            return None
+    except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+        return None
+    return Candidate(expected_source, root, descriptor["wine"], descriptor["wineserver"])
+
+
 def known_candidates(home: Path | None = None) -> list[Candidate]:
     home = home or Path.home()
     candidates: list[Candidate] = []
+
+    prepared_root = home / "Library" / "Caches" / "dev.compatforge" / "interactive-runtimes"
+    for identifier in ("crossover", "whisky"):
+        candidate = prepared_candidate(prepared_root / identifier, identifier)
+        if candidate is not None:
+            candidates.append(candidate)
 
     for app in (
         Path("/Applications/CrossOver.app"),
         home / "Applications" / "CrossOver.app",
     ):
-        candidates.append(
-            Candidate(
-                "crossover-app",
-                app / "Contents" / "SharedSupport" / "CrossOver",
-                "bin/wine",
-                "bin/wineserver",
-            )
+        root = app / "Contents" / "SharedSupport" / "CrossOver"
+        candidates.extend(
+            [
+                Candidate(
+                    "crossover-app",
+                    root,
+                    "bin/wineloader",
+                    "bin/wineserver",
+                ),
+                Candidate(
+                    "crossover-app",
+                    root,
+                    "bin/wine",
+                    "bin/wineserver",
+                ),
+            ]
         )
     for app in (
         Path("/Applications/Whisky.app"),
@@ -149,6 +199,27 @@ def regular_executable(path: Path) -> bool:
     return stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o111 != 0
 
 
+def whisky_graphics_complete(root: Path) -> bool:
+    """Require the paired 64-bit PE and Unix macOS graphics modules."""
+
+    for graphics_root in (root, root / "runtime"):
+        complete = True
+        for relative in WHISKY_GRAPHICS_COMPONENTS:
+            component = graphics_root / relative
+            try:
+                resolved = component.resolve(strict=True)
+                metadata = resolved.stat()
+            except OSError:
+                complete = False
+                break
+            if root not in resolved.parents or not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+                complete = False
+                break
+        if complete:
+            return True
+    return False
+
+
 def run_version(executable: Path, root: Path, runner: Runner) -> subprocess.CompletedProcess[str]:
     return runner(
         [str(executable), "--version"],
@@ -174,6 +245,12 @@ def verify_candidate(candidate: Candidate, runner: Runner = subprocess.run) -> d
     if not regular_executable(wine) or not regular_executable(wineserver):
         return None
     if macho_architectures(wine) != {"x86_64"} or macho_architectures(wineserver) != {"x86_64"}:
+        return None
+    if candidate.source in (
+        "whisky-app",
+        "whisky-library",
+        "whisky-interactive-derived",
+    ) and not whisky_graphics_complete(root):
         return None
     try:
         wine_version = run_version(wine, root, runner)
@@ -210,9 +287,36 @@ def discover(candidates: Iterable[Candidate] | None = None, runner: Runner = sub
     raise DiscoveryError("no executable-verified x86_64 Wine candidate was found")
 
 
+def discover_all(
+    candidates: Iterable[Candidate] | None = None, runner: Runner = subprocess.run
+) -> list[dict[str, str]]:
+    selected_candidates = known_candidates() if candidates is None else candidates
+    selected: dict[str, dict[str, str]] = {}
+    for candidate in selected_candidates:
+        identifier = runtime_id(candidate)
+        if identifier is None or identifier in selected:
+            continue
+        verified = verify_candidate(candidate, runner)
+        if verified is not None:
+            selected[identifier] = {**verified, "runtimeId": identifier}
+    if set(selected) != {"crossover", "whisky"}:
+        raise DiscoveryError("required Runtime is unavailable")
+    return [selected[identifier] for identifier in ("crossover", "whisky")]
+
+
 def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments not in ([], ["--all"]):
+        print("compatforge-wine-discovery: invalid command-line arguments", file=sys.stderr)
+        return 2
     try:
-        result = discover()
+        if arguments == ["--all"]:
+            result: dict[str, object] = {
+                "runtimes": discover_all(),
+                "schemaVersion": "1",
+            }
+        else:
+            result = discover()
     except DiscoveryError as error:
         print(f"compatforge-wine-discovery: {error}", file=sys.stderr)
         return 1

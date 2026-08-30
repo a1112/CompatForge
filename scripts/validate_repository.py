@@ -7,6 +7,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import ast
+import builtins
 import hashlib
 import importlib.util
 import json
@@ -15,6 +17,7 @@ import re
 import stat
 import subprocess
 import types
+import unicodedata
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -407,6 +410,290 @@ MAX_ORDINARY_SCAN_BYTES = 32 * 1024 * 1024
 MAX_ORDINARY_SCAN_ENTRIES = 100_000
 MAX_ORDINARY_SCAN_TOTAL_BYTES = 1024 * 1024 * 1024
 DEVELOPER_PATH_VALIDATION_ERROR = "Repository developer-path validation failed"
+MACOS_ACCEPTANCE_REVIEWED_PATHS = (
+    "README.md",
+    "docs/testing.md",
+    "docs/guides/macos-local-dual-runtime-acceptance.md",
+    "docs/reports/2026-08-21-macos-local-dual-runtime-acceptance.md",
+    "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance-design.md",
+    "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance.md",
+    "docs/plans/2026-08-22-macos-acceptance-acknowledgement-design.md",
+    "docs/plans/2026-08-22-macos-acceptance-integration-hardening.md",
+    "docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md",
+    "docs/plans/2026-08-22-macos-pinned-bottle-execution.md",
+    "examples/macos-dual-runtime-interactions.json",
+    "tests/test_macos_dual_runtime_acceptance.py",
+    "tools/run_macos_dual_runtime_acceptance.py",
+)
+MACOS_ACCEPTANCE_PLANNING_PATHS = frozenset(
+    {
+        "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance-design.md",
+        "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance.md",
+        "docs/plans/2026-08-22-macos-acceptance-acknowledgement-design.md",
+        "docs/plans/2026-08-22-macos-acceptance-integration-hardening.md",
+        "docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md",
+        "docs/plans/2026-08-22-macos-pinned-bottle-execution.md",
+    }
+)
+MACOS_ACCEPTANCE_DEVELOPER_PATH_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]+Users[\\/]+[^\\/\s<>'\"`]+[\\/])"
+    ),
+    re.compile(r"(?<![A-Za-z0-9])/(?:Users|home)/[^/\s<>'\"`]+/"),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]+(?:workspace|workspaces)[\\/]|/(?:workspace|workspaces)/)"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]+(?:hostedtoolcache|toolcache)[\\/]|/(?:opt/)?(?:hostedtoolcache|toolcache)/)"
+    ),
+)
+MACOS_ACKNOWLEDGEMENT_REVIEWED_PATHS = (
+    "tests/test_macos_interaction_acknowledgements.py",
+    "tools/confirm_macos_gui_interactions.py",
+)
+MACOS_ACKNOWLEDGEMENT_MAX_SOURCE_BYTES = 256 * 1024
+MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS = frozenset(
+    {
+        "argparse",
+        "__future__",
+        "collections",
+        "ctypes",
+        "dataclasses",
+        "hashlib",
+        "json",
+        "msvcrt",
+        "os",
+        "pathlib",
+        "re",
+        "secrets",
+        "stat",
+        "sys",
+        "time",
+    }
+)
+MACOS_ACCEPTANCE_GUIDE = "docs/guides/macos-local-dual-runtime-acceptance.md"
+MACOS_ACCEPTANCE_REPORT = "docs/reports/2026-08-21-macos-local-dual-runtime-acceptance.md"
+MACOS_ACCEPTANCE_INTERACTIONS = "examples/macos-dual-runtime-interactions.json"
+MACOS_ACCEPTANCE_MAX_MARKDOWN_BYTES = 96 * 1024
+MACOS_ACCEPTANCE_MAX_JSON_BYTES = 32 * 1024
+MACOS_ACCEPTANCE_MAX_SOURCE_BYTES = 512 * 1024
+MACOS_ACCEPTANCE_RECORDS = (
+    ("round-1", "crossover"),
+    ("round-1", "whisky"),
+    ("round-2", "crossover"),
+    ("round-2", "whisky"),
+)
+MACOS_ACCEPTANCE_INTERACTION_CHECKS = {
+    "7zip": ("fileList", "menus"),
+    "sumatrapdf": ("mainWindow", "openDialog"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
+}
+MACOS_ACCEPTANCE_DISCOVERY_COMMAND = (
+    "python3 -S -B tools/discover_macos_wine.py --all",
+)
+MACOS_ACCEPTANCE_PREFLIGHT_COMMANDS = (
+    "uname -m",
+    "python3 -S -B -c 'import platform,sys; print(sys.executable); print(sys.version); assert sys.version_info >= (3,11); assert platform.machine() == \"arm64\"'",
+    "arch -x86_64 /usr/bin/true",
+    "test -x /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc",
+    "rustc --version",
+    "rustup target list --installed",
+    "node --version",
+    "npm --version",
+    "df -h /absolute/external",
+)
+MACOS_ACCEPTANCE_ROSETTA_INSTALL_COMMAND = (
+    "sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license",
+)
+MACOS_ACCEPTANCE_BUILD_COMMANDS = (
+    "python3 -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v",
+    "python3 -S -B scripts/validate_repository.py",
+    "cargo fmt --all -- --check",
+    "cargo test --offline --workspace --all-targets --locked",
+    "npm ci --offline --prefix apps/desktop",
+    "npm run build --prefix apps/desktop",
+    "cargo build --offline --release --locked -p compatforge-cli",
+    "CARGO_NET_OFFLINE=true npm run tauri --prefix apps/desktop -- build --bundles app",
+)
+MACOS_ACCEPTANCE_ASSET_LIST_COMMAND = (
+    "python3 -S -B tools/download_gui_assets.py list --cache-root /absolute/external/cache",
+)
+MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS = (
+    "python3 -S -B tools/download_gui_assets.py fetch 7zip --cache-root /absolute/external/cache --allow-network",
+    "python3 -S -B tools/download_gui_assets.py fetch sumatrapdf --cache-root /absolute/external/cache --allow-network",
+    "python3 -S -B tools/download_gui_assets.py fetch notepad-plus-plus --cache-root /absolute/external/cache --allow-network",
+)
+MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND = (
+    "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
+    "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
+    "  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \\",
+    "  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \\",
+    "  --cache-root /absolute/external/cache \\",
+    "  --runtime-store-root /absolute/external/runtime-store \\",
+    "  --storage-root /absolute/external/storage \\",
+    "  --work-root /absolute/external/evidence \\",
+    "  --interaction-plan-root /absolute/external/interactions \\",
+    "  --acknowledgement-root /absolute/external/acknowledgements",
+)
+MACOS_ACCEPTANCE_ACKNOWLEDGEMENT_COMMAND = (
+    "python3 -S -B tools/confirm_macos_gui_interactions.py \\",
+    "  --interaction-plan-root /absolute/external/interactions \\",
+    "  --acknowledgement-root /absolute/external/acknowledgements",
+)
+MACOS_ACCEPTANCE_NEGATIVE_COMMAND = (
+    "python3 -S -B tools/run_macos_dual_runtime_acceptance.py \\",
+    "  --compatforge-cli /absolute/external/build/compatforge-cli \\",
+    "  --desktop-app /absolute/external/build/CompatForge.app/Contents/MacOS/CompatForge \\",
+    "  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \\",
+    "  --cache-root /absolute/external/cache \\",
+    "  --runtime-store-root /absolute/external/negative/runtime-store \\",
+    "  --storage-root /absolute/external/negative/storage \\",
+    "  --work-root /absolute/external/negative/evidence \\",
+    "  --interaction-plan-root /absolute/external/interactions \\",
+    "  --acknowledgement-root /absolute/external/negative/acknowledgements \\",
+    "  --negative-checks \\",
+    "  --console-guest /absolute/external/inputs/windows-console-smoke.exe \\",
+    "  --negative-sentinel /absolute/external/inputs/negative-sentinel.txt",
+)
+MACOS_ACCEPTANCE_INTERACTION_PATHS = (
+    "/absolute/external/interactions/round-1/crossover.json",
+    "/absolute/external/interactions/round-1/whisky.json",
+    "/absolute/external/interactions/round-2/crossover.json",
+    "/absolute/external/interactions/round-2/whisky.json",
+)
+MACOS_ACCEPTANCE_INTERACTION_PREP_COMMANDS = (
+    "python3 -S -B -c 'import json,pathlib; source=json.loads(pathlib.Path(\"examples/macos-dual-runtime-interactions.json\").read_text(encoding=\"utf-8\")); root=pathlib.Path(\"/absolute/external/interactions\"); [(root / record[\"planPath\"]).parent.mkdir(parents=True,exist_ok=True) or (root / record[\"planPath\"]).write_text(json.dumps(record[\"document\"],ensure_ascii=False,sort_keys=True,separators=(\",\",\":\"))+\"\\n\",encoding=\"utf-8\",newline=\"\\n\") for record in source[\"records\"]]'",
+    "mkdir -p /absolute/external/acknowledgements/challenges /absolute/external/acknowledgements/receipts",
+)
+MACOS_ACCEPTANCE_GUIDE_BLOCKS = (
+    MACOS_ACCEPTANCE_PREFLIGHT_COMMANDS,
+    MACOS_ACCEPTANCE_ROSETTA_INSTALL_COMMAND,
+    MACOS_ACCEPTANCE_BUILD_COMMANDS,
+    MACOS_ACCEPTANCE_DISCOVERY_COMMAND,
+    MACOS_ACCEPTANCE_ASSET_LIST_COMMAND,
+    MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS,
+    MACOS_ACCEPTANCE_INTERACTION_PATHS,
+    MACOS_ACCEPTANCE_INTERACTION_PREP_COMMANDS,
+    MACOS_ACCEPTANCE_ACKNOWLEDGEMENT_COMMAND,
+    MACOS_ACCEPTANCE_ORCHESTRATOR_COMMAND,
+    MACOS_ACCEPTANCE_NEGATIVE_COMMAND,
+)
+MACOS_ACCEPTANCE_NONCLAIMS = (
+    "- `scope`: 本门禁仅为 local-only/developer-local；不是 public beta、public release 或发布门禁。",
+    "- `distribution`: 本门禁不签名、不 notarize、不生成或分发 DMG。",
+    "- `coverage`: 本门禁不证明所有 Windows 应用、主机或 Runtime 可用。",
+    "- `repositories`: 本门禁不修改也不授权修改 ForgeOS、ForgeTools 或 Mac-Win。",
+)
+MACOS_ACCEPTANCE_SAFE_NETWORK_PROSE = (
+    "只有操作者明确批准本阶段联网时，才逐个执行以下固定 app id。下载器内部固定 URL、大小上限和 SHA-256；不要用 `curl`、浏览器或任意 URL 替代：",
+    "三个固定资产获取完成后必须关闭网络。双轮编排及其余所有阶段都不得使用或追加 `--allow-network`。",
+)
+MACOS_ACCEPTANCE_REPOSITORY_SUBJECT = r"(?:forgeos|forgetools|mac\s+win)"
+MACOS_ACCEPTANCE_REPOSITORY_ACTION = (
+    r"(?:changes?|changed|changing|modifications?|modify|modifies|modified|"
+    r"alter|alters|altered|altering|edits?|edited|editing|adjusts?|adjusted|"
+    r"updat(?:e|es|ed|ing)|rewrit(?:e|es|ten|ing)|mutat(?:e|es|ed|ing|ion)|"
+    r"authori[sz](?:e|es|ed|ation))"
+)
+MACOS_ACCEPTANCE_TOPIC_TRIGGERS = (
+    (
+        "public",
+        (
+            r"\bpublic\s+(?:beta|release)\b",
+            r"\bavailable\s+to\s+(?:the\s+)?public\b",
+            r"\bpublicly\s+available\b",
+            r"\b(?:compatforge|stage|gate|build|application|app|artifact|package)\b"
+            r"\s+(?:is|are|was|were|has\s+been|have\s+been|will\s+be)\s+"
+            r"(?:not\s+)?(?:publicly\s+)?released\b",
+            r"\bpublicly\s+released\s+(?:the\s+)?"
+            r"(?:compatforge|stage|gate|build|application|app|artifact|package)\b",
+            r"\b(?:compatforge|stage|gate|build|application|app|artifact|package)\b"
+            r"\s+(?:(?:is|are|was|were|will\s+be)\s+)?(?:not\s+)?"
+            r"available\s+publicly\b",
+            r"(?:公测|公开测试|公开发布|对外发布|面向公众发布)",
+        ),
+    ),
+    (
+        "signing",
+        (
+            r"\bsign(?:ature|atures|ed|ing)?\b",
+            r"\bnotari[sz](?:e|ed|ing|ation|ations)\b",
+            r"(?:签名|签署|公证)",
+        ),
+    ),
+    (
+        "dmg",
+        (r"\bdmg\b",),
+    ),
+    (
+        "repositories",
+        (
+            rf"\b{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b(?:\s+\w+){{0,5}}\s+"
+            rf"{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b",
+            rf"\b{MACOS_ACCEPTANCE_REPOSITORY_ACTION}\b(?:\s+\w+){{0,5}}\s+"
+            rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}\b",
+            rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}(?:\s+__comma__)?\s*"
+            r"(?:的)?\s*(?:修改|变更|改动|更改|(?:已)?编辑(?:了)?|"
+            r"调整|重写|授权|(?:已)?获授权)",
+            r"(?:修改|变更|改动|更改|(?:已)?编辑(?:了)?|"
+            r"调整|重写|授权(?:修改)?|获授权)\s*"
+            rf"{MACOS_ACCEPTANCE_REPOSITORY_SUBJECT}",
+        ),
+    ),
+)
+MACOS_ACCEPTANCE_NEGATION_INSIDE = (
+    r"\b(?:not|never|neither|nor|without|no)\b",
+    r"(?:绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不|未|无)",
+)
+MACOS_ACCEPTANCE_NEGATION_BEFORE = (
+    r"(?:\b(?:not|never|without|no)\b\s*(?:a|an|the|to|be|being|been)?|"
+    r"绝非|绝不(?:会)?|不会|严禁|禁止|不得|不可|不是|不属于|不包含|"
+    r"不允许|不授权|不|未(?:完成)?|无)\s*$",
+    r"\bnot\s+ready\s+for\s*$",
+    r"\bnot\s+intended\s+(?:as|to\s+be)\s+(?:(?:a|an|the)\s*)?$",
+    r"\bno\s+plans?(?:\s+for)?\s*(?:(?:a|an|the)\s*)?$",
+    r"(?:不打算(?:进入|作为)?|无计划(?:进入|进行)?)\s*$",
+    r"\b(?:not|never|no|without|will\s+not|would\s+not|(?:do|does|did)\s+not)\b"
+    r"(?:\s+(?!__comma__)\w+){0,4}\s*$",
+    r"(?:不计划|不打算|不会|不|无|未|禁止|严禁)[^\s_]{0,8}\s*$",
+    r"\bneither(?:\s+(?:a|an|the))?\s*$",
+    r"\bneither\b(?:(?!__comma__).)*\bnor\b"
+    r"(?:\s+(?!__comma__)\w+){0,4}\s*$",
+)
+MACOS_ACCEPTANCE_SCOPE_SUFFIX = (
+    r"(?:scope|this\s+scope|current\s+scope|the\s+scope|"
+    r"the\s+current\s+scope|the\s+present\s+scope)"
+)
+MACOS_ACCEPTANCE_NEGATION_AFTER = (
+    r"(?:(?:generation|distribution|packaging|release)\s+)?"
+    r"(?:(?:is|are|was|were|will\s+be|would\s+be|has\s+been|have\s+been|"
+    r"remains?|stays?)\s+)?"
+    r"(?:not\s+(?:ready|allowed|permitted|planned|scheduled|happening|occurring|"
+    r"authorized|signed|notarized|generated|modified|changed)|forbidden|prohibited)\b",
+    r"(?:(?:generation|distribution|packaging|release)\s+)?"
+    r"(?:will|would|can|could|shall)\s+not\s+"
+    r"(?:happen|occur|proceed|be\s+(?:allowed|authorized|generated|modified|changed))\b",
+    r"(?:generation|distribution|packaging|release)\s+"
+    r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
+    rf"(?:out(?:side)?(?:\s+of)?\s+{MACOS_ACCEPTANCE_SCOPE_SUFFIX}|"
+    rf"beyond\s+{MACOS_ACCEPTANCE_SCOPE_SUFFIX}|excluded)\b",
+    r"(?:(?:is|remains?|stays?)\s+)?out(?:side)?(?:\s+of)?\s+"
+    rf"{MACOS_ACCEPTANCE_SCOPE_SUFFIX}\b",
+    r"(?:(?:is|are|was|were|remains?|stays?)\s+)?"
+    rf"(?:beyond\s+{MACOS_ACCEPTANCE_SCOPE_SUFFIX}|excluded)\b",
+    r"(?:生成|分发|发布|打包)?(?:不在(?:本阶段)?范围内|"
+    r"超出(?:本阶段)?范围|(?:在)?范围外|(?:已)?排除|"
+    r"(?:被)?(?:严禁|禁止)|不会发生)",
+    r"(?:被)?(?:严禁|禁止)|(?:绝不(?:会)?|不会|不得|不可|不)"
+    r"(?:允许|发生|进行|开始|进入|开放|构成|成立|是)",
+)
+MACOS_ACCEPTANCE_NEGATION_COORDINATOR = r"(?:\bor\b|\bnor\b|或|__comma__)\s*$"
 
 
 def _bind_validator_directory(path: Path) -> tuple[object, tuple[int, int]]:
@@ -4063,6 +4350,1302 @@ def validate_macos_preview_binary_hygiene() -> list[str]:
     return errors
 
 
+def _macos_acceptance_closed_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, nested in pairs:
+        if not isinstance(key, str) or not key or key in value:
+            raise ValueError("macOS acceptance JSON contains an invalid or duplicate key")
+        value[key] = nested
+    return value
+
+
+def _macos_acceptance_reject_constant(_constant: str) -> object:
+    raise ValueError("macOS acceptance JSON contains a non-finite value")
+
+
+def _macos_acceptance_bounded_json(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > 256 or depth > 8:
+            raise ValueError("macOS acceptance JSON exceeds its structural bound")
+        if isinstance(current, dict):
+            stack.extend((nested, depth + 1) for nested in current.values())
+        elif isinstance(current, list):
+            stack.extend((nested, depth + 1) for nested in current)
+        elif isinstance(current, str):
+            if (
+                not current
+                or len(current) > 256
+                or any(ord(character) < 32 or ord(character) == 127 for character in current)
+            ):
+                raise ValueError("macOS acceptance JSON contains invalid text")
+        elif current is not True and current is not False:
+            raise ValueError("macOS acceptance JSON contains an unsupported scalar")
+
+
+def _macos_acceptance_text(relative: str, maximum: int) -> str:
+    raw, _identity = _read_bound_regular_file(ROOT / relative, maximum)
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError(f"{relative} is not UTF-8") from error
+    if "\r" in source or "\x00" in source:
+        raise ValueError(f"{relative} contains non-canonical text")
+    return source
+
+
+def _macos_acceptance_markdown(relative: str) -> str:
+    source = _macos_acceptance_text(relative, MACOS_ACCEPTANCE_MAX_MARKDOWN_BYTES)
+    visible = re.sub(r"(?s)<!--.*?-->", "", source)
+    if "<!--" in visible:
+        raise ValueError(f"{relative} contains an unclosed Markdown comment")
+    return visible
+
+
+def _macos_acceptance_fences(source: str) -> tuple[tuple[str, ...], ...]:
+    blocks = re.findall(r"(?ms)^```text\n(.*?)\n```[ \t]*$", source)
+    return tuple(tuple(block.splitlines()) for block in blocks)
+
+
+def _macos_acceptance_guide_fences(
+    source: str,
+) -> tuple[tuple[tuple[str, ...], ...], str]:
+    allowed_languages = {"", "text", "bash", "sh", "zsh", "console"}
+    blocks: list[tuple[str, ...]] = []
+    prose: list[str] = []
+    body: list[str] | None = None
+    marker_size = 0
+    for line in source.splitlines():
+        if body is None:
+            opening = re.fullmatch(r"(?P<marker>`{3,})(?P<info>[^`]*)", line)
+            if opening is None:
+                if line.lstrip().startswith("```"):
+                    raise ValueError("macOS acceptance guide contains an invalid fence")
+                prose.append(line)
+                continue
+            language = opening.group("info").strip().casefold()
+            if language not in allowed_languages:
+                raise ValueError("macOS acceptance guide uses an unsupported fence language")
+            marker_size = len(opening.group("marker"))
+            body = []
+            continue
+        if re.fullmatch(rf"`{{{marker_size},}}[ \t]*", line):
+            blocks.append(tuple(body))
+            body = None
+            marker_size = 0
+        else:
+            body.append(line)
+    if body is not None:
+        raise ValueError("macOS acceptance guide contains an unclosed fence")
+    return tuple(blocks), "\n".join(prose)
+
+
+def _macos_acceptance_prose(source: str) -> str:
+    return re.sub(r"(?ms)^```[^\n]*\n.*?^```[ \t]*$", "", source)
+
+
+def _macos_acceptance_semantic_clauses(prose: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", prose).casefold()
+    normalized = re.sub(
+        r"[:：]\s*(?=(?:ready|begins?|available|publicly\s+available)\b)",
+        " ",
+        normalized,
+    )
+    clauses: list[str] = []
+    for sentence in re.split(
+        r"[\n\r。！？!?；;:：]+|(?<!\d)\.(?!\d)", normalized
+    ):
+        for clause in re.split(
+            r"\b(?:although|while|but|however|whereas|yet|and)\b|"
+            r"但是|然而|不过|可是|并且|但|而|却",
+            sentence,
+        ):
+            clause = re.sub(r"[,，、/]+", " __comma__ ", clause)
+            compact = re.sub(r"[^\w]+", " ", clause, flags=re.UNICODE).strip()
+            if compact:
+                clauses.append(compact)
+    return tuple(clauses)
+
+
+def _macos_acceptance_claim_is_directly_negated(
+    clause: str, match: re.Match[str]
+) -> bool:
+    matched = match.group()
+    prefix = clause[: match.start()].rstrip()
+    suffix = clause[match.end() :].lstrip()
+
+    return (
+        any(re.search(pattern, matched) for pattern in MACOS_ACCEPTANCE_NEGATION_INSIDE)
+        or any(re.search(pattern, prefix) for pattern in MACOS_ACCEPTANCE_NEGATION_BEFORE)
+        or any(re.match(pattern, suffix) for pattern in MACOS_ACCEPTANCE_NEGATION_AFTER)
+    )
+
+
+def _macos_acceptance_claim_is_negated(
+    clause: str, match: re.Match[str], topic_triggers: tuple[str, ...]
+) -> bool:
+    if _macos_acceptance_claim_is_directly_negated(clause, match):
+        return True
+
+    prefix = clause[: match.start()].rstrip()
+    connector = re.search(MACOS_ACCEPTANCE_NEGATION_COORDINATOR, prefix)
+    if connector is None:
+        return False
+    if connector.group().strip() == "__comma__":
+        current_item = re.split(
+            r"__comma__|\b(?:or|nor)\b|或", clause[match.end() :], maxsplit=1
+        )[0].strip()
+        if current_item:
+            return False
+    previous = prefix[: connector.start()].rstrip()
+    for pattern in topic_triggers:
+        prior_matches = tuple(re.finditer(pattern, previous))
+        if prior_matches and _macos_acceptance_claim_is_directly_negated(
+            previous, prior_matches[-1]
+        ):
+            return True
+    if re.search(r"(?:不包含|不是|不属于).*", previous):
+        return True
+    return False
+
+
+def _validate_macos_acceptance_nonclaims(prose: str) -> None:
+    lines = prose.splitlines()
+    selected = tuple(
+        line
+        for line in lines
+        if line.startswith(("- `scope`:", "- `distribution`:", "- `coverage`:", "- `repositories`:"))
+    )
+    if selected != MACOS_ACCEPTANCE_NONCLAIMS:
+        raise ValueError("macOS acceptance closed non-claims drifted")
+
+    semantic_prose = "\n".join(
+        line for line in lines if line not in MACOS_ACCEPTANCE_NONCLAIMS
+    )
+    for clause in _macos_acceptance_semantic_clauses(semantic_prose):
+        for _topic, topic_triggers in MACOS_ACCEPTANCE_TOPIC_TRIGGERS:
+            for pattern in topic_triggers:
+                for match in re.finditer(pattern, clause):
+                    if _macos_acceptance_claim_is_negated(
+                        clause, match, topic_triggers
+                    ):
+                        continue
+                    raise ValueError(
+                        "macOS acceptance guide contains a contradictory claim"
+                    )
+
+
+def _validate_macos_acceptance_markdown_surface(prose: str) -> None:
+    lines = prose.splitlines()
+    if any(lines.count(safe_line) != 1 for safe_line in MACOS_ACCEPTANCE_SAFE_NETWORK_PROSE):
+        raise ValueError("macOS acceptance guide safe network prose drifted")
+    remaining = "\n".join(
+        line for line in lines if line not in MACOS_ACCEPTANCE_SAFE_NETWORK_PROSE
+    )
+    without_link_destinations = re.sub(
+        r"\[([^\]\r\n]*)\]\(\s*https?://[^)\s]+(?:\s+['\"][^)]*['\"])?\s*\)",
+        r"\1",
+        remaining,
+        flags=re.IGNORECASE,
+    )
+    without_link_destinations = re.sub(
+        r"<https?://[^>\s]+>",
+        "",
+        without_link_destinations,
+        flags=re.IGNORECASE,
+    )
+    without_link_destinations = re.sub(
+        r"(?im)^([ \t]{0,3}\[[^\]\r\n]+\]:)[ \t]*<?https?://[^\s>]+>?"
+        r"[ \t]*(?:(?:\"[^\"]*\"|'[^']*'|\([^)]*\))[ \t]*)?$",
+        r"\1",
+        without_link_destinations,
+    )
+    normalized = unicodedata.normalize("NFKC", without_link_destinations).casefold()
+    normalized = re.sub(r"\s+", " ", normalized)
+    forbidden = (
+        r"(?<![\w-])(?:curl|wget)(?![\w-])",
+        r"(?<![\w-])--allow-network(?![\w-])",
+        r"(?<![\w.-])(?:tools[\\/])?download_gui_assets\.py(?![\w.-])",
+        r"(?<![\w.-])python(?:3(?:\.\d+)*)?(?:\s+-[sb])*\s+tools[\\/]",
+        r"https?://",
+    )
+    if any(re.search(pattern, normalized) for pattern in forbidden):
+        raise ValueError("macOS acceptance guide contains a forbidden network surface")
+
+
+def _validate_macos_acceptance_guide(source: str) -> None:
+    fences, prose = _macos_acceptance_guide_fences(source)
+    headings = tuple(
+        line
+        for line in prose.splitlines()
+        if line.startswith("#")
+    )
+    required_headings = (
+        "# Apple Silicon 双 Runtime 本地验收",
+        "## 1. 前置检查",
+        "## 2. 外部根与清理边界",
+        "## 3. 先构建与运行离线门禁",
+        "## 4. 发现一次双 Runtime",
+        "## 5. 显式 opt-in 获取固定资产",
+        "## 6. 独立准备交互确认",
+        "## 7. 执行两轮矩阵",
+        "## 8. 负向隔离检查",
+        "## 9. 精确退出门禁",
+        "## 10. 闭集非声明",
+    )
+    if headings != required_headings:
+        raise ValueError("macOS acceptance guide headings drifted")
+
+    for marker in (
+        "Python 3.11+",
+        "Apple Silicon `arm64`",
+        "Rosetta",
+        "CrossOver",
+        "Whisky",
+        "x86_64-w64-mingw32-gcc",
+        "Rust stable",
+        "Node.js 24",
+        "足够空间",
+        "默认禁用网络",
+        "16 paths",
+        "zero cleanup failure",
+        "它不是 public beta",
+        "不修改 ForgeOS、ForgeTools 或 Mac-Win",
+        "Screenshots、安装器、Bottle、Runtime 内容",
+        "重新运行必须选择新的空",
+    ):
+        if prose.count(marker) < 1:
+            raise ValueError(f"macOS acceptance guide marker drifted: {marker}")
+    _validate_macos_acceptance_nonclaims(prose)
+    _validate_macos_acceptance_markdown_surface(prose)
+    if any(
+        "curl" in line or "http://" in line or "https://" in line
+        for block in fences
+        for line in block
+    ):
+        raise ValueError("macOS acceptance guide permits an arbitrary download surface")
+    if fences != MACOS_ACCEPTANCE_GUIDE_BLOCKS:
+        raise ValueError("macOS acceptance guide command contract drifted")
+    network_lines = tuple(
+        line for block in fences for line in block if "--allow-network" in line
+    )
+    if network_lines != MACOS_ACCEPTANCE_ASSET_FETCH_COMMANDS:
+        raise ValueError("macOS acceptance network opt-in escaped the fixed asset stage")
+
+
+def _validate_macos_acceptance_report(source: str) -> None:
+    prose = _macos_acceptance_prose(source)
+    headings = tuple(line for line in prose.splitlines() if line.startswith("#"))
+    required_headings = (
+        "# macOS 双 Runtime developer-local 验收报告",
+        "## 结论",
+        "## 主机与工具链",
+        "## Runtime 与应用身份",
+        "## 16 路径结果",
+        "## GUI 与中文验收",
+        "## 负向隔离",
+        "## 本机端口与代码门禁",
+        "## 清理与后续决定",
+        "## 闭集非声明",
+    )
+    if headings != required_headings:
+        raise ValueError("macOS acceptance report headings drifted")
+    lines = prose.splitlines()
+    for required_line in (
+        "- status: `accepted`",
+        "- worktree: `dirty`; 本报告绑定上述基线提交及本地未提交验收修复，不声明远端 CI 状态。",
+        "- matrix: `16/16 accepted`",
+        "- acknowledgements: `12/12 GUI receipts`",
+        "- console: `4/4 automatic results`",
+        "- comparison: `roundsEqual: true`, `status: accepted`",
+        "- cleanup: `zero cleanup failure`",
+        "- negative status: `accepted`",
+    ):
+        if lines.count(required_line) != 1:
+            raise ValueError(
+                f"macOS acceptance report marker drifted: {required_line}"
+            )
+    for marker in (
+        "cjkTextReadable: true",
+        "127.0.0.1:1421",
+        "HTTP 200",
+        "127.0.0.1:1420",
+        "nextStage:",
+    ):
+        if prose.count(marker) != 1:
+            raise ValueError(f"macOS acceptance report marker drifted: {marker}")
+    if len(re.findall(r"(?m)^\| round-[12] \| (?:crossover|whisky) \| "
+                      r"(?:console|7zip|sumatrapdf|notepad-plus-plus) \| accepted \|$", prose)) != 16:
+        raise ValueError("macOS acceptance report matrix is incomplete")
+    if len(re.findall(r"(?m)^- sourceCommit: `[0-9a-f]{40}`$", prose)) != 1:
+        raise ValueError("macOS acceptance report source commit is invalid")
+    if any(
+        pattern.search(source)
+        for pattern in MACOS_ACCEPTANCE_DEVELOPER_PATH_PATTERNS
+    ) or re.search(r"(?i)(?<![A-Za-z0-9])/(?:private/)?tmp/", source):
+        raise ValueError("macOS acceptance report contains a forbidden developer path")
+    if re.search(r"!\[|<img\b", source, re.IGNORECASE):
+        raise ValueError("macOS acceptance report embeds raw visual evidence")
+    _validate_macos_acceptance_nonclaims(prose)
+
+
+def _validate_macos_acceptance_example(source: str) -> None:
+    try:
+        document = json.loads(
+            source,
+            object_pairs_hook=_macos_acceptance_closed_object,
+            parse_constant=_macos_acceptance_reject_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, UnicodeError) as error:
+        raise ValueError("macOS acceptance interaction example is invalid JSON") from error
+    _macos_acceptance_bounded_json(document)
+    if not isinstance(document, dict) or set(document) != {"schemaVersion", "records"}:
+        raise ValueError("macOS acceptance interaction example is not closed")
+    if document["schemaVersion"] != "1" or not isinstance(document["records"], list):
+        raise ValueError("macOS acceptance interaction example schema drifted")
+    records = document["records"]
+    if len(records) != len(MACOS_ACCEPTANCE_RECORDS):
+        raise ValueError("macOS acceptance interaction records are incomplete")
+    for record, (round_id, runtime_id) in zip(records, MACOS_ACCEPTANCE_RECORDS):
+        if not isinstance(record, dict) or set(record) != {
+            "document",
+            "planPath",
+            "roundId",
+            "runtimeId",
+        }:
+            raise ValueError("macOS acceptance interaction record is not closed")
+        if record["roundId"] != round_id or record["runtimeId"] != runtime_id:
+            raise ValueError("macOS acceptance interaction identity drifted")
+        if record["planPath"] != f"{round_id}/{runtime_id}.json":
+            raise ValueError("macOS acceptance interaction path is not fixed and relative")
+        plan = record["document"]
+        if (
+            not isinstance(plan, dict)
+            or set(plan)
+            != {"schemaVersion", "roundId", "runtimeId", "applications"}
+            or plan["schemaVersion"] != "1"
+            or plan["roundId"] != round_id
+            or plan["runtimeId"] != runtime_id
+            or not isinstance(plan["applications"], dict)
+            or set(plan["applications"]) != set(MACOS_ACCEPTANCE_INTERACTION_CHECKS)
+        ):
+            raise ValueError("macOS acceptance runner document is not closed")
+        for application_id, expected_checks in MACOS_ACCEPTANCE_INTERACTION_CHECKS.items():
+            application = plan["applications"][application_id]
+            if (
+                not isinstance(application, dict)
+                or set(application) != {"requiredChecks"}
+                or not isinstance(application["requiredChecks"], list)
+                or application["requiredChecks"] != list(expected_checks)
+            ):
+                raise ValueError("macOS acceptance interaction checks drifted")
+    canonical = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, indent=2
+    ) + "\n"
+    if source != canonical:
+        raise ValueError("macOS acceptance interaction example is not canonical")
+
+
+def validate_macos_acceptance_docs() -> list[str]:
+    """Validate the closed local-only guide, navigation and interaction template."""
+
+    try:
+        guide = _macos_acceptance_markdown(MACOS_ACCEPTANCE_GUIDE)
+        report = _macos_acceptance_markdown(MACOS_ACCEPTANCE_REPORT)
+        readme = _macos_acceptance_markdown("README.md")
+        testing = _macos_acceptance_markdown("docs/testing.md")
+        example = _macos_acceptance_text(
+            MACOS_ACCEPTANCE_INTERACTIONS, MACOS_ACCEPTANCE_MAX_JSON_BYTES
+        )
+        _validate_macos_acceptance_guide(guide)
+        _validate_macos_acceptance_report(report)
+        _validate_macos_acceptance_example(example)
+        readme_marker = (
+            "[Apple Silicon 双 Runtime 本地验收指南]"
+            "(docs/guides/macos-local-dual-runtime-acceptance.md)"
+        )
+        testing_marker = (
+            "[双 Runtime 本地验收指南]"
+            "(guides/macos-local-dual-runtime-acceptance.md)"
+        )
+        report_marker = (
+            "[脱敏阶段报告]"
+            "(reports/2026-08-21-macos-local-dual-runtime-acceptance.md)"
+        )
+        readme_prose = _macos_acceptance_prose(readme)
+        testing_prose = _macos_acceptance_prose(testing)
+        testing_fences = _macos_acceptance_fences(testing)
+        if (
+            readme_prose.count(readme_marker) != 1
+            or testing_prose.count(testing_marker) != 1
+            or testing_prose.count(report_marker) != 1
+        ):
+            raise ValueError("macOS acceptance navigation marker drifted")
+        if (
+            "## Apple Silicon 双 Runtime developer-local 门禁" not in testing_prose
+            or not any(
+                "python3 -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v"
+                in block
+                for block in testing_fences
+            )
+            or "默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。"
+            not in testing_prose
+            or "默认 CI 下载并运行" in testing_prose
+        ):
+            raise ValueError("macOS acceptance testing marker drifted")
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        return [f"macOS acceptance documentation validation failed: {error}"]
+    return []
+
+
+def validate_macos_acceptance_surface() -> list[str]:
+    """Require every explicitly reviewed local acceptance entry to be regular."""
+
+    errors: list[str] = []
+    for relative in MACOS_ACCEPTANCE_REVIEWED_PATHS:
+        parts = PurePosixPath(relative).parts
+        path = ROOT
+        try:
+            for index, part in enumerate((None, *parts)):
+                if part is not None:
+                    path = path / part
+                metadata = path.lstat()
+                is_leaf = index == len(parts)
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or getattr(metadata, "st_reparse_tag", 0)
+                    or (
+                        not is_leaf
+                        and not stat.S_ISDIR(metadata.st_mode)
+                    )
+                ):
+                    raise ValueError("unsafe path component")
+        except OSError as error:
+            errors.append(f"macOS acceptance surface {relative}: {error}")
+            continue
+        except ValueError:
+            errors.append(
+                f"macOS acceptance surface {relative}: unsafe path component"
+            )
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            errors.append(
+                f"macOS acceptance surface {relative}: expected a regular no-follow file"
+            )
+            continue
+        if metadata.st_size > MACOS_ACCEPTANCE_MAX_SOURCE_BYTES:
+            errors.append(
+                f"macOS acceptance surface {relative}: exceeds its source byte bound"
+            )
+            continue
+        try:
+            raw, _identity = _read_bound_regular_file(
+                path, MACOS_ACCEPTANCE_MAX_SOURCE_BYTES
+            )
+        except (OSError, ValueError) as error:
+            errors.append(f"macOS acceptance surface {relative}: {error}")
+            continue
+        if relative in MACOS_ACCEPTANCE_PLANNING_PATHS:
+            try:
+                source = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(
+                    f"macOS acceptance surface {relative}: expected UTF-8 planning text"
+                )
+                continue
+            if any(
+                pattern.search(source)
+                for pattern in MACOS_ACCEPTANCE_DEVELOPER_PATH_PATTERNS
+            ):
+                errors.append(
+                    f"macOS acceptance surface {relative}: "
+                    "contains a forbidden developer path"
+                )
+    return errors
+
+
+def _macos_acknowledgement_is_reparse(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & marker) or bool(getattr(metadata, "st_reparse_tag", 0))
+
+
+def _macos_acknowledgement_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _macos_acknowledgement_source(relative: str, role: str) -> str:
+    path = ROOT / relative
+    components: list[tuple[Path, tuple[int, int, int]]] = []
+    for component in reversed((path, *path.parents)):
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            raise ValueError(f"macOS acknowledgement {role} is unsafe") from error
+        if stat.S_ISLNK(metadata.st_mode) or _macos_acknowledgement_is_reparse(metadata):
+            raise ValueError(f"macOS acknowledgement {role} is unsafe")
+        if component != path and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"macOS acknowledgement {role} is unsafe")
+        components.append(
+            (
+                component,
+                (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)),
+            )
+        )
+
+    entry = path.lstat()
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_nlink != 1
+        or entry.st_size <= 0
+    ):
+        raise ValueError(f"macOS acknowledgement {role} is unsafe")
+    if entry.st_size > MACOS_ACKNOWLEDGEMENT_MAX_SOURCE_BYTES:
+        raise ValueError(f"macOS acknowledgement {role} exceeds its source byte bound")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor: int | None = None
+    native_handle: object | None = None
+    try:
+        if os.name == "nt":
+            native_handle = _VALIDATOR_CREATE_FILE(
+                str(path),
+                0x80000000 | 0x0080,
+                0x00000001,
+                None,
+                3,
+                0x00200000 | 0x08000000,
+                None,
+            )
+            if native_handle == _VALIDATOR_INVALID_HANDLE:
+                raise ValueError(f"macOS acknowledgement {role} is unsafe")
+            descriptor = msvcrt.open_osfhandle(
+                int(native_handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            )
+            native_handle = None
+        else:
+            descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(opened.st_mode)
+            or _macos_acknowledgement_is_reparse(opened)
+            or opened.st_nlink != 1
+            or _macos_acknowledgement_identity(opened)
+            != _macos_acknowledgement_identity(entry)
+        ):
+            raise ValueError(f"macOS acknowledgement {role} is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while total < opened.st_size:
+            chunk = os.read(descriptor, min(4096, opened.st_size - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        final = os.fstat(descriptor)
+        after = path.lstat()
+        for component, expected in components:
+            current = component.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or _macos_acknowledgement_is_reparse(current)
+                or (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode))
+                != expected
+            ):
+                raise ValueError(
+                    f"macOS acknowledgement {role} identity changed"
+                )
+        if (
+            total != opened.st_size
+            or final.st_nlink != 1
+            or after.st_nlink != 1
+            or _macos_acknowledgement_identity(final)
+            != _macos_acknowledgement_identity(opened)
+            or _macos_acknowledgement_identity(after)
+            != _macos_acknowledgement_identity(opened)
+        ):
+            raise ValueError(f"macOS acknowledgement {role} identity changed")
+        try:
+            return b"".join(chunks).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"macOS acknowledgement {role} is not valid UTF-8"
+            ) from error
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(f"macOS acknowledgement {role} is unsafe") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if native_handle is not None:
+            _VALIDATOR_CLOSE_HANDLE(native_handle)
+
+
+def _macos_acknowledgement_expression_uses_root(node: ast.AST) -> bool:
+    return any(
+        isinstance(nested, ast.Name) and nested.id == "ROOT"
+        for nested in ast.walk(node)
+    )
+
+
+def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
+    try:
+        tree = ast.parse(source, filename="<macos-acknowledgement-helper>")
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return True
+
+    aliases: dict[str, str] = {}
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    def scope(node: ast.AST) -> str | None:
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+            current = parents.get(current)
+        return None
+
+    allowed_from_imports = {
+        "__future__": {"annotations"},
+        "collections.abc": {"Callable"},
+        "ctypes": {"wintypes"},
+        "dataclasses": {"dataclass"},
+        "pathlib": {"Path"},
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                root = imported.name.split(".", 1)[0]
+                if root not in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS:
+                    return True
+                aliases[imported.asname or root] = imported.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module is None:
+                return True
+            root = node.module.split(".", 1)[0]
+            allowed_names = allowed_from_imports.get(node.module, set())
+            if (
+                root not in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS
+                or any(imported.name not in allowed_names for imported in node.names)
+            ):
+                return True
+            for imported in node.names:
+                aliases[imported.asname or imported.name] = (
+                    f"{node.module}.{imported.name}"
+                )
+
+    forbidden_builtins = {
+        "__import__",
+        "compile",
+        "eval",
+        "exec",
+        "breakpoint",
+        "getattr",
+        "globals",
+        "help",
+        "input",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    }
+    forbidden_os_attributes = {"environ", "get_exec_path", "getenv", "popen", "system"}
+    mutating_methods = {
+        "chmod",
+        "hardlink_to",
+        "lchmod",
+        "link_to",
+        "mkdir",
+        "open",
+        "rename",
+        "replace",
+        "rmdir",
+        "symlink_to",
+        "touch",
+        "unlink",
+        "write_bytes",
+        "write_text",
+    }
+    mutating_os_calls = {
+        "ftruncate",
+        "link",
+        "mkdir",
+        "open",
+        "remove",
+        "rename",
+        "replace",
+        "rmdir",
+        "symlink",
+        "unlink",
+    }
+    forbidden_module_names = {
+        "__builtins__",
+        "http",
+        "requests",
+        "shutil",
+        "socket",
+        "subprocess",
+        "urllib",
+    }
+    allowed_mutating_scopes = {
+        "ftruncate": {"_invalidate_descriptor_if_owned"},
+        "open": {"_bind_directory", "_relative_open"},
+        "unlink": {"_relative_unlink"},
+    }
+    allowed_os_attributes = {
+        "O_CREAT",
+        "O_BINARY",
+        "O_CLOEXEC",
+        "O_DIRECTORY",
+        "O_EXCL",
+        "O_NOINHERIT",
+        "O_NOFOLLOW",
+        "O_NONBLOCK",
+        "O_RDONLY",
+        "O_WRONLY",
+        "SEEK_SET",
+        "close",
+        "fsencode",
+        "fstat",
+        "ftruncate",
+        "fsync",
+        "lseek",
+        "name",
+        "open",
+        "read",
+        "stat",
+        "stat_result",
+        "unlink",
+        "write",
+    }
+    allowed_ctypes_attributes = {
+        "CDLL",
+        "Structure",
+        "WinDLL",
+        "byref",
+        "c_char_p",
+        "c_int",
+        "c_ubyte",
+        "c_uint",
+        "c_ulonglong",
+        "c_void_p",
+        "get_errno",
+        "get_last_error",
+        "sizeof",
+    }
+    allowed_argparse_attributes = {
+        "ArgumentParser",
+        "ArgumentTypeError",
+        "Namespace",
+    }
+    allowed_kernel32_attributes = {
+        "CloseHandle",
+        "CreateFileW",
+        "GetFileInformationByHandleEx",
+        "MoveFileExW",
+    }
+    native_function_bindings = {
+        "CloseHandle": "_CLOSE_HANDLE",
+        "CreateFileW": "_CREATE_FILE",
+        "GetFileInformationByHandleEx": "_GET_FILE_INFORMATION",
+        "MoveFileExW": "_MOVE_FILE",
+    }
+
+    def qualified_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            base = aliases.get(node.value.id, node.value.id)
+            return f"{base}.{node.attr}"
+        return None
+
+    dll_bindings: dict[str, str] = {}
+    ftruncate_calls: list[tuple[str | None, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+        ):
+            constructor = qualified_name(node.value.func)
+            if constructor in ("ctypes.CDLL", "ctypes.WinDLL"):
+                dll_bindings[node.targets[0].id] = constructor
+
+    allowed_native_calls = {
+        (
+            "_atomic_publish",
+            "rename(binding.handle, os.fsencode(staged_name), binding.handle, "
+            "os.fsencode(final_name), flag)",
+        ),
+        (
+            "_atomic_publish",
+            "_MOVE_FILE(str(binding.path / staged_name), "
+            "str(binding.path / final_name), _MOVEFILE_WRITE_THROUGH)",
+        ),
+        (
+            "_bind_directory",
+            "_CREATE_FILE(str(path), _FILE_READ_ATTRIBUTES, "
+            "_FILE_SHARE_READ | _FILE_SHARE_WRITE, None, _OPEN_EXISTING, "
+            "_FILE_FLAG_OPEN_REPARSE_POINT | _FILE_FLAG_BACKUP_SEMANTICS, None)",
+        ),
+        (
+            "_bind_directory",
+            "_GET_FILE_INFORMATION(handle, _FILE_ATTRIBUTE_TAG_INFO_CLASS, "
+            "ctypes.byref(attributes), ctypes.sizeof(attributes))",
+        ),
+        (
+            "_bind_directory",
+            "_GET_FILE_INFORMATION(handle, _FILE_ID_INFO_CLASS, "
+            "ctypes.byref(file_id), ctypes.sizeof(file_id))",
+        ),
+        ("_bind_directory", "_CLOSE_HANDLE(handle)"),
+        ("_close_directory", "_CLOSE_HANDLE(binding.handle)"),
+        (
+            "_revalidate_directory",
+            "_GET_FILE_INFORMATION(binding.handle, _FILE_ATTRIBUTE_TAG_INFO_CLASS, "
+            "ctypes.byref(attributes), ctypes.sizeof(attributes))",
+        ),
+        (
+            "_revalidate_directory",
+            "_GET_FILE_INFORMATION(binding.handle, _FILE_ID_INFO_CLASS, "
+            "ctypes.byref(file_id), ctypes.sizeof(file_id))",
+        ),
+    }
+    native_names = set(native_function_bindings.values())
+
+    critical_name_assignments = {
+        "ROOT": ["Path(__file__).resolve().parents[1]"],
+        "_O_CLOEXEC": ["os.O_CLOEXEC", "0"],
+        "_O_NOFOLLOW": ["os.O_NOFOLLOW", "0"],
+        "_O_BINARY": ["os.O_BINARY", "0"],
+        "_O_NONBLOCK": ["os.O_NONBLOCK", "0"],
+        "_O_NOINHERIT": ["os.O_NOINHERIT", "0"],
+        "_O_DIRECTORY": ["os.O_DIRECTORY", "0"],
+        "_FILE_READ_ATTRIBUTES": ["128"],
+        "_FILE_SHARE_READ": ["1"],
+        "_FILE_SHARE_WRITE": ["2"],
+        "_OPEN_EXISTING": ["3"],
+        "_FILE_ATTRIBUTE_REPARSE_POINT": ["1024"],
+        "_FILE_FLAG_OPEN_REPARSE_POINT": ["2097152"],
+        "_FILE_FLAG_BACKUP_SEMANTICS": ["33554432"],
+        "_FILE_ATTRIBUTE_TAG_INFO_CLASS": ["9"],
+        "_FILE_ID_INFO_CLASS": ["18"],
+        "_MOVEFILE_WRITE_THROUGH": ["8"],
+        "_INVALID_HANDLE_VALUE": ["ctypes.c_void_p(-1).value"],
+        "_KERNEL32": ["ctypes.WinDLL('kernel32', use_last_error=True)"],
+        "_CREATE_FILE": ["_KERNEL32.CreateFileW"],
+        "_GET_FILE_INFORMATION": ["_KERNEL32.GetFileInformationByHandleEx"],
+        "_CLOSE_HANDLE": ["_KERNEL32.CloseHandle"],
+        "_MOVE_FILE": ["_KERNEL32.MoveFileExW"],
+        "library": ["ctypes.CDLL(None, use_errno=True)"],
+        "flag": ["1", "4", "0"],
+    }
+    critical_name_assignments = {
+        name: [
+            (
+                "_atomic_publish" if name in {"library", "flag"} else None,
+                expression,
+            )
+            for expression in expressions
+        ]
+        for name, expressions in critical_name_assignments.items()
+    }
+    actual_name_assignments = {name: [] for name in critical_name_assignments}
+    expected_attribute_assignments = sorted(
+        (
+            "_CREATE_FILE.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, "
+            "wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, "
+            "wintypes.HANDLE)",
+            "_CREATE_FILE.restype = wintypes.HANDLE",
+            "_GET_FILE_INFORMATION.argtypes = (wintypes.HANDLE, ctypes.c_int, "
+            "ctypes.c_void_p, wintypes.DWORD)",
+            "_GET_FILE_INFORMATION.restype = wintypes.BOOL",
+            "_CLOSE_HANDLE.argtypes = (wintypes.HANDLE,)",
+            "_CLOSE_HANDLE.restype = wintypes.BOOL",
+            "_MOVE_FILE.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, "
+            "wintypes.DWORD)",
+            "_MOVE_FILE.restype = wintypes.BOOL",
+            "rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, "
+            "ctypes.c_char_p, ctypes.c_uint)",
+            "rename.restype = ctypes.c_int",
+        )
+    )
+    actual_attribute_assignments: list[str] = []
+    actual_subscript_assignments: list[tuple[str | None, str]] = []
+    protected_assignment_names = (
+        set(aliases)
+        | set(critical_name_assignments)
+        | forbidden_builtins
+        | native_names
+        | {"rename"}
+    )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if target.id in actual_name_assignments:
+                        actual_name_assignments[target.id].append(
+                            (scope(node), ast.unparse(node.value))
+                        )
+                    elif target.id in set(aliases) | forbidden_builtins:
+                        return True
+                elif isinstance(target, ast.Attribute):
+                    actual_attribute_assignments.append(ast.unparse(node))
+                elif isinstance(target, ast.Subscript):
+                    actual_subscript_assignments.append((scope(node), ast.unparse(node)))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            target = node.target
+            if isinstance(target, (ast.Attribute, ast.Subscript)) or (
+                isinstance(target, ast.Name) and target.id in protected_assignment_names
+            ):
+                return True
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, (ast.Attribute, ast.Subscript)) or (
+                    isinstance(target, ast.Name)
+                    and target.id in protected_assignment_names
+                ):
+                    return True
+    if any(
+        sorted(actual_name_assignments[name]) != sorted(expected)
+        for name, expected in critical_name_assignments.items()
+    ):
+        return True
+    if sorted(actual_attribute_assignments) != expected_attribute_assignments:
+        return True
+    if actual_subscript_assignments != [
+        ("close", "value[key] = nested"),
+    ]:
+        return True
+
+    builtin_names = frozenset(dir(builtins))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node.id in builtin_names
+        ):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in builtin_names:
+                return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            positional = (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)
+            if any(argument.arg in builtin_names for argument in positional):
+                return True
+            if arguments.vararg is not None and arguments.vararg.arg in builtin_names:
+                return True
+            if arguments.kwarg is not None and arguments.kwarg.arg in builtin_names:
+                return True
+        if isinstance(node, ast.alias):
+            bound = node.asname or node.name.split(".", 1)[0]
+            if bound in builtin_names:
+                return True
+        if isinstance(node, ast.ExceptHandler) and node.name in builtin_names:
+            return True
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in builtin_names:
+            return True
+        if isinstance(node, ast.MatchMapping) and node.rest in builtin_names:
+            return True
+
+    def allowed_native_name_use(node: ast.Name) -> bool:
+        parent = parents.get(node)
+        if node.id in dll_bindings:
+            if not isinstance(parent, ast.Attribute) or parent.value is not node:
+                return False
+            assignment = parents.get(parent)
+            if not isinstance(assignment, ast.Assign) or assignment.value is not parent:
+                return False
+            if len(assignment.targets) != 1 or not isinstance(
+                assignment.targets[0], ast.Name
+            ):
+                return False
+            if node.id == "_KERNEL32":
+                return (
+                    native_function_bindings.get(parent.attr)
+                    == assignment.targets[0].id
+                    and scope(node) is None
+                )
+            return (
+                node.id == "library"
+                and parent.attr in {"renameat2", "renameatx_np"}
+                and assignment.targets[0].id == "rename"
+                and scope(node) == "_atomic_publish"
+            )
+        if node.id in native_names or node.id == "rename":
+            if (
+                node.id == "rename"
+                and isinstance(parent, ast.Compare)
+                and ast.unparse(parent) == "rename is None"
+                and scope(parent) == "_atomic_publish"
+            ):
+                return True
+            if isinstance(parent, ast.Call) and parent.func is node:
+                return (scope(parent), ast.unparse(parent)) in allowed_native_calls
+            if isinstance(parent, ast.Attribute) and parent.value is node:
+                assignment = parents.get(parent)
+                return (
+                    parent.attr in {"argtypes", "restype"}
+                    and isinstance(assignment, ast.Assign)
+                    and assignment.targets == [parent]
+                    and (
+                        (node.id in native_names and scope(node) is None)
+                        or (node.id == "rename" and scope(node) == "_atomic_publish")
+                    )
+                )
+            return False
+        return True
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.NamedExpr):
+            return True
+        if isinstance(node, ast.Assign):
+            if isinstance(node.value, ast.Name) and (
+                node.value.id in dll_bindings
+                or node.value.id in set(native_function_bindings.values())
+                or aliases.get(node.value.id) in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS
+            ):
+                return True
+            if (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id in dll_bindings
+            ):
+                targets = node.targets
+                if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                    return True
+                if node.value.value.id == "_KERNEL32":
+                    if native_function_bindings.get(node.value.attr) != targets[0].id:
+                        return True
+                elif not (
+                    node.value.value.id == "library"
+                    and scope(node) == "_atomic_publish"
+                    and targets[0].id == "rename"
+                    and node.value.attr in {"renameat2", "renameatx_np"}
+                ):
+                    return True
+        if isinstance(node, ast.Name) and node.id in forbidden_module_names:
+            return True
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in forbidden_builtins
+            and not (
+                node.id == "input"
+                and isinstance(parents.get(node), ast.arguments)
+                and scope(node) == "watch"
+            )
+        ):
+            return True
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and not allowed_native_name_use(node)
+        ):
+            return True
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute):
+            module = node.value.value
+            if (
+                isinstance(module, ast.Name)
+                and aliases.get(module.id) in MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS
+                and not (aliases.get(module.id) == "sys" and node.value.attr == "argv")
+            ):
+                return True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            if _macos_acknowledgement_expression_uses_root(node):
+                return True
+        if isinstance(node, ast.Attribute):
+            base = node.value
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return True
+            if node.attr in mutating_methods:
+                parent = parents.get(node)
+                if not isinstance(parent, ast.Call) or parent.func is not node:
+                    return True
+            if (
+                isinstance(base, ast.Call)
+                and qualified_name(base.func) in ("ctypes.CDLL", "ctypes.WinDLL")
+            ):
+                return True
+            if isinstance(base, ast.Name) and aliases.get(base.id) == "os":
+                if node.attr not in allowed_os_attributes:
+                    return True
+            if isinstance(base, ast.Name) and aliases.get(base.id) == "ctypes":
+                if node.attr not in allowed_ctypes_attributes:
+                    return True
+                if node.attr in {"CDLL", "WinDLL"}:
+                    parent = parents.get(node)
+                    if not isinstance(parent, ast.Call) or parent.func is not node:
+                        return True
+            if (
+                isinstance(base, ast.Name)
+                and aliases.get(base.id) == "argparse"
+                and node.attr not in allowed_argparse_attributes
+            ):
+                return True
+            if isinstance(base, ast.Name) and base.id in dll_bindings:
+                kernel32_attribute = (
+                    dll_bindings[base.id] == "ctypes.WinDLL"
+                    and base.id == "_KERNEL32"
+                    and node.attr in allowed_kernel32_attributes
+                )
+                posix_rename_attribute = (
+                    dll_bindings[base.id] == "ctypes.CDLL"
+                    and base.id == "library"
+                    and scope(node) == "_atomic_publish"
+                    and node.attr in {"renameat2", "renameatx_np"}
+                )
+                if not kernel32_attribute and not posix_rename_attribute:
+                    return True
+            if (
+                isinstance(base, ast.Name)
+                and aliases.get(base.id) == "os"
+                and node.attr in forbidden_os_attributes
+            ):
+                return True
+        if not isinstance(node, ast.Call):
+            continue
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+        ):
+            target = node.args[0]
+            attribute = node.args[1]
+            if aliases.get(target.id) in {"os", "ctypes"} or target.id in dll_bindings:
+                if not isinstance(attribute, ast.Constant) or not isinstance(
+                    attribute.value, str
+                ):
+                    return True
+                if aliases.get(target.id) == "os" and not attribute.value.startswith(
+                    "O_"
+                ):
+                    return True
+                if (
+                    aliases.get(target.id) == "ctypes"
+                    and attribute.value not in allowed_ctypes_attributes
+                ):
+                    return True
+                if target.id in dll_bindings and (
+                    dll_bindings[target.id] != "ctypes.CDLL"
+                    or scope(node) != "_atomic_publish"
+                    or attribute.value not in {"renameat2", "renameatx_np"}
+                ):
+                    return True
+        if isinstance(node.func, ast.Name) and node.func.id in forbidden_builtins:
+            return True
+        constructor = qualified_name(node.func)
+        if constructor in ("ctypes.CDLL", "ctypes.WinDLL"):
+            if constructor == "ctypes.CDLL":
+                if (
+                    scope(node) != "_atomic_publish"
+                    or not node.args
+                    or not isinstance(node.args[0], ast.Constant)
+                    or node.args[0].value is not None
+                ):
+                    return True
+            elif (
+                scope(node) is not None
+                or not node.args
+                or not isinstance(node.args[0], ast.Constant)
+                or node.args[0].value != "kernel32"
+            ):
+                return True
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        base = node.func.value
+        if node.func.attr in mutating_methods:
+            if not (isinstance(base, ast.Name) and aliases.get(base.id) == "os"):
+                if node.func.attr != "unlink" or scope(node) != "_relative_unlink":
+                    return True
+                if _macos_acknowledgement_expression_uses_root(node.func.value):
+                    return True
+        if (
+            isinstance(base, ast.Name)
+            and aliases.get(base.id) == "os"
+            and node.func.attr in mutating_os_calls
+        ):
+            allowed = allowed_mutating_scopes.get(node.func.attr, set())
+            if scope(node) not in allowed or any(
+                _macos_acknowledgement_expression_uses_root(argument)
+                for argument in node.args
+            ):
+                return True
+        if (
+            isinstance(base, ast.Name)
+            and aliases.get(base.id) == "os"
+            and node.func.attr == "lseek"
+            and (
+                scope(node) != "_invalidate_descriptor_if_owned"
+                or ast.unparse(node) != "os.lseek(descriptor, 0, os.SEEK_SET)"
+            )
+        ):
+            return True
+        if (
+            isinstance(base, ast.Name)
+            and aliases.get(base.id) == "os"
+            and node.func.attr == "ftruncate"
+        ):
+            ftruncate_calls.append((scope(node), ast.unparse(node)))
+            if ftruncate_calls[-1] != (
+                "_invalidate_descriptor_if_owned",
+                "os.ftruncate(descriptor, 1)",
+            ):
+                return True
+    return ftruncate_calls != [
+        (
+            "_invalidate_descriptor_if_owned",
+            "os.ftruncate(descriptor, 1)",
+        )
+    ]
+
+
+def validate_macos_acknowledgement_surface() -> list[str]:
+    """Bind the interactive helper to a narrow, reviewed local capability set."""
+
+    errors: list[str] = []
+    sources: dict[str, str] = {}
+    for relative, role in zip(
+        MACOS_ACKNOWLEDGEMENT_REVIEWED_PATHS,
+        ("tests", "helper"),
+    ):
+        try:
+            sources[role] = _macos_acknowledgement_source(relative, role)
+        except (OSError, ValueError, UnicodeError) as error:
+            errors.append(str(error))
+    helper = sources.get("helper")
+    if helper is not None and _macos_acknowledgement_forbidden_capability(helper):
+        errors.append(
+            "macOS acknowledgement helper uses a forbidden side-effect capability"
+        )
+    return errors
+
+
 def main() -> int:
     errors = (
         validate_macwin_asset_migration()
@@ -4073,6 +5656,9 @@ def main() -> int:
         + validate_no_developer_paths()
         + validate_pe_inspection_fixture()
         + validate_macos_preview_binary_hygiene()
+        + validate_macos_acceptance_surface()
+        + validate_macos_acknowledgement_surface()
+        + validate_macos_acceptance_docs()
     )
     if errors:
         print("repository validation failed:", file=sys.stderr)

@@ -22,6 +22,8 @@ jobs:
         run: python -S -B -m unittest tests.test_macos_headless_preview -v
       - name: Test desktop GUI baseline contracts
         run: python -S -B -m unittest tests.test_gui_baseline_contracts -v
+      - name: Test Mac-Win workflow policy contract
+        run: python -S -B -m unittest tests.test_macwin_asset_migration.MacWinMigrationWorkflowTests.test_workflow_changes_only_pins_and_read_only_migration_checks -v
       - name: Test Phase 2.3 probe and MSI contracts
         run: python -S -B -m unittest tests.test_phase_2_3_contracts -v
       - name: Test Bottle migration contracts and independent goldens
@@ -32,6 +34,20 @@ jobs:
         run: cc -std=c11 -Wall -Wextra -Werror -x c -fsyntax-only -include crates/compatforge-ffi/include/compatforge.h /dev/null
       - name: Compile public C++ header
         run: c++ -std=c++17 -Wall -Wextra -Werror -x c++ -fsyntax-only -include crates/compatforge-ffi/include/compatforge.h /dev/null
+
+  macos-dual-runtime-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Test dual-Runtime macOS acceptance contracts
+        run: python -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v
 
   rust:
     strategy:

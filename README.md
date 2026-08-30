@@ -118,10 +118,12 @@ python tools/run_gui_baseline.py \
   --allow-network
 ```
 
-默认运行只生成 `unverified` 证据。只有完成逐应用人工行为检查后，才可追加
-`--accept-interactive --interaction-evidence /absolute/external/interactions.json`；该 JSON 的固定字段见
-`docs/implementation/phase-2-tauri-gui-baseline.md`。验收结果逐应用标记为 `accepted`、`failed` 或
-`unverified`；截图和 RuntimeEvent 证据不会进入 Git，也不由默认 CI 生成。
+默认运行只生成 `unverified` 证据。显式人工验收使用只列 required checks 的
+`--interaction-plan`、独立 `--acknowledgement-root` 与 `--round-id`；第二终端 helper 只在应用窗口
+出现后接收确认，预填 boolean 不能产生 `accepted`。完整双轮流程要求 12 个 GUI receipts 与 4 个
+Console 自动结果；固定计划、命令与清理边界见
+[双 Runtime 指南](docs/guides/macos-local-dual-runtime-acceptance.md)。截图和
+RuntimeEvent 证据不会进入 Git，也不由默认 CI 生成。
 
 人工验收先生成 fail-safe 工作表；所有检查默认是 `false`，观察者必须填写带时区的 `observedAt`
 并逐项确认后才能用于 `accepted`：
@@ -163,6 +165,7 @@ python3 -S -B tools/run_gui_soak.py \
 - [Tauri 桌面壳与 GUI 基线](docs/implementation/phase-2-tauri-gui-baseline.md)
 - [Phase 2.1 交互式兼容认证](docs/implementation/phase-2-1-interactive-certification.md)
 - [Apple Silicon 本地无头预览指南](docs/guides/macos-headless-preview.md)
+- [Apple Silicon 双 Runtime 本地验收指南](docs/guides/macos-local-dual-runtime-acceptance.md)（developer-local；CrossOver + Whisky；不进入默认 CI 或 public beta）
 - [进程树与 Wine 生命周期决策](docs/decisions/0006-process-tree-and-wine-lifecycle.md)
 - [能力证据与 Provider 声明决策](docs/decisions/0007-capability-evidence-boundary.md)
 - [Runtime Pack 内容寻址与原子激活决策](docs/decisions/0008-runtime-pack-content-store.md)

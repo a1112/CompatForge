@@ -13913,8 +13913,8 @@ class MacWinMigrationWorkflowTests(unittest.TestCase):
     WORKFLOW = ROOT / ".github/workflows/ci.yml"
     CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
     SETUP_PYTHON = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
-    BASELINE_SHA256 = "3b0550ece6e066af7750f21c26d025ac82931e5361d881b4e4bb9ca2c6193575"
-    APPROVED_RUN_COMMANDS_SHA256 = "90cbb909273ffb2e76b4777c13a7ac0c99d7c98fd8bf48b9c0771cc79ccaff7a"
+    BASELINE_SHA256 = "020b84ecb2fb60aa6604c26896ec0f6827e05f794353ad8d10f2c5f72a952b24"
+    APPROVED_RUN_COMMANDS_SHA256 = "8e6117b1795ce247dcc598a717f27cd566d4961230d584674b34ec748d0f1f59"
     MIGRATION_STEP = (
         "      - name: Check portable Mac-Win assets\n"
         "        run: python -B tools/convert_macwin_assets.py --check\n"
@@ -13974,6 +13974,9 @@ class MacWinMigrationWorkflowTests(unittest.TestCase):
         self.assertIn('python-version: "3.12"', contracts)
         expected = (
             "run: python -B scripts/validate_repository.py",
+            "run: python -S -B -m unittest tests.test_macwin_asset_migration."
+            "MacWinMigrationWorkflowTests."
+            "test_workflow_changes_only_pins_and_read_only_migration_checks -v",
             "run: python -B tools/convert_macwin_assets.py --check",
             "name: Compile public C header",
             "name: Compile public C++ header",

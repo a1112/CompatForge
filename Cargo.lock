@@ -45,6 +45,7 @@ dependencies = [
  "compatforge-bottle",
  "compatforge-capability",
  "compatforge-domain",
+ "compatforge-guest-artifact",
  "compatforge-inspect",
  "compatforge-orchestrator",
  "compatforge-process",
@@ -83,6 +84,7 @@ version = "0.12.0"
 dependencies = [
  "compatforge-domain",
  "compatforge-inspect",
+ "libc",
  "sha2",
 ]
 
@@ -113,6 +115,8 @@ version = "0.12.0"
 dependencies = [
  "compatforge-domain",
  "compatforge-guest-artifact",
+ "compatforge-orchestrator",
+ "libc",
  "serde_json",
  "sha2",
 ]

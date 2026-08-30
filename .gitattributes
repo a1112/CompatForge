@@ -11,6 +11,9 @@ tests/fixtures/*.exe binary
 /tests/fixtures/bottle-migration/**/*.txt text eol=lf
 /README.md text eol=lf
 /docs/testing.md text eol=lf
+/docs/guides/macos-local-dual-runtime-acceptance.md text eol=lf
+/docs/reports/2026-08-21-macos-local-dual-runtime-acceptance.md text eol=lf
 /docs/plans/*.md text eol=lf
+/examples/macos-dual-runtime-interactions.json text eol=lf
 /docs/migration/macwin-portable-assets.md text eol=lf
 /docs/migration/macwin-patch-provenance.md text eol=lf
