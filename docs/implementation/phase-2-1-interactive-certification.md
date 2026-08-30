@@ -33,7 +33,9 @@ macOS Runner 在窗口探测前读取登录会话状态：
 
 `tools/run_gui_soak.py` 默认选择五个认证扩展应用并运行 60 个逐轮新 Bottle。调用方必须显式给出 Runtime ID 以及 `wine-root`、`wine`、`wineserver`、`version` 四元组；该选择原样持久化，并逐轮转发给 GUI baseline runner。Runtime 和固定摘要缓存可复用，但每轮 storage、work、截图和日志独立。正式 M0 在创建第 1 轮状态前离线复验全部所选固定摘要资产，不使用网络回退。
 
-外部输出根中的 `configuration.json` 绑定应用、资产、轮数和 Runtime 选择，允许保留仅供本机恢复使用的本地路径，因此不得提交到仓库；聚合 `summary.json` 只保留计数和稳定 Runtime 投影，必须无路径。`cycles.jsonl` 每轮追加并 fsync，`--resume` 只接受从第 1 轮开始、连续且全部 `verified` 的前缀；任何配置或 Runtime 身份漂移都会写入终止性的 failed 轮次并停止，后续成功不能覆盖该输出根。
+外部输出根中的 `configuration.json` 绑定应用、资产、轮数和 Runtime 选择，允许保留仅供本机恢复使用的本地路径，因此不得提交到仓库。聚合 `summary.json` 是无路径闭集：包含 schema/测试套件身份、排序后的应用 ID、轮次与应用执行计数、状态与门禁、可选的稳定停止原因及稳定 Runtime 投影。
+
+`cycles.jsonl` 每轮追加并 fsync。`--resume` 只接受从第 1 轮开始、连续且全部 `verified` 的既有前缀；配置漂移、既有记录的 Runtime 漂移或任何 failed/unverified 记录都会在新轮次开始前拒绝恢复，且不修改输出根。当前轮次开始后，summary 合同异常或 Runtime receipt 漂移会写入终止性的 failed 轮次并停止；含有 failed/unverified 记录的输出根不能再次恢复。
 
 Soak 的 `verified` 只表示 package/installer、窗口、截图、退出、Bottle 清理和零残留全部通过；交互检查仍保持 `policy-blocked`，不会被提升为兼容性 `accepted`。锁屏或 Accessibility/screencapture 缺失记为 `unverified` 且不伪造硬失败；产品或配方检查失败记为 `hardFailure=true`。
 
