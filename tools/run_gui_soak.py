@@ -8,8 +8,10 @@ import json
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -46,11 +48,43 @@ SOAK_CHECK_OUTCOMES = {"passed", "failed", "blocked", "skipped"}
 SOAK_ARCHITECTURES = {"arm64", "x86_64"}
 MAX_CYCLES = 1000
 MAX_LOG_BYTES = 16 * 1024 * 1024
+MAX_CONFIGURATION_BYTES = 64 * 1024
+MAX_SUMMARY_BYTES = 16 * 1024 * 1024
+MAX_JSON_DEPTH = 32
+MAX_JSON_NODES = 100_000
+MAX_JSON_STRING_CHARS = 64 * 1024
+MAX_JSON_TEXT_CHARS = 8 * 1024 * 1024
 RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 RUNTIME_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+() -]*")
 SOAK_STOP_REASON = re.compile(
     r"cycle [1-9][0-9]* completed with status (?:verified|unverified|failed)"
 )
+SOAK_TIMESTAMP = re.compile(
+    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z"
+)
+SOAK_TERMINAL_REASONS = {
+    "GUI runner did not produce summary.json",
+    "cycle summary contract or Runtime identity is invalid",
+}
+SOAK_CYCLE_COMMON_FIELDS = {
+    "schemaVersion",
+    "testSuiteVersion",
+    "cycle",
+    "startedAt",
+    "finishedAt",
+    "runnerExitCode",
+    "status",
+    "hardFailure",
+    "infrastructureBlocked",
+    "applications",
+}
+SOAK_APPLICATION_FIELDS = {
+    "recipeId",
+    "outcome",
+    "lifecyclePassed",
+    "checks",
+}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -106,19 +140,191 @@ def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
     }
 
 
-def load_cycle_log(path: Path) -> list[dict[str, object]]:
-    if path.is_symlink():
-        raise AcceptanceError("cycles.jsonl must be a bounded regular file")
-    if not path.exists():
-        return []
-    if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_LOG_BYTES:
-        raise AcceptanceError("cycles.jsonl must be a bounded regular file")
-    entries: list[dict[str, object]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+def _reject_json_constant(_: str) -> object:
+    raise ValueError("non-finite JSON constant")
+
+
+def _closed_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _validate_bounded_json_structure(value: object) -> None:
+    nodes = 0
+    text_chars = 0
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+            raise ValueError("JSON structure exceeds its bound")
+        if isinstance(current, dict):
+            for key, item in current.items():
+                if (
+                    not isinstance(key, str)
+                    or not key
+                    or len(key) > MAX_JSON_STRING_CHARS
+                    or any(ord(character) < 32 or ord(character) == 127 for character in key)
+                ):
+                    raise ValueError("JSON object key is invalid")
+                key.encode("utf-8")
+                nodes += 1
+                text_chars += len(key)
+                if nodes > MAX_JSON_NODES or text_chars > MAX_JSON_TEXT_CHARS:
+                    raise ValueError("JSON structure exceeds its bound")
+                stack.append((item, depth + 1))
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            text_chars += len(current)
+            current.encode("utf-8")
+            if (
+                len(current) > MAX_JSON_STRING_CHARS
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in current
+                )
+                or text_chars > MAX_JSON_TEXT_CHARS
+            ):
+                raise ValueError("JSON text is invalid or exceeds its bound")
+        elif current is None or type(current) in (bool, int):
+            continue
+        else:
+            raise ValueError("JSON value type is unsupported")
+
+
+def _parse_strict_json(text: str, label: str) -> object:
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_closed_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_bounded_json_structure(value)
+        return value
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise AcceptanceError(f"{label} contains invalid JSON") from error
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _file_snapshot(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        *_file_identity(metadata),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _safe_regular_metadata(metadata: os.stat_result, maximum_bytes: int) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not _is_reparse_point(metadata)
+        and 0 <= metadata.st_size <= maximum_bytes
+    )
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    label: str,
+    maximum_bytes: int,
+) -> bytes:
+    error_message = f"{label} must be a bounded regular file"
+    try:
+        before = path.lstat()
+        if not _safe_regular_metadata(before, maximum_bytes):
+            raise AcceptanceError(error_message)
+        flags = os.O_RDONLY
+        for name in ("O_NOFOLLOW", "O_CLOEXEC", "O_BINARY"):
+            flags |= getattr(os, name, 0)
+        descriptor = os.open(path, flags)
+    except AcceptanceError:
+        raise
+    except OSError as error:
+        raise AcceptanceError(error_message) from error
+
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not _safe_regular_metadata(opened, maximum_bytes)
+            or _file_snapshot(opened) != _file_snapshot(before)
+        ):
+            raise AcceptanceError(error_message)
+        chunks: list[bytes] = []
+        total = 0
+        while total <= maximum_bytes:
+            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > maximum_bytes:
+            raise AcceptanceError(error_message)
+        after_open = os.fstat(descriptor)
+        after_path = path.lstat()
+        if (
+            not _safe_regular_metadata(after_open, maximum_bytes)
+            or not _safe_regular_metadata(after_path, maximum_bytes)
+            or _file_snapshot(after_open) != _file_snapshot(opened)
+            or _file_snapshot(after_path) != _file_snapshot(opened)
+            or after_open.st_size != total
+        ):
+            raise AcceptanceError(error_message)
+        return b"".join(chunks)
+    except AcceptanceError:
+        raise
+    except OSError as error:
+        raise AcceptanceError(error_message) from error
+    finally:
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise AcceptanceError("cycles.jsonl contains invalid JSON") from error
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _read_strict_json_file(
+    path: Path,
+    label: str,
+    maximum_bytes: int,
+) -> object:
+    data = _read_bounded_regular_file(path, label, maximum_bytes)
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise AcceptanceError(f"{label} contains invalid JSON") from error
+    return _parse_strict_json(text, label)
+
+
+def load_cycle_log(path: Path) -> list[dict[str, object]]:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise AcceptanceError("cycles.jsonl must be a bounded regular file") from error
+    data = _read_bounded_regular_file(path, "cycles.jsonl", MAX_LOG_BYTES)
+    try:
+        lines = data.decode("utf-8", errors="strict").splitlines()
+    except UnicodeError as error:
+        raise AcceptanceError("cycles.jsonl contains invalid JSON") from error
+    entries: list[dict[str, object]] = []
+    for line in lines:
+        value = _parse_strict_json(line, "cycles.jsonl")
         if not isinstance(value, dict) or value.get("schemaVersion") != "1":
             raise AcceptanceError("cycles.jsonl contains an invalid cycle record")
         if value.get("cycle") != len(entries) + 1:
@@ -230,6 +436,182 @@ def safe_runtime_projection(value: object) -> dict[str, str]:
     }
 
 
+def _project_application(
+    application: object,
+    selected: set[str],
+) -> dict[str, object]:
+    if not isinstance(application, dict):
+        raise AcceptanceError("cycle contains an invalid projected application")
+    outcome = application.get("outcome")
+    expected_fields = set(SOAK_APPLICATION_FIELDS)
+    if outcome != "passed":
+        expected_fields.add("failureClassification")
+    if set(application) != expected_fields:
+        raise AcceptanceError("cycle contains an invalid projected application")
+    recipe_id = application.get("recipeId")
+    lifecycle_passed = application.get("lifecyclePassed")
+    checks = application.get("checks")
+    if (
+        not isinstance(recipe_id, str)
+        or recipe_id not in selected
+        or not isinstance(outcome, str)
+        or outcome not in SOAK_OUTCOMES
+        or type(lifecycle_passed) is not bool
+        or not isinstance(checks, dict)
+        or set(checks) != SOAK_CHECKS
+        or any(
+            not isinstance(checks[check_id], str)
+            or checks[check_id] not in SOAK_CHECK_OUTCOMES
+            for check_id in SOAK_CHECKS
+        )
+    ):
+        raise AcceptanceError("cycle contains an invalid projected application")
+    classification = application.get("failureClassification")
+    if outcome == "passed":
+        if "failureClassification" in application:
+            raise AcceptanceError("cycle contains an invalid projected application")
+    elif (
+        not isinstance(classification, str)
+        or classification not in SOAK_FAILURE_CLASSIFICATIONS
+    ):
+        raise AcceptanceError("cycle contains an invalid projected application")
+
+    derived_lifecycle = all(
+        checks[check_id] == "passed" for check_id in SOAK_CHECKS
+    )
+    if lifecycle_passed is not derived_lifecycle:
+        raise AcceptanceError("cycle projected lifecycle evidence is inconsistent")
+    infrastructure_blocked = classification == "test-infrastructure"
+    hard_failure = (
+        outcome == "failed"
+        or classification == "runtime-regression"
+        or (classification != "test-infrastructure" and not derived_lifecycle)
+    )
+    return {
+        "recipeId": recipe_id,
+        "lifecyclePassed": derived_lifecycle,
+        "hardFailure": hard_failure,
+        "infrastructureBlocked": infrastructure_blocked,
+        "cleanupFailure": checks["bottle-cleanup"] != "passed",
+        "residualProcessFailure": checks["no-residual-processes"] != "passed",
+    }
+
+
+def project_cycle_evidence(
+    entry: object,
+    ordinal: int,
+    selected: set[str],
+    *,
+    allow_terminal: bool,
+) -> dict[str, object]:
+    if not isinstance(entry, dict):
+        raise AcceptanceError("cycle record is not an object")
+    if (
+        entry.get("schemaVersion") != "1"
+        or entry.get("testSuiteVersion") != TEST_SUITE_VERSION
+        or type(entry.get("cycle")) is not int
+        or entry["cycle"] != ordinal
+        or not isinstance(entry.get("startedAt"), str)
+        or SOAK_TIMESTAMP.fullmatch(entry["startedAt"]) is None
+        or not isinstance(entry.get("finishedAt"), str)
+        or SOAK_TIMESTAMP.fullmatch(entry["finishedAt"]) is None
+        or type(entry.get("runnerExitCode")) is not int
+        or not -(2**31) <= entry["runnerExitCode"] < 2**31
+        or type(entry.get("hardFailure")) is not bool
+        or type(entry.get("infrastructureBlocked")) is not bool
+        or not isinstance(entry.get("applications"), list)
+    ):
+        raise AcceptanceError("cycle record structure is invalid")
+
+    applications = entry["applications"]
+    terminal = "reason" in entry or not applications
+    if terminal:
+        terminal_fields = SOAK_CYCLE_COMMON_FIELDS | {"reason"}
+        if "runtime" in entry:
+            terminal_fields = terminal_fields | {"runtime"}
+        if (
+            not allow_terminal
+            or set(entry) != terminal_fields
+            or entry.get("status") != "failed"
+            or entry["hardFailure"] is not True
+            or entry["infrastructureBlocked"] is not False
+            or applications != []
+            or not isinstance(entry.get("reason"), str)
+            or entry.get("reason") not in SOAK_TERMINAL_REASONS
+        ):
+            raise AcceptanceError("cycle terminal evidence is invalid")
+        runtime = (
+            safe_runtime_projection(entry["runtime"])
+            if "runtime" in entry
+            else None
+        )
+        return {
+            "status": "failed",
+            "hardFailure": True,
+            "infrastructureBlocked": False,
+            "runtime": runtime,
+            "completedApplications": 0,
+            "verifiedApplications": 0,
+            "cleanupFailures": 0,
+            "residualProcessFailures": 0,
+            "terminal": True,
+        }
+
+    if set(entry) != SOAK_CYCLE_COMMON_FIELDS | {"runtime"}:
+        raise AcceptanceError("cycle record structure is invalid")
+    runtime = safe_runtime_projection(entry.get("runtime"))
+    if len(applications) != len(selected):
+        raise AcceptanceError("cycle contains an invalid application set")
+    projected_applications = [
+        _project_application(application, selected) for application in applications
+    ]
+    recipe_ids = [
+        str(application["recipeId"]) for application in projected_applications
+    ]
+    if len(set(recipe_ids)) != len(recipe_ids) or set(recipe_ids) != selected:
+        raise AcceptanceError("cycle contains an invalid application set")
+
+    hard_failure = any(
+        application["hardFailure"] is True
+        for application in projected_applications
+    )
+    infrastructure_blocked = any(
+        application["infrastructureBlocked"] is True
+        for application in projected_applications
+    )
+    status = (
+        "failed"
+        if hard_failure
+        else ("unverified" if infrastructure_blocked else "verified")
+    )
+    if (
+        entry.get("status") != status
+        or entry["hardFailure"] is not hard_failure
+        or entry["infrastructureBlocked"] is not infrastructure_blocked
+    ):
+        raise AcceptanceError("cycle projected status is inconsistent")
+    return {
+        "status": status,
+        "hardFailure": hard_failure,
+        "infrastructureBlocked": infrastructure_blocked,
+        "runtime": runtime,
+        "completedApplications": len(projected_applications),
+        "verifiedApplications": sum(
+            application["lifecyclePassed"] is True
+            for application in projected_applications
+        ),
+        "cleanupFailures": sum(
+            application["cleanupFailure"] is True
+            for application in projected_applications
+        ),
+        "residualProcessFailures": sum(
+            application["residualProcessFailure"] is True
+            for application in projected_applications
+        ),
+        "terminal": False,
+    }
+
+
 def validate_verified_prefix(
     entries: list[dict[str, object]],
     selected: set[str],
@@ -238,26 +620,22 @@ def validate_verified_prefix(
     expected_version = _runtime_version(expected_runtime.get("version"))
     stable_runtime: dict[str, str] | None = None
     for ordinal, entry in enumerate(entries, start=1):
-        if (
-            not isinstance(entry, dict)
-            or entry.get("schemaVersion") != "1"
-            or entry.get("testSuiteVersion") != TEST_SUITE_VERSION
-            or type(entry.get("cycle")) is not int
-            or entry["cycle"] != ordinal
-            or entry.get("status") != "verified"
-            or type(entry.get("hardFailure")) is not bool
-            or entry["hardFailure"] is not False
-            or type(entry.get("infrastructureBlocked")) is not bool
-            or entry["infrastructureBlocked"] is not False
-        ):
-            raise AcceptanceError("cycles.jsonl does not contain a verified cycle prefix")
-
         try:
-            projected_runtime = safe_runtime_projection(entry.get("runtime"))
+            projected = project_cycle_evidence(
+                entry,
+                ordinal,
+                selected,
+                allow_terminal=False,
+            )
         except AcceptanceError as error:
             raise AcceptanceError(
-                "cycles.jsonl contains invalid Runtime identity evidence"
+                "cycles.jsonl does not contain a verified cycle prefix"
             ) from error
+        if projected["status"] != "verified":
+            raise AcceptanceError("cycles.jsonl does not contain a verified cycle prefix")
+        projected_runtime = projected["runtime"]
+        if not isinstance(projected_runtime, dict):
+            raise AcceptanceError("cycles.jsonl contains invalid Runtime identity evidence")
         if (
             projected_runtime["runtimeId"] != expected_runtime.get("runtimeId")
             or projected_runtime["version"] != expected_version
@@ -267,33 +645,6 @@ def validate_verified_prefix(
             stable_runtime = projected_runtime
         elif projected_runtime != stable_runtime:
             raise AcceptanceError("cycles.jsonl Runtime identity is not stable")
-
-        applications = entry.get("applications")
-        if not isinstance(applications, list) or len(applications) != len(selected):
-            raise AcceptanceError("cycles.jsonl contains an invalid application set")
-        seen: set[str] = set()
-        for application in applications:
-            if not isinstance(application, dict):
-                raise AcceptanceError("cycles.jsonl contains an invalid application record")
-            recipe_id = application.get("recipeId")
-            if (
-                not isinstance(recipe_id, str)
-                or recipe_id not in selected
-                or recipe_id in seen
-                or type(application.get("lifecyclePassed")) is not bool
-                or application["lifecyclePassed"] is not True
-            ):
-                raise AcceptanceError("cycles.jsonl contains an invalid application record")
-            checks = application.get("checks")
-            if (
-                not isinstance(checks, dict)
-                or set(checks) != SOAK_CHECKS
-                or any(checks[check_id] != "passed" for check_id in SOAK_CHECKS)
-            ):
-                raise AcceptanceError("cycles.jsonl contains invalid lifecycle checks")
-            seen.add(recipe_id)
-        if seen != selected:
-            raise AcceptanceError("cycles.jsonl contains an invalid application set")
     return stable_runtime
 
 
@@ -401,12 +752,12 @@ def write_report(
         or any(not isinstance(recipe_id, str) or not recipe_id for recipe_id in selected)
     ):
         raise AcceptanceError("soak report request is invalid")
+    selected_assets(selected)
     if stop_reason is not None and (
         not isinstance(stop_reason, str)
         or SOAK_STOP_REASON.fullmatch(stop_reason) is None
     ):
         raise AcceptanceError("soak report stop reason is invalid")
-    known_statuses = {"verified", "unverified", "failed"}
     statuses: Counter[str] = Counter()
     completed_applications = 0
     verified_applications = 0
@@ -415,46 +766,36 @@ def write_report(
     hard_failures = 0
     infrastructure_blocked = 0
     cycles_valid = True
-    application_sets_valid = True
     runtime_complete = True
     runtime_consistent = True
     stable_runtime: dict[str, str] | None = None
 
     for ordinal, entry in enumerate(entries, start=1):
-        if not isinstance(entry, dict):
+        try:
+            projected = project_cycle_evidence(
+                entry,
+                ordinal,
+                selected,
+                allow_terminal=True,
+            )
+        except AcceptanceError:
             statuses["invalid"] += 1
             cycles_valid = False
-            application_sets_valid = False
             runtime_complete = False
             continue
-
-        status = entry.get("status")
-        if isinstance(status, str) and status in known_statuses:
-            statuses[status] += 1
-        else:
-            statuses["invalid"] += 1
-            cycles_valid = False
-        hard_failure = entry.get("hardFailure")
-        blocked = entry.get("infrastructureBlocked")
-        if type(hard_failure) is not bool:
-            cycles_valid = False
-        else:
-            hard_failures += int(hard_failure)
-        if type(blocked) is not bool:
-            cycles_valid = False
-        else:
-            infrastructure_blocked += int(blocked)
-        if (
-            entry.get("schemaVersion") != "1"
-            or entry.get("testSuiteVersion") != TEST_SUITE_VERSION
-            or type(entry.get("cycle")) is not int
-            or entry["cycle"] != ordinal
-        ):
-            cycles_valid = False
-
-        try:
-            projected_runtime = safe_runtime_projection(entry.get("runtime"))
-        except AcceptanceError:
+        statuses[str(projected["status"])] += 1
+        hard_failures += int(projected["hardFailure"] is True)
+        infrastructure_blocked += int(
+            projected["infrastructureBlocked"] is True
+        )
+        completed_applications += int(projected["completedApplications"])
+        verified_applications += int(projected["verifiedApplications"])
+        cleanup_failures += int(projected["cleanupFailures"])
+        residual_process_failures += int(
+            projected["residualProcessFailures"]
+        )
+        projected_runtime = projected["runtime"]
+        if not isinstance(projected_runtime, dict):
             runtime_complete = False
         else:
             if stable_runtime is None:
@@ -462,77 +803,11 @@ def write_report(
             elif projected_runtime != stable_runtime:
                 runtime_consistent = False
 
-        applications = entry.get("applications")
-        if not isinstance(applications, list):
-            application_sets_valid = False
-            continue
-        seen: set[str] = set()
-        for application in applications:
-            if not isinstance(application, dict):
-                application_sets_valid = False
-                continue
-            allowed_application_fields = {
-                "recipeId",
-                "outcome",
-                "failureClassification",
-                "lifecyclePassed",
-                "checks",
-            }
-            recipe_id = application.get("recipeId")
-            outcome = application.get("outcome")
-            classification_present = "failureClassification" in application
-            classification = application.get("failureClassification")
-            lifecycle_passed = application.get("lifecyclePassed")
-            checks = application.get("checks")
-            checks_are_exact = isinstance(checks, dict) and set(checks) == SOAK_CHECKS
-            if checks_are_exact:
-                cleanup_failures += int(checks["bottle-cleanup"] != "passed")
-                residual_process_failures += int(
-                    checks["no-residual-processes"] != "passed"
-                )
-            structurally_valid = (
-                set(application).issubset(allowed_application_fields)
-                and isinstance(recipe_id, str)
-                and recipe_id in selected
-                and recipe_id not in seen
-                and isinstance(outcome, str)
-                and outcome in SOAK_OUTCOMES
-                and type(lifecycle_passed) is bool
-                and checks_are_exact
-                and all(
-                    isinstance(checks[check_id], str)
-                    and checks[check_id] in SOAK_CHECK_OUTCOMES
-                    for check_id in SOAK_CHECKS
-                )
-                and (
-                    (outcome == "passed" and not classification_present)
-                    or (
-                        outcome != "passed"
-                        and classification_present
-                        and isinstance(classification, str)
-                        and classification in SOAK_FAILURE_CLASSIFICATIONS
-                    )
-                )
-            )
-            if not structurally_valid:
-                application_sets_valid = False
-                continue
-            seen.add(recipe_id)
-            completed_applications += 1
-            all_checks_passed = all(
-                checks[check_id] == "passed" for check_id in SOAK_CHECKS
-            )
-            if lifecycle_passed is True and all_checks_passed:
-                verified_applications += 1
-        if seen != selected or len(applications) != len(selected):
-            application_sets_valid = False
-
     finished = len(entries) == requested_cycles
     expected_applications = requested_cycles * len(selected)
     passed = (
         finished
         and cycles_valid
-        and application_sets_valid
         and statuses == Counter({"verified": requested_cycles})
         and completed_applications == expected_applications
         and verified_applications == expected_applications
@@ -573,24 +848,46 @@ def write_report(
         ),
         "releaseGate": release_gate,
     }
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    serialized = (
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    descriptor_open = True
+    try:
+        created = os.fstat(descriptor)
+        if not stat.S_ISREG(created.st_mode) or _is_reparse_point(created):
+            raise AcceptanceError("soak report temporary file is invalid")
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor_open = False
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        closed = temporary.lstat()
+        if (
+            not stat.S_ISREG(closed.st_mode)
+            or _is_reparse_point(closed)
+            or _file_identity(closed) != _file_identity(created)
+            or closed.st_size != len(serialized)
+        ):
+            raise AcceptanceError("soak report temporary file is invalid")
+        os.replace(temporary, path)
+    except Exception:
+        if descriptor_open:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return report
-
-
-def cycle_application_ids(entry: dict[str, object]) -> set[str]:
-    applications = entry.get("applications")
-    if not isinstance(applications, list):
-        raise AcceptanceError("cycle record omitted applications")
-    result = {
-        str(application["recipeId"])
-        for application in applications
-        if isinstance(application, dict) and isinstance(application.get("recipeId"), str)
-    }
-    if len(result) != len(applications):
-        raise AcceptanceError("cycle record application set is invalid")
-    return result
 
 
 def selected_assets(selected: set[str]) -> list[dict[str, str]]:
@@ -693,12 +990,11 @@ def validate_configuration(
     cycles: int,
     runtime: dict[str, str],
 ) -> None:
-    if not path.is_file() or path.is_symlink() or path.stat().st_size > 64 * 1024:
-        raise AcceptanceError("configuration.json must be a bounded regular file")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise AcceptanceError("configuration.json is unreadable") from error
+    value = _read_strict_json_file(
+        path,
+        "configuration.json",
+        MAX_CONFIGURATION_BYTES,
+    )
     if (
         not isinstance(value, dict)
         or type(value.get("cycles")) is not int
@@ -760,9 +1056,20 @@ def main() -> int:
         entries = load_cycle_log(cycles_path) if arguments.resume else []
         if not arguments.resume and output_root.exists() and any(output_root.iterdir()):
             raise AcceptanceError("output-root must be empty unless --resume is used")
-        if configuration_path.is_symlink():
+        try:
+            configuration_metadata = configuration_path.lstat()
+        except FileNotFoundError:
+            configuration_metadata = None
+        except OSError as error:
+            raise AcceptanceError(
+                "configuration.json must be a bounded regular file"
+            ) from error
+        if configuration_metadata is not None and (
+            not stat.S_ISREG(configuration_metadata.st_mode)
+            or _is_reparse_point(configuration_metadata)
+        ):
             raise AcceptanceError("configuration.json must be a bounded regular file")
-        configuration_exists = configuration_path.exists()
+        configuration_exists = configuration_metadata is not None
         stable_runtime: dict[str, str] | None = None
         if arguments.resume:
             if not configuration_exists:
@@ -818,7 +1125,9 @@ def main() -> int:
             with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
                 completed = subprocess.run(command, cwd=ROOT, stdout=stdout, stderr=stderr, check=False)
             summary_path = work_root / "summary.json"
-            if not summary_path.is_file() or summary_path.is_symlink():
+            try:
+                summary_path.lstat()
+            except FileNotFoundError:
                 projection: dict[str, object] = {
                     "status": "failed",
                     "hardFailure": True,
@@ -826,9 +1135,21 @@ def main() -> int:
                     "applications": [],
                     "reason": "GUI runner did not produce summary.json",
                 }
+            except OSError:
+                projection = {
+                    "status": "failed",
+                    "hardFailure": True,
+                    "infrastructureBlocked": False,
+                    "applications": [],
+                    "reason": "cycle summary contract or Runtime identity is invalid",
+                }
             else:
                 try:
-                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary = _read_strict_json_file(
+                        summary_path,
+                        "GUI runner summary",
+                        MAX_SUMMARY_BYTES,
+                    )
                     if not isinstance(summary, dict):
                         raise AcceptanceError("GUI runner summary is not an object")
                     projection = classify_summary(
@@ -837,12 +1158,7 @@ def main() -> int:
                         runtime,
                         stable_runtime,
                     )
-                except (
-                    OSError,
-                    UnicodeDecodeError,
-                    json.JSONDecodeError,
-                    AcceptanceError,
-                ):
+                except AcceptanceError:
                     projection = {
                         "status": "failed",
                         "hardFailure": True,

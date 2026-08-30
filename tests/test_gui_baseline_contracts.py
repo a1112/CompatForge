@@ -4581,6 +4581,9 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             "schemaVersion": "1",
             "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
             "cycle": cycle,
+            "startedAt": f"2026-08-30T10:{(cycle - 1) % 60:02d}:00Z",
+            "finishedAt": f"2026-08-30T10:{(cycle - 1) % 60:02d}:01Z",
+            "runnerExitCode": 0,
             "status": "verified",
             "hardFailure": False,
             "infrastructureBlocked": False,
@@ -4820,6 +4823,73 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     self.baseline.AcceptanceError
                 ):
                     self.soak_tool.validate_verified_prefix(value, selected, runtime)
+
+    def test_soak_resume_rejects_contradictory_verified_application_semantics(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-resume-semantics-") as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            output_root.mkdir()
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+            self.soak_tool.write_configuration(
+                output_root / "configuration.json",
+                selected,
+                2,
+                runtime,
+            )
+            cycle = self.soak_verified_entry(1, selected, runtime)
+            cycle["applications"][0]["outcome"] = "failed"
+            cycle["applications"][0]["failureClassification"] = "runtime-regression"
+            (output_root / "cycles.jsonl").write_text(
+                json.dumps(cycle) + "\n",
+                encoding="utf-8",
+            )
+
+            def run_cycle(
+                command: list[str],
+                **_: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                work_root = Path(command[command.index("--work-root") + 1])
+                (work_root / "summary.json").write_text(
+                    json.dumps(self.soak_runner_summary(selected, runtime)),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.soak_main_arguments(
+                        root,
+                        output_root,
+                        runtime,
+                        cycles=2,
+                        resume=True,
+                    ),
+                ),
+                mock.patch.object(self.soak_tool, "fetch") as fetch,
+                mock.patch.object(self.soak_tool, "start_power_assertion") as power,
+                mock.patch.object(
+                    self.soak_tool.subprocess,
+                    "run",
+                    side_effect=run_cycle,
+                ) as run,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.soak_tool.main()
+
+            self.assertEqual(result, 2)
+            self.assertIn("verified cycle prefix", stderr.getvalue())
+            fetch.assert_not_called()
+            power.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(
+                len((output_root / "cycles.jsonl").read_text(encoding="utf-8").splitlines()),
+                1,
+            )
 
     def test_soak_offline_preflight_validates_every_selected_digest(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-cache-") as temporary:
@@ -5215,6 +5285,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             "object check outcome",
         )
         original_read_text = Path.read_text
+        original_os_read = os.read
         for name in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(
                 prefix="compatforge-soak-invalid-summary-"
@@ -5257,14 +5328,10 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                         )
                     return subprocess.CompletedProcess(command, 0, b"", b"")
 
-                def read_text(path: Path, *args: object, **kwargs: object) -> str:
-                    if (
-                        isinstance(payload, OSError)
-                        and path.name == "summary.json"
-                        and path.parent.name == "work"
-                    ):
+                def read_bytes(descriptor: int, size: int) -> bytes:
+                    if isinstance(payload, OSError):
                         raise payload
-                    return original_read_text(path, *args, **kwargs)
+                    return original_os_read(descriptor, size)
 
                 stderr = io.StringIO()
                 with (
@@ -5284,7 +5351,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                         "run",
                         side_effect=run_cycle,
                     ),
-                    mock.patch.object(Path, "read_text", new=read_text),
+                    mock.patch.object(self.soak_tool.os, "read", new=read_bytes),
                     contextlib.redirect_stdout(io.StringIO()),
                     contextlib.redirect_stderr(stderr),
                 ):
@@ -5313,6 +5380,205 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 self.assertNotIn("not-a-digest", persisted)
                 self.assertNotIn("UnicodeDecodeError", persisted)
                 self.assertNotIn("invalid start byte", persisted)
+
+    def test_soak_strict_json_rejects_duplicate_resume_inputs_before_side_effects(
+        self,
+    ) -> None:
+        for name in ("cycle", "configuration"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                prefix="compatforge-soak-duplicate-resume-"
+            ) as temporary:
+                root = Path(temporary)
+                output_root = root / "soak"
+                output_root.mkdir()
+                runtime = self.soak_runtime_selection(root)
+                selected = {"winmerge"}
+                requested_cycles = 2 if name == "cycle" else 1
+                self.soak_tool.write_configuration(
+                    output_root / "configuration.json",
+                    selected,
+                    requested_cycles,
+                    runtime,
+                )
+                if name == "cycle":
+                    cycle_text = json.dumps(
+                        self.soak_verified_entry(1, selected, runtime),
+                        separators=(",", ":"),
+                    ).replace(
+                        '"status":"verified"',
+                        '"status":"failed","status":"verified"',
+                        1,
+                    )
+                    (output_root / "cycles.jsonl").write_text(
+                        cycle_text + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    configuration_path = output_root / "configuration.json"
+                    configuration_text = configuration_path.read_text(
+                        encoding="utf-8"
+                    ).replace(
+                        '"schemaVersion": "1"',
+                        '"schemaVersion": "2",\n  "schemaVersion": "1"',
+                        1,
+                    )
+                    configuration_path.write_text(
+                        configuration_text,
+                        encoding="utf-8",
+                    )
+
+                def run_cycle(
+                    command: list[str],
+                    **_: object,
+                ) -> subprocess.CompletedProcess[bytes]:
+                    work_root = Path(command[command.index("--work-root") + 1])
+                    (work_root / "summary.json").write_text(
+                        json.dumps(self.soak_runner_summary(selected, runtime)),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        self.soak_main_arguments(
+                            root,
+                            output_root,
+                            runtime,
+                            cycles=requested_cycles,
+                            resume=True,
+                        ),
+                    ),
+                    mock.patch.object(self.soak_tool, "fetch") as fetch,
+                    mock.patch.object(self.soak_tool, "start_power_assertion") as power,
+                    mock.patch.object(
+                        self.soak_tool.subprocess,
+                        "run",
+                        side_effect=run_cycle,
+                    ) as run,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    result = self.soak_tool.main()
+
+                self.assertEqual(result, 2)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "compatforge-gui-soak: "
+                    + (
+                        "cycles.jsonl contains invalid JSON\n"
+                        if name == "cycle"
+                        else "configuration.json contains invalid JSON\n"
+                    ),
+                )
+                fetch.assert_not_called()
+                power.assert_not_called()
+                run.assert_not_called()
+
+    def test_soak_runner_summary_uses_bounded_strict_json(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-strict-summary-source-"
+        ) as source_temporary:
+            source_root = Path(source_temporary)
+            source_runtime = self.soak_runtime_selection(source_root)
+            base = json.dumps(
+                self.soak_runner_summary({"winmerge"}, source_runtime),
+                separators=(",", ":"),
+            )
+            cases = {
+                "duplicate critical key": base.replace(
+                    '"schemaVersion":"1"',
+                    '"schemaVersion":"2","schemaVersion":"1"',
+                    1,
+                ).encode("utf-8"),
+                "deep nesting": ("[" * 5000 + "0" + "]" * 5000).encode(
+                    "utf-8"
+                ),
+                "oversized": (
+                    base[:-1]
+                    + ',"padding":"'
+                    + "p" * (16 * 1024 * 1024)
+                    + '"}'
+                ).encode("utf-8"),
+                "NaN constant": (base[:-1] + ',"constant":NaN}').encode("utf-8"),
+                "Infinity constant": (
+                    base[:-1] + ',"constant":Infinity}'
+                ).encode("utf-8"),
+            }
+
+            for name, raw_summary in cases.items():
+                with self.subTest(name=name), tempfile.TemporaryDirectory(
+                    prefix="compatforge-soak-strict-summary-"
+                ) as temporary:
+                    root = Path(temporary)
+                    output_root = root / "soak"
+                    runtime = self.soak_runtime_selection(root)
+
+                    # Keep Runtime-selection values aligned with the per-case root
+                    # without reconstructing malformed JSON through a permissive parser.
+                    raw = raw_summary.replace(
+                        source_runtime["version"].encode("utf-8"),
+                        runtime["version"].encode("utf-8"),
+                    )
+
+                    def run_cycle(
+                        command: list[str],
+                        **_: object,
+                    ) -> subprocess.CompletedProcess[bytes]:
+                        work_root = Path(command[command.index("--work-root") + 1])
+                        (work_root / "summary.json").write_bytes(raw)
+                        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+                    stderr = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            sys,
+                            "argv",
+                            self.soak_main_arguments(root, output_root, runtime),
+                        ),
+                        mock.patch.object(self.soak_tool, "fetch"),
+                        mock.patch.object(
+                            self.soak_tool,
+                            "start_power_assertion",
+                            return_value=None,
+                        ),
+                        mock.patch.object(
+                            self.soak_tool.subprocess,
+                            "run",
+                            side_effect=run_cycle,
+                        ),
+                        contextlib.redirect_stdout(io.StringIO()),
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        result = self.soak_tool.main()
+
+                    self.assertEqual(result, 1)
+                    self.assertEqual(stderr.getvalue(), "")
+                    cycle = json.loads(
+                        (output_root / "cycles.jsonl").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(cycle["status"], "failed")
+                    self.assertTrue(cycle["hardFailure"])
+                    self.assertEqual(
+                        cycle["reason"],
+                        "cycle summary contract or Runtime identity is invalid",
+                    )
+                    report_text = (output_root / "summary.json").read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertEqual(json.loads(report_text)["releaseGate"], "failed")
+                    persisted = json.dumps(cycle) + report_text
+                    for detail in (
+                        str(root),
+                        "duplicate critical key",
+                        "RecursionError",
+                        "padding",
+                        "NaN",
+                        "Infinity",
+                    ):
+                        self.assertNotIn(detail, persisted)
 
     def test_soak_fresh_preflight_failure_is_redacted_and_has_no_side_effects(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-preflight-main-") as temporary:
@@ -6233,18 +6499,6 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 self.soak_tool.validate_configuration(path, {"winmerge"}, 60, runtime)
             with self.assertRaises(self.baseline.AcceptanceError):
                 self.soak_tool.validate_configuration(path, selected, 61, runtime)
-            self.assertEqual(
-                self.soak_tool.cycle_application_ids(
-                    {
-                        "applications": [
-                            {"recipeId": "winmerge"},
-                            {"recipeId": "everything-x86"},
-                        ]
-                    }
-                ),
-                selected,
-            )
-
     def test_soak_resume_configuration_rejects_json_numeric_aliases(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-cycle-type-") as temporary:
             root = Path(temporary)
@@ -6304,6 +6558,60 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 )
         self.assertEqual(report["stopReason"], "cycle 1 completed with status unverified")
 
+    def test_soak_report_does_not_follow_a_preexisting_fixed_temp_symlink(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-report-temp-"
+        ) as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            output_root.mkdir()
+            sentinel = root / "external-sentinel.json"
+            original = b"external sentinel must remain unchanged\n"
+            sentinel.write_bytes(original)
+            legacy_temp = output_root / "summary.json.tmp"
+            legacy_temp.symlink_to(sentinel)
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+
+            report = self.soak_tool.write_report(
+                output_root / "summary.json",
+                [self.soak_verified_entry(1, selected, runtime)],
+                1,
+                selected,
+            )
+
+            self.assertEqual(report["releaseGate"], "passed")
+            self.assertEqual(sentinel.read_bytes(), original)
+            self.assertTrue(legacy_temp.is_symlink())
+            report_path = output_root / "summary.json"
+            self.assertTrue(report_path.is_file())
+            self.assertFalse(report_path.is_symlink())
+            self.assertEqual(
+                json.loads(report_path.read_text(encoding="utf-8")),
+                report,
+            )
+            self.assertEqual(
+                sorted(path.name for path in output_root.iterdir()),
+                ["summary.json", "summary.json.tmp"],
+            )
+
+    def test_soak_report_rejects_noncertification_application_sets(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-report-selected-"
+        ) as temporary:
+            path = Path(temporary) / "summary.json"
+            for selected in (
+                {"not-certified"},
+                {"winmerge", "../external-recipe"},
+            ):
+                with self.subTest(selected=sorted(selected)), self.assertRaises(
+                    self.baseline.AcceptanceError
+                ):
+                    self.soak_tool.write_report(path, [], 1, selected)
+                self.assertFalse(path.exists())
+
     def test_soak_report_counts_300_verified_lifecycles(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-report-300-") as temporary:
             root = Path(temporary)
@@ -6330,9 +6638,6 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 "/private/customer/runtime",
                 "C:\\Users\\operator\\runtime",
             ]
-            for entry in entries:
-                entry["localEvidence"] = list(forbidden_paths)
-
             report = self.soak_tool.write_report(path, entries, 60, selected)
 
             self.assertEqual(report["requestedCycles"], 60)
@@ -6363,6 +6668,8 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             )
             for check_id, counter in check_cases:
                 mutant = json.loads(json.dumps(entries))
+                mutant[0]["status"] = "failed"
+                mutant[0]["hardFailure"] = True
                 mutant[0]["applications"][0]["lifecyclePassed"] = False
                 mutant[0]["applications"][0]["checks"][check_id] = "failed"
                 with self.subTest(check=check_id):
@@ -6473,10 +6780,103 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 1,
                 selected,
             )
-            self.assertEqual(hard_report["hardFailures"], 1)
-            self.assertEqual(hard_report["releaseGate"], "failed")
+            self.assertEqual(hard_report["hardFailures"], 0)
+            self.assertEqual(hard_report["releaseGate"], "blocked")
 
-    def test_soak_report_counts_malformed_nonpassed_cleanup(self) -> None:
+    def test_soak_report_derives_cycle_semantics_before_counting_applications(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-report-semantics-") as temporary:
+            root = Path(temporary)
+            path = root / "summary.json"
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge", "everything-x86"}
+            base = [self.soak_verified_entry(1, selected, runtime)]
+
+            contradictory = json.loads(json.dumps(base))
+            contradictory[0]["applications"][0]["outcome"] = "failed"
+            contradictory[0]["applications"][0][
+                "failureClassification"
+            ] = "runtime-regression"
+
+            duplicate_cleanup = json.loads(json.dumps(base))
+            duplicate_cleanup[0]["applications"][1] = json.loads(
+                json.dumps(duplicate_cleanup[0]["applications"][0])
+            )
+            duplicate_cleanup[0]["applications"][1]["lifecyclePassed"] = False
+            duplicate_cleanup[0]["applications"][1]["checks"][
+                "bottle-cleanup"
+            ] = "failed"
+
+            malformed_cleanup = json.loads(json.dumps(base))
+            malformed_cleanup[0]["applications"][0][
+                "unexpectedPath"
+            ] = "/private/customer/application"
+            malformed_cleanup[0]["applications"][0]["lifecyclePassed"] = False
+            malformed_cleanup[0]["applications"][0]["checks"][
+                "bottle-cleanup"
+            ] = "failed"
+
+            duplicate_residual = json.loads(json.dumps(base))
+            duplicate_residual[0]["applications"][1] = json.loads(
+                json.dumps(duplicate_residual[0]["applications"][0])
+            )
+            duplicate_residual[0]["applications"][1]["lifecyclePassed"] = False
+            duplicate_residual[0]["applications"][1]["checks"][
+                "no-residual-processes"
+            ] = "failed"
+
+            for name, entries in (
+                ("contradictory semantics", contradictory),
+                ("duplicate cleanup", duplicate_cleanup),
+                ("malformed cleanup", malformed_cleanup),
+                ("duplicate residual", duplicate_residual),
+            ):
+                with self.subTest(name=name):
+                    report = self.soak_tool.write_report(path, entries, 1, selected)
+                    self.assertNotEqual(report["releaseGate"], "passed")
+                    self.assertEqual(report["completedApplicationExecutions"], 0)
+                    self.assertEqual(report["verifiedApplicationExecutions"], 0)
+                    self.assertEqual(report["cleanupFailures"], 0)
+                    self.assertEqual(report["residualProcessFailures"], 0)
+                    self.assertNotIn("/private/customer/application", json.dumps(report))
+
+    def test_soak_report_fails_closed_for_an_unhashable_terminal_reason(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-report-terminal-reason-"
+        ) as temporary:
+            root = Path(temporary)
+            path = root / "summary.json"
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+            for reason in (
+                ["/private/customer/reason"],
+                {"detail": "/private/customer/reason"},
+            ):
+                entry = self.soak_verified_entry(1, selected, runtime)
+                entry.update(
+                    {
+                        "status": "failed",
+                        "hardFailure": True,
+                        "applications": [],
+                        "reason": reason,
+                    }
+                )
+                entry.pop("runtime")
+
+                with self.subTest(reason_type=type(reason).__name__):
+                    report = self.soak_tool.write_report(
+                        path,
+                        [entry],
+                        1,
+                        selected,
+                    )
+                    self.assertEqual(report["releaseGate"], "blocked")
+                    self.assertEqual(report["hardFailures"], 0)
+                    self.assertNotIn(
+                        "/private/customer/reason",
+                        json.dumps(report),
+                    )
+
+    def test_soak_report_does_not_count_malformed_nonpassed_cleanup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-report-cleanup-") as temporary:
             root = Path(temporary)
             selected = {"winmerge"}
@@ -6492,8 +6892,9 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 1,
                 selected,
             )
-            self.assertEqual(cleanup_report["cleanupFailures"], 1)
-            self.assertEqual(cleanup_report["releaseGate"], "failed")
+            self.assertEqual(cleanup_report["completedApplicationExecutions"], 0)
+            self.assertEqual(cleanup_report["cleanupFailures"], 0)
+            self.assertEqual(cleanup_report["releaseGate"], "blocked")
 
     def test_residual_process_check_uses_the_launch_process_group(self) -> None:
         with (
