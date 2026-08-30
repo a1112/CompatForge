@@ -3,7 +3,7 @@
 ## 状态
 
 - 日期：2026-08-18
-- 状态：M1 最小纵向切片已实现；M0 需从新输出根重新验证
+- 状态：M0 implementation/evidence rerun in progress
 - 前置里程碑：Phase 2.2 五应用、60 轮 fresh-Bottle 生命周期 soak
 - 首批宿主：macOS ARM64、Linux x86_64
 - 测试套件候选版本：`cross-host-capability-v3`
