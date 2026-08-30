@@ -5220,6 +5220,463 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertEqual(selected, original_selected)
             self.assertEqual(runtime, original_runtime)
 
+    def test_soak_main_runs_one_offline_cycle_with_bound_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-main-e2e-"
+        ) as temporary:
+            root = Path(temporary).resolve()
+            cli = root / "CompatForge CLI"
+            cli.write_bytes(b"placeholder")
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            output_root = root / "soak"
+            runtime = self.soak_runtime_selection(root)
+            app_ids = [
+                "7zip-x86",
+                "audacity-x86",
+                "everything-x86",
+                "vlc",
+                "winmerge",
+            ]
+            asset_digests = {
+                "7zip-x86": "615976598f800c70827c5a47e68c2b0d2b17d048b9721ba071c8af825d2476bd",
+                "audacity-x86": "c0482d84a05ddd26905d010daff32b79eba18673489d2cb90ee87a386d24c74f",
+                "everything-x86": "781a31b440045219752a1bb40fbd204b1d96964d4bf56af01b18e3d549b037aa",
+                "vlc": "9742689a50e96ddc04d80ceff046b28da2beefd617be18166f8c5e715ec60c59",
+                "winmerge": "58a0e36abc99b0da539d3b33b1df8a494239d53900f1ab57c305853df5da94a6",
+            }
+            assets = sorted(
+                self.assets.CERTIFICATION_ASSETS,
+                key=lambda asset: asset.app_id,
+            )
+            self.assertEqual([asset.app_id for asset in assets], app_ids)
+            self.assertEqual(
+                {asset.app_id: asset.sha256 for asset in assets},
+                asset_digests,
+            )
+            self.assertTrue(cli.is_absolute())
+            self.assertTrue(cache_root.is_absolute())
+            self.assertFalse(output_root.exists())
+            self.assertNotEqual(root, ROOT)
+            self.assertNotIn(ROOT, root.parents)
+
+            runtime_digest = "sha256:" + "d" * 64
+            receipt = {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "packId": "macos-explicit",
+                "version": runtime["version"],
+                "packDigest": runtime_digest,
+                "source": "explicit-override",
+            }
+            expected_runtime = {
+                "runtimeId": "crossover",
+                "version": runtime["version"],
+                "architecture": "arm64",
+                "packDigest": runtime_digest,
+            }
+            expected_checks = {
+                "bottle-cleanup": "passed",
+                "installer-inspection": "passed",
+                "lifecycle-exit": "passed",
+                "no-residual-processes": "passed",
+                "screenshot": "passed",
+                "window-visible": "passed",
+            }
+            argv = self.soak_main_arguments(
+                root,
+                output_root,
+                runtime,
+                applications=(),
+            )
+            self.assertNotIn("--app", argv)
+            self.assertNotIn("--allow-network", argv)
+
+            events: list[str] = []
+            commands: list[list[str]] = []
+            screenshot_paths: list[Path] = []
+            executable_paths: list[Path] = []
+
+            def offline_fetch(
+                asset: object,
+                actual_cache_root: Path,
+                allow_network: bool,
+            ) -> Path:
+                app_id = getattr(asset, "app_id")
+                events.append(f"fetch:{app_id}")
+                return actual_cache_root / getattr(asset, "filename")
+
+            def start_power_assertion() -> None:
+                events.append("power")
+                return None
+
+            def run_cycle(
+                command: list[str],
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                events.append("runner")
+                commands.append(command)
+                self.assertEqual(kwargs["cwd"], ROOT)
+                self.assertIs(kwargs["check"], False)
+                self.assertTrue(hasattr(kwargs["stdout"], "write"))
+                self.assertTrue(hasattr(kwargs["stderr"], "write"))
+
+                work_root = Path(command[command.index("--work-root") + 1])
+                storage_root = Path(
+                    command[command.index("--storage-root") + 1]
+                )
+                evidence_values: list[dict[str, object]] = []
+                compatibility_results: list[dict[str, object]] = []
+                for asset in assets:
+                    screenshot_path = work_root / f"{asset.app_id}-window.png"
+                    executable_path = storage_root.joinpath(
+                        "bottles",
+                        f"gui-{asset.app_id}",
+                        "prefix",
+                        "drive_c",
+                        *Path(asset.installed_executable).parts,
+                    )
+                    screenshot_paths.append(screenshot_path)
+                    executable_paths.append(executable_path)
+                    evidence = {
+                        "schemaVersion": "1",
+                        "runtimeId": runtime["runtimeId"],
+                        "appId": asset.app_id,
+                        "assetSha256": asset.sha256,
+                        "bottleId": f"gui-{asset.app_id}",
+                        "matrix": {
+                            "category": asset.category,
+                            "toolkit": asset.toolkit,
+                            "guestArchitecture": asset.guest_architecture,
+                            "recipeDigest": self.baseline.matrix_entry_digest(
+                                asset
+                            ),
+                        },
+                        "startedAt": "2026-08-31T09:00:00Z",
+                        "finishedAt": "2026-08-31T09:00:01Z",
+                        "status": "unverified",
+                        "failureClassification": "policy-blocked",
+                        "cleanup": True,
+                        "windows": {"available": True},
+                        "screenshot": {
+                            "available": True,
+                            "path": str(screenshot_path),
+                        },
+                        "exit": {"present": True},
+                        "interactionChecks": {},
+                        "residualProcesses": [],
+                        "installerInspection": {
+                            "architecture": asset.guest_architecture,
+                            "path": str(executable_path),
+                        },
+                    }
+                    result = self.baseline.compatibility_result(
+                        asset,
+                        evidence,
+                        receipt,
+                        "2026-08-31T09:00:00Z",
+                        "2026-08-31T09:00:01Z",
+                    )
+                    result["host"] = {
+                        "os": "macos",
+                        "version": "15.6",
+                        "architecture": "arm64",
+                    }
+                    evidence_values.append(evidence)
+                    compatibility_results.append(result)
+                summary = {
+                    "schemaVersion": "1",
+                    "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
+                    "receipt": receipt,
+                    "applications": evidence_values,
+                    "compatibilityResults": compatibility_results,
+                }
+                (work_root / "summary.json").write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    self.soak_tool,
+                    "fetch",
+                    side_effect=offline_fetch,
+                ) as fetch,
+                mock.patch.object(
+                    self.soak_tool,
+                    "start_power_assertion",
+                    side_effect=start_power_assertion,
+                ) as power,
+                mock.patch.object(
+                    self.soak_tool.subprocess,
+                    "run",
+                    side_effect=run_cycle,
+                ) as run,
+                mock.patch.object(
+                    self.soak_tool,
+                    "utc_now",
+                    side_effect=(
+                        "2026-08-31T10:00:00Z",
+                        "2026-08-31T10:00:01Z",
+                    ),
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.soak_tool.main()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(fetch.call_count, 5)
+            power.assert_called_once_with()
+            run.assert_called_once()
+            self.assertEqual(
+                events,
+                [*(f"fetch:{app_id}" for app_id in app_ids), "power", "runner"],
+            )
+            for call, asset in zip(fetch.call_args_list, assets, strict=True):
+                self.assertIs(call.args[0], asset)
+                self.assertEqual(call.args[1], cache_root)
+                self.assertIs(call.args[2], False)
+                self.assertEqual(call.kwargs, {})
+
+            self.assertEqual(len(commands), 1)
+            command = commands[0]
+            runtime_store = output_root / "runtime"
+            cycle_root = output_root / "runs" / "cycle-001"
+            storage_root = cycle_root / "storage"
+            work_root = cycle_root / "work"
+            expected_command = [
+                sys.executable,
+                "-S",
+                "-B",
+                str(self.soak_tool.RUNNER),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(cache_root),
+                "--runtime-store",
+                str(runtime_store),
+                "--storage-root",
+                str(storage_root),
+                "--work-root",
+                str(work_root),
+                "--runtime-id",
+                runtime["runtimeId"],
+                "--wine-root",
+                runtime["wineRoot"],
+                "--wine",
+                runtime["wine"],
+                "--wineserver",
+                runtime["wineserver"],
+                "--version",
+                runtime["version"],
+            ]
+            for app_id in app_ids:
+                expected_command.extend(("--app", app_id))
+            self.assertEqual(command, expected_command)
+            for option in (
+                "--compatforge-cli",
+                "--cache-root",
+                "--runtime-store",
+                "--storage-root",
+                "--work-root",
+                "--runtime-id",
+                "--wine-root",
+                "--wine",
+                "--wineserver",
+                "--version",
+            ):
+                self.assertEqual(command.count(option), 1)
+            self.assertEqual(command.count("--app"), 5)
+            self.assertNotIn("--allow-network", command)
+            self.assertEqual(
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--app"
+                ],
+                app_ids,
+            )
+            for app_id in app_ids:
+                self.assertEqual(command.count(app_id), 1)
+
+            child_arguments = self.baseline.parser().parse_args(command[4:])
+            self.assertEqual(child_arguments.compatforge_cli, str(cli))
+            self.assertEqual(child_arguments.cache_root, str(cache_root))
+            self.assertEqual(child_arguments.runtime_store, str(runtime_store))
+            self.assertEqual(child_arguments.storage_root, str(storage_root))
+            self.assertEqual(child_arguments.work_root, str(work_root))
+            self.assertEqual(child_arguments.runtime_id, runtime["runtimeId"])
+            self.assertEqual(child_arguments.wine_root, runtime["wineRoot"])
+            self.assertEqual(child_arguments.wine, runtime["wine"])
+            self.assertEqual(child_arguments.wineserver, runtime["wineserver"])
+            self.assertEqual(child_arguments.version, runtime["version"])
+            self.assertEqual(child_arguments.applications, app_ids)
+            self.assertFalse(child_arguments.allow_network)
+            self.assertEqual(
+                self.baseline.validate_runtime_selection(child_arguments),
+                "crossover",
+            )
+
+            configuration = self.soak_tool._read_strict_json_file(
+                output_root / "configuration.json",
+                "configuration.json",
+                self.soak_tool.MAX_CONFIGURATION_BYTES,
+            )
+            self.assertEqual(
+                configuration,
+                {
+                    "schemaVersion": "1",
+                    "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
+                    "applications": app_ids,
+                    "assets": [
+                        {
+                            "appId": app_id,
+                            "sha256": f"sha256:{asset_digests[app_id]}",
+                        }
+                        for app_id in app_ids
+                    ],
+                    "cycles": 1,
+                    "runtimeSelection": runtime,
+                },
+            )
+            self.assertEqual(
+                configuration["runtimeSelection"]["wineRoot"],
+                runtime["wineRoot"],
+            )
+
+            cycles = self.soak_tool.load_cycle_log(output_root / "cycles.jsonl")
+            expected_applications = [
+                {
+                    "recipeId": app_id,
+                    "outcome": "blocked",
+                    "failureClassification": "policy-blocked",
+                    "lifecyclePassed": True,
+                    "checks": expected_checks,
+                }
+                for app_id in app_ids
+            ]
+            self.assertEqual(
+                cycles,
+                [
+                    {
+                        "schemaVersion": "1",
+                        "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
+                        "cycle": 1,
+                        "startedAt": "2026-08-31T10:00:00Z",
+                        "finishedAt": "2026-08-31T10:00:01Z",
+                        "runnerExitCode": 0,
+                        "status": "verified",
+                        "hardFailure": False,
+                        "infrastructureBlocked": False,
+                        "runtime": expected_runtime,
+                        "applications": expected_applications,
+                    }
+                ],
+            )
+            cycle = cycles[0]
+            self.assertLessEqual(cycle["startedAt"], cycle["finishedAt"])
+            self.assertEqual(
+                len({app["recipeId"] for app in cycle["applications"]}),
+                5,
+            )
+            for application in cycle["applications"]:
+                self.assertEqual(set(application["checks"]), set(expected_checks))
+
+            report = self.soak_tool._read_strict_json_file(
+                output_root / "summary.json",
+                "soak report",
+                self.soak_tool.MAX_SUMMARY_BYTES,
+            )
+            self.assertEqual(
+                report,
+                {
+                    "schemaVersion": "1",
+                    "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
+                    "requestedCycles": 1,
+                    "completedCycles": 1,
+                    "requestedApplications": app_ids,
+                    "requestedApplicationExecutions": 5,
+                    "completedApplicationExecutions": 5,
+                    "verifiedApplicationExecutions": 5,
+                    "cleanupFailures": 0,
+                    "residualProcessFailures": 0,
+                    "statuses": {"verified": 1},
+                    "hardFailures": 0,
+                    "infrastructureBlocked": 0,
+                    "finished": True,
+                    "stoppedEarly": False,
+                    "runtime": expected_runtime,
+                    "releaseGate": "passed",
+                },
+            )
+
+            persisted = json.dumps(
+                {"cycle": cycle, "summary": report},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            sensitive_paths = [
+                root,
+                cache_root,
+                output_root,
+                runtime_store,
+                storage_root,
+                work_root,
+                cli,
+                Path(runtime["wineRoot"]),
+                Path(runtime["wineRoot"]) / runtime["wine"],
+                Path(runtime["wineRoot"]) / runtime["wineserver"],
+                *screenshot_paths,
+                *executable_paths,
+            ]
+            for path in sensitive_paths:
+                raw = str(path)
+                with self.subTest(sensitive_path=raw):
+                    self.assertNotIn(raw, persisted)
+                    self.assertNotIn(raw.replace("\\", "/"), persisted)
+                    self.assertNotIn(
+                        json.dumps(raw, ensure_ascii=False)[1:-1],
+                        persisted,
+                    )
+            for marker in ("/Users/", "C:\\Users\\", r"C:\\Users\\"):
+                self.assertNotIn(marker, persisted)
+            for value in expected_runtime.values():
+                self.assertNotIn("/", value)
+                self.assertNotIn("\\", value)
+
+            self.assertEqual(
+                {path.name for path in output_root.iterdir()},
+                {
+                    "configuration.json",
+                    "cycles.jsonl",
+                    "summary.json",
+                    "runtime",
+                    "runs",
+                },
+            )
+            self.assertEqual(list(runtime_store.iterdir()), [])
+            self.assertEqual(
+                {path.name for path in (output_root / "runs").iterdir()},
+                {"cycle-001"},
+            )
+            self.assertEqual(
+                {path.name for path in cycle_root.iterdir()},
+                {"runner.stdout", "runner.stderr", "storage", "work"},
+            )
+            self.assertEqual((cycle_root / "runner.stdout").read_bytes(), b"")
+            self.assertEqual((cycle_root / "runner.stderr").read_bytes(), b"")
+            self.assertEqual(list(storage_root.iterdir()), [])
+            self.assertEqual(
+                {path.name for path in work_root.iterdir()},
+                {"summary.json"},
+            )
+
     def test_soak_main_completes_a_verified_cycle(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-main-") as temporary:
             root = Path(temporary)
