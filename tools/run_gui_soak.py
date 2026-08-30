@@ -75,6 +75,7 @@ def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
     runtime_id = validate_runtime_selection(arguments)
     if runtime_id is None:
         raise AcceptanceError("runtime-id is required")
+    version = _runtime_version(arguments.version)
     wine_root = absolute(arguments.wine_root, "wine-root", external=True)
 
     entrypoints: dict[str, str] = {}
@@ -83,7 +84,8 @@ def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
         if (
             not isinstance(entrypoint, str)
             or not entrypoint
-            or entrypoint.startswith(("/", "\\"))
+            or entrypoint.startswith(("-", "/", "\\"))
+            or not entrypoint.isprintable()
             or "\\" in entrypoint
             or ":" in entrypoint
             or any(component in ("", ".", "..") for component in entrypoint.split("/"))
@@ -96,7 +98,7 @@ def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
         "wineRoot": str(wine_root),
         "wine": entrypoints["wine"],
         "wineserver": entrypoints["wineserver"],
-        "version": arguments.version,
+        "version": version,
     }
 
 
@@ -358,7 +360,7 @@ def validate_cached_assets(cache_root: Path, selected: set[str]) -> None:
             continue
         try:
             fetch(asset, cache_root, False)
-        except AssetError as error:
+        except (AssetError, OSError) as error:
             raise AcceptanceError(
                 f"offline asset preflight failed for {asset.app_id}"
             ) from error
@@ -492,7 +494,6 @@ def main() -> int:
         output_root = absolute(arguments.output_root, "output-root", external=True)
         if output_root.exists() and (not output_root.is_dir() or output_root.is_symlink()):
             raise AcceptanceError("output-root must be a real directory")
-        output_root.mkdir(parents=True, exist_ok=True)
         known = {asset.app_id for asset in CERTIFICATION_ASSETS}
         selected = set(arguments.applications or known)
         unknown = selected - known
@@ -502,10 +503,11 @@ def main() -> int:
         report_path = output_root / "summary.json"
         configuration_path = output_root / "configuration.json"
         entries = load_cycle_log(cycles_path) if arguments.resume else []
-        if not arguments.resume and any(output_root.iterdir()):
+        if not arguments.resume and output_root.exists() and any(output_root.iterdir()):
             raise AcceptanceError("output-root must be empty unless --resume is used")
+        configuration_exists = configuration_path.exists()
         if arguments.resume:
-            if configuration_path.exists():
+            if configuration_exists:
                 validate_configuration(
                     configuration_path,
                     selected,
@@ -515,24 +517,19 @@ def main() -> int:
             else:
                 if any(cycle_application_ids(entry) != selected for entry in entries):
                     raise AcceptanceError("legacy cycle records do not match the requested application set")
-                write_configuration(
-                    configuration_path,
-                    selected,
-                    arguments.cycles,
-                    runtime,
-                )
-        else:
+        if len(entries) > arguments.cycles:
+            raise AcceptanceError("cycles.jsonl already exceeds the requested cycle count")
+        if arguments.resume and any(entry.get("status") != "verified" for entry in entries):
+            raise AcceptanceError("cannot resume a soak containing a non-verified cycle; use a new output-root")
+        validate_cached_assets(cache_root, selected)
+        output_root.mkdir(parents=True, exist_ok=True)
+        if not arguments.resume or not configuration_exists:
             write_configuration(
                 configuration_path,
                 selected,
                 arguments.cycles,
                 runtime,
             )
-        validate_cached_assets(cache_root, selected)
-        if len(entries) > arguments.cycles:
-            raise AcceptanceError("cycles.jsonl already exceeds the requested cycle count")
-        if arguments.resume and any(entry.get("status") != "verified" for entry in entries):
-            raise AcceptanceError("cannot resume a soak containing a non-verified cycle; use a new output-root")
         runtime_root = output_root / "runtime"
         runtime_root.mkdir(exist_ok=True)
         if runtime_root.is_symlink():
@@ -579,7 +576,7 @@ def main() -> int:
                     raise AcceptanceError("GUI runner produced unreadable summary.json") from error
                 if not isinstance(summary, dict):
                     raise AcceptanceError("GUI runner summary is not an object")
-                projection = classify_summary(summary, selected)
+                projection = classify_summary(summary, selected, runtime)
             entry = {
                 "schemaVersion": "1",
                 "testSuiteVersion": TEST_SUITE_VERSION,
