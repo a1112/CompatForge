@@ -4996,6 +4996,162 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             start_power_assertion.assert_not_called()
             run.assert_not_called()
 
+    def test_soak_resume_rejects_dangling_cycles_log_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-cycles-link-") as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            output_root.mkdir()
+            cycles_path = output_root / "cycles.jsonl"
+            target = root / "missing-cycles.jsonl"
+            try:
+                cycles_path.symlink_to(target)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            runtime = self.soak_runtime_selection(root)
+
+            with self.assertRaises(self.baseline.AcceptanceError) as direct_failure:
+                self.soak_tool.load_cycle_log(cycles_path)
+            self.assertEqual(
+                str(direct_failure.exception),
+                "cycles.jsonl must be a bounded regular file",
+            )
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.soak_main_arguments(
+                        root,
+                        output_root,
+                        runtime,
+                        resume=True,
+                    ),
+                ),
+                mock.patch.object(self.soak_tool, "fetch") as fetch,
+                mock.patch.object(
+                    self.soak_tool,
+                    "start_power_assertion",
+                ) as start_power_assertion,
+                mock.patch.object(self.soak_tool.subprocess, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.soak_tool.main()
+
+            self.assertEqual(result, 2)
+            self.assertEqual(
+                stderr.getvalue(),
+                "compatforge-gui-soak: cycles.jsonl must be a bounded regular file\n",
+            )
+            self.assertTrue(cycles_path.is_symlink())
+            self.assertFalse(target.exists())
+            fetch.assert_not_called()
+            start_power_assertion.assert_not_called()
+            run.assert_not_called()
+
+    def test_soak_resume_rejects_dangling_configuration_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-config-link-") as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            output_root.mkdir()
+            configuration_path = output_root / "configuration.json"
+            target = root / "missing-configuration.json"
+            try:
+                configuration_path.symlink_to(target)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            runtime = self.soak_runtime_selection(root)
+
+            with self.assertRaises(self.baseline.AcceptanceError) as direct_failure:
+                self.soak_tool.write_configuration(
+                    configuration_path,
+                    {"winmerge"},
+                    1,
+                    runtime,
+                )
+            self.assertEqual(
+                str(direct_failure.exception),
+                "configuration.json must be a bounded regular file",
+            )
+            self.assertTrue(configuration_path.is_symlink())
+            self.assertFalse(target.exists())
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.soak_main_arguments(
+                        root,
+                        output_root,
+                        runtime,
+                        resume=True,
+                    ),
+                ),
+                mock.patch.object(self.soak_tool, "fetch") as fetch,
+                mock.patch.object(
+                    self.soak_tool,
+                    "start_power_assertion",
+                ) as start_power_assertion,
+                mock.patch.object(self.soak_tool.subprocess, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.soak_tool.main()
+
+            self.assertEqual(result, 2)
+            self.assertEqual(
+                stderr.getvalue(),
+                "compatforge-gui-soak: configuration.json must be a bounded regular file\n",
+            )
+            self.assertTrue(configuration_path.is_symlink())
+            self.assertFalse(target.exists())
+            self.assertFalse((output_root / "runtime").exists())
+            self.assertFalse((output_root / "runs").exists())
+            fetch.assert_not_called()
+            start_power_assertion.assert_not_called()
+            run.assert_not_called()
+
+    def test_soak_rejects_dangling_output_root_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-output-link-") as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            target = root / "missing-output-root"
+            try:
+                output_root.symlink_to(target, target_is_directory=True)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            runtime = self.soak_runtime_selection(root)
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.soak_main_arguments(root, output_root, runtime),
+                ),
+                mock.patch.object(self.soak_tool, "fetch") as fetch,
+                mock.patch.object(
+                    self.soak_tool,
+                    "start_power_assertion",
+                ) as start_power_assertion,
+                mock.patch.object(self.soak_tool.subprocess, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.soak_tool.main()
+
+            self.assertEqual(result, 2)
+            self.assertEqual(
+                stderr.getvalue(),
+                "compatforge-gui-soak: output-root must be a real directory\n",
+            )
+            self.assertTrue(output_root.is_symlink())
+            self.assertFalse(target.exists())
+            fetch.assert_not_called()
+            start_power_assertion.assert_not_called()
+            run.assert_not_called()
+
     def test_soak_runtime_selection_is_required_closed_and_unique(self) -> None:
         common = [
             "--compatforge-cli",

@@ -103,6 +103,8 @@ def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
 
 
 def load_cycle_log(path: Path) -> list[dict[str, object]]:
+    if path.is_symlink():
+        raise AcceptanceError("cycles.jsonl must be a bounded regular file")
     if not path.exists():
         return []
     if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_LOG_BYTES:
@@ -430,6 +432,8 @@ def write_configuration(
     cycles: int,
     runtime: dict[str, str],
 ) -> None:
+    if path.is_symlink():
+        raise AcceptanceError("configuration.json must be a bounded regular file")
     value = configuration_value(selected, cycles, runtime)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -492,7 +496,9 @@ def main() -> int:
         cli = absolute(arguments.compatforge_cli, "compatforge-cli")
         cache_root = absolute(arguments.cache_root, "cache-root", external=True)
         output_root = absolute(arguments.output_root, "output-root", external=True)
-        if output_root.exists() and (not output_root.is_dir() or output_root.is_symlink()):
+        if output_root.is_symlink() or (
+            output_root.exists() and not output_root.is_dir()
+        ):
             raise AcceptanceError("output-root must be a real directory")
         known = {asset.app_id for asset in CERTIFICATION_ASSETS}
         selected = set(arguments.applications or known)
@@ -505,6 +511,8 @@ def main() -> int:
         entries = load_cycle_log(cycles_path) if arguments.resume else []
         if not arguments.resume and output_root.exists() and any(output_root.iterdir()):
             raise AcceptanceError("output-root must be empty unless --resume is used")
+        if configuration_path.is_symlink():
+            raise AcceptanceError("configuration.json must be a bounded regular file")
         configuration_exists = configuration_path.exists()
         if arguments.resume:
             if configuration_exists:
