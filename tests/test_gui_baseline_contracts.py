@@ -4630,11 +4630,154 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                         with self.assertRaises(self.baseline.AcceptanceError):
                             self.soak_tool.runtime_selection(mutant)
 
+    def test_soak_runtime_projection_is_closed_and_path_free(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-projection-") as temporary:
+            runtime = self.soak_runtime_selection(Path(temporary))
+            receipt = {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "packId": "macos-explicit",
+                "version": runtime["version"],
+                "packDigest": "sha256:" + "d" * 64,
+                "source": "explicit-override",
+            }
+            summary = {
+                "receipt": receipt,
+                "compatibilityResults": [
+                    {
+                        "host": {
+                            "os": "macos",
+                            "version": "15.6",
+                            "architecture": "arm64",
+                        }
+                    }
+                ],
+            }
+
+            projection = self.soak_tool.runtime_projection(summary, runtime)
+            self.assertEqual(
+                projection,
+                {
+                    "runtimeId": "crossover",
+                    "version": runtime["version"],
+                    "architecture": "arm64",
+                    "packDigest": "sha256:" + "d" * 64,
+                },
+            )
+            serialized = json.dumps(projection)
+            self.assertNotIn("wineRoot", serialized)
+            self.assertNotIn(json.dumps(temporary)[1:-1], serialized)
+
+            activated = json.loads(json.dumps(summary))
+            activated["receipt"]["activated"] = True
+            self.assertEqual(self.soak_tool.runtime_projection(activated, runtime), projection)
+
+            mutations: list[tuple[str, dict[str, object]]] = []
+
+            def mutate(name: str, callback) -> None:
+                value = json.loads(json.dumps(summary))
+                callback(value)
+                mutations.append((name, value))
+
+            mutate("missing receipt", lambda value: value.pop("receipt"))
+            mutate("receipt is not an object", lambda value: value.__setitem__("receipt", []))
+            mutate(
+                "unknown receipt key",
+                lambda value: value["receipt"].__setitem__("wineRoot", temporary),
+            )
+            mutate("missing required receipt key", lambda value: value["receipt"].pop("packId"))
+            mutate(
+                "receipt schema mismatch",
+                lambda value: value["receipt"].__setitem__("schemaVersion", "2"),
+            )
+            mutate(
+                "runtimeId mismatch",
+                lambda value: value["receipt"].__setitem__("runtimeId", "whisky"),
+            )
+            mutate(
+                "version mismatch",
+                lambda value: value["receipt"].__setitem__("version", "24.0"),
+            )
+            for field in ("packId", "source"):
+                for invalid in ("", 1):
+                    mutate(
+                        f"invalid {field} {invalid!r}",
+                        lambda value, field=field, invalid=invalid: value["receipt"].__setitem__(
+                            field, invalid
+                        ),
+                    )
+            for invalid in (
+                "md5:" + "d" * 64,
+                "sha256:" + "d" * 63,
+                "sha256:" + "D" * 64,
+            ):
+                mutate(
+                    f"invalid digest {invalid}",
+                    lambda value, invalid=invalid: value["receipt"].__setitem__(
+                        "packDigest", invalid
+                    ),
+                )
+            mutate(
+                "activated is not a bool",
+                lambda value: value["receipt"].__setitem__("activated", 1),
+            )
+            mutate(
+                "missing compatibility results",
+                lambda value: value.pop("compatibilityResults"),
+            )
+            mutate(
+                "empty compatibility results",
+                lambda value: value.__setitem__("compatibilityResults", []),
+            )
+            mutate(
+                "compatibility results is not a list",
+                lambda value: value.__setitem__("compatibilityResults", {}),
+            )
+            mutate(
+                "compatibility result is not an object",
+                lambda value: value.__setitem__("compatibilityResults", [None]),
+            )
+            mutate(
+                "missing host",
+                lambda value: value["compatibilityResults"][0].pop("host"),
+            )
+            mutate(
+                "host is not an object",
+                lambda value: value["compatibilityResults"][0].__setitem__("host", []),
+            )
+            mutate(
+                "host is not macos",
+                lambda value: value["compatibilityResults"][0]["host"].__setitem__(
+                    "os", "windows"
+                ),
+            )
+            mutate(
+                "missing architecture",
+                lambda value: value["compatibilityResults"][0]["host"].pop("architecture"),
+            )
+            for invalid in ("", 1):
+                mutate(
+                    f"invalid architecture {invalid!r}",
+                    lambda value, invalid=invalid: value["compatibilityResults"][0][
+                        "host"
+                    ].__setitem__("architecture", invalid),
+                )
+            mutate(
+                "inconsistent architectures",
+                lambda value: value["compatibilityResults"].append(
+                    {"host": {"os": "macos", "architecture": "x86_64"}}
+                ),
+            )
+
+            for name, mutant in mutations:
+                with self.subTest(name=name), self.assertRaises(self.baseline.AcceptanceError):
+                    self.soak_tool.runtime_projection(mutant, runtime)
+
     def test_soak_distinguishes_verified_lifecycle_from_acceptance_and_infrastructure(self) -> None:
         asset = self.assets.asset_for("everything-x86")
 
         def result(classification: str, visible: bool) -> dict[str, object]:
-            return self.baseline.compatibility_result(
+            value = self.baseline.compatibility_result(
                 asset,
                 {
                     "status": "unverified",
@@ -4654,41 +4797,165 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 "2026-08-18T10:00:00Z",
                 "2026-08-18T10:01:00Z",
             )
+            value["host"] = {"os": "macos", "version": "15.6", "architecture": "arm64"}
+            return value
 
-        verified = self.soak_tool.classify_summary(
-            {
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-classification-") as temporary:
+            runtime = self.soak_runtime_selection(Path(temporary))
+            receipt = {
                 "schemaVersion": "1",
-                "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
-                "compatibilityResults": [result("policy-blocked", True)],
-            },
-            {"everything-x86"},
-        )
-        self.assertEqual(verified["status"], "verified")
-        self.assertFalse(verified["hardFailure"])
-        self.assertEqual(verified["applications"][0]["outcome"], "blocked")
+                "runtimeId": runtime["runtimeId"],
+                "packId": "macos-explicit",
+                "version": runtime["version"],
+                "packDigest": "sha256:" + "d" * 64,
+                "source": "explicit-override",
+            }
 
-        duplicate_check = result("policy-blocked", True)
-        duplicate_check["checks"].append(duplicate_check["checks"][0])
-        with self.assertRaises(self.baseline.AcceptanceError):
-            self.soak_tool.classify_summary(
-                {
+            def summary(application: dict[str, object]) -> dict[str, object]:
+                return {
                     "schemaVersion": "1",
                     "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
-                    "compatibilityResults": [duplicate_check],
-                },
+                    "receipt": dict(receipt),
+                    "compatibilityResults": [application],
+                }
+
+            verified_summary = summary(result("policy-blocked", True))
+            verified = self.soak_tool.classify_summary(
+                verified_summary,
                 {"everything-x86"},
+                runtime,
+            )
+            self.assertEqual(verified["status"], "verified")
+            self.assertFalse(verified["hardFailure"])
+            self.assertFalse(verified["infrastructureBlocked"])
+            self.assertEqual(verified["applications"][0]["outcome"], "blocked")
+            self.assertEqual(
+                verified["runtime"],
+                {
+                    "runtimeId": runtime["runtimeId"],
+                    "version": runtime["version"],
+                    "architecture": "arm64",
+                    "packDigest": receipt["packDigest"],
+                },
             )
 
-        unavailable = self.soak_tool.classify_summary(
-            {
-                "schemaVersion": "1",
-                "testSuiteVersion": self.baseline.TEST_SUITE_VERSION,
-                "compatibilityResults": [result("test-infrastructure", False)],
-            },
-            {"everything-x86"},
-        )
-        self.assertEqual(unavailable["status"], "unverified")
-        self.assertFalse(unavailable["hardFailure"])
+            infrastructure_with_passing_lifecycle = self.soak_tool.classify_summary(
+                summary(result("test-infrastructure", True)),
+                {"everything-x86"},
+                runtime,
+            )
+            self.assertEqual(infrastructure_with_passing_lifecycle["status"], "unverified")
+            self.assertTrue(infrastructure_with_passing_lifecycle["infrastructureBlocked"])
+            self.assertFalse(infrastructure_with_passing_lifecycle["hardFailure"])
+
+            infrastructure_without_observations = self.soak_tool.classify_summary(
+                summary(result("test-infrastructure", False)),
+                {"everything-x86"},
+                runtime,
+            )
+            self.assertEqual(infrastructure_without_observations["status"], "unverified")
+            self.assertTrue(infrastructure_without_observations["infrastructureBlocked"])
+            self.assertFalse(infrastructure_without_observations["hardFailure"])
+
+            runtime_regression = self.soak_tool.classify_summary(
+                summary(result("runtime-regression", True)),
+                {"everything-x86"},
+                runtime,
+            )
+            self.assertEqual(runtime_regression["status"], "failed")
+            self.assertTrue(runtime_regression["hardFailure"])
+
+            policy_lifecycle_failure = self.soak_tool.classify_summary(
+                summary(result("policy-blocked", False)),
+                {"everything-x86"},
+                runtime,
+            )
+            self.assertEqual(policy_lifecycle_failure["status"], "failed")
+            self.assertTrue(policy_lifecycle_failure["hardFailure"])
+
+            no_classification = result("policy-blocked", True)
+            no_classification.pop("failureClassification")
+            no_classification["outcome"] = "passed"
+            self.assertEqual(
+                self.soak_tool.classify_summary(
+                    summary(no_classification),
+                    {"everything-x86"},
+                    runtime,
+                )["status"],
+                "verified",
+            )
+
+            for invalid in ("unsupported", 1):
+                unknown_classification = result("policy-blocked", True)
+                unknown_classification["failureClassification"] = invalid
+                with self.subTest(classification=invalid), self.assertRaises(
+                    self.baseline.AcceptanceError
+                ):
+                    self.soak_tool.classify_summary(
+                        summary(unknown_classification),
+                        {"everything-x86"},
+                        runtime,
+                    )
+
+            for invalid in ("skipped", "unknown", 1, None):
+                unknown_outcome = result("policy-blocked", True)
+                unknown_outcome["outcome"] = invalid
+                with self.subTest(outcome=invalid), self.assertRaises(
+                    self.baseline.AcceptanceError
+                ):
+                    self.soak_tool.classify_summary(
+                        summary(unknown_outcome),
+                        {"everything-x86"},
+                        runtime,
+                    )
+
+            duplicate_check = result("policy-blocked", True)
+            duplicate_check["checks"].append(duplicate_check["checks"][0])
+            with self.assertRaises(self.baseline.AcceptanceError):
+                self.soak_tool.classify_summary(
+                    summary(duplicate_check),
+                    {"everything-x86"},
+                    runtime,
+                )
+
+            missing_check = result("policy-blocked", True)
+            missing_check["checks"] = [
+                check for check in missing_check["checks"] if check["id"] != "screenshot"
+            ]
+            with self.assertRaises(self.baseline.AcceptanceError):
+                self.soak_tool.classify_summary(
+                    summary(missing_check),
+                    {"everything-x86"},
+                    runtime,
+                )
+
+            self.assertEqual(
+                self.soak_tool.classify_summary(
+                    verified_summary,
+                    {"everything-x86"},
+                    runtime,
+                    verified["runtime"],
+                ),
+                verified,
+            )
+            stable_runtime_mutations = {
+                "runtimeId": "whisky",
+                "version": "24.0",
+                "architecture": "x86_64",
+                "packDigest": "sha256:" + "e" * 64,
+            }
+            for field, replacement in stable_runtime_mutations.items():
+                mutant = dict(verified["runtime"])
+                mutant[field] = replacement
+                with self.subTest(stable_runtime=field), self.assertRaises(
+                    self.baseline.AcceptanceError
+                ):
+                    self.soak_tool.classify_summary(
+                        verified_summary,
+                        {"everything-x86"},
+                        runtime,
+                        mutant,
+                    )
 
     def test_soak_resume_configuration_is_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-resume-") as temporary:

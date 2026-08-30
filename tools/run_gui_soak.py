@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import uuid
@@ -34,8 +35,16 @@ SOAK_CHECKS = {
     "bottle-cleanup",
     "no-residual-processes",
 }
+SOAK_FAILURE_CLASSIFICATIONS = {
+    None,
+    "policy-blocked",
+    "test-infrastructure",
+    "runtime-regression",
+}
+SOAK_OUTCOMES = {"passed", "blocked", "failed"}
 MAX_CYCLES = 1000
 MAX_LOG_BYTES = 16 * 1024 * 1024
+RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -108,9 +117,75 @@ def load_cycle_log(path: Path) -> list[dict[str, object]]:
     return entries
 
 
-def classify_summary(summary: dict[str, object], expected_apps: set[str]) -> dict[str, object]:
+def runtime_projection(
+    summary: dict[str, object],
+    expected_runtime: dict[str, str],
+) -> dict[str, str]:
+    receipt = summary.get("receipt")
+    required_receipt = {
+        "schemaVersion",
+        "runtimeId",
+        "packId",
+        "version",
+        "packDigest",
+        "source",
+    }
+    if (
+        not isinstance(receipt, dict)
+        or not required_receipt.issubset(receipt)
+        or not set(receipt).issubset(required_receipt | {"activated"})
+        or receipt.get("schemaVersion") != "1"
+        or receipt.get("runtimeId") != expected_runtime["runtimeId"]
+        or receipt.get("version") != expected_runtime["version"]
+        or not isinstance(receipt.get("packId"), str)
+        or not receipt["packId"]
+        or not isinstance(receipt.get("source"), str)
+        or not receipt["source"]
+        or not isinstance(receipt.get("packDigest"), str)
+        or RUNTIME_DIGEST.fullmatch(receipt["packDigest"]) is None
+        or ("activated" in receipt and type(receipt["activated"]) is not bool)
+    ):
+        raise AcceptanceError("cycle summary contains an invalid runtime receipt")
+
+    raw_results = summary.get("compatibilityResults")
+    if not isinstance(raw_results, list) or not raw_results:
+        raise AcceptanceError("cycle summary omitted compatibility host evidence")
+    architecture: str | None = None
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            raise AcceptanceError("cycle compatibility result is not an object")
+        host = raw.get("host")
+        if not isinstance(host, dict) or host.get("os") != "macos":
+            raise AcceptanceError("cycle compatibility result has invalid host evidence")
+        current_architecture = host.get("architecture")
+        if not isinstance(current_architecture, str) or not current_architecture:
+            raise AcceptanceError("cycle compatibility result has invalid host architecture")
+        if architecture is None:
+            architecture = current_architecture
+        elif current_architecture != architecture:
+            raise AcceptanceError("cycle compatibility results have inconsistent host architecture")
+
+    if architecture is None:
+        raise AcceptanceError("cycle summary omitted compatibility host evidence")
+    return {
+        "runtimeId": expected_runtime["runtimeId"],
+        "version": expected_runtime["version"],
+        "architecture": architecture,
+        "packDigest": receipt["packDigest"],
+    }
+
+
+def classify_summary(
+    summary: dict[str, object],
+    expected_apps: set[str],
+    expected_runtime: dict[str, str],
+    stable_runtime: dict[str, str] | None = None,
+) -> dict[str, object]:
     if summary.get("schemaVersion") != "1" or summary.get("testSuiteVersion") != TEST_SUITE_VERSION:
         raise AcceptanceError("cycle summary uses an unsupported contract")
+    runtime = runtime_projection(summary, expected_runtime)
+    if stable_runtime is not None and runtime != stable_runtime:
+        raise AcceptanceError("cycle summary runtime changed during soak")
     raw_results = summary.get("compatibilityResults")
     if not isinstance(raw_results, list) or len(raw_results) != len(expected_apps):
         raise AcceptanceError("cycle summary does not contain the selected application set")
@@ -142,15 +217,23 @@ def classify_summary(summary: dict[str, object], expected_apps: set[str]) -> dic
         if not SOAK_CHECKS.issubset(projected):
             raise AcceptanceError("cycle compatibility result omitted a soak check")
         classification = raw.get("failureClassification")
+        if classification is not None and (
+            not isinstance(classification, str)
+            or classification not in SOAK_FAILURE_CLASSIFICATIONS
+        ):
+            raise AcceptanceError("cycle compatibility result has an invalid failure classification")
+        outcome = raw.get("outcome")
+        if not isinstance(outcome, str) or outcome not in SOAK_OUTCOMES:
+            raise AcceptanceError("cycle compatibility result has an invalid outcome")
         lifecycle_passed = all(projected[name] == "passed" for name in SOAK_CHECKS)
-        if classification == "test-infrastructure" and not lifecycle_passed:
+        if classification == "test-infrastructure":
             infrastructure_blocked = True
-        elif not lifecycle_passed:
+        elif classification == "runtime-regression" or not lifecycle_passed:
             hard_failure = True
         applications.append(
             {
                 "recipeId": recipe_id,
-                "outcome": raw.get("outcome"),
+                "outcome": outcome,
                 **({"failureClassification": classification} if isinstance(classification, str) else {}),
                 "lifecyclePassed": lifecycle_passed,
                 "checks": {name: projected[name] for name in sorted(SOAK_CHECKS)},
@@ -163,6 +246,7 @@ def classify_summary(summary: dict[str, object], expected_apps: set[str]) -> dic
         "status": status,
         "hardFailure": hard_failure,
         "infrastructureBlocked": infrastructure_blocked,
+        "runtime": runtime,
         "applications": applications,
     }
 
