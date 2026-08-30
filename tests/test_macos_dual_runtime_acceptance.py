@@ -5696,7 +5696,7 @@ raise SystemExit(1)
             signal_group.call_args_list,
             [
                 mock.call(4242, acceptance.signal.SIGTERM),
-                mock.call(4242, acceptance.signal.SIGKILL),
+                mock.call(4242, acceptance.SIGKILL),
             ],
         )
 

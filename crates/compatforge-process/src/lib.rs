@@ -1555,7 +1555,9 @@ mod platform {
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::path::Path;
-    use std::process::{Child, Command, Stdio};
+    #[cfg(target_os = "macos")]
+    use std::process::Stdio;
+    use std::process::{Child, Command};
     #[cfg(target_os = "macos")]
     use std::thread;
     #[cfg(target_os = "macos")]
