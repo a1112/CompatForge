@@ -42,9 +42,11 @@ SOAK_FAILURE_CLASSIFICATIONS = {
     "runtime-regression",
 }
 SOAK_OUTCOMES = {"passed", "blocked", "failed"}
+SOAK_ARCHITECTURES = {"arm64", "x86_64"}
 MAX_CYCLES = 1000
 MAX_LOG_BYTES = 16 * 1024 * 1024
 RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+RUNTIME_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+() -]*")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -117,10 +119,21 @@ def load_cycle_log(path: Path) -> list[dict[str, object]]:
     return entries
 
 
+def _runtime_version(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 128
+        or RUNTIME_VERSION.fullmatch(value) is None
+    ):
+        raise AcceptanceError("cycle Runtime version is invalid")
+    return value
+
+
 def runtime_projection(
     summary: dict[str, object],
     expected_runtime: dict[str, str],
 ) -> dict[str, str]:
+    expected_version = _runtime_version(expected_runtime.get("version"))
     receipt = summary.get("receipt")
     required_receipt = {
         "schemaVersion",
@@ -136,7 +149,6 @@ def runtime_projection(
         or not set(receipt).issubset(required_receipt | {"activated"})
         or receipt.get("schemaVersion") != "1"
         or receipt.get("runtimeId") != expected_runtime["runtimeId"]
-        or receipt.get("version") != expected_runtime["version"]
         or not isinstance(receipt.get("packId"), str)
         or not receipt["packId"]
         or not isinstance(receipt.get("source"), str)
@@ -146,19 +158,34 @@ def runtime_projection(
         or ("activated" in receipt and type(receipt["activated"]) is not bool)
     ):
         raise AcceptanceError("cycle summary contains an invalid runtime receipt")
+    receipt_version = _runtime_version(receipt["version"])
+    if receipt_version != expected_version:
+        raise AcceptanceError("cycle summary contains an invalid runtime receipt")
 
     raw_results = summary.get("compatibilityResults")
     if not isinstance(raw_results, list) or not raw_results:
         raise AcceptanceError("cycle summary omitted compatibility host evidence")
+    receipt_digest = receipt["packDigest"]
     architecture: str | None = None
     for raw in raw_results:
         if not isinstance(raw, dict):
             raise AcceptanceError("cycle compatibility result is not an object")
+        result_digest = raw.get("runtimePackDigest")
+        if not isinstance(result_digest, str) or RUNTIME_DIGEST.fullmatch(result_digest) is None:
+            raise AcceptanceError("cycle compatibility result has an invalid Runtime digest")
+        if result_digest != receipt_digest:
+            raise AcceptanceError("cycle compatibility result Runtime digest differs from receipt")
         host = raw.get("host")
         if not isinstance(host, dict) or host.get("os") != "macos":
             raise AcceptanceError("cycle compatibility result has invalid host evidence")
+        host_version = host.get("version")
+        if not isinstance(host_version, str) or not host_version:
+            raise AcceptanceError("cycle compatibility result has invalid host version")
         current_architecture = host.get("architecture")
-        if not isinstance(current_architecture, str) or not current_architecture:
+        if (
+            not isinstance(current_architecture, str)
+            or current_architecture not in SOAK_ARCHITECTURES
+        ):
             raise AcceptanceError("cycle compatibility result has invalid host architecture")
         if architecture is None:
             architecture = current_architecture
@@ -169,9 +196,9 @@ def runtime_projection(
         raise AcceptanceError("cycle summary omitted compatibility host evidence")
     return {
         "runtimeId": expected_runtime["runtimeId"],
-        "version": expected_runtime["version"],
+        "version": expected_version,
         "architecture": architecture,
-        "packDigest": receipt["packDigest"],
+        "packDigest": receipt_digest,
     }
 
 
@@ -216,25 +243,38 @@ def classify_summary(
             projected[check_id] = str(outcome)
         if not SOAK_CHECKS.issubset(projected):
             raise AcceptanceError("cycle compatibility result omitted a soak check")
-        classification = raw.get("failureClassification")
-        if classification is not None and (
-            not isinstance(classification, str)
-            or classification not in SOAK_FAILURE_CLASSIFICATIONS
-        ):
-            raise AcceptanceError("cycle compatibility result has an invalid failure classification")
         outcome = raw.get("outcome")
         if not isinstance(outcome, str) or outcome not in SOAK_OUTCOMES:
             raise AcceptanceError("cycle compatibility result has an invalid outcome")
+        classification_present = "failureClassification" in raw
+        classification = raw.get("failureClassification")
+        if outcome == "passed":
+            if classification_present:
+                raise AcceptanceError(
+                    "passed cycle compatibility result has a failure classification"
+                )
+        elif (
+            not classification_present
+            or not isinstance(classification, str)
+            or classification not in SOAK_FAILURE_CLASSIFICATIONS
+        ):
+            raise AcceptanceError(
+                "non-passing cycle compatibility result requires a failure classification"
+            )
         lifecycle_passed = all(projected[name] == "passed" for name in SOAK_CHECKS)
         if classification == "test-infrastructure":
             infrastructure_blocked = True
-        elif classification == "runtime-regression" or not lifecycle_passed:
+        if (
+            outcome == "failed"
+            or classification == "runtime-regression"
+            or (classification != "test-infrastructure" and not lifecycle_passed)
+        ):
             hard_failure = True
         applications.append(
             {
                 "recipeId": recipe_id,
                 "outcome": outcome,
-                **({"failureClassification": classification} if isinstance(classification, str) else {}),
+                **({"failureClassification": classification} if classification_present else {}),
                 "lifecyclePassed": lifecycle_passed,
                 "checks": {name: projected[name] for name in sorted(SOAK_CHECKS)},
             }

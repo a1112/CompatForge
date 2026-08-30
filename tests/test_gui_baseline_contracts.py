@@ -4645,6 +4645,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 "receipt": receipt,
                 "compatibilityResults": [
                     {
+                        "runtimePackDigest": receipt["packDigest"],
                         "host": {
                             "os": "macos",
                             "version": "15.6",
@@ -4671,6 +4672,35 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             activated = json.loads(json.dumps(summary))
             activated["receipt"]["activated"] = True
             self.assertEqual(self.soak_tool.runtime_projection(activated, runtime), projection)
+
+            for common_version in ("24.0", "7.7"):
+                common_summary = json.loads(json.dumps(summary))
+                common_summary["receipt"]["version"] = common_version
+                common_runtime = dict(runtime)
+                common_runtime["version"] = common_version
+                with self.subTest(common_version=common_version):
+                    self.assertEqual(
+                        self.soak_tool.runtime_projection(common_summary, common_runtime)[
+                            "version"
+                        ],
+                        common_version,
+                    )
+
+            for invalid_version in (
+                "",
+                "/Users/private/runtime",
+                "C:\\private",
+                "24.0\nprivate",
+                "a" * 129,
+            ):
+                invalid_summary = json.loads(json.dumps(summary))
+                invalid_summary["receipt"]["version"] = invalid_version
+                invalid_runtime = dict(runtime)
+                invalid_runtime["version"] = invalid_version
+                with self.subTest(version=invalid_version), self.assertRaises(
+                    self.baseline.AcceptanceError
+                ):
+                    self.soak_tool.runtime_projection(invalid_summary, invalid_runtime)
 
             mutations: list[tuple[str, dict[str, object]]] = []
 
@@ -4738,6 +4768,36 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 lambda value: value.__setitem__("compatibilityResults", [None]),
             )
             mutate(
+                "missing compatibility result Runtime digest",
+                lambda value: value["compatibilityResults"][0].pop("runtimePackDigest"),
+            )
+            for invalid in (1, "not-a-digest"):
+                mutate(
+                    f"invalid compatibility result Runtime digest {invalid!r}",
+                    lambda value, invalid=invalid: value["compatibilityResults"][0].__setitem__(
+                        "runtimePackDigest", invalid
+                    ),
+                )
+            mutate(
+                "compatibility result Runtime digest differs from receipt",
+                lambda value: value["compatibilityResults"][0].__setitem__(
+                    "runtimePackDigest", "sha256:" + "e" * 64
+                ),
+            )
+            mutate(
+                "later compatibility result Runtime digest differs from receipt",
+                lambda value: value["compatibilityResults"].append(
+                    {
+                        "runtimePackDigest": "sha256:" + "e" * 64,
+                        "host": {
+                            "os": "macos",
+                            "version": "15.6",
+                            "architecture": "arm64",
+                        },
+                    }
+                ),
+            )
+            mutate(
                 "missing host",
                 lambda value: value["compatibilityResults"][0].pop("host"),
             )
@@ -4752,10 +4812,21 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ),
             )
             mutate(
+                "missing host version",
+                lambda value: value["compatibilityResults"][0]["host"].pop("version"),
+            )
+            for invalid in ("", 1):
+                mutate(
+                    f"invalid host version {invalid!r}",
+                    lambda value, invalid=invalid: value["compatibilityResults"][0][
+                        "host"
+                    ].__setitem__("version", invalid),
+                )
+            mutate(
                 "missing architecture",
                 lambda value: value["compatibilityResults"][0]["host"].pop("architecture"),
             )
-            for invalid in ("", 1):
+            for invalid in ("", 1, "sparc"):
                 mutate(
                     f"invalid architecture {invalid!r}",
                     lambda value, invalid=invalid: value["compatibilityResults"][0][
@@ -4765,7 +4836,14 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             mutate(
                 "inconsistent architectures",
                 lambda value: value["compatibilityResults"].append(
-                    {"host": {"os": "macos", "architecture": "x86_64"}}
+                    {
+                        "runtimePackDigest": receipt["packDigest"],
+                        "host": {
+                            "os": "macos",
+                            "version": "15.6",
+                            "architecture": "x86_64",
+                        },
+                    }
                 ),
             )
 
@@ -4884,6 +4962,36 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 )["status"],
                 "verified",
             )
+
+            classification_relations = (
+                ("passed with policy classification", "passed", True, "policy-blocked"),
+                ("passed with explicit null classification", "passed", True, None),
+                ("blocked without classification", "blocked", False, None),
+                ("failed without classification", "failed", False, None),
+            )
+            for name, outcome, classification_present, classification in classification_relations:
+                application = result("policy-blocked", True)
+                application["outcome"] = outcome
+                if classification_present:
+                    application["failureClassification"] = classification
+                else:
+                    application.pop("failureClassification")
+                with self.subTest(name=name), self.assertRaises(self.baseline.AcceptanceError):
+                    self.soak_tool.classify_summary(
+                        summary(application),
+                        {"everything-x86"},
+                        runtime,
+                    )
+
+            failed_with_policy = result("policy-blocked", True)
+            failed_with_policy["outcome"] = "failed"
+            failed_projection = self.soak_tool.classify_summary(
+                summary(failed_with_policy),
+                {"everything-x86"},
+                runtime,
+            )
+            self.assertEqual(failed_projection["status"], "failed")
+            self.assertTrue(failed_projection["hardFailure"])
 
             for invalid in ("unsupported", 1):
                 unknown_classification = result("policy-blocked", True)
