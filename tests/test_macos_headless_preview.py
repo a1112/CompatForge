@@ -176,6 +176,10 @@ print(run_gui_baseline.installed_executable(asset, pathlib.Path(sys.argv[2])))
             env={"PATH": os.environ.get("PATH", "")},
         )
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX executable modes and atomic directory fsync are required",
+    )
     def test_registration_is_deterministic_source_read_only_and_rust_compatible(self) -> None:
         before = {path: path.read_bytes() for path in (self.wine, self.wineserver)}
         first = self.run_register(self.root / "first")
@@ -201,6 +205,10 @@ print(run_gui_baseline.installed_executable(asset, pathlib.Path(sys.argv[2])))
         self.assertEqual(before, {path: path.read_bytes() for path in before})
         self.assertEqual(sha256(self.root / "first/bundle/components/wine-entrypoint.bin"), sha256(self.wine))
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX executable modes and atomic directory fsync are required",
+    )
     def test_identical_existing_output_is_idempotent_but_foreign_output_fails(self) -> None:
         output = self.root / "output"
         self.assertEqual(self.run_register(output).returncode, 0)
@@ -567,9 +575,18 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
                 component.write_bytes(b"graphics-driver-fixture")
         return self.module.Candidate(source, root, "bin/wine", "bin/wineserver")
 
+    def verify_candidate(self, candidate, runner):
+        # These tests own candidate selection, architecture, and version contracts.
+        # Windows cannot represent their executable-mode fixture; POSIX keeps the
+        # production verifier here and in the dedicated negative contract below.
+        if os.name == "nt":
+            with mock.patch.object(self.module, "regular_executable", return_value=True):
+                return self.module.verify_candidate(candidate, runner)
+        return self.module.verify_candidate(candidate, runner)
+
     def test_whisky_requires_paired_x86_64_graphics_modules(self) -> None:
         candidate = self.make_candidate("whisky-library", "whisky-graphics")
-        self.assertIsNotNone(self.module.verify_candidate(candidate, self.successful_runner))
+        self.assertIsNotNone(self.verify_candidate(candidate, self.successful_runner))
 
         for relative in self.module.WHISKY_GRAPHICS_COMPONENTS:
             with self.subTest(relative=relative):
@@ -577,7 +594,7 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
                 payload = component.read_bytes()
                 component.unlink()
                 self.assertIsNone(
-                    self.module.verify_candidate(candidate, self.successful_runner)
+                    self.verify_candidate(candidate, self.successful_runner)
                 )
                 component.write_bytes(payload)
 
@@ -592,11 +609,12 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     def discover_all(self, candidates, runner):
-        # Windows does not preserve the executable bit used by the macOS-only
-        # verifier. Keep these enumeration tests focused on the closed candidate
-        # classification while the existing verifier tests own that invariant.
-        with mock.patch.object(self.module, "regular_executable", return_value=True):
-            return self.module.discover_all(candidates, runner=runner)
+        # Windows cannot represent the executable-mode fixture; POSIX keeps the
+        # production verifier for these positive enumeration contracts.
+        if os.name == "nt":
+            with mock.patch.object(self.module, "regular_executable", return_value=True):
+                return self.module.discover_all(candidates, runner=runner)
+        return self.module.discover_all(candidates, runner=runner)
 
     def test_runtime_id_is_a_closed_source_classification(self) -> None:
         cases = (
@@ -693,12 +711,12 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
             [(candidate.wine, candidate.wineserver) for candidate in candidates],
             [("bin/wineloader", "bin/wineserver"), ("bin/wine", "bin/wineserver")],
         )
-        selected = self.module.verify_candidate(candidates[0], self.successful_runner)
+        selected = self.verify_candidate(candidates[0], self.successful_runner)
         self.assertIsNotNone(selected)
         self.assertEqual(selected["wine"], "bin/wineloader")
 
         (root / "bin/wineloader").unlink()
-        selected = self.module.verify_candidate(candidates[1], self.successful_runner)
+        selected = self.verify_candidate(candidates[1], self.successful_runner)
         self.assertIsNotNone(selected)
         self.assertEqual(selected["wine"], "bin/wine")
 
@@ -717,7 +735,7 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
             "crossover-app", root, "bin/wine", "bin/wineserver"
         )
 
-        self.assertIsNone(self.module.verify_candidate(candidate, self.successful_runner))
+        self.assertIsNone(self.verify_candidate(candidate, self.successful_runner))
 
     def test_crossover_wineloader_keeps_thin_x86_64_and_root_checks(self) -> None:
         root = self.root / "crossover-invalid-architecture"
@@ -735,7 +753,7 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
         candidate = self.module.Candidate(
             "crossover-app", root, "bin/wineloader", "bin/wineserver"
         )
-        self.assertIsNone(self.module.verify_candidate(candidate, self.successful_runner))
+        self.assertIsNone(self.verify_candidate(candidate, self.successful_runner))
 
         wineloader.write_bytes(
             b"\xcf\xfa\xed\xfe" + (0x0100_0007).to_bytes(4, "little") + b"fixture"
@@ -745,7 +763,7 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
         outside.chmod(0o700)
         wineloader.unlink()
         wineloader.symlink_to(outside)
-        self.assertIsNone(self.module.verify_candidate(candidate, self.successful_runner))
+        self.assertIsNone(self.verify_candidate(candidate, self.successful_runner))
 
     def test_discover_all_selects_first_verified_candidate_per_required_runtime(self) -> None:
         invalid_crossover = self.make_candidate("crossover-app", "crossover-invalid-macho")
@@ -928,17 +946,17 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
         def runner(argv, **kwargs):
             calls.append(list(argv))
             self.assertEqual(kwargs["env"], {"LANG": "C", "LC_ALL": "C", "WINEDEBUG": "-all"})
-            stdout = "wine-11.11\n" if argv[0].endswith("/wine") else "Wine 11.11\n"
+            stdout = "wine-11.11\n" if Path(argv[0]).name == "wine" else "Wine 11.11\n"
             return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
         candidate = self.module.Candidate("test", self.root, "loader/wine", "server/wineserver")
-        selected = self.module.verify_candidate(candidate, runner)
+        selected = self.verify_candidate(candidate, runner)
         self.assertEqual(selected["version"], "11.11")
         self.assertEqual(selected["wine"], "loader/wine")
         self.assertEqual(len(calls), 2)
 
         self.wine.write_bytes(b"\xcf\xfa\xed\xfe" + (0x0100_000C).to_bytes(4, "little") + b"fixture")
-        self.assertIsNone(self.module.verify_candidate(candidate, runner))
+        self.assertIsNone(self.verify_candidate(candidate, runner))
 
     def test_discovery_rejects_failed_version_probe_and_escaping_entrypoint(self) -> None:
         candidate = self.module.Candidate("test", self.root, "loader/wine", "server/wineserver")
@@ -946,13 +964,23 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
         def failed(argv, **_kwargs):
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="failed")
 
-        self.assertIsNone(self.module.verify_candidate(candidate, failed))
+        self.assertIsNone(self.verify_candidate(candidate, failed))
         outside = self.root.parent / "outside-wine"
         outside.write_bytes(self.wine.read_bytes())
         outside.chmod(0o700)
         self.wine.unlink()
         self.wine.symlink_to(outside)
-        self.assertIsNone(self.module.verify_candidate(candidate, failed))
+        self.assertIsNone(self.verify_candidate(candidate, failed))
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable-mode bits are required")
+    def test_discovery_rejects_non_executable_entrypoint(self) -> None:
+        self.wine.chmod(0o600)
+        candidate = self.module.Candidate(
+            "test", self.root, "loader/wine", "server/wineserver"
+        )
+        self.assertIsNone(
+            self.module.verify_candidate(candidate, self.successful_runner)
+        )
 
 
 if __name__ == "__main__":

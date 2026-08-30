@@ -193,6 +193,14 @@ residuals. The installed Whisky 7.7 Runtime exits before window creation and ind
 that its graphics driver cannot be loaded, including for a basic GUI probe; that remains a
 Runtime-specific acceptance blocker rather than a reason to weaken or bypass the pinned path.
 
+### 2026-08-31 Resolution Note
+
+The later [local dual-Runtime acceptance](../reports/2026-08-21-macos-local-dual-runtime-acceptance.md)
+produced the required Whisky GUI evidence and completed the dual-Runtime developer-local gate. This
+later resolution does not rewrite the checkpoint above: the installed Whisky 7.7 Runtime and host
+state tested at that earlier checkpoint did exit before window creation, so that finding remains an
+accurate historical record.
+
 ## Testing
 
 Required RED/GREEN coverage includes:
