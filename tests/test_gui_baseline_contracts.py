@@ -5397,6 +5397,14 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 )
                 return subprocess.CompletedProcess(command, 0)
 
+            def repository_entry_snapshot() -> tuple[str, ...]:
+                return tuple(
+                    sorted(
+                        path.relative_to(ROOT).as_posix()
+                        for path in ROOT.rglob("*")
+                    )
+                )
+
             stdout = io.StringIO()
             stderr = io.StringIO()
             with (
@@ -5427,9 +5435,15 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
+                repository_entries_before = repository_entry_snapshot()
                 result = self.soak_tool.main()
+                repository_entries_after = repository_entry_snapshot()
 
             self.assertEqual(result, 0)
+            self.assertEqual(
+                repository_entries_after,
+                repository_entries_before,
+            )
             self.assertEqual(stderr.getvalue(), "")
             self.assertEqual(fetch.call_count, 5)
             power.assert_called_once_with()
