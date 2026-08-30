@@ -86,6 +86,10 @@ projection: Runtime ID, Runtime version, architecture, and Runtime Pack digest.
 Every subsequent cycle must reproduce that projection. Any drift is an integrity
 failure and stops the run before it can be reported as verified.
 
+Here, architecture is the macOS host architecture recorded consistently by every
+application result in the cycle. The established bootstrap receipt has no separate
+Runtime-binary architecture field, so the implementation must not invent one.
+
 Absolute Runtime paths may exist in the external local configuration needed for
 safe resume, but they must not enter the committed report or the redacted summary
 projection.
