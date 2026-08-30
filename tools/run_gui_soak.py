@@ -14,7 +14,15 @@ from collections import Counter
 from pathlib import Path
 
 from download_gui_assets import CERTIFICATION_ASSETS
-from run_gui_baseline import AcceptanceError, TEST_SUITE_VERSION, absolute, utc_now
+from run_gui_baseline import (
+    AcceptanceError,
+    RUNTIME_IDS,
+    TEST_SUITE_VERSION,
+    UniqueValueAction,
+    absolute,
+    utc_now,
+    validate_runtime_selection,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tools" / "run_gui_baseline.py"
@@ -31,15 +39,48 @@ MAX_LOG_BYTES = 16 * 1024 * 1024
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(description=__doc__)
+    value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     value.add_argument("--compatforge-cli", required=True)
     value.add_argument("--cache-root", required=True)
     value.add_argument("--output-root", required=True)
+    value.add_argument(
+        "--runtime-id",
+        required=True,
+        choices=RUNTIME_IDS,
+        action=UniqueValueAction,
+    )
+    value.add_argument("--wine-root", required=True, action=UniqueValueAction)
+    value.add_argument("--wine", required=True, action=UniqueValueAction)
+    value.add_argument("--wineserver", required=True, action=UniqueValueAction)
+    value.add_argument("--version", required=True, action=UniqueValueAction)
     value.add_argument("--cycles", type=int, default=60)
     value.add_argument("--app", action="append", dest="applications")
     value.add_argument("--allow-network", action="store_true")
     value.add_argument("--resume", action="store_true")
     return value
+
+
+def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
+    runtime_id = validate_runtime_selection(arguments)
+    if runtime_id is None:
+        raise AcceptanceError("runtime-id is required")
+    wine_root = absolute(arguments.wine_root, "wine-root", external=True)
+
+    entrypoints: dict[str, str] = {}
+    for field in ("wine", "wineserver"):
+        entrypoint = getattr(arguments, field)
+        path = Path(entrypoint)
+        if path.is_absolute() or any(part in (".", "..") for part in path.parts):
+            raise AcceptanceError(f"{field} must be a relative non-traversing path")
+        entrypoints[field] = entrypoint
+
+    return {
+        "runtimeId": runtime_id,
+        "wineRoot": str(wine_root),
+        "wine": entrypoints["wine"],
+        "wineserver": entrypoints["wineserver"],
+        "version": arguments.version,
+    }
 
 
 def load_cycle_log(path: Path) -> list[dict[str, object]]:
@@ -169,29 +210,55 @@ def cycle_application_ids(entry: dict[str, object]) -> set[str]:
     return result
 
 
-def write_configuration(path: Path, selected: set[str], cycles: int) -> None:
-    value = {
+def selected_assets(selected: set[str]) -> list[dict[str, str]]:
+    projected = [
+        {"appId": asset.app_id, "sha256": f"sha256:{asset.sha256}"}
+        for asset in CERTIFICATION_ASSETS
+        if asset.app_id in selected
+    ]
+    if {value["appId"] for value in projected} != selected:
+        raise AcceptanceError("selected certification asset set is invalid")
+    return sorted(projected, key=lambda value: value["appId"])
+
+
+def configuration_value(
+    selected: set[str],
+    cycles: int,
+    runtime: dict[str, str],
+) -> dict[str, object]:
+    return {
         "schemaVersion": "1",
         "testSuiteVersion": TEST_SUITE_VERSION,
         "applications": sorted(selected),
+        "assets": selected_assets(selected),
         "cycles": cycles,
+        "runtimeSelection": runtime,
     }
+
+
+def write_configuration(
+    path: Path,
+    selected: set[str],
+    cycles: int,
+    runtime: dict[str, str],
+) -> None:
+    value = configuration_value(selected, cycles, runtime)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def validate_configuration(path: Path, selected: set[str], cycles: int) -> None:
+def validate_configuration(
+    path: Path,
+    selected: set[str],
+    cycles: int,
+    runtime: dict[str, str],
+) -> None:
     if not path.is_file() or path.is_symlink() or path.stat().st_size > 64 * 1024:
         raise AcceptanceError("configuration.json must be a bounded regular file")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise AcceptanceError("configuration.json is unreadable") from error
-    if value != {
-        "schemaVersion": "1",
-        "testSuiteVersion": TEST_SUITE_VERSION,
-        "applications": sorted(selected),
-        "cycles": cycles,
-    }:
+    if value != configuration_value(selected, cycles, runtime):
         raise AcceptanceError("resume configuration does not match the requested soak")
 
 

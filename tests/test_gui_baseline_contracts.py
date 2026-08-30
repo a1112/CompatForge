@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import dataclasses
 import hashlib
@@ -4521,6 +4522,91 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 }
             )
 
+    def soak_runtime_selection(self, root: Path) -> dict[str, str]:
+        return {
+            "runtimeId": "crossover",
+            "wineRoot": str(root / "CrossOver Runtime"),
+            "wine": "Contents/SharedSupport/CrossOver/bin/wine",
+            "wineserver": "Contents/SharedSupport/CrossOver/bin/wineserver",
+            "version": "11.0-8726-g2e2f5fca349",
+        }
+
+    def test_soak_runtime_selection_is_required_closed_and_unique(self) -> None:
+        common = [
+            "--compatforge-cli",
+            "C:\\tools\\compatforge.exe",
+            "--cache-root",
+            "C:\\acceptance\\cache",
+            "--output-root",
+            "C:\\acceptance\\soak",
+        ]
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-runtime-") as temporary:
+            runtime = self.soak_runtime_selection(Path(temporary))
+            identity = [
+                "--runtime-id",
+                runtime["runtimeId"],
+                "--wine-root",
+                runtime["wineRoot"],
+                "--wine",
+                runtime["wine"],
+                "--wineserver",
+                runtime["wineserver"],
+                "--version",
+                runtime["version"],
+            ]
+
+            parser_failures = (
+                common,
+                [*common, identity[0], "other", *identity[2:]],
+                [*common, *identity, "--version", runtime["version"]],
+            )
+            for argv in parser_failures:
+                with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        self.soak_tool.parser().parse_args(argv)
+
+            arguments = self.soak_tool.parser().parse_args([*common, *identity])
+            self.assertEqual(self.soak_tool.runtime_selection(arguments), runtime)
+
+            missing_quartet_field = argparse.Namespace(
+                runtime_id=runtime["runtimeId"],
+                wine_root=runtime["wineRoot"],
+                wine=runtime["wine"],
+                wineserver=None,
+                version=runtime["version"],
+            )
+            with self.assertRaises(self.baseline.AcceptanceError):
+                self.soak_tool.runtime_selection(missing_quartet_field)
+
+            missing_runtime_id = argparse.Namespace(
+                runtime_id=None,
+                wine_root=runtime["wineRoot"],
+                wine=runtime["wine"],
+                wineserver=runtime["wineserver"],
+                version=runtime["version"],
+            )
+            with self.assertRaises(self.baseline.AcceptanceError):
+                self.soak_tool.runtime_selection(missing_runtime_id)
+
+            for field in ("wine", "wineserver"):
+                for invalid in (
+                    "",
+                    str(Path(temporary) / field),
+                    f"../bin/{field}",
+                    f"bin/../{field}",
+                ):
+                    mutant = argparse.Namespace(
+                        runtime_id=runtime["runtimeId"],
+                        wine_root=runtime["wineRoot"],
+                        wine=runtime["wine"],
+                        wineserver=runtime["wineserver"],
+                        version=runtime["version"],
+                    )
+                    setattr(mutant, field, invalid)
+                    with self.subTest(field=field, invalid=invalid):
+                        with self.assertRaises(self.baseline.AcceptanceError):
+                            self.soak_tool.runtime_selection(mutant)
+
     def test_soak_distinguishes_verified_lifecycle_from_acceptance_and_infrastructure(self) -> None:
         asset = self.assets.asset_for("everything-x86")
 
@@ -4583,12 +4669,54 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
     def test_soak_resume_configuration_is_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-resume-") as temporary:
-            path = Path(temporary) / "configuration.json"
+            root = Path(temporary)
+            path = root / "configuration.json"
             selected = {"winmerge", "everything-x86"}
-            self.soak_tool.write_configuration(path, selected, 60)
-            self.soak_tool.validate_configuration(path, selected, 60)
+            runtime = self.soak_runtime_selection(root)
+            self.soak_tool.write_configuration(path, selected, 60, runtime)
+            configuration = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(configuration),
+                {
+                    "schemaVersion",
+                    "testSuiteVersion",
+                    "applications",
+                    "assets",
+                    "cycles",
+                    "runtimeSelection",
+                },
+            )
+            self.assertEqual(
+                configuration["assets"],
+                sorted(
+                    (
+                        {"appId": asset.app_id, "sha256": f"sha256:{asset.sha256}"}
+                        for asset in self.assets.CERTIFICATION_ASSETS
+                        if asset.app_id in selected
+                    ),
+                    key=lambda value: value["appId"],
+                ),
+            )
+            self.assertEqual(configuration["runtimeSelection"], runtime)
+            self.soak_tool.validate_configuration(path, selected, 60, runtime)
+
+            runtime_mutations = {
+                "runtimeId": "whisky",
+                "wineRoot": str(root / "Whisky Runtime"),
+                "wine": "bin/wine",
+                "wineserver": "bin/wineserver",
+                "version": "24.0",
+            }
+            for field, replacement in runtime_mutations.items():
+                mutant = dict(runtime)
+                mutant[field] = replacement
+                with self.subTest(field=field), self.assertRaises(self.baseline.AcceptanceError):
+                    self.soak_tool.validate_configuration(path, selected, 60, mutant)
+
             with self.assertRaises(self.baseline.AcceptanceError):
-                self.soak_tool.validate_configuration(path, {"winmerge"}, 60)
+                self.soak_tool.validate_configuration(path, {"winmerge"}, 60, runtime)
+            with self.assertRaises(self.baseline.AcceptanceError):
+                self.soak_tool.validate_configuration(path, selected, 61, runtime)
             self.assertEqual(
                 self.soak_tool.cycle_application_ids(
                     {
