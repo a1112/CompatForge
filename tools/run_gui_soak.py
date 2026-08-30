@@ -69,9 +69,15 @@ def runtime_selection(arguments: argparse.Namespace) -> dict[str, str]:
     entrypoints: dict[str, str] = {}
     for field in ("wine", "wineserver"):
         entrypoint = getattr(arguments, field)
-        path = Path(entrypoint)
-        if path.is_absolute() or any(part in (".", "..") for part in path.parts):
-            raise AcceptanceError(f"{field} must be a relative non-traversing path")
+        if (
+            not isinstance(entrypoint, str)
+            or not entrypoint
+            or entrypoint.startswith(("/", "\\"))
+            or "\\" in entrypoint
+            or ":" in entrypoint
+            or any(component in ("", ".", "..") for component in entrypoint.split("/"))
+        ):
+            raise AcceptanceError(f"{field} must be a portable relative path")
         entrypoints[field] = entrypoint
 
     return {
@@ -258,7 +264,11 @@ def validate_configuration(
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise AcceptanceError("configuration.json is unreadable") from error
-    if value != configuration_value(selected, cycles, runtime):
+    if (
+        not isinstance(value, dict)
+        or type(value.get("cycles")) is not int
+        or value != configuration_value(selected, cycles, runtime)
+    ):
         raise AcceptanceError("resume configuration does not match the requested soak")
 
 

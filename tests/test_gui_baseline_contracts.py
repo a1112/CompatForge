@@ -4608,9 +4608,15 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             for field in ("wine", "wineserver"):
                 for invalid in (
                     "",
+                    ".",
                     str(Path(temporary) / field),
                     f"../bin/{field}",
+                    f"bin/./{field}",
                     f"bin/../{field}",
+                    f"bin//{field}",
+                    f"\\bin\\{field}",
+                    f"bin\\{field}",
+                    f"C:bin/{field}",
                 ):
                     mutant = argparse.Namespace(
                         runtime_id=runtime["runtimeId"],
@@ -4717,6 +4723,19 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertEqual(configuration["runtimeSelection"], runtime)
             self.soak_tool.validate_configuration(path, selected, 60, runtime)
 
+            digest_mutant = json.loads(json.dumps(configuration))
+            digest_mutant["assets"][0]["sha256"] = "sha256:" + "0" * 64
+            version_mutant = dict(configuration)
+            version_mutant["testSuiteVersion"] = "drifted"
+            for field, mutant in (
+                ("assets.sha256", digest_mutant),
+                ("testSuiteVersion", version_mutant),
+            ):
+                self.write_canonical_json(path, mutant)
+                with self.subTest(field=field), self.assertRaises(self.baseline.AcceptanceError):
+                    self.soak_tool.validate_configuration(path, selected, 60, runtime)
+            self.write_canonical_json(path, configuration)
+
             runtime_mutations = {
                 "runtimeId": "whisky",
                 "wineRoot": str(root / "Whisky Runtime"),
@@ -4745,6 +4764,28 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ),
                 selected,
             )
+
+    def test_soak_resume_configuration_rejects_json_numeric_aliases(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-cycle-type-") as temporary:
+            root = Path(temporary)
+            path = root / "configuration.json"
+            selected = {"winmerge", "everything-x86"}
+            runtime = self.soak_runtime_selection(root)
+            self.soak_tool.write_configuration(path, selected, 60, runtime)
+            configuration = json.loads(path.read_text(encoding="utf-8"))
+
+            for persisted_cycles, requested_cycles in ((60.0, 60), (True, 1)):
+                mutant = dict(configuration)
+                mutant["cycles"] = persisted_cycles
+                self.write_canonical_json(path, mutant)
+                with self.subTest(cycles=persisted_cycles):
+                    with self.assertRaises(self.baseline.AcceptanceError):
+                        self.soak_tool.validate_configuration(
+                            path,
+                            selected,
+                            requested_cycles,
+                            runtime,
+                        )
 
     def test_soak_report_records_fail_fast_reason(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-report-") as temporary:
