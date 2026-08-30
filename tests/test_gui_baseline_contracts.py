@@ -5225,6 +5225,12 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             prefix="compatforge-soak-main-e2e-"
         ) as temporary:
             root = Path(temporary).resolve()
+            repository_root = root / "repository"
+            isolated_runner = (
+                repository_root / "tools" / self.soak_tool.RUNNER.name
+            )
+            isolated_runner.parent.mkdir(parents=True)
+            shutil.copyfile(self.soak_tool.RUNNER, isolated_runner)
             cli = root / "CompatForge CLI"
             cli.write_bytes(b"placeholder")
             cache_root = root / "cache"
@@ -5259,6 +5265,8 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertFalse(output_root.exists())
             self.assertNotEqual(root, ROOT)
             self.assertNotIn(ROOT, root.parents)
+            self.assertNotEqual(repository_root, ROOT)
+            self.assertTrue(isolated_runner.is_file())
 
             runtime_digest = "sha256:" + "d" * 64
             receipt = {
@@ -5316,7 +5324,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             ) -> subprocess.CompletedProcess[bytes]:
                 events.append("runner")
                 commands.append(command)
-                self.assertEqual(kwargs["cwd"], ROOT)
+                self.assertEqual(kwargs["cwd"], repository_root)
                 self.assertIs(kwargs["check"], False)
                 self.assertTrue(hasattr(kwargs["stdout"], "write"))
                 self.assertTrue(hasattr(kwargs["stderr"], "write"))
@@ -5400,14 +5408,29 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             def repository_entry_snapshot() -> tuple[str, ...]:
                 return tuple(
                     sorted(
-                        path.relative_to(ROOT).as_posix()
-                        for path in ROOT.rglob("*")
+                        path.relative_to(repository_root).as_posix()
+                        for path in repository_root.rglob("*")
                     )
                 )
 
             stdout = io.StringIO()
             stderr = io.StringIO()
             with (
+                mock.patch.object(
+                    self.soak_tool,
+                    "ROOT",
+                    repository_root,
+                ),
+                mock.patch.object(
+                    self.soak_tool,
+                    "RUNNER",
+                    isolated_runner,
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "ROOT",
+                    repository_root,
+                ),
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(
                     self.soak_tool,
@@ -5468,7 +5491,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 sys.executable,
                 "-S",
                 "-B",
-                str(self.soak_tool.RUNNER),
+                str(isolated_runner),
                 "--compatforge-cli",
                 str(cli),
                 "--cache-root",
