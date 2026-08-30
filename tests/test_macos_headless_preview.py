@@ -609,11 +609,12 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     def discover_all(self, candidates, runner):
-        # Windows does not preserve the executable bit used by the macOS-only
-        # verifier. Keep these enumeration tests focused on the closed candidate
-        # classification while the existing verifier tests own that invariant.
-        with mock.patch.object(self.module, "regular_executable", return_value=True):
-            return self.module.discover_all(candidates, runner=runner)
+        # Windows cannot represent the executable-mode fixture; POSIX keeps the
+        # production verifier for these positive enumeration contracts.
+        if os.name == "nt":
+            with mock.patch.object(self.module, "regular_executable", return_value=True):
+                return self.module.discover_all(candidates, runner=runner)
+        return self.module.discover_all(candidates, runner=runner)
 
     def test_runtime_id_is_a_closed_source_classification(self) -> None:
         cases = (
