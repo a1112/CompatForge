@@ -1225,7 +1225,11 @@ mod tests {
 
     fn temp_root(label: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("compatforge-{label}-{}-{nonce}", std::process::id()));
+        #[cfg(target_os = "macos")]
+        let temporary = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!("compatforge-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         root
     }

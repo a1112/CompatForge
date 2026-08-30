@@ -20,6 +20,10 @@ from unittest import mock
 from pathlib import Path
 
 
+if sys.platform == "darwin" and Path("/private/tmp").is_dir():
+    tempfile.tempdir = "/private/tmp"
+
+
 ROOT = Path(__file__).resolve().parents[1]
 ACCEPTANCE_TOOL = ROOT / "tools" / "run_macos_dual_runtime_acceptance.py"
 GUI_BASELINE_TOOL = ROOT / "tools" / "run_gui_baseline.py"

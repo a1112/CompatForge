@@ -1785,6 +1785,7 @@ mod platform {
     use std::io;
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
+    use std::path::Path;
     use std::process::{Child, Command};
 
     type Bool = i32;
@@ -1871,6 +1872,10 @@ mod platform {
     pub struct ProcessTree {
         job: JobHandle,
         process_group_id: u32,
+    }
+
+    pub fn force_kill_wine_prefix_clients(_prefix: &Path) -> io::Result<()> {
+        Ok(())
     }
 
     impl ProcessTree {

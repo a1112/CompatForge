@@ -1033,7 +1033,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("compatforge-{label}-{}-{nonce}", std::process::id()));
+        #[cfg(target_os = "macos")]
+        let temporary = std::path::PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let temporary = std::env::temp_dir();
+        let root = temporary.join(format!("compatforge-{label}-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut config = config(CpuArchitecture::X86_64);
         config.storage_root = root.join("store").to_string_lossy().into_owned();

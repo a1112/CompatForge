@@ -31,6 +31,7 @@ SUMMARY_TOOL = ROOT / "tools" / "summarize_gui_compatibility.py"
 SOAK_TOOL = ROOT / "tools" / "run_gui_soak.py"
 DESKTOP = ROOT / "apps" / "desktop"
 TAURI = DESKTOP / "src-tauri"
+PRIVATE_TMP = Path("/private/tmp") if Path("/private/tmp").is_dir() else None
 
 
 def load_tool(path: Path):
@@ -407,7 +408,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         payload = b"MZportable-sumatra-fixture"
         digest = hashlib.sha256(payload).hexdigest()
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-portable-sumatra-", dir="/private/tmp"
+            prefix="compatforge-portable-sumatra-", dir=PRIVATE_TMP
         ) as temporary:
             root = Path(temporary)
             source = root / "SumatraPDF.exe"
@@ -480,7 +481,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
     def test_cjk_font_is_copied_once_into_the_owned_bottle(self) -> None:
         payload = b"local-system-cjk-font-fixture"
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-cjk-font-", dir="/private/tmp"
+            prefix="compatforge-cjk-font-", dir=PRIVATE_TMP
         ) as temporary:
             root = Path(temporary)
             source = root / "system-font.ttf"
@@ -529,7 +530,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
     def test_cjk_font_registry_is_bottle_local_fixed_and_reaps_wineserver(self) -> None:
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-cjk-font-registry-", dir="/private/tmp"
+            prefix="compatforge-cjk-font-registry-", dir=PRIVATE_TMP
         ) as temporary:
             root = Path(temporary)
             wine = root / "wine"
@@ -600,7 +601,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
     def test_cjk_font_staging_rejects_linked_sources_and_destinations(self) -> None:
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-cjk-font-links-", dir="/private/tmp"
+            prefix="compatforge-cjk-font-links-", dir=PRIVATE_TMP
         ) as temporary:
             root = Path(temporary)
             source = root / "system-font.ttf"
@@ -634,7 +635,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
     def test_notepad_cjk_style_is_bottle_local_and_digest_bound(self) -> None:
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-notepad-cjk-style-", dir="/private/tmp"
+            prefix="compatforge-notepad-cjk-style-", dir=PRIVATE_TMP
         ) as temporary:
             bottle = Path(temporary) / "prefix" / "drive_c"
             style = (
@@ -3033,7 +3034,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         outputs = self.baseline.parse_pinned_receipt(receipt)
 
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-pinned-runner-", dir="/private/tmp"
+            prefix="compatforge-pinned-runner-", dir=PRIVATE_TMP
         ) as temporary:
             directory = os.open(
                 temporary,
@@ -3062,7 +3063,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
     def test_pinned_evidence_root_is_isolated_from_screenshot_metadata_changes(self) -> None:
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-pinned-root-", dir="/private/tmp"
+            prefix="compatforge-pinned-root-", dir=PRIVATE_TMP
         ) as temporary:
             work_root = Path(temporary)
             pinned_root, identity = self.baseline.create_pinned_evidence_work_root(
@@ -3140,7 +3141,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         records: list[dict[str, object]] = []
         with (
             tempfile.TemporaryDirectory(
-                prefix="compatforge-pinned-observed-", dir="/private/tmp"
+                prefix="compatforge-pinned-observed-", dir=PRIVATE_TMP
             ) as temporary,
             mock.patch.object(
                 self.baseline.subprocess, "Popen", return_value=Process()
@@ -4706,11 +4707,25 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
         console = '"kCGSSessionOnConsoleKey"=Yes'
         awake = "Assertion status system-wide:\n   UserIsActive                 1\n"
-        with mock.patch.object(self.baseline.subprocess, "run", side_effect=[completed(console), completed(awake)]):
+        with (
+            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline.subprocess,
+                "run",
+                side_effect=[completed(console), completed(awake)],
+            ),
+        ):
             self.assertEqual(self.baseline.desktop_session_state()["state"], "interactive")
 
         asleep = "Assertion status system-wide:\n   UserIsActive                 0\n"
-        with mock.patch.object(self.baseline.subprocess, "run", side_effect=[completed(console), completed(asleep)]):
+        with (
+            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline.subprocess,
+                "run",
+                side_effect=[completed(console), completed(asleep)],
+            ),
+        ):
             value = self.baseline.desktop_session_state()
         self.assertEqual(value["state"], "display-inactive")
         self.assertEqual(value["failureClassification"], "test-infrastructure")
@@ -4720,7 +4735,14 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             '"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,'
             '"CGSSessionScreenIsLocked"=Yes})\n'
         )
-        with mock.patch.object(self.baseline.subprocess, "run", side_effect=[completed(locked), completed(awake)]):
+        with (
+            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline.subprocess,
+                "run",
+                side_effect=[completed(locked), completed(awake)],
+            ),
+        ):
             value = self.baseline.desktop_session_state()
         self.assertEqual(value["state"], "locked")
         self.assertFalse(value["observable"])
@@ -4846,6 +4868,11 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         with (
             mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
             mock.patch.object(
+                self.baseline,
+                "desktop_session_state",
+                return_value={"observable": True, "state": "interactive"},
+            ),
+            mock.patch.object(
                 self.baseline, "process_group_ids", return_value=[57496]
             ),
             mock.patch.object(
@@ -4869,6 +4896,11 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         detached_executable = Path("/external/bottle/drive_c/7-Zip/7zFM.exe")
         with (
             mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline,
+                "desktop_session_state",
+                return_value={"observable": True, "state": "interactive"},
+            ),
             mock.patch.object(
                 self.baseline, "process_group_ids", return_value=[57496]
             ),
@@ -4906,6 +4938,11 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         with (
             mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
             mock.patch.object(
+                self.baseline,
+                "desktop_session_state",
+                return_value={"observable": True, "state": "interactive"},
+            ),
+            mock.patch.object(
                 self.baseline, "process_group_ids", return_value=[57496]
             ),
             mock.patch.object(
@@ -4923,7 +4960,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertEqual(prepared_detached["processIds"], [57496, 60003])
 
         with tempfile.TemporaryDirectory(
-            prefix="compatforge-window-screenshot-", dir="/private/tmp"
+            prefix="compatforge-window-screenshot-", dir=PRIVATE_TMP
         ) as temporary:
             target = Path(temporary) / "window.png"
             target.write_bytes(b"png")

@@ -121,6 +121,7 @@ MAX_PROCESS_OUTPUT_BYTES = 64 * 1024
 PROCESS_READ_CHUNK_BYTES = 8192
 PROCESS_POLL_SECONDS = 0.01
 PROCESS_STOP_TIMEOUT_SECONDS = 5
+SIGKILL = getattr(signal, "SIGKILL", 9)
 DISCOVERY_TIMEOUT_SECONDS = 30
 CHILD_TIMEOUT_SECONDS = 20 * 60
 DESKTOP_TIMEOUT_SECONDS = 20 * 60
@@ -1058,7 +1059,7 @@ def _stop_posix_process_group(process: object, process_group: int) -> bool:
     except Exception:
         cleanup_failed = True
     if _process_group_exists(process_group):
-        _signal_process_group(process_group, signal.SIGKILL)
+        _signal_process_group(process_group, SIGKILL)
         try:
             wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
         except Exception:

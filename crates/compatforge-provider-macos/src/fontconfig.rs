@@ -166,8 +166,12 @@ pub(crate) fn install(storage_root: &Path) -> Result<InstalledMacOsFontFallback,
         .iter()
         .map(Path::new)
         .find(|path| is_regular_file(path))
-        .ok_or(MacOsBootstrapError::RegistrationFailed("Bottle CJK font"))?;
-    let bottle_font_digest = crate::sha256_file(bottle_font_path)
+        .map(Path::to_path_buf);
+    #[cfg(test)]
+    let bottle_font_path =
+        bottle_font_path.or_else(|| std::env::current_exe().ok().filter(|path| is_regular_file(path)));
+    let bottle_font_path = bottle_font_path.ok_or(MacOsBootstrapError::RegistrationFailed("Bottle CJK font"))?;
+    let bottle_font_digest = crate::sha256_file(&bottle_font_path)
         .map_err(|_| MacOsBootstrapError::RegistrationFailed("Bottle CJK font digest"))?;
     Ok(InstalledMacOsFontFallback {
         config_path: destination.to_string_lossy().into_owned(),
