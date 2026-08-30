@@ -406,6 +406,10 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     finally:
                         binding.close()
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX directory descriptors and atomic directory fsync are required",
+    )
     def test_sumatrapdf_portable_materialization_is_single_use_and_digest_bound(self) -> None:
         payload = b"MZportable-sumatra-fixture"
         digest = hashlib.sha256(payload).hexdigest()
@@ -480,6 +484,10 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             finally:
                 binding.close()
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX directory descriptors and atomic directory fsync are required",
+    )
     def test_cjk_font_is_copied_once_into_the_owned_bottle(self) -> None:
         payload = b"local-system-cjk-font-fixture"
         with tempfile.TemporaryDirectory(
@@ -635,6 +643,10 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 self.baseline.stage_macos_cjk_font(bottle)
             self.assertTrue(destination.is_symlink())
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "POSIX directory descriptors and atomic directory fsync are required",
+    )
     def test_notepad_cjk_style_is_bottle_local_and_digest_bound(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="compatforge-notepad-cjk-style-", dir=PRIVATE_TMP
@@ -1592,6 +1604,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 mock.patch.object(self.baseline, "rosetta_available", return_value=True),
                 mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
                 mock.patch.object(self.baseline, "fetch_asset", return_value=root / "installer.exe"),
+                mock.patch.object(self.baseline, "process_snapshot", return_value=[]),
                 mock.patch.object(
                     self.baseline,
                     "materialize_sumatrapdf_portable",
@@ -2095,6 +2108,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     "fetch",
                     side_effect=http.client.IncompleteRead(b"partial", 4096),
                 ),
+                mock.patch.object(self.baseline, "process_snapshot", return_value=[]),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -2174,6 +2188,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     mock.patch.object(self.baseline, "rosetta_available", return_value=True),
                     mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
                     mock.patch.object(self.baseline, "fetch_asset", side_effect=fetch_error),
+                    mock.patch.object(self.baseline, "process_snapshot", return_value=[]),
                     contextlib.redirect_stdout(stdout),
                     contextlib.redirect_stderr(stderr),
                 ):
@@ -3014,6 +3029,10 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertEqual(len(hook_budgets), 1)
         self.assertIsNotNone(observed_processes[0].poll())
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "anonymous unlinked descriptors and fcntl binding require POSIX",
+    )
     def test_pinned_receipt_and_anonymous_outputs_are_fd_bound(self) -> None:
         inspection = {"architecture": "x86_64", "schemaVersion": "1"}
         plan = {"process": {"arguments": []}, "schemaVersion": "1"}
@@ -3063,6 +3082,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     os.close(binding.descriptor)
                 os.close(directory)
 
+    @unittest.skipIf(os.name == "nt", "POSIX private directory modes are required")
     def test_pinned_evidence_root_is_isolated_from_screenshot_metadata_changes(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="compatforge-pinned-root-", dir=PRIVATE_TMP
@@ -3881,7 +3901,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertIn("application interaction root identity changed", stderr.getvalue())
 
     def test_main_revalidates_after_window_failure_and_before_last_summary(self) -> None:
-        for raise_at in (3, 13):
+        for raise_at in ((3,) if os.name == "nt" else (3, 13)):
             with self.subTest(raise_at=raise_at), tempfile.TemporaryDirectory(
                 prefix="compatforge-gui-window-drift-"
             ) as temporary:
@@ -4030,6 +4050,11 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 self.assertEqual(calls, [*expected_numbers, "close"])
                 self.assertIn(
                     "application interaction root identity changed", stderr.getvalue()
+                )
+        if os.name == "nt":
+            with self.subTest(raise_at=13):
+                self.skipTest(
+                    "final-summary revalidation follows the POSIX pinned-root boundary"
                 )
 
     def test_acknowledgement_binds_every_identity_digest_nonce_and_check(self) -> None:
@@ -7602,20 +7627,28 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertEqual(cleanup_report["releaseGate"], "blocked")
 
     def test_residual_process_check_uses_the_launch_process_group(self) -> None:
-        with (
-            mock.patch.object(
-                self.baseline,
-                "process_table",
-                return_value=[
-                    (100, 100, "/runtime/wine unrelated.exe"),
-                    (101, 777, "/runtime/wine target.exe"),
-                    (102, 102, "/runtime/wine /external/bottle/drive_c/app.exe"),
-                    (103, 103, "C:\\windows\\system32\\services.exe"),
-                ],
-            ),
-            mock.patch.object(self.baseline, "prefix_process_ids", return_value={103}),
-        ):
-            residual = self.baseline.process_snapshot(Path("/external/bottle/drive_c"), 777)
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-external-process-fixture-"
+        ) as temporary:
+            bottle = Path(temporary).resolve() / "bottle" / "drive_c"
+            executable = bottle / "app.exe"
+            self.assertFalse(bottle.exists())
+            with (
+                mock.patch.object(
+                    self.baseline,
+                    "process_table",
+                    return_value=[
+                        (100, 100, "/runtime/wine unrelated.exe"),
+                        (101, 777, "/runtime/wine target.exe"),
+                        (102, 102, f"/runtime/wine {executable}"),
+                        (103, 103, "C:\\windows\\system32\\services.exe"),
+                    ],
+                ),
+                mock.patch.object(
+                    self.baseline, "prefix_process_ids", return_value={103}
+                ),
+            ):
+                residual = self.baseline.process_snapshot(bottle, 777)
         self.assertEqual(len(residual), 3)
         self.assertTrue(any(value.startswith("101 ") for value in residual))
         self.assertTrue(any(value.startswith("102 ") for value in residual))
@@ -7874,44 +7907,50 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertTrue(observed["available"])
         self.assertEqual(observed["windows"], native)
 
-        detached_executable = Path("/external/bottle/drive_c/7-Zip/7zFM.exe")
-        with (
-            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
-            mock.patch.object(
-                self.baseline,
-                "desktop_session_state",
-                return_value={"observable": True, "state": "interactive"},
-            ),
-            mock.patch.object(
-                self.baseline, "process_group_ids", return_value=[57496]
-            ),
-            mock.patch.object(
-                self.baseline,
-                "process_table",
-                return_value=[
-                    (60001, 60001, f"/runtime/wine64-preloader {detached_executable}"),
-                    (60002, 60002, "/runtime/wine64-preloader unrelated.exe"),
-                ],
-            ),
-            mock.patch.object(
-                self.baseline,
-                "core_graphics_window_list",
-                return_value=[
-                    {
-                        "kCGWindowOwnerPID": 60001,
-                        "kCGWindowName": "7-Zip",
-                        "kCGWindowBounds": {"Width": 1288, "Height": 711},
-                        "kCGWindowLayer": 0,
-                        "kCGWindowNumber": 1543,
-                    }
-                ],
-            ),
-        ):
-            detached = self.baseline.observer(
-                57496,
-                ("7-Zip",),
-                detached_executable,
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-external-window-fixture-"
+        ) as temporary:
+            detached_executable = (
+                Path(temporary).resolve() / "bottle" / "drive_c" / "7-Zip" / "7zFM.exe"
             )
+            self.assertFalse(detached_executable.exists())
+            with (
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(
+                    self.baseline,
+                    "desktop_session_state",
+                    return_value={"observable": True, "state": "interactive"},
+                ),
+                mock.patch.object(
+                    self.baseline, "process_group_ids", return_value=[57496]
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "process_table",
+                    return_value=[
+                        (60001, 60001, f"/runtime/wine64-preloader {detached_executable}"),
+                        (60002, 60002, "/runtime/wine64-preloader unrelated.exe"),
+                    ],
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "core_graphics_window_list",
+                    return_value=[
+                        {
+                            "kCGWindowOwnerPID": 60001,
+                            "kCGWindowName": "7-Zip",
+                            "kCGWindowBounds": {"Width": 1288, "Height": 711},
+                            "kCGWindowLayer": 0,
+                            "kCGWindowNumber": 1543,
+                        }
+                    ],
+                ),
+            ):
+                detached = self.baseline.observer(
+                    57496,
+                    ("7-Zip",),
+                    detached_executable,
+                )
         self.assertTrue(detached["available"])
         self.assertEqual(detached["processIds"], [57496, 60001])
         self.assertEqual(detached["windows"][0]["processId"], 60001)
