@@ -577,9 +577,12 @@ class MacOsWineDiscoveryTests(unittest.TestCase):
 
     def verify_candidate(self, candidate, runner):
         # These tests own candidate selection, architecture, and version contracts.
-        # The POSIX executable-mode contract is exercised separately below.
-        with mock.patch.object(self.module, "regular_executable", return_value=True):
-            return self.module.verify_candidate(candidate, runner)
+        # Windows cannot represent their executable-mode fixture; POSIX keeps the
+        # production verifier here and in the dedicated negative contract below.
+        if os.name == "nt":
+            with mock.patch.object(self.module, "regular_executable", return_value=True):
+                return self.module.verify_candidate(candidate, runner)
+        return self.module.verify_candidate(candidate, runner)
 
     def test_whisky_requires_paired_x86_64_graphics_modules(self) -> None:
         candidate = self.make_candidate("whisky-library", "whisky-graphics")

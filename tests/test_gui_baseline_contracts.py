@@ -7955,29 +7955,52 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertEqual(detached["processIds"], [57496, 60001])
         self.assertEqual(detached["windows"][0]["processId"], 60001)
 
-        with (
-            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
-            mock.patch.object(
-                self.baseline,
-                "desktop_session_state",
-                return_value={"observable": True, "state": "interactive"},
-            ),
-            mock.patch.object(
-                self.baseline, "process_group_ids", return_value=[57496]
-            ),
-            mock.patch.object(
-                self.baseline,
-                "core_graphics_window_list",
-                return_value=[prepared_window],
-            ),
-        ):
-            prepared_detached = self.baseline.observer(
-                57496,
-                ("SumatraPDF",),
-                Path("/external/bottle/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"),
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-external-prepared-window-fixture-"
+        ) as temporary:
+            prepared_executable = (
+                Path(temporary).resolve()
+                / "bottle"
+                / "drive_c"
+                / "CompatForge"
+                / "SumatraPDF"
+                / "SumatraPDF.exe"
             )
+            self.assertFalse(prepared_executable.exists())
+            with (
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(
+                    self.baseline,
+                    "desktop_session_state",
+                    return_value={"observable": True, "state": "interactive"},
+                ),
+                mock.patch.object(
+                    self.baseline, "process_group_ids", return_value=[57496]
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "process_table",
+                    return_value=[
+                        (
+                            60005,
+                            60005,
+                            f"/runtime/wine64-preloader {prepared_executable}",
+                        )
+                    ],
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "core_graphics_window_list",
+                    return_value=[prepared_window],
+                ),
+            ):
+                prepared_detached = self.baseline.observer(
+                    57496,
+                    ("SumatraPDF",),
+                    prepared_executable,
+                )
         self.assertTrue(prepared_detached["available"])
-        self.assertEqual(prepared_detached["processIds"], [57496, 60003])
+        self.assertEqual(prepared_detached["processIds"], [57496, 60003, 60005])
 
         with tempfile.TemporaryDirectory(
             prefix="compatforge-window-screenshot-", dir=PRIVATE_TMP
