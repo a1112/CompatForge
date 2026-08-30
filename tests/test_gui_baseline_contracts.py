@@ -4531,6 +4531,193 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             "version": "11.0-8726-g2e2f5fca349",
         }
 
+    def test_soak_offline_preflight_validates_every_selected_digest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-cache-") as temporary:
+            cache_root = Path(temporary)
+            selected = {"winmerge", "7zip-x86", "audacity-x86"}
+            expected = sorted(
+                (
+                    asset
+                    for asset in self.assets.CERTIFICATION_ASSETS
+                    if asset.app_id in selected
+                ),
+                key=lambda asset: asset.app_id,
+            )
+
+            with mock.patch.object(self.soak_tool, "fetch") as fetch:
+                self.soak_tool.validate_cached_assets(cache_root, selected)
+
+            self.assertEqual(fetch.call_count, len(expected))
+            for call, asset in zip(fetch.call_args_list, expected, strict=True):
+                self.assertIs(call.args[0], asset)
+                self.assertIs(call.args[1], cache_root)
+                self.assertIs(call.args[2], False)
+                self.assertEqual(call.kwargs, {})
+            self.assertEqual(
+                {call.args[0].app_id for call in fetch.call_args_list},
+                selected,
+            )
+
+            private_detail = "digest mismatch under /private/path"
+            with mock.patch.object(
+                self.soak_tool,
+                "fetch",
+                side_effect=self.assets.AssetError(private_detail),
+            ):
+                with self.assertRaises(self.baseline.AcceptanceError) as failure:
+                    self.soak_tool.validate_cached_assets(cache_root, {"winmerge"})
+            self.assertEqual(
+                str(failure.exception),
+                "offline asset preflight failed for winmerge",
+            )
+            self.assertNotIn(private_detail, str(failure.exception))
+            self.assertNotIn("/private/path", str(failure.exception))
+
+            with mock.patch.object(self.soak_tool, "fetch") as fetch:
+                with self.assertRaises(self.baseline.AcceptanceError):
+                    self.soak_tool.validate_cached_assets(
+                        cache_root,
+                        {"winmerge", "not-certified"},
+                    )
+            fetch.assert_not_called()
+
+    def test_soak_cycle_command_forwards_the_exact_runtime_quartet(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-soak-command-") as temporary:
+            root = Path(temporary)
+            cli = root / "CompatForge CLI.exe"
+            cache_root = root / "cache"
+            runtime_store = root / "output" / "runtime"
+            selected = {"winmerge", "7zip-x86", "audacity-x86"}
+            runtime = self.soak_runtime_selection(root)
+            original_selected = set(selected)
+            original_runtime = dict(runtime)
+
+            commands = [
+                self.soak_tool.cycle_command(
+                    cli,
+                    cache_root,
+                    runtime_store,
+                    root / "runs" / "cycle-001" / "storage",
+                    root / "runs" / "cycle-001" / "work",
+                    selected,
+                    runtime,
+                    False,
+                ),
+                self.soak_tool.cycle_command(
+                    cli,
+                    cache_root,
+                    runtime_store,
+                    root / "runs" / "cycle-002" / "storage",
+                    root / "runs" / "cycle-002" / "work",
+                    selected,
+                    runtime,
+                    True,
+                ),
+            ]
+
+            def expected_command(storage: Path, work: Path, allow_network: bool) -> list[str]:
+                command = [
+                    sys.executable,
+                    "-S",
+                    "-B",
+                    str(self.soak_tool.RUNNER),
+                    "--compatforge-cli",
+                    str(cli),
+                    "--cache-root",
+                    str(cache_root),
+                    "--runtime-store",
+                    str(runtime_store),
+                    "--storage-root",
+                    str(storage),
+                    "--work-root",
+                    str(work),
+                    "--runtime-id",
+                    runtime["runtimeId"],
+                    "--wine-root",
+                    runtime["wineRoot"],
+                    "--wine",
+                    runtime["wine"],
+                    "--wineserver",
+                    runtime["wineserver"],
+                    "--version",
+                    runtime["version"],
+                ]
+                if allow_network:
+                    command.append("--allow-network")
+                for app_id in sorted(selected):
+                    command.extend(("--app", app_id))
+                return command
+
+            first_storage = root / "runs" / "cycle-001" / "storage"
+            first_work = root / "runs" / "cycle-001" / "work"
+            second_storage = root / "runs" / "cycle-002" / "storage"
+            second_work = root / "runs" / "cycle-002" / "work"
+            self.assertEqual(
+                commands[0],
+                expected_command(first_storage, first_work, False),
+            )
+            self.assertEqual(
+                commands[1],
+                expected_command(second_storage, second_work, True),
+            )
+
+            quartet = {
+                "--runtime-id": "runtimeId",
+                "--wine-root": "wineRoot",
+                "--wine": "wine",
+                "--wineserver": "wineserver",
+                "--version": "version",
+            }
+            path_options = {
+                "--compatforge-cli": cli,
+                "--cache-root": cache_root,
+                "--runtime-store": runtime_store,
+            }
+            for command in commands:
+                self.assertEqual(
+                    command[:4],
+                    [sys.executable, "-S", "-B", str(self.soak_tool.RUNNER)],
+                )
+                for option, path in path_options.items():
+                    self.assertEqual(command.count(option), 1)
+                    self.assertEqual(command[command.index(option) + 1], str(path))
+                for option, field in quartet.items():
+                    self.assertEqual(command.count(option), 1)
+                    self.assertEqual(command[command.index(option) + 1], runtime[field])
+                self.assertEqual(
+                    [
+                        command[index + 1]
+                        for index, value in enumerate(command)
+                        if value == "--app"
+                    ],
+                    sorted(selected),
+                )
+                for app_id in selected:
+                    self.assertEqual(command.count(app_id), 1)
+
+            self.assertEqual(
+                commands[0][commands[0].index("--storage-root") + 1],
+                str(first_storage),
+            )
+            self.assertEqual(
+                commands[0][commands[0].index("--work-root") + 1],
+                str(first_work),
+            )
+            self.assertEqual(
+                commands[1][commands[1].index("--storage-root") + 1],
+                str(second_storage),
+            )
+            self.assertEqual(
+                commands[1][commands[1].index("--work-root") + 1],
+                str(second_work),
+            )
+            self.assertNotEqual(first_storage, second_storage)
+            self.assertNotEqual(first_work, second_work)
+            self.assertNotIn("--allow-network", commands[0])
+            self.assertEqual(commands[1].count("--allow-network"), 1)
+            self.assertEqual(selected, original_selected)
+            self.assertEqual(runtime, original_runtime)
+
     def test_soak_runtime_selection_is_required_closed_and_unique(self) -> None:
         common = [
             "--compatforge-cli",

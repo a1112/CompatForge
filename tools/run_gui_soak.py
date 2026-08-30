@@ -14,7 +14,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-from download_gui_assets import CERTIFICATION_ASSETS
+from download_gui_assets import AssetError, CERTIFICATION_ASSETS, fetch
 from run_gui_baseline import (
     AcceptanceError,
     RUNTIME_IDS,
@@ -351,6 +351,62 @@ def selected_assets(selected: set[str]) -> list[dict[str, str]]:
     return sorted(projected, key=lambda value: value["appId"])
 
 
+def validate_cached_assets(cache_root: Path, selected: set[str]) -> None:
+    selected_assets(selected)
+    for asset in sorted(CERTIFICATION_ASSETS, key=lambda value: value.app_id):
+        if asset.app_id not in selected:
+            continue
+        try:
+            fetch(asset, cache_root, False)
+        except AssetError as error:
+            raise AcceptanceError(
+                f"offline asset preflight failed for {asset.app_id}"
+            ) from error
+
+
+def cycle_command(
+    cli: Path,
+    cache_root: Path,
+    runtime_store: Path,
+    storage_root: Path,
+    work_root: Path,
+    selected: set[str],
+    runtime: dict[str, str],
+    allow_network: bool,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-S",
+        "-B",
+        str(RUNNER),
+        "--compatforge-cli",
+        str(cli),
+        "--cache-root",
+        str(cache_root),
+        "--runtime-store",
+        str(runtime_store),
+        "--storage-root",
+        str(storage_root),
+        "--work-root",
+        str(work_root),
+        "--runtime-id",
+        runtime["runtimeId"],
+        "--wine-root",
+        runtime["wineRoot"],
+        "--wine",
+        runtime["wine"],
+        "--wineserver",
+        runtime["wineserver"],
+        "--version",
+        runtime["version"],
+    ]
+    if allow_network:
+        command.append("--allow-network")
+    for app_id in sorted(selected):
+        command.extend(("--app", app_id))
+    return command
+
+
 def configuration_value(
     selected: set[str],
     cycles: int,
@@ -428,6 +484,7 @@ def main() -> int:
     power_assertion: subprocess.Popen[bytes] | None = None
     try:
         arguments = parser().parse_args()
+        runtime = runtime_selection(arguments)
         if not 1 <= arguments.cycles <= MAX_CYCLES:
             raise AcceptanceError("cycles must be in the range 1..1000")
         cli = absolute(arguments.compatforge_cli, "compatforge-cli")
@@ -449,13 +506,29 @@ def main() -> int:
             raise AcceptanceError("output-root must be empty unless --resume is used")
         if arguments.resume:
             if configuration_path.exists():
-                validate_configuration(configuration_path, selected, arguments.cycles)
+                validate_configuration(
+                    configuration_path,
+                    selected,
+                    arguments.cycles,
+                    runtime,
+                )
             else:
                 if any(cycle_application_ids(entry) != selected for entry in entries):
                     raise AcceptanceError("legacy cycle records do not match the requested application set")
-                write_configuration(configuration_path, selected, arguments.cycles)
+                write_configuration(
+                    configuration_path,
+                    selected,
+                    arguments.cycles,
+                    runtime,
+                )
         else:
-            write_configuration(configuration_path, selected, arguments.cycles)
+            write_configuration(
+                configuration_path,
+                selected,
+                arguments.cycles,
+                runtime,
+            )
+        validate_cached_assets(cache_root, selected)
         if len(entries) > arguments.cycles:
             raise AcceptanceError("cycles.jsonl already exceeds the requested cycle count")
         if arguments.resume and any(entry.get("status") != "verified" for entry in entries):
@@ -478,26 +551,16 @@ def main() -> int:
             stdout_path = cycle_root / "runner.stdout"
             stderr_path = cycle_root / "runner.stderr"
             started_at = utc_now()
-            command = [
-                sys.executable,
-                "-S",
-                "-B",
-                str(RUNNER),
-                "--compatforge-cli",
-                str(cli),
-                "--cache-root",
-                str(cache_root),
-                "--runtime-store",
-                str(runtime_root),
-                "--storage-root",
-                str(storage_root),
-                "--work-root",
-                str(work_root),
-            ]
-            if arguments.allow_network:
-                command.append("--allow-network")
-            for app_id in sorted(selected):
-                command.extend(("--app", app_id))
+            command = cycle_command(
+                cli,
+                cache_root,
+                runtime_root,
+                storage_root,
+                work_root,
+                selected,
+                runtime,
+                arguments.allow_network,
+            )
             with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
                 completed = subprocess.run(command, cwd=ROOT, stdout=stdout, stderr=stderr, check=False)
             summary_path = work_root / "summary.json"
