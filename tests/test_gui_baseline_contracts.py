@@ -5206,7 +5206,14 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertEqual((output_root / "summary.json").read_bytes(), report_before_resume)
 
     def test_soak_invalid_summaries_write_terminal_failed_cycles(self) -> None:
-        cases = ("unreadable", "non-object", "malformed receipt")
+        cases = (
+            "unreadable",
+            "invalid utf-8",
+            "non-object",
+            "malformed receipt",
+            "array check outcome",
+            "object check outcome",
+        )
         original_read_text = Path.read_text
         for name in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(
@@ -5219,12 +5226,21 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     payload: object = OSError(
                         "read failed under /private/customer/output"
                     )
+                elif name == "invalid utf-8":
+                    payload = b"\xff/private/customer/invalid-utf8"
                 elif name == "non-object":
                     payload = []
-                else:
+                elif name == "malformed receipt":
                     payload = self.soak_runner_summary({"winmerge"}, runtime)
                     payload["receipt"]["packDigest"] = "not-a-digest"
                     payload["receipt"]["source"] = "/private/customer/runtime"
+                else:
+                    payload = self.soak_runner_summary({"winmerge"}, runtime)
+                    payload["compatibilityResults"][0]["checks"][0]["outcome"] = (
+                        ["/private/customer/list-outcome"]
+                        if name == "array check outcome"
+                        else {"detail": "/private/customer/object-outcome"}
+                    )
 
                 def run_cycle(
                     command: list[str],
@@ -5232,10 +5248,13 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ) -> subprocess.CompletedProcess[bytes]:
                     work_root = Path(command[command.index("--work-root") + 1])
                     summary_path = work_root / "summary.json"
-                    summary_path.write_text(
-                        json.dumps({} if isinstance(payload, OSError) else payload),
-                        encoding="utf-8",
-                    )
+                    if isinstance(payload, bytes):
+                        summary_path.write_bytes(payload)
+                    else:
+                        summary_path.write_text(
+                            json.dumps({} if isinstance(payload, OSError) else payload),
+                            encoding="utf-8",
+                        )
                     return subprocess.CompletedProcess(command, 0, b"", b"")
 
                 def read_text(path: Path, *args: object, **kwargs: object) -> str:
@@ -5288,7 +5307,12 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 self.assertEqual(json.loads(persisted)["releaseGate"], "failed")
                 self.assertNotIn("/private/customer/output", persisted)
                 self.assertNotIn("/private/customer/runtime", persisted)
+                self.assertNotIn("/private/customer/invalid-utf8", persisted)
+                self.assertNotIn("/private/customer/list-outcome", persisted)
+                self.assertNotIn("/private/customer/object-outcome", persisted)
                 self.assertNotIn("not-a-digest", persisted)
+                self.assertNotIn("UnicodeDecodeError", persisted)
+                self.assertNotIn("invalid start byte", persisted)
 
     def test_soak_fresh_preflight_failure_is_redacted_and_has_no_side_effects(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-preflight-main-") as temporary:

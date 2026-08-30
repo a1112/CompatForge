@@ -333,9 +333,9 @@ def classify_summary(
             if check_id in projected:
                 raise AcceptanceError("cycle compatibility result contains a duplicate check")
             outcome = check.get("outcome")
-            if outcome not in SOAK_CHECK_OUTCOMES:
+            if not isinstance(outcome, str) or outcome not in SOAK_CHECK_OUTCOMES:
                 raise AcceptanceError("cycle compatibility check has an invalid outcome")
-            projected[check_id] = str(outcome)
+            projected[check_id] = outcome
         if not SOAK_CHECKS.issubset(projected):
             raise AcceptanceError("cycle compatibility result omitted a soak check")
         outcome = raw.get("outcome")
@@ -837,7 +837,12 @@ def main() -> int:
                         runtime,
                         stable_runtime,
                     )
-                except (OSError, json.JSONDecodeError, AcceptanceError):
+                except (
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    AcceptanceError,
+                ):
                     projection = {
                         "status": "failed",
                         "hardFailure": True,
