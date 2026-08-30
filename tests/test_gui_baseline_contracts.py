@@ -4824,6 +4824,125 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ):
                     self.soak_tool.validate_verified_prefix(value, selected, runtime)
 
+    def test_soak_cycle_returncode_range_covers_posix_and_windows(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-returncode-range-"
+        ) as temporary:
+            root = Path(temporary)
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+            for returncode in (-(2**31), -15, 0, 42, 2**32 - 1):
+                entry = self.soak_verified_entry(1, selected, runtime)
+                entry["runnerExitCode"] = returncode
+                with self.subTest(valid=returncode):
+                    self.assertEqual(
+                        self.soak_tool.validate_verified_prefix(
+                            [entry],
+                            selected,
+                            runtime,
+                        ),
+                        entry["runtime"],
+                    )
+
+            for returncode in (True, -(2**31) - 1, 2**32):
+                entry = self.soak_verified_entry(1, selected, runtime)
+                entry["runnerExitCode"] = returncode
+                with self.subTest(invalid=returncode), self.assertRaises(
+                    self.baseline.AcceptanceError
+                ):
+                    self.soak_tool.validate_verified_prefix(
+                        [entry],
+                        selected,
+                        runtime,
+                    )
+
+    def test_soak_prefix_requires_real_ordered_utc_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-prefix-time-"
+        ) as temporary:
+            root = Path(temporary)
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+            valid = self.soak_verified_entry(1, selected, runtime)
+            valid["startedAt"] = "2024-02-29T10:00:00Z"
+            valid["finishedAt"] = "2024-02-29T10:00:00Z"
+            self.assertEqual(
+                self.soak_tool.validate_verified_prefix(
+                    [valid],
+                    selected,
+                    runtime,
+                ),
+                valid["runtime"],
+            )
+
+            invalid_cases = {
+                "impossible date": (
+                    "2026-02-31T10:00:00Z",
+                    "2026-02-31T10:00:01Z",
+                ),
+                "finished before started": (
+                    "2026-08-30T10:00:01Z",
+                    "2026-08-30T10:00:00Z",
+                ),
+            }
+            for name, (started_at, finished_at) in invalid_cases.items():
+                entry = self.soak_verified_entry(1, selected, runtime)
+                entry["startedAt"] = started_at
+                entry["finishedAt"] = finished_at
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    self.baseline.AcceptanceError,
+                    "^cycles\\.jsonl does not contain a verified cycle prefix$",
+                ):
+                    self.soak_tool.validate_verified_prefix(
+                        [entry],
+                        selected,
+                        runtime,
+                    )
+
+    def test_soak_report_cannot_pass_invalid_or_reversed_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-report-time-"
+        ) as temporary:
+            root = Path(temporary)
+            path = root / "summary.json"
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+            valid = self.soak_verified_entry(1, selected, runtime)
+            valid["startedAt"] = "2024-02-29T10:00:00Z"
+            valid["finishedAt"] = "2024-02-29T10:00:00Z"
+            self.assertEqual(
+                self.soak_tool.write_report(path, [valid], 1, selected)[
+                    "releaseGate"
+                ],
+                "passed",
+            )
+
+            for name, started_at, finished_at in (
+                (
+                    "impossible date",
+                    "2026-02-31T10:00:00Z",
+                    "2026-02-31T10:00:01Z",
+                ),
+                (
+                    "finished before started",
+                    "2026-08-30T10:00:01Z",
+                    "2026-08-30T10:00:00Z",
+                ),
+            ):
+                entry = self.soak_verified_entry(1, selected, runtime)
+                entry["startedAt"] = started_at
+                entry["finishedAt"] = finished_at
+                with self.subTest(name=name):
+                    report = self.soak_tool.write_report(
+                        path,
+                        [entry],
+                        1,
+                        selected,
+                    )
+                    self.assertEqual(report["releaseGate"], "blocked")
+                    self.assertEqual(report["statuses"], {"invalid": 1})
+                    self.assertEqual(report["completedApplicationExecutions"], 0)
+
     def test_soak_resume_rejects_contradictory_verified_application_semantics(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-soak-resume-semantics-") as temporary:
             root = Path(temporary)
@@ -5380,6 +5499,62 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 self.assertNotIn("not-a-digest", persisted)
                 self.assertNotIn("UnicodeDecodeError", persisted)
                 self.assertNotIn("invalid start byte", persisted)
+
+    def test_soak_windows_crash_returncode_preserves_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-windows-returncode-"
+        ) as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            runtime = self.soak_runtime_selection(root)
+            crash_returncode = 0xC0000005
+
+            def run_cycle(
+                command: list[str],
+                **_: object,
+            ) -> subprocess.CompletedProcess[bytes]:
+                return subprocess.CompletedProcess(
+                    command,
+                    crash_returncode,
+                    b"",
+                    b"",
+                )
+
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    self.soak_main_arguments(root, output_root, runtime),
+                ),
+                mock.patch.object(self.soak_tool, "fetch"),
+                mock.patch.object(
+                    self.soak_tool,
+                    "start_power_assertion",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.soak_tool.subprocess,
+                    "run",
+                    side_effect=run_cycle,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                result = self.soak_tool.main()
+
+            self.assertEqual(result, 1)
+            cycle = json.loads(
+                (output_root / "cycles.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cycle["runnerExitCode"], crash_returncode)
+            self.assertEqual(cycle["status"], "failed")
+            self.assertTrue(cycle["hardFailure"])
+            report = json.loads(
+                (output_root / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["releaseGate"], "failed")
+            self.assertEqual(report["hardFailures"], 1)
+            self.assertEqual(report["statuses"], {"failed": 1})
 
     def test_soak_strict_json_rejects_duplicate_resume_inputs_before_side_effects(
         self,
@@ -6595,6 +6770,42 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             self.assertEqual(
                 sorted(path.name for path in output_root.iterdir()),
                 ["summary.json", "summary.json.tmp"],
+            )
+
+    def test_soak_report_cleans_its_temp_when_fsync_is_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-soak-report-interrupt-"
+        ) as temporary:
+            root = Path(temporary)
+            output_root = root / "soak"
+            output_root.mkdir()
+            report_path = output_root / "summary.json"
+            original = b"existing report remains authoritative\n"
+            report_path.write_bytes(original)
+            runtime = self.soak_runtime_selection(root)
+            selected = {"winmerge"}
+            interruption = KeyboardInterrupt("stop report write")
+
+            with (
+                mock.patch.object(
+                    self.soak_tool.os,
+                    "fsync",
+                    side_effect=interruption,
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                self.soak_tool.write_report(
+                    report_path,
+                    [self.soak_verified_entry(1, selected, runtime)],
+                    1,
+                    selected,
+                )
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(report_path.read_bytes(), original)
+            self.assertEqual(
+                sorted(path.name for path in output_root.iterdir()),
+                ["summary.json"],
             )
 
     def test_soak_report_rejects_noncertification_application_sets(self) -> None:

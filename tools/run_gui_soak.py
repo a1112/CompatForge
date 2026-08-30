@@ -14,6 +14,7 @@ import sys
 import tempfile
 import uuid
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 from download_gui_assets import AssetError, CERTIFICATION_ASSETS, fetch
@@ -436,6 +437,18 @@ def safe_runtime_projection(value: object) -> dict[str, str]:
     }
 
 
+def _soak_timestamp(value: object) -> datetime:
+    if (
+        not isinstance(value, str)
+        or SOAK_TIMESTAMP.fullmatch(value) is None
+    ):
+        raise AcceptanceError("cycle timestamp is invalid")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise AcceptanceError("cycle timestamp is invalid") from error
+
+
 def _project_application(
     application: object,
     selected: set[str],
@@ -511,17 +524,17 @@ def project_cycle_evidence(
         or entry.get("testSuiteVersion") != TEST_SUITE_VERSION
         or type(entry.get("cycle")) is not int
         or entry["cycle"] != ordinal
-        or not isinstance(entry.get("startedAt"), str)
-        or SOAK_TIMESTAMP.fullmatch(entry["startedAt"]) is None
-        or not isinstance(entry.get("finishedAt"), str)
-        or SOAK_TIMESTAMP.fullmatch(entry["finishedAt"]) is None
         or type(entry.get("runnerExitCode")) is not int
-        or not -(2**31) <= entry["runnerExitCode"] < 2**31
+        or not -(2**31) <= entry["runnerExitCode"] < 2**32
         or type(entry.get("hardFailure")) is not bool
         or type(entry.get("infrastructureBlocked")) is not bool
         or not isinstance(entry.get("applications"), list)
     ):
         raise AcceptanceError("cycle record structure is invalid")
+    started_at = _soak_timestamp(entry.get("startedAt"))
+    finished_at = _soak_timestamp(entry.get("finishedAt"))
+    if finished_at < started_at:
+        raise AcceptanceError("cycle timestamps are not ordered")
 
     applications = entry["applications"]
     terminal = "reason" in entry or not applications
@@ -858,6 +871,7 @@ def write_report(
     )
     temporary = Path(temporary_name)
     descriptor_open = True
+    cleanup_owned = True
     try:
         created = os.fstat(descriptor)
         if not stat.S_ISREG(created.st_mode) or _is_reparse_point(created):
@@ -876,17 +890,18 @@ def write_report(
         ):
             raise AcceptanceError("soak report temporary file is invalid")
         os.replace(temporary, path)
-    except Exception:
+        cleanup_owned = False
+    finally:
         if descriptor_open:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+        if cleanup_owned:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     return report
 
 
