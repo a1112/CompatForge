@@ -4588,6 +4588,23 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             with self.assertRaises(self.baseline.AcceptanceError):
                 self.soak_tool.runtime_selection(missing_runtime_id)
 
+            invalid_wine_roots = (
+                str(Path("relative") / "CrossOver Runtime"),
+                str(Path(temporary) / "CrossOver Runtime" / ".." / "Selected Runtime"),
+                str(ROOT / "runtime"),
+            )
+            for invalid in invalid_wine_roots:
+                mutant = argparse.Namespace(
+                    runtime_id=runtime["runtimeId"],
+                    wine_root=invalid,
+                    wine=runtime["wine"],
+                    wineserver=runtime["wineserver"],
+                    version=runtime["version"],
+                )
+                with self.subTest(wine_root=invalid):
+                    with self.assertRaises(self.baseline.AcceptanceError):
+                        self.soak_tool.runtime_selection(mutant)
+
             for field in ("wine", "wineserver"):
                 for invalid in (
                     "",
