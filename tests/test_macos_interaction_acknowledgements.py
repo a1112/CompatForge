@@ -24,7 +24,13 @@ APPLICATIONS = ("7zip", "sumatrapdf", "notepad-plus-plus")
 REQUIRED_CHECKS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
-    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
 }
 
 
@@ -1279,6 +1285,7 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
             "getattr(os, 'system')('true')",
             "Path('evidence.json').write_text('x')",
             "os.spawnl(0, 'tool')",
+            "os.ftruncate(5, 0)",
             "ctypes.pythonapi.PyRun_SimpleString(b'pass')",
             "from os import system as invoke\ninvoke('tool')",
             "from pathlib import Path\nPath('x').open('w')",
@@ -1347,6 +1354,43 @@ class AcknowledgementRepositoryValidationTests(unittest.TestCase):
                 helper = copied / "tools" / "confirm_macos_gui_interactions.py"
                 helper.write_text(
                     helper.read_text(encoding="utf-8") + "\n" + marker + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                original_root = self.validator.ROOT
+                self.validator.ROOT = copied
+                try:
+                    self.assertEqual(
+                        self.validator.validate_macos_acknowledgement_surface(),
+                        [
+                            "macOS acknowledgement helper uses a forbidden side-effect capability"
+                        ],
+                    )
+                finally:
+                    self.validator.ROOT = original_root
+
+    def test_validator_binds_cleanup_truncation_to_the_owned_tombstone(self) -> None:
+        replacements = (
+            "os.ftruncate(descriptor, 0)",
+            "os.ftruncate(descriptor, 2)",
+            "os.ftruncate(other_descriptor, 1)",
+            "os.ftruncate(descriptor, 1)\n    os.ftruncate(descriptor, 1)",
+        )
+        for replacement in replacements:
+            with (
+                self.subTest(replacement=replacement),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                copied = Path(directory)
+                for relative in self.validator.MACOS_ACKNOWLEDGEMENT_REVIEWED_PATHS:
+                    target = copied / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(ROOT / relative, target)
+                helper = copied / "tools" / "confirm_macos_gui_interactions.py"
+                source = helper.read_text(encoding="utf-8")
+                self.assertEqual(source.count("os.ftruncate(descriptor, 1)"), 1)
+                helper.write_text(
+                    source.replace("os.ftruncate(descriptor, 1)", replacement),
                     encoding="utf-8",
                     newline="\n",
                 )

@@ -40,7 +40,13 @@ GUI_EXPLICIT_SOURCE = "explicit-override"
 REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
-    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
 }
 STATUSES = ("accepted", "failed", "unverified", "blocked")
 FAILURE_CLASSES = ("environment", "runtime", "core", "desktop", "application", "cleanup")
@@ -891,8 +897,12 @@ def parse_discovery(text: object, arguments: argparse.Namespace) -> list[dict[st
             raise AcceptanceError("Runtime descriptor identity is invalid")
         source = _safe_text(descriptor["source"], "Runtime source")
         expected_sources = {
-            "crossover": {"crossover-app"},
-            "whisky": {"whisky-app", "whisky-library"},
+            "crossover": {"crossover-app", "crossover-interactive-derived"},
+            "whisky": {
+                "whisky-app",
+                "whisky-library",
+                "whisky-interactive-derived",
+            },
         }
         if source not in expected_sources[runtime_id]:
             raise AcceptanceError("Runtime descriptor source is invalid")
@@ -1038,8 +1048,9 @@ def _stop_posix_process_group(process: object, process_group: int) -> bool:
     if not callable(wait):
         raise CleanupError("managed process group cleanup failed")
     cleanup_failed = False
-    if not _signal_process_group(process_group, signal.SIGTERM):
-        cleanup_failed = True
+    # The group can disappear, or briefly become unsignalable on macOS, between
+    # the existence probe and killpg. Final group absence is the cleanup gate.
+    _signal_process_group(process_group, signal.SIGTERM)
     try:
         wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -1047,8 +1058,7 @@ def _stop_posix_process_group(process: object, process_group: int) -> bool:
     except Exception:
         cleanup_failed = True
     if _process_group_exists(process_group):
-        if not _signal_process_group(process_group, signal.SIGKILL):
-            cleanup_failed = True
+        _signal_process_group(process_group, signal.SIGKILL)
         try:
             wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
         except Exception:
@@ -2357,6 +2367,19 @@ def _complete_accepted_gui(application: object) -> bool:
         return False
     asset_digest = application.get("assetSha256")
     interactions = application.get("interactionChecks")
+    installer_exit = application.get("installerExit")
+    termination_requested = application.get("installerTerminationRequested")
+    if termination_requested is not None and (
+        application_id != "sumatrapdf"
+        or termination_requested is not True
+        or installer_exit != {"present": True, "code": None, "success": False}
+    ):
+        return False
+    installer_accepted = _successful_exit(installer_exit) or (
+        application_id == "sumatrapdf"
+        and termination_requested is True
+        and installer_exit == {"present": True, "code": None, "success": False}
+    )
     return (
         isinstance(asset_digest, str)
         and re.fullmatch(r"[0-9a-f]{64}", asset_digest) is not None
@@ -2364,9 +2387,10 @@ def _complete_accepted_gui(application: object) -> bool:
         and isinstance(interactions, dict)
         and tuple(interactions) == REQUIRED_INTERACTIONS[application_id]
         and all(checked is True for checked in interactions.values())
-        and _successful_exit(application.get("installerExit"))
+        and installer_accepted
         and _successful_exit(application.get("exit"))
         and application.get("windowAvailable") is True
+        and application.get("screenshotAvailable") is True
     )
 
 
@@ -2414,6 +2438,7 @@ def _project_gui(
         "failureClass",
         "reasonCode",
         "interactionChecks",
+        "installerTerminationRequested",
         "installerExit",
         "exit",
         "windowAvailable",
@@ -2475,6 +2500,15 @@ def _project_gui(
         for field in ("installerExit", "exit"):
             if field in application:
                 output[field] = _project_exit(application[field])
+        if "installerTerminationRequested" in application:
+            if (
+                application_id != "sumatrapdf"
+                or application["installerTerminationRequested"] is not True
+                or output.get("installerExit")
+                != {"present": True, "code": None, "success": False}
+            ):
+                raise AcceptanceError("GUI installer termination relation is invalid")
+            output["installerTerminationRequested"] = True
         for field in ("windowAvailable", "screenshotAvailable"):
             if field in application:
                 if not isinstance(application[field], bool):
@@ -2588,6 +2622,7 @@ def _failure_projection(
         "failureClass": failure_class,
         "reasonCode": reason_code,
         "interactionChecks": {},
+        "installerTerminationRequested": None,
         "installerExitPresent": None,
         "installerExitCode": None,
         "exitPresent": None,
@@ -2649,6 +2684,7 @@ def _project_console_evidence(
         "status": "accepted",
         "interactionChecks": {},
         "eventKinds": list(event_kinds),
+        "installerTerminationRequested": None,
         "installerExitPresent": None,
         "installerExitCode": None,
         "exitPresent": True,
@@ -2667,6 +2703,7 @@ def _project_gui_evidence(
         "failureClass",
         "reasonCode",
         "interactionChecks",
+        "installerTerminationRequested",
         "installerExit",
         "exit",
         "windowAvailable",
@@ -2707,12 +2744,27 @@ def _project_gui_evidence(
             ):
                 raise AcceptanceError("projected GUI interaction checks are invalid")
             failure["interactionChecks"] = {name: interactions[name] for name in required}
+        termination_requested = value.get("installerTerminationRequested")
         if "installerExit" in value:
             installer_exit = _project_exit(value["installerExit"])
-            if not _closed_exit_relation(installer_exit):
+            requested_termination = (
+                application_id == "sumatrapdf"
+                and termination_requested is True
+                and installer_exit == {"present": True, "code": None, "success": False}
+            )
+            if not _closed_exit_relation(installer_exit) and not requested_termination:
                 raise AcceptanceError("projected GUI installer exit relation is invalid")
             failure["installerExitPresent"] = installer_exit["present"]
             failure["installerExitCode"] = installer_exit["code"]
+        if termination_requested is not None:
+            if (
+                application_id != "sumatrapdf"
+                or termination_requested is not True
+                or failure["installerExitPresent"] is not True
+                or failure["installerExitCode"] is not None
+            ):
+                raise AcceptanceError("projected GUI installer termination relation is invalid")
+            failure["installerTerminationRequested"] = True
         if "exit" in value:
             exit_value = _project_exit(value["exit"])
             if not _closed_exit_relation(exit_value):
@@ -2746,6 +2798,7 @@ def _project_gui_evidence(
             name: stable["interactionChecks"][name]
             for name in REQUIRED_INTERACTIONS[application_id]
         },
+        "installerTerminationRequested": stable.get("installerTerminationRequested") is True,
         "installerExitPresent": installer_exit["present"],
         "installerExitCode": installer_exit["code"],
         "exitPresent": exit_value["present"],
@@ -2856,6 +2909,7 @@ def _validate_canonical_application(
         "assetSha256",
         "status",
         "interactionChecks",
+        "installerTerminationRequested",
         "installerExitPresent",
         "installerExitCode",
         "exitPresent",
@@ -2884,6 +2938,9 @@ def _validate_canonical_application(
     ):
         raise AcceptanceError("round projection asset digest is invalid")
     interactions = application["interactionChecks"]
+    termination_requested = application["installerTerminationRequested"]
+    if termination_requested is not None and not isinstance(termination_requested, bool):
+        raise AcceptanceError("round projection installer termination flag is invalid")
     required_interactions = () if application_id == "console" else REQUIRED_INTERACTIONS[application_id]
     if (
         not isinstance(interactions, dict)
@@ -2906,10 +2963,18 @@ def _validate_canonical_application(
     for prefix in ("installerExit", "exit"):
         present = application[f"{prefix}Present"]
         code = application[f"{prefix}Code"]
+        requested_termination = (
+            prefix == "installerExit"
+            and application_id == "sumatrapdf"
+            and termination_requested is True
+            and present is True
+            and code is None
+        )
         if not (
             (present is None and code is None)
             or (present is False and code is None)
             or (present is True and isinstance(code, int) and not isinstance(code, bool))
+            or requested_termination
         ):
             raise AcceptanceError("round projection exit relation is invalid")
     for field in ("windowAvailable", "cleanup"):
@@ -2932,6 +2997,7 @@ def _validate_canonical_application(
                     or re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*", kind) is None
                     for kind in event_kinds
                 )
+                or termination_requested is not None
                 or application["installerExitCode"] is not None
                 or application["installerExitPresent"] is not None
                 or application["exitPresent"] is not True
@@ -2941,18 +3007,28 @@ def _validate_canonical_application(
                 or interactions
             ):
                 raise AcceptanceError("round projection Console result is invalid")
-        elif (
-            application["assetSha256"] is None
-            or tuple(interactions) != required_interactions
-            or any(checked is not True for checked in interactions.values())
-            or application["installerExitCode"] != 0
-            or application["installerExitPresent"] is not True
-            or application["exitPresent"] is not True
-            or application["exitCode"] != 0
-            or application["windowAvailable"] is not True
-            or application["cleanup"] is not True
-        ):
-            raise AcceptanceError("round projection GUI result is invalid")
+        else:
+            installer_accepted = (
+                termination_requested is False
+                and application["installerExitCode"] == 0
+                and application["installerExitPresent"] is True
+            ) or (
+                application_id == "sumatrapdf"
+                and termination_requested is True
+                and application["installerExitCode"] is None
+                and application["installerExitPresent"] is True
+            )
+            if (
+                application["assetSha256"] is None
+                or tuple(interactions) != required_interactions
+                or any(checked is not True for checked in interactions.values())
+                or not installer_accepted
+                or application["exitPresent"] is not True
+                or application["exitCode"] != 0
+                or application["windowAvailable"] is not True
+                or application["cleanup"] is not True
+            ):
+                raise AcceptanceError("round projection GUI result is invalid")
         return
 
     failure_class = application.get("failureClass")
@@ -2963,6 +3039,13 @@ def _validate_canonical_application(
         or APPLICATION_FAILURE_RELATIONS.get(reason_code) != (status_value, failure_class)
     ):
         raise AcceptanceError("round projection application failure is invalid")
+    if termination_requested is not None and (
+        termination_requested is not True
+        or application_id != "sumatrapdf"
+        or application["installerExitPresent"] is not True
+        or application["installerExitCode"] is not None
+    ):
+        raise AcceptanceError("round projection installer termination relation is invalid")
 
 
 def _validate_canonical_projection(projection: object) -> None:

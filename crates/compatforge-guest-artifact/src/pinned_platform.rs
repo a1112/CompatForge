@@ -46,6 +46,20 @@ fn full_identity_and_cloexec_match(expected: MetadataSnapshot, actual: MetadataS
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn entry_identity_and_cloexec_match(
+    expected: MetadataSnapshot,
+    actual: MetadataSnapshot,
+    cloexec: bool,
+    full_identity: bool,
+) -> bool {
+    if full_identity {
+        full_identity_and_cloexec_match(expected, actual, cloexec)
+    } else {
+        cloexec && expected.device == actual.device && expected.inode == actual.inode && expected.kind == actual.kind
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn valid_initial_staging_snapshot(snapshot: MetadataSnapshot, effective_user: u64) -> bool {
     snapshot.kind == REGULAR_FILE_KIND
         && snapshot.owner == effective_user
@@ -78,8 +92,8 @@ where
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{
-        full_identity_and_cloexec_match, retry_exclusive_create, valid_initial_staging_snapshot, CreateAttemptError,
-        File, MetadataSnapshot, Path, PlatformError,
+        entry_identity_and_cloexec_match, full_identity_and_cloexec_match, retry_exclusive_create,
+        valid_initial_staging_snapshot, CreateAttemptError, File, MetadataSnapshot, Path, PlatformError,
     };
     use std::cell::Cell;
     use std::ffi::{CStr, CString, OsStr};
@@ -351,11 +365,13 @@ mod macos {
             )?;
             let identity = fstat_fd(file.as_raw_fd())?;
             let entry_identity = fstat_entry(parent, &component)?;
+            let full_identity = bind_final_full_identity && index + 1 == component_count;
             if !identity.is_directory()
-                || !full_identity_and_cloexec_match(
+                || !entry_identity_and_cloexec_match(
                     identity.snapshot(),
                     entry_identity.snapshot(),
                     fd_flags(file.as_raw_fd())? & libc::FD_CLOEXEC != 0,
+                    full_identity,
                 )
             {
                 return Err(PlatformError::Integrity);
@@ -364,7 +380,7 @@ mod macos {
                 file,
                 identity: Cell::new(identity),
                 name_from_parent: Some(component),
-                full_identity: bind_final_full_identity && index + 1 == component_count,
+                full_identity,
             });
         }
         Ok(chain)
@@ -391,10 +407,11 @@ mod macos {
                 identity.is_directory()
             };
             if !valid_kind
-                || !full_identity_and_cloexec_match(
+                || !entry_identity_and_cloexec_match(
                     identity.snapshot(),
                     entry_identity.snapshot(),
                     fd_flags(file.as_raw_fd())? & libc::FD_CLOEXEC != 0,
+                    false,
                 )
             {
                 return Err(PlatformError::Integrity);
@@ -1205,6 +1222,43 @@ mod contract_tests {
             },
         ] {
             assert!(!full_identity_and_cloexec_match(expected, actual, true));
+        }
+    }
+
+    #[test]
+    fn ancestor_entry_oracle_allows_metadata_drift_but_rejects_substitution() {
+        let expected = snapshot();
+        assert!(entry_identity_and_cloexec_match(expected, expected, true, false));
+        assert!(!entry_identity_and_cloexec_match(expected, expected, false, false));
+        for actual in [
+            MetadataSnapshot {
+                mode: 0o100400,
+                ..expected
+            },
+            MetadataSnapshot { links: 2, ..expected },
+            MetadataSnapshot { owner: 502, ..expected },
+            MetadataSnapshot { size: 1, ..expected },
+            MetadataSnapshot {
+                modified_seconds: 14,
+                ..expected
+            },
+            MetadataSnapshot {
+                changed_nanoseconds: 24,
+                ..expected
+            },
+        ] {
+            assert!(entry_identity_and_cloexec_match(expected, actual, true, false));
+            assert!(!entry_identity_and_cloexec_match(expected, actual, true, true));
+        }
+        for actual in [
+            MetadataSnapshot { device: 8, ..expected },
+            MetadataSnapshot { inode: 12, ..expected },
+            MetadataSnapshot {
+                kind: 0o040000,
+                ..expected
+            },
+        ] {
+            assert!(!entry_identity_and_cloexec_match(expected, actual, true, false));
         }
     }
 

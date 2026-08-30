@@ -4,7 +4,7 @@
 
 **Goal:** Close the four final integration findings so the branch can safely begin the real Apple Silicon dual-Runtime acceptance matrix.
 
-**Architecture:** Replace pre-run interaction booleans with a file-based challenge/acknowledgement protocol consumed by a second-terminal watch helper. Keep the orchestrator non-interactive, bind every acknowledgement to the current round, Runtime, application, Runtime Pack, asset, and nonce, and retain the existing no-follow and bounded-process boundaries. Separately make SumatraPDF installation deterministic, restore the legacy workflow oracle, and remove the tracked developer path.
+**Architecture:** Replace pre-run interaction booleans with a file-based challenge/acknowledgement protocol consumed by a second-terminal watch helper. Keep the orchestrator non-interactive, bind every acknowledgement to the current round, Runtime, application, Runtime Pack, asset, and nonce, and retain the existing no-follow and bounded-process boundaries. Separately make SumatraPDF materialization deterministic, restore the legacy workflow oracle, and remove the tracked developer path.
 
 **Tech Stack:** Dependency-free Python 3.11+, canonical JSON, no-follow filesystem operations, `unittest`, GitHub Actions YAML contract tests, Rust/Cargo and Tauri regression gates.
 
@@ -207,7 +207,7 @@ git add tools/run_macos_dual_runtime_acceptance.py tests/test_macos_dual_runtime
 git commit -s -m "feat: orchestrate observed macOS acknowledgements"
 ```
 
-### Task 4: Make SumatraPDF installation deterministic
+### Task 4: Make SumatraPDF materialization deterministic
 
 **Files:**
 - Modify: `tools/download_gui_assets.py`
@@ -216,21 +216,17 @@ git commit -s -m "feat: orchestrate observed macOS acknowledgements"
 - Modify: `tests/test_gui_baseline_contracts.py`
 - Modify: `tests/test_macos_dual_runtime_acceptance.py`
 
-**Step 1: Write installation-path RED tests**
+**Step 1: Write fixed-artifact RED tests**
 
-Require SumatraPDF arguments to include:
+Require the official SumatraPDF 3.6.1 portable artifact, fixed SHA-256, and a bounded no-argument preparation launch.
 
-```text
--install -silent -d C:\CompatForge\SumatraPDF
-```
+Require exclusive no-follow materialization at `CompatForge/SumatraPDF/SumatraPDF.exe`. Test digest mismatch, source symlink, duplicate target, partial-target cleanup, and an empty child environment; prove no `USER`, `HOME`, profile enumeration, or Public fallback is consulted.
 
-Require the reviewed installed executable to be `CompatForge/SumatraPDF/SumatraPDF.exe`. Test with an empty child environment and prove no `USER`, `HOME`, profile enumeration, or Public fallback is consulted.
+Expected: RED until the runner owns a fixed portable copy inside the current Bottle.
 
-Expected: RED because the current installer uses only `-silent` and lookup falls back to `users/Public`.
+**Step 2: Implement the fixed portable path**
 
-**Step 2: Implement the fixed path**
-
-Update the asset descriptor and remove the Sumatra user-profile fallback from `installed_executable()`. Keep 7-Zip and Notepad++ paths unchanged.
+Update the asset descriptor, materialize the fixed portable bytes exactly once, run the bounded Bottle-in-place preparation smoke, and remove the Sumatra user-profile fallback from `installed_executable()`. Keep 7-Zip and Notepad++ paths unchanged.
 
 **Step 3: Add path-safety regressions**
 
@@ -256,7 +252,7 @@ git commit -s -m "fix: pin SumatraPDF installation path"
 
 **Step 1: Write developer-path RED tests**
 
-Replace the tracked `C:\Users\10428\...python.exe` command with an explicit environment-independent Python 3.12 placeholder. Add validator tests that mutate the new macOS acceptance design/plan documents with Windows user, macOS user, Linux home, workspace, and tool-cache absolute paths and require fixed no-leak errors.
+Replace the tracked developer-specific Python command with an explicit environment-independent Python 3.12 placeholder. Add validator tests that mutate the reviewed macOS acceptance planning documents with Windows user, macOS user, Linux home, workspace, and tool-cache absolute paths and require fixed no-leak errors.
 
 **Step 2: Write legacy workflow RED tests**
 

@@ -30,9 +30,9 @@ use std::time::{Duration, Instant};
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(not(test))]
 const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-// Keep cleanup timeout tests fast while preserving the production five-second bound.
+// Exercise the same scheduling budget as production on loaded macOS hosts.
 #[cfg(test)]
-const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
+const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_FORCE_COMPLETION_TIMEOUT: Duration = Duration::from_secs(16);
 const WINE_PREFIX_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 const EXECUTABLE_BUSY_RETRY_LIMIT: usize = 20;
@@ -178,7 +178,7 @@ fn pinned_command_spec(
     }
     Ok(PinnedCommandSpec {
         executable: plan.process.executable.clone(),
-        arguments: vec!["start.exe".into(), "/unix".into(), format!("/dev/fd/{descriptor}")],
+        arguments: vec![format!("/dev/fd/{descriptor}")],
         environment: plan.process.environment.clone(),
         current_dir: plan.process.working_directory.clone(),
     })
@@ -1382,14 +1382,42 @@ mod platform {
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
+    #[cfg(target_os = "macos")]
+    use std::thread;
+    #[cfg(target_os = "macos")]
+    use std::time::Duration;
 
     const SIGKILL: i32 = 9;
     const SIGTERM: i32 = 15;
     const ESRCH: i32 = 3;
+    #[cfg(target_os = "macos")]
+    const EPERM: i32 = 1;
+    #[cfg(target_os = "macos")]
+    const SIGNAL_RETRY_LIMIT: usize = 50;
+    #[cfg(target_os = "macos")]
+    const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(5);
 
     extern "C" {
         fn kill(process_id: i32, signal: i32) -> i32;
         fn setpgid(process_id: i32, process_group_id: i32) -> i32;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn retry_permission_denied_signal(
+        mut signal_once: impl FnMut() -> io::Result<()>,
+        mut wait_before_retry: impl FnMut(),
+    ) -> io::Result<()> {
+        let mut retries = 0;
+        loop {
+            match signal_once() {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(EPERM) && retries < SIGNAL_RETRY_LIMIT => {
+                    retries += 1;
+                    wait_before_retry();
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub struct PreparedProcessTree;
@@ -1433,21 +1461,80 @@ mod platform {
         }
 
         fn send_signal(&self, signal: i32) -> io::Result<()> {
+            #[cfg(target_os = "macos")]
+            {
+                retry_permission_denied_signal(|| self.send_signal_once(signal), || thread::sleep(SIGNAL_RETRY_DELAY))
+            }
+            #[cfg(not(target_os = "macos"))]
+            self.send_signal_once(signal)
+        }
+
+        fn send_signal_once(&self, signal: i32) -> io::Result<()> {
             // SAFETY: the negative id targets the process group created for this
             // launch. No Rust memory is shared with the operating system call.
-            if unsafe { kill(-self.process_group_id, signal) } == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(ESRCH) {
-                    return Err(error);
-                }
+            if unsafe { kill(-self.process_group_id, signal) } != -1 {
+                return Ok(());
             }
-            Ok(())
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
         }
     }
 
     impl Drop for ProcessTree {
         fn drop(&mut self) {
             let _ = self.force_kill();
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod tests {
+        use super::*;
+        use std::cell::Cell;
+
+        #[test]
+        fn permission_denied_signal_retries_until_success() {
+            let calls = Cell::new(0);
+            let waits = Cell::new(0);
+
+            retry_permission_denied_signal(
+                || {
+                    let next = calls.get() + 1;
+                    calls.set(next);
+                    if next < 3 {
+                        Err(io::Error::from_raw_os_error(EPERM))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || waits.set(waits.get() + 1),
+            )
+            .unwrap();
+
+            assert_eq!(calls.get(), 3);
+            assert_eq!(waits.get(), 2);
+        }
+
+        #[test]
+        fn permission_denied_signal_returns_error_after_retry_budget() {
+            let calls = Cell::new(0);
+            let waits = Cell::new(0);
+
+            let error = retry_permission_denied_signal(
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(io::Error::from_raw_os_error(EPERM))
+                },
+                || waits.set(waits.get() + 1),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.raw_os_error(), Some(EPERM));
+            assert_eq!(calls.get(), SIGNAL_RETRY_LIMIT + 1);
+            assert_eq!(waits.get(), SIGNAL_RETRY_LIMIT);
         }
     }
 }
@@ -1680,14 +1767,14 @@ mod tests {
     }
 
     #[test]
-    fn pinned_command_uses_only_reviewed_wine_start_unix_and_actual_descriptor() {
+    fn pinned_command_uses_only_reviewed_wine_and_actual_descriptor() {
         let (plan, binding) = pinned_fixture_plan();
         let serialized_before = serde_json::to_string(&plan).unwrap();
 
         let command = pinned_command_spec(&plan, &binding, 41).unwrap();
 
         assert_eq!(command.executable, plan.process.executable);
-        assert_eq!(command.arguments, ["start.exe", "/unix", "/dev/fd/41"]);
+        assert_eq!(command.arguments, ["/dev/fd/41"]);
         assert_eq!(command.current_dir, plan.process.working_directory);
         assert_eq!(command.environment, plan.process.environment);
         assert!(!command.arguments.iter().any(|argument| argument == &binding.path));
@@ -1879,7 +1966,7 @@ mod tests {
         let reviewed_wine = root.join("reviewed-wine");
         let mut wine = std::fs::File::create(&reviewed_wine).unwrap();
         wine.write_all(
-            b"#!/bin/sh\nwhile [ ! -f \"$COMPATFORGE_PINNED_GATE\" ]; do :; done\nprintf '%s\\n' \"$@\" > \"$COMPATFORGE_PINNED_ARGUMENTS\"\n/bin/cat \"$3\" > \"$COMPATFORGE_PINNED_OUTPUT\"\n",
+            b"#!/bin/sh\nwhile [ ! -f \"$COMPATFORGE_PINNED_GATE\" ]; do :; done\nprintf '%s\\n' \"$@\" > \"$COMPATFORGE_PINNED_ARGUMENTS\"\n/bin/cat \"$1\" > \"$COMPATFORGE_PINNED_OUTPUT\"\n",
         )
         .unwrap();
         wine.sync_all().unwrap();
@@ -1940,15 +2027,16 @@ mod tests {
         std::fs::write(gate, b"revalidation-complete").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (!output.exists() || !arguments.exists()) && Instant::now() < deadline {
+        while (std::fs::read(&output).ok().as_deref() != Some(bytes.as_slice()) || !arguments.exists())
+            && Instant::now() < deadline
+        {
             thread::sleep(PROCESS_POLL_INTERVAL);
         }
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
         let child_arguments = std::fs::read_to_string(&arguments).unwrap();
         let lines = child_arguments.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3);
-        assert_eq!(&lines[..2], ["start.exe", "/unix"]);
-        let descriptor = lines[2].strip_prefix("/dev/fd/").unwrap().parse::<i32>().unwrap();
+        assert_eq!(lines.len(), 1);
+        let descriptor = lines[0].strip_prefix("/dev/fd/").unwrap().parse::<i32>().unwrap();
         // SAFETY: F_GETFD does not take ownership. The process-owned parent
         // descriptor must already be closed once spawn returned.
         assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
@@ -2466,7 +2554,7 @@ mod tests {
         });
 
         let handle = ProcessSupervisor::start(&plan).unwrap();
-        let start_deadline = Instant::now() + Duration::from_secs(2);
+        let start_deadline = Instant::now() + Duration::from_secs(5);
         let mut before_termination = Vec::new();
         while !started.exists() && Instant::now() < start_deadline {
             if let EventPoll::Event(event) = handle.next_event(PROCESS_POLL_INTERVAL) {

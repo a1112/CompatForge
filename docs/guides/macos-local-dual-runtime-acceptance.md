@@ -121,7 +121,7 @@ python3 -S -B tools/confirm_macos_gui_interactions.py \
   --acknowledgement-root /absolute/external/acknowledgements
 ```
 
-helper 出现 challenge 后，才在已显示的应用窗口执行对应动作：7-Zip 的 `fileList`/`menus`；SumatraPDF 的 `mainWindow`/`openDialog`；Notepad++ 的 `open`/`edit`/`saveUtf8Chinese`/`rereadMatches`。每完成一项立即在第二终端确认；不要提前确认、批量确认或在应用关闭后凭记忆确认。否定回答或超时保持 `unverified`，错误 identity、digest、nonce、重复/跨轮 receipt 或 unsafe entry 为 `failed`。Console 由无头 runner 自动验证，不需要人工 receipt。
+helper 出现 challenge 后，才在已显示的应用窗口执行对应动作：7-Zip 的 `fileList`/`menus`；SumatraPDF 的 `mainWindow`/`openDialog`；Notepad++ 的 `open`/`edit`/`saveUtf8Chinese`/`cjkTextReadable`/`rereadMatches`。其中 `cjkTextReadable` 必须依据应用内中文实际显示为可读字形（不是方框）确认；每完成一项立即在第二终端确认，不要提前确认、批量确认或在应用关闭后凭记忆确认。否定回答或超时保持 `unverified`，错误 identity、digest、nonce、重复/跨轮 receipt 或 unsafe entry 为 `failed`。Console 由无头 runner 自动验证，不需要人工 receipt。
 
 ## 7. 执行两轮矩阵
 

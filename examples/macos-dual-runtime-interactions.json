@@ -14,6 +14,7 @@
               "open",
               "edit",
               "saveUtf8Chinese",
+              "cjkTextReadable",
               "rereadMatches"
             ]
           },
@@ -46,6 +47,7 @@
               "open",
               "edit",
               "saveUtf8Chinese",
+              "cjkTextReadable",
               "rereadMatches"
             ]
           },
@@ -78,6 +80,7 @@
               "open",
               "edit",
               "saveUtf8Chinese",
+              "cjkTextReadable",
               "rereadMatches"
             ]
           },
@@ -110,6 +113,7 @@
               "open",
               "edit",
               "saveUtf8Chinese",
+              "cjkTextReadable",
               "rereadMatches"
             ]
           },

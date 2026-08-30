@@ -167,4 +167,4 @@ python3 -S -B scripts/validate_repository.py
 python3 -S -B tools/discover_macos_wine.py --all
 ```
 
-真实 Mac 的固定资产 opt-in、四份只读交互计划、一次启动的第二终端 helper、窗口出现后的即时确认、12 个 GUI receipts + 4 个 Console 自动结果、精确双轮命令、仓库外根、负向隔离检查与 `16 accepted + projections equal + zero cleanup failure` 退出条件见[双 Runtime 本地验收指南](guides/macos-local-dual-runtime-acceptance.md)。默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。
+真实 Mac 的固定资产 opt-in、四份只读交互计划、一次启动的第二终端 helper、窗口出现后的即时确认、12 个 GUI receipts + 4 个 Console 自动结果、精确双轮命令、仓库外根、负向隔离检查与 `16 accepted + projections equal + zero cleanup failure` 退出条件见[双 Runtime 本地验收指南](guides/macos-local-dual-runtime-acceptance.md)。本机复核结果见[脱敏阶段报告](reports/2026-08-21-macos-local-dual-runtime-acceptance.md)。默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。

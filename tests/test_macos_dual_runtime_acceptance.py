@@ -27,7 +27,14 @@ VALIDATOR = ROOT / "scripts" / "validate_repository.py"
 GUI_ASSET_TOOL = ROOT / "tools" / "download_gui_assets.py"
 ACKNOWLEDGEMENT_TOOL = ROOT / "tools" / "confirm_macos_gui_interactions.py"
 ACCEPTANCE_GUIDE = ROOT / "docs" / "guides" / "macos-local-dual-runtime-acceptance.md"
+ACCEPTANCE_REPORT = ROOT / "docs" / "reports" / "2026-08-21-macos-local-dual-runtime-acceptance.md"
 ACCEPTANCE_INTERACTIONS = ROOT / "examples" / "macos-dual-runtime-interactions.json"
+ACCEPTANCE_DESIGN = ROOT / "docs" / "plans" / "2026-08-21-macos-local-dual-runtime-acceptance-design.md"
+ACCEPTANCE_PLAN = ROOT / "docs" / "plans" / "2026-08-21-macos-local-dual-runtime-acceptance.md"
+ACKNOWLEDGEMENT_DESIGN = ROOT / "docs" / "plans" / "2026-08-22-macos-acceptance-acknowledgement-design.md"
+ACCEPTANCE_HARDENING_PLAN = ROOT / "docs" / "plans" / "2026-08-22-macos-acceptance-integration-hardening.md"
+PINNED_EXECUTION_DESIGN = ROOT / "docs" / "plans" / "2026-08-22-macos-pinned-bottle-execution-design.md"
+PINNED_EXECUTION_PLAN = ROOT / "docs" / "plans" / "2026-08-22-macos-pinned-bottle-execution.md"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 DESKTOP_SMOKE = ROOT / "apps" / "desktop" / "tests" / "smoke.py"
 
@@ -39,14 +46,38 @@ EXPECTED_REVIEWED_PATHS = (
     "README.md",
     "docs/testing.md",
     "docs/guides/macos-local-dual-runtime-acceptance.md",
+    "docs/reports/2026-08-21-macos-local-dual-runtime-acceptance.md",
+    "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance-design.md",
+    "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance.md",
+    "docs/plans/2026-08-22-macos-acceptance-acknowledgement-design.md",
+    "docs/plans/2026-08-22-macos-acceptance-integration-hardening.md",
+    "docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md",
+    "docs/plans/2026-08-22-macos-pinned-bottle-execution.md",
     "examples/macos-dual-runtime-interactions.json",
     "tests/test_macos_dual_runtime_acceptance.py",
     "tools/run_macos_dual_runtime_acceptance.py",
 )
+EXPECTED_PLANNING_PATHS = frozenset(
+    path.relative_to(ROOT).as_posix()
+    for path in (
+        ACCEPTANCE_DESIGN,
+        ACCEPTANCE_PLAN,
+        ACKNOWLEDGEMENT_DESIGN,
+        ACCEPTANCE_HARDENING_PLAN,
+        PINNED_EXECUTION_DESIGN,
+        PINNED_EXECUTION_PLAN,
+    )
+)
 EXPECTED_REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
-    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
 }
 
 CI_CHECKOUT = "uses:actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
@@ -102,6 +133,14 @@ EXPECTED_CI_STEP_SURFACES = {
         (
             "Test desktop GUI baseline contracts",
             "run:python -S -B -m unittest tests.test_gui_baseline_contracts -v",
+            "",
+            "",
+        ),
+        (
+            "Test Mac-Win workflow policy contract",
+            "run:python -S -B -m unittest "
+            "tests.test_macwin_asset_migration.MacWinMigrationWorkflowTests."
+            "test_workflow_changes_only_pins_and_read_only_migration_checks -v",
             "",
             "",
         ),
@@ -768,7 +807,7 @@ class MacOsDualRuntimeCiContractTests(unittest.TestCase):
         asset = gui_assets.asset_for("sumatrapdf")
         self.assertEqual(
             asset.install_args,
-            ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+            (),
         )
         self.assertEqual(
             asset.installed_executable,
@@ -1469,6 +1508,35 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
         ):
             self.assertIn(required, guide)
 
+    def test_redacted_stage_report_is_complete_closed_and_path_free(self) -> None:
+        self.assertTrue(ACCEPTANCE_REPORT.is_file())
+        report = ACCEPTANCE_REPORT.read_text(encoding="utf-8")
+        validator._validate_macos_acceptance_report(report)
+        self.assertEqual(
+            len(
+                re.findall(
+                    r"(?m)^\| round-[12] \| (?:crossover|whisky) \| "
+                    r"(?:console|7zip|sumatrapdf|notepad-plus-plus) \| accepted \|$",
+                    report,
+                )
+            ),
+            16,
+        )
+        mutants = (
+            report.replace("16/16 accepted", "15/16 accepted", 1),
+            report + "\n/private/tmp/private-evidence\n",
+            report.replace(
+                "- `scope`: 本门禁仅为 local-only/developer-local；不是 public beta、public release 或发布门禁。",
+                "- `scope`: public beta",
+                1,
+            ),
+            report + "\n![raw](evidence.png)\n",
+        )
+        for mutant in mutants:
+            with self.subTest(mutant=hashlib.sha256(mutant.encode()).hexdigest()[:8]):
+                with self.assertRaises(ValueError):
+                    validator._validate_macos_acceptance_report(mutant)
+
     def test_interaction_template_exists_and_has_four_independent_records(self) -> None:
         self.assertTrue(ACCEPTANCE_INTERACTIONS.is_file())
         document = json.loads(ACCEPTANCE_INTERACTIONS.read_text(encoding="utf-8"))
@@ -1625,8 +1693,47 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
             validator.MACOS_ACCEPTANCE_REVIEWED_PATHS,
             EXPECTED_REVIEWED_PATHS,
         )
+        self.assertEqual(
+            validator.MACOS_ACCEPTANCE_PLANNING_PATHS,
+            EXPECTED_PLANNING_PATHS,
+        )
         self.assertEqual(validator.validate_macos_acceptance_surface(), [])
         self.assertEqual(validator.validate_macos_acceptance_docs(), [])
+
+    def test_repository_validator_rejects_planning_document_path_leaks(self) -> None:
+        markers = (
+            r"C:\Users\developer\.cache\runtime\python.exe",
+            "/Users/developer/work/CompatForge/target/tool",
+            "/home/developer/work/CompatForge/target/tool",
+            "/workspace/CompatForge/target/tool",
+            r"C:\hostedtoolcache\windows\Python\3.12\python.exe",
+        )
+        for relative in sorted(EXPECTED_PLANNING_PATHS):
+            for marker in markers:
+                with (
+                    self.subTest(relative=relative, marker=marker),
+                    tempfile.TemporaryDirectory(
+                        prefix="compatforge-macos-plan-path-mutant-"
+                    ) as temporary,
+                ):
+                    repository_root = Path(temporary) / "repository"
+                    self._copy_reviewed_surface(repository_root)
+                    target = repository_root / relative
+                    target.write_text(
+                        target.read_text(encoding="utf-8") + "\n" + marker + "\n",
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    with mock.patch.object(validator, "ROOT", repository_root):
+                        errors = validator.validate_macos_acceptance_surface()
+                    self.assertEqual(
+                        errors,
+                        [
+                            f"macOS acceptance surface {relative}: "
+                            "contains a forbidden developer path"
+                        ],
+                    )
+                    self.assertNotIn(marker, "\n".join(errors))
 
     def test_repository_validator_rejects_independent_document_mutants(self) -> None:
         def delete(relative: str):
@@ -2238,6 +2345,7 @@ class MacOsDualRuntimeProjectionTests(unittest.TestCase):
                 "open": True,
                 "edit": True,
                 "saveUtf8Chinese": True,
+                "cjkTextReadable": True,
                 "rereadMatches": True,
             },
         }
@@ -2343,6 +2451,38 @@ class MacOsDualRuntimeProjectionTests(unittest.TestCase):
             ["console", "7zip", "sumatrapdf", "notepad-plus-plus"],
         )
 
+    def test_sumatrapdf_requested_installer_termination_survives_round_projection(self) -> None:
+        first = self._round_fixture("round-1", "one")
+        second = self._round_fixture("round-2", "two")
+        for round_value in (first, second):
+            for runtime in round_value["runtimes"]:
+                sumatrapdf = runtime["applications"][2]
+                sumatrapdf["installerTerminationRequested"] = True
+                sumatrapdf["installerExit"] = {
+                    "present": True,
+                    "code": None,
+                    "success": False,
+                }
+
+        projection = acceptance.project_round_evidence(first)
+
+        for runtime in projection["runtimes"]:
+            applications = {value["appId"]: value for value in runtime["applications"]}
+            self.assertIs(
+                applications["sumatrapdf"]["installerTerminationRequested"], True
+            )
+            self.assertIsNone(applications["sumatrapdf"]["installerExitCode"])
+            self.assertIs(
+                applications["7zip"]["installerTerminationRequested"], False
+            )
+        self.assertTrue(acceptance.compare_round_evidence(first, second))
+
+        missing = copy.deepcopy(first)
+        del missing["runtimes"][0]["applications"][2][
+            "installerTerminationRequested"
+        ]
+        self.assertFalse(acceptance.compare_round_evidence(first, missing))
+
     def test_stable_security_and_behavior_mutations_never_compare_equal(self) -> None:
         baseline = self._round_fixture("round-1", "one")
         cases: list[tuple[str, callable]] = [
@@ -2357,6 +2497,8 @@ class MacOsDualRuntimeProjectionTests(unittest.TestCase):
             ("interaction", lambda value: value["runtimes"][0]["applications"][1]["interactionChecks"].update(menus=False)),
             ("exit", lambda value: value["runtimes"][0]["applications"][1]["exit"].update(code=9, success=False)),
             ("window", lambda value: value["runtimes"][0]["applications"][1].update(windowAvailable=False)),
+            ("screenshot", lambda value: value["runtimes"][0]["applications"][1].update(screenshotAvailable=False)),
+            ("missing-screenshot", lambda value: value["runtimes"][0]["applications"][1].pop("screenshotAvailable")),
             ("cleanup", lambda value: value["runtimes"][0]["applications"][1].update(cleanup=False)),
         ]
         for label, mutate in cases:
@@ -3462,6 +3604,7 @@ raise SystemExit(1)
                 "open": True,
                 "edit": True,
                 "saveUtf8Chinese": True,
+                "cjkTextReadable": True,
                 "rereadMatches": True,
             },
         }
@@ -4433,6 +4576,7 @@ raise SystemExit(1)
                     "open",
                     "edit",
                     "saveUtf8Chinese",
+                    "cjkTextReadable",
                     "rereadMatches",
                 ),
             },
@@ -4899,6 +5043,8 @@ raise SystemExit(1)
             "check-false",
             "exit-nonzero",
             "window-false",
+            "screenshot-false",
+            "missing-screenshot",
             "missing-asset",
             "missing-installer-exit",
         ):
@@ -4914,6 +5060,10 @@ raise SystemExit(1)
                 application["exit"] = {"present": True, "code": 1, "success": False}
             elif label == "window-false":
                 application["windowAvailable"] = False
+            elif label == "screenshot-false":
+                application["screenshotAvailable"] = False
+            elif label == "missing-screenshot":
+                del application["screenshotAvailable"]
             elif label == "missing-asset":
                 del application["assetSha256"]
             else:
@@ -4946,6 +5096,42 @@ raise SystemExit(1)
             }
         ]
         self.assertFalse(acceptance.aggregate_is_accepted(incomplete_rounds))
+
+    def test_sumatrapdf_requested_installer_termination_is_explicitly_projected(self) -> None:
+        descriptor = acceptance.parse_discovery(
+            json.dumps(self._discovery()), self._arguments()
+        )[0]
+        summary = self._gui_summary("crossover")
+        sumatrapdf = summary["applications"][1]
+        sumatrapdf["installerExit"] = {
+            "present": True,
+            "code": None,
+            "success": False,
+        }
+        sumatrapdf["installerTerminationRequested"] = True
+
+        _receipt, applications = acceptance._project_gui(summary, descriptor)
+        self.assertIs(applications[1]["installerTerminationRequested"], True)
+        self.assertEqual(applications[1]["status"], "accepted")
+
+        missing = json.loads(json.dumps(summary))
+        del missing["applications"][1]["installerTerminationRequested"]
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "accepted GUI"):
+            acceptance._project_gui(missing, descriptor)
+
+        false_value = json.loads(json.dumps(summary))
+        false_value["applications"][1]["installerTerminationRequested"] = False
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "installer termination relation"
+        ):
+            acceptance._project_gui(false_value, descriptor)
+
+        wrong_app = json.loads(json.dumps(self._gui_summary("crossover")))
+        wrong_app["applications"][0]["installerTerminationRequested"] = True
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "installer termination relation"
+        ):
+            acceptance._project_gui(wrong_app, descriptor)
 
     def test_gui_receipt_is_bound_to_the_explicit_provider_identity(self) -> None:
         for runtime_id in ("crossover", "whisky"):
@@ -5471,6 +5657,69 @@ raise SystemExit(1)
             self.assertRaises(acceptance.CleanupError),
         ):
             acceptance._reap_residual_process_group(object(), 4242)
+
+    def test_process_group_cleanup_uses_final_absence_after_signal_race(self) -> None:
+        class FinishedProcess:
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, _timeout: int | None = None, **_kwargs: object) -> int:
+                return 0
+
+        process = FinishedProcess()
+        with (
+            mock.patch.object(
+                acceptance,
+                "_signal_process_group",
+                side_effect=(True, False),
+            ) as signal_group,
+            mock.patch.object(
+                acceptance,
+                "_process_group_exists",
+                side_effect=(True, False, False),
+            ),
+        ):
+            self.assertTrue(
+                acceptance._stop_posix_process_group(process, 4242)
+            )
+        self.assertEqual(
+            signal_group.call_args_list,
+            [
+                mock.call(4242, acceptance.signal.SIGTERM),
+                mock.call(4242, acceptance.signal.SIGKILL),
+            ],
+        )
+
+    def test_process_group_cleanup_rejects_signal_refusal_with_residuals(self) -> None:
+        class FinishedProcess:
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, _timeout: int | None = None, **_kwargs: object) -> int:
+                return 0
+
+        with (
+            mock.patch.object(
+                acceptance,
+                "_signal_process_group",
+                return_value=False,
+            ),
+            mock.patch.object(
+                acceptance,
+                "_process_group_exists",
+                return_value=True,
+            ),
+            mock.patch.object(
+                acceptance.time,
+                "monotonic",
+                side_effect=(0.0, 6.0),
+            ),
+            self.assertRaisesRegex(
+                acceptance.CleanupError,
+                "^managed process group cleanup failed$",
+            ),
+        ):
+            acceptance._stop_posix_process_group(FinishedProcess(), 4242)
 
     @unittest.skipUnless(os.name == "posix", "real process-group probe requires POSIX")
     def test_timeout_reaps_grandchildren_for_child_and_desktop(self) -> None:

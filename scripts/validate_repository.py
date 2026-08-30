@@ -411,9 +411,38 @@ MACOS_ACCEPTANCE_REVIEWED_PATHS = (
     "README.md",
     "docs/testing.md",
     "docs/guides/macos-local-dual-runtime-acceptance.md",
+    "docs/reports/2026-08-21-macos-local-dual-runtime-acceptance.md",
+    "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance-design.md",
+    "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance.md",
+    "docs/plans/2026-08-22-macos-acceptance-acknowledgement-design.md",
+    "docs/plans/2026-08-22-macos-acceptance-integration-hardening.md",
+    "docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md",
+    "docs/plans/2026-08-22-macos-pinned-bottle-execution.md",
     "examples/macos-dual-runtime-interactions.json",
     "tests/test_macos_dual_runtime_acceptance.py",
     "tools/run_macos_dual_runtime_acceptance.py",
+)
+MACOS_ACCEPTANCE_PLANNING_PATHS = frozenset(
+    {
+        "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance-design.md",
+        "docs/plans/2026-08-21-macos-local-dual-runtime-acceptance.md",
+        "docs/plans/2026-08-22-macos-acceptance-acknowledgement-design.md",
+        "docs/plans/2026-08-22-macos-acceptance-integration-hardening.md",
+        "docs/plans/2026-08-22-macos-pinned-bottle-execution-design.md",
+        "docs/plans/2026-08-22-macos-pinned-bottle-execution.md",
+    }
+)
+MACOS_ACCEPTANCE_DEVELOPER_PATH_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]+Users[\\/]+[^\\/\s<>'\"`]+[\\/])"
+    ),
+    re.compile(r"(?<![A-Za-z0-9])/(?:Users|home)/[^/\s<>'\"`]+/"),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]+(?:workspace|workspaces)[\\/]|/(?:workspace|workspaces)/)"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])(?:[A-Z]:[\\/]+(?:hostedtoolcache|toolcache)[\\/]|/(?:opt/)?(?:hostedtoolcache|toolcache)/)"
+    ),
 )
 MACOS_ACKNOWLEDGEMENT_REVIEWED_PATHS = (
     "tests/test_macos_interaction_acknowledgements.py",
@@ -440,6 +469,7 @@ MACOS_ACKNOWLEDGEMENT_ALLOWED_IMPORTS = frozenset(
     }
 )
 MACOS_ACCEPTANCE_GUIDE = "docs/guides/macos-local-dual-runtime-acceptance.md"
+MACOS_ACCEPTANCE_REPORT = "docs/reports/2026-08-21-macos-local-dual-runtime-acceptance.md"
 MACOS_ACCEPTANCE_INTERACTIONS = "examples/macos-dual-runtime-interactions.json"
 MACOS_ACCEPTANCE_MAX_MARKDOWN_BYTES = 96 * 1024
 MACOS_ACCEPTANCE_MAX_JSON_BYTES = 32 * 1024
@@ -453,7 +483,13 @@ MACOS_ACCEPTANCE_RECORDS = (
 MACOS_ACCEPTANCE_INTERACTION_CHECKS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
-    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
 }
 MACOS_ACCEPTANCE_DISCOVERY_COMMAND = (
     "python3 -S -B tools/discover_macos_wine.py --all",
@@ -4599,6 +4635,62 @@ def _validate_macos_acceptance_guide(source: str) -> None:
         raise ValueError("macOS acceptance network opt-in escaped the fixed asset stage")
 
 
+def _validate_macos_acceptance_report(source: str) -> None:
+    prose = _macos_acceptance_prose(source)
+    headings = tuple(line for line in prose.splitlines() if line.startswith("#"))
+    required_headings = (
+        "# macOS 双 Runtime developer-local 验收报告",
+        "## 结论",
+        "## 主机与工具链",
+        "## Runtime 与应用身份",
+        "## 16 路径结果",
+        "## GUI 与中文验收",
+        "## 负向隔离",
+        "## 本机端口与代码门禁",
+        "## 清理与后续决定",
+        "## 闭集非声明",
+    )
+    if headings != required_headings:
+        raise ValueError("macOS acceptance report headings drifted")
+    lines = prose.splitlines()
+    for required_line in (
+        "- status: `accepted`",
+        "- worktree: `dirty`; 本报告绑定上述基线提交及本地未提交验收修复，不声明远端 CI 状态。",
+        "- matrix: `16/16 accepted`",
+        "- acknowledgements: `12/12 GUI receipts`",
+        "- console: `4/4 automatic results`",
+        "- comparison: `roundsEqual: true`, `status: accepted`",
+        "- cleanup: `zero cleanup failure`",
+        "- negative status: `accepted`",
+    ):
+        if lines.count(required_line) != 1:
+            raise ValueError(
+                f"macOS acceptance report marker drifted: {required_line}"
+            )
+    for marker in (
+        "cjkTextReadable: true",
+        "127.0.0.1:1421",
+        "HTTP 200",
+        "127.0.0.1:1420",
+        "nextStage:",
+    ):
+        if prose.count(marker) != 1:
+            raise ValueError(f"macOS acceptance report marker drifted: {marker}")
+    if len(re.findall(r"(?m)^\| round-[12] \| (?:crossover|whisky) \| "
+                      r"(?:console|7zip|sumatrapdf|notepad-plus-plus) \| accepted \|$", prose)) != 16:
+        raise ValueError("macOS acceptance report matrix is incomplete")
+    if len(re.findall(r"(?m)^- sourceCommit: `[0-9a-f]{40}`$", prose)) != 1:
+        raise ValueError("macOS acceptance report source commit is invalid")
+    if any(
+        pattern.search(source)
+        for pattern in MACOS_ACCEPTANCE_DEVELOPER_PATH_PATTERNS
+    ) or re.search(r"(?i)(?<![A-Za-z0-9])/(?:private/)?tmp/", source):
+        raise ValueError("macOS acceptance report contains a forbidden developer path")
+    if re.search(r"!\[|<img\b", source, re.IGNORECASE):
+        raise ValueError("macOS acceptance report embeds raw visual evidence")
+    _validate_macos_acceptance_nonclaims(prose)
+
+
 def _validate_macos_acceptance_example(source: str) -> None:
     try:
         document = json.loads(
@@ -4661,12 +4753,14 @@ def validate_macos_acceptance_docs() -> list[str]:
 
     try:
         guide = _macos_acceptance_markdown(MACOS_ACCEPTANCE_GUIDE)
+        report = _macos_acceptance_markdown(MACOS_ACCEPTANCE_REPORT)
         readme = _macos_acceptance_markdown("README.md")
         testing = _macos_acceptance_markdown("docs/testing.md")
         example = _macos_acceptance_text(
             MACOS_ACCEPTANCE_INTERACTIONS, MACOS_ACCEPTANCE_MAX_JSON_BYTES
         )
         _validate_macos_acceptance_guide(guide)
+        _validate_macos_acceptance_report(report)
         _validate_macos_acceptance_example(example)
         readme_marker = (
             "[Apple Silicon 双 Runtime 本地验收指南]"
@@ -4676,12 +4770,17 @@ def validate_macos_acceptance_docs() -> list[str]:
             "[双 Runtime 本地验收指南]"
             "(guides/macos-local-dual-runtime-acceptance.md)"
         )
+        report_marker = (
+            "[脱敏阶段报告]"
+            "(reports/2026-08-21-macos-local-dual-runtime-acceptance.md)"
+        )
         readme_prose = _macos_acceptance_prose(readme)
         testing_prose = _macos_acceptance_prose(testing)
         testing_fences = _macos_acceptance_fences(testing)
         if (
             readme_prose.count(readme_marker) != 1
             or testing_prose.count(testing_marker) != 1
+            or testing_prose.count(report_marker) != 1
         ):
             raise ValueError("macOS acceptance navigation marker drifted")
         if (
@@ -4742,9 +4841,28 @@ def validate_macos_acceptance_surface() -> list[str]:
             )
             continue
         try:
-            _read_bound_regular_file(path, MACOS_ACCEPTANCE_MAX_SOURCE_BYTES)
+            raw, _identity = _read_bound_regular_file(
+                path, MACOS_ACCEPTANCE_MAX_SOURCE_BYTES
+            )
         except (OSError, ValueError) as error:
             errors.append(f"macOS acceptance surface {relative}: {error}")
+            continue
+        if relative in MACOS_ACCEPTANCE_PLANNING_PATHS:
+            try:
+                source = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                errors.append(
+                    f"macOS acceptance surface {relative}: expected UTF-8 planning text"
+                )
+                continue
+            if any(
+                pattern.search(source)
+                for pattern in MACOS_ACCEPTANCE_DEVELOPER_PATH_PATTERNS
+            ):
+                errors.append(
+                    f"macOS acceptance surface {relative}: "
+                    "contains a forbidden developer path"
+                )
     return errors
 
 
@@ -4968,6 +5086,7 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "write_text",
     }
     mutating_os_calls = {
+        "ftruncate",
         "link",
         "mkdir",
         "open",
@@ -4988,6 +5107,7 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "urllib",
     }
     allowed_mutating_scopes = {
+        "ftruncate": {"_invalidate_descriptor_if_owned"},
         "open": {"_bind_directory", "_relative_open"},
         "unlink": {"_relative_unlink"},
     }
@@ -5006,6 +5126,7 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         "close",
         "fsencode",
         "fstat",
+        "ftruncate",
         "fsync",
         "lseek",
         "name",
@@ -5058,6 +5179,7 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
         return None
 
     dll_bindings: dict[str, str] = {}
+    ftruncate_calls: list[tuple[str | None, str]] = []
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Assign)
@@ -5481,7 +5603,23 @@ def _macos_acknowledgement_forbidden_capability(source: str) -> bool:
             )
         ):
             return True
-    return False
+        if (
+            isinstance(base, ast.Name)
+            and aliases.get(base.id) == "os"
+            and node.func.attr == "ftruncate"
+        ):
+            ftruncate_calls.append((scope(node), ast.unparse(node)))
+            if ftruncate_calls[-1] != (
+                "_invalidate_descriptor_if_owned",
+                "os.ftruncate(descriptor, 1)",
+            ):
+                return True
+    return ftruncate_calls != [
+        (
+            "_invalidate_descriptor_if_owned",
+            "os.ftruncate(descriptor, 1)",
+        )
+    ]
 
 
 def validate_macos_acknowledgement_surface() -> list[str]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in downloader for the fixed GUI compatibility baseline installers.
+"""Opt-in downloader for the fixed GUI compatibility baseline assets.
 
 The cache must live outside the repository. Downloads are never attempted
 unless ``--allow-network`` is explicitly provided, and every response is
@@ -51,11 +51,11 @@ ASSETS = (
     ),
     GuiAsset(
         "sumatrapdf",
-        "SumatraPDF 3.6.1",
-        "SumatraPDF-3.6.1-64-install.exe",
-        "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64-install.exe",
-        "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381",
-        ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+        "SumatraPDF 3.6.1 Portable",
+        "SumatraPDF-3.6.1-64.exe",
+        "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.exe",
+        "719f689b34f47be8ca105ce8484948474dafde0e106bab599e4a89326070c3d0",
+        (),
         "CompatForge/SumatraPDF/SumatraPDF.exe",
         ("SumatraPDF",),
     ),

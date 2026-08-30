@@ -55,7 +55,7 @@ Also require the repository validator to include the new tool and test in its re
 Run on Windows with the explicit Python 3.12 executable:
 
 ```powershell
-& 'C:\Users\10428\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' `
+& '<absolute-path-to-python-3.12.exe>' `
   -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v
 ```
 
@@ -351,18 +351,19 @@ Add required arguments:
 --runtime-store-root
 --storage-root
 --work-root
---interaction-evidence-root
+--interaction-plan-root
+--acknowledgement-root
 --allow-network
 ```
 
-Refuse repository-internal roots, symlinks, overlaps, non-empty Work Root, unsupported Python, non-Darwin/arm64, or incomplete interaction evidence files. Do not read PATH to find Wine or the compiler.
+Refuse repository-internal roots, symlinks, overlaps, non-empty Work Root, unsupported Python, non-Darwin/arm64, incomplete interaction plans, or unsafe acknowledgement roots. Do not read PATH to find Wine or the compiler.
 
 **Step 4: Implement orchestration using existing tools**
 
 For each round and Runtime:
 
 1. invoke the existing headless runner with the explicit Runtime quartet;
-2. invoke the GUI runner with `--runtime-id`, a Runtime-specific store, and the round-specific interaction evidence;
+2. invoke the GUI runner with `--runtime-id`, a Runtime-specific store, the round-specific interaction plan, and the acknowledgement root;
 3. print the exact Tauri command using the same quartet and Runtime-specific acceptance root;
 4. require the tester to close the desktop app before continuing;
 5. collect child summaries without copying screenshots or absolute paths into the aggregate.
@@ -565,7 +566,7 @@ git commit -s -m "ci: gate macOS acceptance contracts"
 ### Task 10: Execute the real two-Runtime matrix on the Mac
 
 **Files:**
-- External only: asset cache, Runtime Store, storage roots, Work Root, interaction evidence, screenshots
+- External only: asset cache, Runtime Store, storage roots, Work Root, interaction plans, acknowledgements, screenshots
 - Verify: repository-wide
 
 **Step 1: Synchronize and verify the exact branch on the Mac**
@@ -616,7 +617,7 @@ python3 -S -B tools/download_gui_assets.py fetch \
 
 Expected: three fixed asset receipts with matching SHA-256 values. Disable network for all later runs.
 
-**Step 6: Prepare four separate interaction documents**
+**Step 6: Prepare four separate interaction plans and start the acknowledgement helper**
 
 Copy the reviewed template to:
 
@@ -627,7 +628,7 @@ interactions/round-2/crossover.json
 interactions/round-2/whisky.json
 ```
 
-Complete each document only while observing that exact run.
+Keep the plans free of observed booleans. Start `confirm_macos_gui_interactions.py` in a second terminal, then perform and confirm each required check only after the matching challenge appears.
 
 **Step 7: Run the two-round orchestrator**
 
@@ -635,12 +636,13 @@ Complete each document only while observing that exact run.
 python3 -S -B tools/run_macos_dual_runtime_acceptance.py \
   --compatforge-cli /absolute/external/cargo-target/debug/compatforge-cli \
   --desktop-app /absolute/path/CompatForge.app/Contents/MacOS/CompatForge \
-  --cc /opt/homebrew/bin/x86_64-w64-mingw32-gcc \
+  --cc /absolute/external/toolchains/bin/x86_64-w64-mingw32-gcc \
   --cache-root /absolute/external/cache \
   --runtime-store-root /absolute/external/runtime-stores \
   --storage-root /absolute/external/storage \
   --work-root /absolute/empty/dual-runtime-evidence \
-  --interaction-evidence-root /absolute/external/interactions
+  --interaction-plan-root /absolute/external/interactions \
+  --acknowledgement-root /absolute/external/acknowledgements
 ```
 
 Expected: 16 `accepted` results, equal round projections, zero cleanup failures, exit 0.

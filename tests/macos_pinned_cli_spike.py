@@ -72,6 +72,9 @@ _EVENT_KINDS = {
     "wine-server-stop-requested",
     "exited",
 }
+_PINNED_LOGICAL_SUFFIX = (
+    "/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"
+)
 
 
 class SpikeError(RuntimeError):
@@ -217,8 +220,7 @@ def _validate_manifest(value: object) -> dict[str, object]:
             if field == "logicalExecutable":
                 logical_paths.append(path)
         _closed_absolute_path(runtime["workRoot"], "work root")
-    suffix = "/bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"
-    if any(not path.endswith(suffix) for path in logical_paths):
+    if any(not path.endswith(_PINNED_LOGICAL_SUFFIX) for path in logical_paths):
         raise SpikeError("logical executable is invalid")
     return manifest
 
@@ -280,6 +282,13 @@ def _runtime_protected_roots(raw: bytes) -> set[str]:
     return protected
 
 
+def _runtime_storage_root(raw: bytes) -> str:
+    value = _parse_json(raw, "Runtime config", MAX_INPUT_BYTES)
+    if type(value) is not dict:
+        raise SpikeError("Runtime config is invalid")
+    return _closed_absolute_path(value.get("storageRoot"), "storage root")
+
+
 def _bind_manifest_inputs(
     manifest: dict[str, object],
     boundary: object,
@@ -315,6 +324,14 @@ def _bind_manifest_inputs(
             forbidden.update(_absolute_json_paths(binding.payload))
         if label == "config":
             forbidden.update(_runtime_protected_roots(binding.payload))
+    for runtime in runtime_values:
+        config_path, _config_digest = _file_reference(runtime["config"], "config")
+        logical_path, _logical_digest = _file_reference(
+            runtime["logicalExecutable"], "logical executable"
+        )
+        storage_root = _runtime_storage_root(bindings[config_path].payload)
+        if logical_path != storage_root + _PINNED_LOGICAL_SUFFIX:
+            raise SpikeError("logical executable is invalid")
     return bindings, runtime_values, forbidden
 
 

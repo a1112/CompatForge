@@ -500,6 +500,20 @@ class MacOsPinnedCliSpikeTests(unittest.TestCase):
             with self.subTest(mutant=mutant[:80]), self.assertRaises(spike.SpikeError):
                 spike.parse_manifest_bytes(mutant)
 
+    def test_logical_executable_is_bound_to_the_config_storage_root(self) -> None:
+        mutant = copy.deepcopy(self.manifest)
+        expected = mutant["runtimes"][0]["logicalExecutable"]["path"]  # type: ignore[index]
+        wrong = expected.replace("/private/storage/", "/private/other-storage/", 1)
+        mutant["runtimes"][0]["logicalExecutable"]["path"] = wrong  # type: ignore[index]
+        inputs = dict(self.inputs)
+        inputs[wrong] = inputs[expected]
+        boundary = _FakeBoundary(mutant, inputs)
+
+        with self.assertRaises(spike.SpikeError):
+            spike.run_spike_document(mutant, boundary)
+
+        self.assertEqual(boundary.commands, [])
+
     def test_complete_run_uses_exact_closed_command_and_live_window(self) -> None:
         boundary = _FakeBoundary(self.manifest, self.inputs)
         results = spike.run_spike_document(self.manifest, boundary)

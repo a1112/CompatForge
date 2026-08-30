@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -207,7 +208,13 @@ class GuiBaselineContractTests(unittest.TestCase):
                     ("sumatrapdf", ("mainWindow", "openDialog")),
                     (
                         "notepad-plus-plus",
-                        ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+                        (
+                            "open",
+                            "edit",
+                            "saveUtf8Chinese",
+                            "cjkTextReadable",
+                            "rereadMatches",
+                        ),
                     ),
                 )
             },
@@ -302,7 +309,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             [asset.sha256 for asset in self.assets.ASSETS],
             [
                 "d64a0468f5b5b0b0fc5b2188450bcd655b70809d97b1c4535f2884635094377d",
-                "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381",
+                "719f689b34f47be8ca105ce8484948474dafde0e106bab599e4a89326070c3d0",
                 "7c243203265ce8fdac76c839bf744ae35dcf620760eb97c2ea279af498560e45",
             ],
         )
@@ -315,7 +322,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         asset = self.assets.asset_for("sumatrapdf")
         self.assertEqual(
             asset.install_args,
-            ("-install", "-silent", "-d", r"C:\CompatForge\SumatraPDF"),
+            (),
         )
         self.assertEqual(
             asset.installed_executable,
@@ -336,6 +343,57 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ),
             },
         )
+
+    def test_sumatrapdf_portable_materialization_is_single_use_and_digest_bound(self) -> None:
+        payload = b"MZportable-sumatra-fixture"
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-portable-sumatra-", dir="/private/tmp"
+        ) as temporary:
+            root = Path(temporary)
+            source = root / "SumatraPDF.exe"
+            source.write_bytes(payload)
+            bottle = root / "prefix" / "drive_c"
+            bottle.mkdir(parents=True)
+
+            installed = self.baseline.materialize_sumatrapdf_portable(
+                source, bottle, digest
+            )
+            self.assertEqual(
+                installed,
+                bottle / "CompatForge" / "SumatraPDF" / "SumatraPDF.exe",
+            )
+            self.assertEqual(installed.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o700)
+            with self.assertRaises(self.baseline.ExecutableIntegrityError):
+                self.baseline.materialize_sumatrapdf_portable(
+                    source, bottle, digest
+                )
+            self.assertEqual(installed.read_bytes(), payload)
+
+            rejected_bottle = root / "rejected" / "drive_c"
+            rejected_bottle.mkdir(parents=True)
+            with self.assertRaises(self.baseline.ExecutableIntegrityError):
+                self.baseline.materialize_sumatrapdf_portable(
+                    source, rejected_bottle, "0" * 64
+                )
+            self.assertFalse(
+                (
+                    rejected_bottle
+                    / "CompatForge"
+                    / "SumatraPDF"
+                    / "SumatraPDF.exe"
+                ).exists()
+            )
+
+            linked_source = root / "linked.exe"
+            linked_source.symlink_to(source)
+            linked_bottle = root / "linked" / "drive_c"
+            linked_bottle.mkdir(parents=True)
+            with self.assertRaises(self.baseline.ExecutableIntegrityError):
+                self.baseline.materialize_sumatrapdf_portable(
+                    linked_source, linked_bottle, digest
+                )
 
     def test_sumatrapdf_lookup_ignores_ambient_user_state(self) -> None:
         class ForbiddenEnvironment(dict[str, str]):
@@ -359,6 +417,193 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 binding.revalidate()
             finally:
                 binding.close()
+
+    def test_cjk_font_is_copied_once_into_the_owned_bottle(self) -> None:
+        payload = b"local-system-cjk-font-fixture"
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-cjk-font-", dir="/private/tmp"
+        ) as temporary:
+            root = Path(temporary)
+            source = root / "system-font.ttf"
+            source.write_bytes(payload)
+            bottle = root / "prefix" / "drive_c"
+            bottle.mkdir(parents=True)
+            candidates = ((source, "CompatForgeCJK.ttf"),)
+            with (
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(
+                    self.baseline, "MACOS_CJK_FONT_CANDIDATES", candidates
+                ),
+            ):
+                evidence = self.baseline.stage_macos_cjk_font(bottle)
+                with self.assertRaises(self.baseline.CjkFontIntegrityError):
+                    self.baseline.stage_macos_cjk_font(bottle)
+
+            destination = bottle / "windows" / "Fonts" / "CompatForgeCJK.ttf"
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+            self.assertEqual(
+                evidence,
+                {
+                    "schemaVersion": "1",
+                    "scope": "bottle-local",
+                    "registration": "windows-fonts-directory",
+                    "fileName": "CompatForgeCJK.ttf",
+                    "sizeBytes": len(payload),
+                    "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                },
+            )
+            self.assertNotIn(str(source), json.dumps(evidence))
+
+    def test_cjk_font_is_staged_before_the_first_wine_installer_launch(self) -> None:
+        source = BASELINE_TOOL.read_text(encoding="utf-8")
+        application_loop = source.index("for asset in ASSETS:")
+        font_stage = source.index(
+            'evidence["cjkFont"] = stage_macos_cjk_font(bottle_root)',
+            application_loop,
+        )
+        installer_launch = source.index(
+            'failure_stage = "installer-launch"',
+            application_loop,
+        )
+        self.assertLess(font_stage, installer_launch)
+
+    def test_cjk_font_registry_is_bottle_local_fixed_and_reaps_wineserver(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-cjk-font-registry-", dir="/private/tmp"
+        ) as temporary:
+            root = Path(temporary)
+            wine = root / "wine"
+            wineserver = root / "wineserver"
+            wine.write_bytes(b"wine")
+            wineserver.write_bytes(b"wineserver")
+            wine.chmod(0o700)
+            wineserver.chmod(0o700)
+            prefix = root / "prefix"
+            font = prefix / "drive_c" / "windows" / "Fonts" / "CompatForgeCJK.ttf"
+            font.parent.mkdir(parents=True)
+            font.write_bytes(b"font")
+
+            completed = subprocess.CompletedProcess([], 0, b"", b"")
+            with (
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(
+                    self.baseline.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as run,
+                mock.patch.object(
+                    self.baseline, "process_snapshot", return_value=[]
+                ),
+            ):
+                evidence = self.baseline.register_macos_cjk_font(
+                    wine, wineserver, prefix
+                )
+
+            registry_count = len(self.baseline.CJK_FONT_REGISTRY_VALUES)
+            self.assertEqual(run.call_count, registry_count + 2)
+            for call, registry_value in zip(
+                run.call_args_list[:registry_count],
+                self.baseline.CJK_FONT_REGISTRY_VALUES,
+                strict=True,
+            ):
+                key, name, value = registry_value
+                self.assertEqual(
+                    call.args[0],
+                    [
+                        str(wine),
+                        "reg",
+                        "add",
+                        key,
+                        "/v",
+                        name,
+                        "/d",
+                        value,
+                        "/f",
+                    ],
+                )
+                self.assertEqual(call.kwargs["env"], {"WINEPREFIX": str(prefix)})
+                self.assertEqual(call.kwargs["timeout"], 10)
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list[registry_count:]],
+                [[str(wineserver), "-k"], [str(wineserver), "-w"]],
+            )
+            self.assertEqual(
+                evidence,
+                {
+                    "schemaVersion": "1",
+                    "scope": "bottle-local",
+                    "family": "Arial Unicode MS",
+                    "registration": "wine-registry",
+                    "replacementCount": registry_count - 1,
+                },
+            )
+
+    def test_cjk_font_staging_rejects_linked_sources_and_destinations(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-cjk-font-links-", dir="/private/tmp"
+        ) as temporary:
+            root = Path(temporary)
+            source = root / "system-font.ttf"
+            source.write_bytes(b"font")
+            linked_source = root / "linked-font.ttf"
+            linked_source.symlink_to(source)
+            bottle = root / "prefix" / "drive_c"
+            (bottle / "windows" / "Fonts").mkdir(parents=True)
+            candidates = ((linked_source, "CompatForgeCJK.ttf"),)
+            with (
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(
+                    self.baseline, "MACOS_CJK_FONT_CANDIDATES", candidates
+                ),
+                self.assertRaises(self.baseline.CjkFontIntegrityError),
+            ):
+                self.baseline.stage_macos_cjk_font(bottle)
+
+            destination = bottle / "windows" / "Fonts" / "CompatForgeCJK.ttf"
+            destination.symlink_to(source)
+            candidates = ((source, "CompatForgeCJK.ttf"),)
+            with (
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(
+                    self.baseline, "MACOS_CJK_FONT_CANDIDATES", candidates
+                ),
+                self.assertRaises(self.baseline.CjkFontIntegrityError),
+            ):
+                self.baseline.stage_macos_cjk_font(bottle)
+            self.assertTrue(destination.is_symlink())
+
+    def test_notepad_cjk_style_is_bottle_local_and_digest_bound(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-notepad-cjk-style-", dir="/private/tmp"
+        ) as temporary:
+            bottle = Path(temporary) / "prefix" / "drive_c"
+            style = (
+                bottle
+                / "Program Files"
+                / "Notepad++"
+                / "stylers.model.xml"
+            )
+            style.parent.mkdir(parents=True)
+            original = (
+                b'<WidgetStyle name="Default Style" fontName="Courier New" />\n'
+                b'<WidgetStyle name="Global override" fontName="Courier New" />\n'
+            )
+            style.write_bytes(original)
+
+            evidence = self.baseline.configure_notepad_cjk_font(bottle)
+            updated = style.read_bytes()
+            self.assertEqual(updated.count(b'fontName="Arial Unicode MS"'), 2)
+            self.assertNotIn(b'fontName="Courier New"', updated)
+            self.assertEqual(stat.S_IMODE(style.stat().st_mode), 0o600)
+            self.assertEqual(evidence["scope"], "bottle-local")
+            self.assertEqual(evidence["editorFont"], "Arial Unicode MS")
+            self.assertEqual(
+                evidence["sha256"],
+                "sha256:" + hashlib.sha256(updated).hexdigest(),
+            )
+            with self.assertRaises(self.baseline.CjkFontIntegrityError):
+                self.baseline.configure_notepad_cjk_font(bottle)
 
     def test_sumatrapdf_rejects_exact_known_legacy_locations(self) -> None:
         asset = self.assets.asset_for("sumatrapdf")
@@ -502,12 +747,24 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
 
             original_installer_succeeded = self.baseline.installer_succeeded
 
+            def materialize_fixture(
+                _source: Path,
+                _bottle: Path,
+                _digest: str,
+            ) -> Path:
+                installed.parent.mkdir(parents=True, exist_ok=True)
+                installed.write_bytes(b"MZportable")
+                return installed
+
             def mutate_after_validation(
                 evidence: dict[str, object],
                 events: list[dict[str, object]],
                 binding: object,
+                **options: object,
             ) -> bool:
-                succeeded = original_installer_succeeded(evidence, events, binding)
+                succeeded = original_installer_succeeded(
+                    evidence, events, binding, **options
+                )
                 if succeeded:
                     os.link(installed, root / "second-name.exe")
                 return succeeded
@@ -535,6 +792,11 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ),
                 mock.patch.object(
                     self.baseline, "fetch_asset", return_value=installer
+                ),
+                mock.patch.object(
+                    self.baseline,
+                    "materialize_sumatrapdf_portable",
+                    side_effect=materialize_fixture,
                 ),
                 mock.patch.object(
                     self.baseline,
@@ -1006,6 +1268,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             "core-verification-failed": "failed",
             "core-rollback-failed": "failed",
             "desktop-launch-failed": "failed",
+            "desktop-font-unavailable": "blocked",
             "desktop-window-unobserved": "failed",
             "application-install-failed": "failed",
             "application-interaction-unverified": "unverified",
@@ -1238,6 +1501,11 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 mock.patch.object(self.baseline, "rosetta_available", return_value=True),
                 mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
                 mock.patch.object(self.baseline, "fetch_asset", return_value=root / "installer.exe"),
+                mock.patch.object(
+                    self.baseline,
+                    "materialize_sumatrapdf_portable",
+                    return_value=root / "installer.exe",
+                ),
                 mock.patch.object(self.baseline.shutil, "rmtree", side_effect=OSError(cleanup)),
                 contextlib.redirect_stdout(stdout),
             ):
@@ -1310,13 +1578,13 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 ("failed", "application", "application-content-verification-failed"),
             ),
             (
-                "termination-failed",
+                "termination-accepted",
                 termination_failed_events,
                 {"available": True},
                 {"available": True},
                 [],
                 complete_checks,
-                ("failed", "cleanup", "cleanup-termination-failed"),
+                ("accepted", None, None),
             ),
             (
                 "window-failed",
@@ -1358,6 +1626,50 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     expected,
                 )
         self.assertEqual(self.baseline.status(nonzero_events), "failed")
+
+    def test_application_evaluation_accepts_requested_cli_termination(self) -> None:
+        events = [
+            {"kind": "terminate-requested"},
+            {"kind": "exited", "exit": {"code": 1, "success": False}},
+        ]
+        self.assertEqual(self.baseline.status(events), "failed")
+        self.assertEqual(
+            self.baseline.status(events, allow_requested_termination=True),
+            "accepted",
+        )
+
+        sumatra: dict[str, object] = {}
+        self.baseline.evaluate_application_outcome(
+            sumatra,
+            "sumatrapdf",
+            events,
+            {"available": True},
+            {"available": True},
+            [],
+            {"mainWindow": True, "openDialog": True},
+        )
+        self.assertEqual(sumatra["status"], "accepted")
+
+        seven_zip: dict[str, object] = {}
+        self.baseline.evaluate_application_outcome(
+            seven_zip,
+            "7zip",
+            events,
+            {"available": True},
+            {"available": True},
+            [],
+            {"fileList": True, "menus": True},
+        )
+        self.assertEqual(seven_zip["status"], "accepted")
+
+        installer: dict[str, object] = {}
+        installed = Path("/private/tmp/compatforge-missing-installer-output.exe")
+        self.assertFalse(
+            self.baseline.installer_succeeded(installer, events, installed)
+        )
+        self.assertEqual(
+            installer["reasonCode"], "cleanup-termination-failed"
+        )
 
     def test_live_ack_error_never_masks_process_window_or_cleanup_failure(self) -> None:
         accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
@@ -2271,6 +2583,57 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             with self.subTest(mutant=mutant), self.assertRaises(self.baseline.AcceptanceError):
                 self.baseline.compact_json(mutant)
 
+    def test_compact_summary_preserves_sumatrapdf_requested_installer_termination(self) -> None:
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "wine-macos-auto-preview",
+            "version": "24.0",
+            "packDigest": "sha256:" + "a" * 64,
+            "source": "explicit-override",
+        }
+        application = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "appId": "sumatrapdf",
+            "assetSha256": "b" * 64,
+            "status": "accepted",
+            "cleanup": True,
+            "interactionChecks": {"mainWindow": True, "openDialog": True},
+            "installerEvents": [
+                {"kind": "started"},
+                {"kind": "terminate-requested"},
+                {"kind": "exited"},
+            ],
+            "installerExit": {"present": True, "code": None, "success": False},
+            "exit": {"present": True, "code": 0, "success": True},
+            "windows": {"available": True},
+            "screenshot": {"available": True},
+        }
+
+        compact = self.baseline.compact_summary(receipt, [application])
+        self.assertIs(compact["applications"][0]["installerTerminationRequested"], True)
+        self.baseline.validate_compact_summary(compact)
+
+        for label, mutation in (
+            ("false", False),
+            ("wrong-app", True),
+            ("successful-exit", True),
+        ):
+            mutant = json.loads(json.dumps(compact))
+            target = mutant["applications"][0]
+            target["installerTerminationRequested"] = mutation
+            if label == "wrong-app":
+                target["appId"] = "7zip"
+                target["interactionChecks"] = {"fileList": True, "menus": True}
+            elif label == "successful-exit":
+                target["installerExit"] = {"present": True, "code": 0, "success": True}
+            with self.subTest(label=label), self.assertRaisesRegex(
+                self.baseline.AcceptanceError,
+                "installer termination relation",
+            ):
+                self.baseline.validate_compact_summary(mutant)
+
     def test_each_application_evidence_is_appended_once(self) -> None:
         source = BASELINE_TOOL.read_text(encoding="utf-8")
         self.assertEqual(source.count("results.append(evidence)"), 1)
@@ -2411,15 +2774,15 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 session.close()
             self.assertEqual(checks, {"fileList": True, "menus": True})
             self.assertEqual(callback_calls, ["7zip"])
-            self.assertTrue(
+            self.assertEqual(
                 (acknowledgement_root / "challenges" / "round-1--crossover--7zip.json")
-                .read_bytes()
-                .startswith(b"!"),
+                .read_bytes(),
+                b"!",
             )
-            self.assertTrue(
+            self.assertEqual(
                 (acknowledgement_root / "receipts" / "round-1--crossover--7zip.json")
-                .read_bytes()
-                .startswith(b"!"),
+                .read_bytes(),
+                b"!",
             )
 
     def test_observed_launch_calls_ack_hook_after_window_while_process_is_alive(self) -> None:
@@ -2482,7 +2845,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             order.append("window")
             return {"available": True, "windows": [{"title": "7-Zip"}]}
 
-        def capture(_path: Path) -> dict[str, object]:
+        def capture(_path: Path, _window_id: int | None = None) -> dict[str, object]:
             order.append("screenshot")
             return {"available": True}
 
@@ -2558,6 +2921,158 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertTrue(shot["available"])
         self.assertEqual(len(hook_budgets), 1)
         self.assertIsNotNone(observed_processes[0].poll())
+
+    def test_pinned_receipt_and_anonymous_outputs_are_fd_bound(self) -> None:
+        inspection = {"architecture": "x86_64", "schemaVersion": "1"}
+        plan = {"process": {"arguments": []}, "schemaVersion": "1"}
+        payloads = [
+            self.baseline.canonical_json_bytes(inspection),
+            self.baseline.canonical_json_bytes(plan),
+        ]
+        receipt = {
+            "outputs": [
+                {
+                    "byteLength": len(payload),
+                    "kind": kind,
+                    "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                }
+                for kind, payload in zip(("inspection", "plan"), payloads, strict=True)
+            ],
+            "recordType": "pinned-evidence-receipt",
+            "schemaVersion": 1,
+        }
+        outputs = self.baseline.parse_pinned_receipt(receipt)
+
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-pinned-runner-", dir="/private/tmp"
+        ) as temporary:
+            directory = os.open(
+                temporary,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            bindings = []
+            try:
+                for payload in payloads:
+                    binding = self.baseline.create_anonymous_pinned_output(directory)
+                    bindings.append(binding)
+                    self.assertEqual(os.fstat(binding.descriptor).st_nlink, 0)
+                    os.write(binding.descriptor, payload)
+                self.assertEqual(
+                    self.baseline.read_pinned_evidence(bindings[0], outputs[0]),
+                    inspection,
+                )
+                self.assertEqual(
+                    self.baseline.read_pinned_evidence(bindings[1], outputs[1]),
+                    plan,
+                )
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+            finally:
+                for binding in reversed(bindings):
+                    os.close(binding.descriptor)
+                os.close(directory)
+
+    def test_pinned_evidence_root_is_isolated_from_screenshot_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-pinned-root-", dir="/private/tmp"
+        ) as temporary:
+            work_root = Path(temporary)
+            pinned_root, identity = self.baseline.create_pinned_evidence_work_root(
+                work_root
+            )
+            before = pinned_root.stat()
+            (work_root / "sumatrapdf.png").write_bytes(b"screenshot")
+            after = pinned_root.stat()
+            self.assertEqual(
+                (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns),
+                (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+            )
+            self.baseline.remove_pinned_evidence_work_root(pinned_root, identity)
+            self.assertFalse(pinned_root.exists())
+            self.assertTrue((work_root / "sumatrapdf.png").is_file())
+
+    def test_observed_pinned_launch_forwards_exact_fds_and_terminal_receipt(self) -> None:
+        receipt = {
+            "outputs": [
+                {"byteLength": 1, "kind": "inspection", "sha256": "sha256:" + "a" * 64},
+                {"byteLength": 1, "kind": "plan", "sha256": "sha256:" + "b" * 64},
+            ],
+            "recordType": "pinned-evidence-receipt",
+            "schemaVersion": 1,
+        }
+        transcript = "\n".join(
+            (
+                '{"kind":"started","processId":321}',
+                '{"kind":"exited","exit":{"code":0,"success":true}}',
+                self.baseline.canonical_json_bytes(receipt).decode("utf-8"),
+            )
+        ) + "\n"
+
+        class Output:
+            @staticmethod
+            def read() -> str:
+                return transcript
+
+        class Errors:
+            @staticmethod
+            def read() -> str:
+                return ""
+
+        class Process:
+            stdout = Output()
+            stderr = Errors()
+            returncode = 0
+
+            @staticmethod
+            def poll() -> int:
+                return 0
+
+            @staticmethod
+            def wait(timeout: int) -> int:
+                del timeout
+                return 0
+
+            @staticmethod
+            def kill() -> None:
+                return None
+
+        class Selector:
+            @staticmethod
+            def register(_stream: object, _events: object) -> None:
+                return None
+
+            @staticmethod
+            def unregister(_stream: object) -> None:
+                return None
+
+            @staticmethod
+            def close() -> None:
+                return None
+
+        records: list[dict[str, object]] = []
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="compatforge-pinned-observed-", dir="/private/tmp"
+            ) as temporary,
+            mock.patch.object(
+                self.baseline.subprocess, "Popen", return_value=Process()
+            ) as popen,
+            mock.patch.object(
+                self.baseline.selectors, "DefaultSelector", return_value=Selector()
+            ),
+        ):
+            events, _windows, _shot, process_id = self.baseline.observed_launch(
+                ["/absolute/compatforge", "prepared-pinned-sumatrapdf-launch-terminate"],
+                Path(temporary) / "window.png",
+                ("SumatraPDF",),
+                pass_fds=(7, 8, 9),
+                terminal_records=records,
+                require_empty_stderr=True,
+            )
+        self.assertEqual([event["kind"] for event in events], ["started", "exited"])
+        self.assertEqual(process_id, 321)
+        self.assertEqual(records, [receipt])
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], (7, 8, 9))
+        self.assertIs(popen.call_args.kwargs["close_fds"], True)
 
     def test_observed_launch_cleans_child_and_selector_when_live_hook_raises(self) -> None:
         cases = (
@@ -2808,7 +3323,7 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             now[0] = 2.0
             process.returncode = 0
 
-        def capture(_path: Path) -> dict[str, object]:
+        def capture(_path: Path, _window_id: int | None = None) -> dict[str, object]:
             screenshot_calls.append("screenshot")
             return {"available": True}
 
@@ -2899,6 +3414,10 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertLessEqual(
             self.baseline.ACKNOWLEDGEMENT_WAIT_SECONDS,
             self.baseline.INTERACTIVE_RUNTIME_MILLISECONDS / 1000,
+        )
+        self.assertGreaterEqual(
+            self.baseline.INTERACTIVE_RUNTIME_MILLISECONDS / 1000,
+            2 * self.baseline.ACKNOWLEDGEMENT_WAIT_SECONDS,
         )
 
     def test_receipt_at_the_deadline_is_late_and_cannot_be_accepted(self) -> None:
@@ -3007,15 +3526,15 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                             ):
                                 invocation()
                     name = "round-1--crossover--7zip.json"
-                    self.assertTrue(
+                    self.assertEqual(
                         (acknowledgement_root / "challenges" / name)
-                        .read_bytes()
-                        .startswith(b"!")
+                        .read_bytes(),
+                        b"!",
                     )
-                    self.assertTrue(
+                    self.assertEqual(
                         (acknowledgement_root / "receipts" / name)
-                        .read_bytes()
-                        .startswith(b"!")
+                        .read_bytes(),
+                        b"!",
                     )
                 finally:
                     session.close()
@@ -3075,8 +3594,8 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                 / "receipts"
                 / "round-1--crossover--7zip.json"
             )
-            self.assertTrue(challenge.read_bytes().startswith(b"!"))
-            self.assertTrue(receipt.read_bytes().startswith(b"!"))
+            self.assertEqual(challenge.read_bytes(), b"!")
+            self.assertEqual(receipt.read_bytes(), b"!")
 
     def test_accepted_compact_application_requires_literal_complete_checks(self) -> None:
         receipt = {
@@ -3384,6 +3903,20 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
                     mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
                     mock.patch.object(self.baseline, "fetch_asset", return_value=installer),
                     mock.patch.object(
+                        self.baseline, "stage_macos_cjk_font", return_value={}
+                    ),
+                    mock.patch.object(
+                        self.baseline, "register_macos_cjk_font", return_value={}
+                    ),
+                    mock.patch.object(
+                        self.baseline, "configure_notepad_cjk_font", return_value={}
+                    ),
+                    mock.patch.object(
+                        self.baseline,
+                        "materialize_sumatrapdf_portable",
+                        return_value=installed,
+                    ),
+                    mock.patch.object(
                         self.baseline, "installed_executable", return_value=installed
                     ),
                     mock.patch.object(
@@ -3670,6 +4203,50 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         self.assertTrue(any(value.startswith("101 ") for value in residual))
         self.assertTrue(any(value.startswith("102 ") for value in residual))
 
+    def test_bottle_wineserver_cleanup_is_prefix_scoped_and_waits(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-wineserver-cleanup-") as temporary:
+            root = Path(temporary)
+            wineserver = root / "wineserver"
+            prefix = root / "prefix"
+            wineserver.write_bytes(b"runtime")
+            wineserver.chmod(0o700)
+            prefix.mkdir()
+            completed = subprocess.CompletedProcess([], 0, b"", b"")
+            with mock.patch.object(
+                self.baseline.subprocess,
+                "run",
+                side_effect=[completed, completed],
+            ) as run:
+                self.baseline.stop_bottle_wineserver(wineserver, prefix)
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [[str(wineserver), "-k"], [str(wineserver), "-w"]],
+        )
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"]["WINEPREFIX"], str(prefix))
+            self.assertEqual(call.kwargs["timeout"], 10)
+
+    def test_bottle_wineserver_cleanup_rejects_failure_and_aliases(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="compatforge-wineserver-invalid-") as temporary:
+            root = Path(temporary)
+            wineserver = root / "wineserver"
+            alias = root / "wineserver-alias"
+            prefix = root / "prefix"
+            wineserver.write_bytes(b"runtime")
+            wineserver.chmod(0o700)
+            alias.symlink_to(wineserver)
+            prefix.mkdir()
+            with self.assertRaises(self.baseline.AcceptanceError):
+                self.baseline.stop_bottle_wineserver(alias, prefix)
+            failed = subprocess.CompletedProcess([], 1, b"", b"failed")
+            with mock.patch.object(
+                self.baseline.subprocess,
+                "run",
+                return_value=failed,
+            ), self.assertRaises(self.baseline.AcceptanceError):
+                self.baseline.stop_bottle_wineserver(wineserver, prefix)
+
     def test_window_evidence_is_structured_and_title_bound(self) -> None:
         windows = self.baseline.matching_windows(
             "48498|7-Zip|1288x711\n99|Unrelated|800x600\n100|7-Zip|0x600\n",
@@ -3679,6 +4256,158 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             windows,
             [{"processId": 48498, "title": "7-Zip", "width": 1288, "height": 711}],
         )
+
+        native = self.baseline.matching_core_graphics_windows(
+            [
+                {
+                    "kCGWindowOwnerPID": 57496,
+                    "kCGWindowName": "SumatraPDF",
+                    "kCGWindowBounds": {"Width": 771.0, "Height": 1003.0},
+                    "kCGWindowLayer": 0,
+                    "kCGWindowNumber": 1541,
+                },
+                {
+                    "kCGWindowOwnerPID": 99,
+                    "kCGWindowName": "SumatraPDF",
+                    "kCGWindowBounds": {"Width": 800, "Height": 600},
+                    "kCGWindowLayer": 0,
+                    "kCGWindowNumber": 1542,
+                },
+            ],
+            [57496],
+            ("SumatraPDF",),
+        )
+        self.assertEqual(
+            native,
+            [
+                {
+                    "processId": 57496,
+                    "title": "SumatraPDF",
+                    "width": 771,
+                    "height": 1003,
+                    "windowId": 1541,
+                }
+            ],
+        )
+
+        prepared_window = {
+            "kCGWindowOwnerPID": 60003,
+            "kCGWindowOwnerName": "CompatForgeWhiskyAcceptance",
+            "kCGWindowName": "SumatraPDF",
+            "kCGWindowBounds": {"Width": 774, "Height": 1013},
+            "kCGWindowLayer": 0,
+            "kCGWindowNumber": 1544,
+        }
+        prepared = self.baseline.matching_prepared_core_graphics_windows(
+            [prepared_window], ("SumatraPDF",)
+        )
+        self.assertEqual(prepared[0]["processId"], 60003)
+        self.assertEqual(
+            self.baseline.matching_prepared_core_graphics_windows(
+                [
+                    prepared_window,
+                    {**prepared_window, "kCGWindowOwnerPID": 60004},
+                ],
+                ("SumatraPDF",),
+            ),
+            [],
+        )
+
+        with (
+            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline, "process_group_ids", return_value=[57496]
+            ),
+            mock.patch.object(
+                self.baseline,
+                "core_graphics_window_list",
+                return_value=[
+                    {
+                        "kCGWindowOwnerPID": 57496,
+                        "kCGWindowName": "SumatraPDF",
+                        "kCGWindowBounds": {"Width": 771, "Height": 1003},
+                        "kCGWindowLayer": 0,
+                        "kCGWindowNumber": 1541,
+                    }
+                ],
+            ),
+        ):
+            observed = self.baseline.observer(57496, ("SumatraPDF",))
+        self.assertTrue(observed["available"])
+        self.assertEqual(observed["windows"], native)
+
+        detached_executable = Path("/external/bottle/drive_c/7-Zip/7zFM.exe")
+        with (
+            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline, "process_group_ids", return_value=[57496]
+            ),
+            mock.patch.object(
+                self.baseline,
+                "process_table",
+                return_value=[
+                    (60001, 60001, f"/runtime/wine64-preloader {detached_executable}"),
+                    (60002, 60002, "/runtime/wine64-preloader unrelated.exe"),
+                ],
+            ),
+            mock.patch.object(
+                self.baseline,
+                "core_graphics_window_list",
+                return_value=[
+                    {
+                        "kCGWindowOwnerPID": 60001,
+                        "kCGWindowName": "7-Zip",
+                        "kCGWindowBounds": {"Width": 1288, "Height": 711},
+                        "kCGWindowLayer": 0,
+                        "kCGWindowNumber": 1543,
+                    }
+                ],
+            ),
+        ):
+            detached = self.baseline.observer(
+                57496,
+                ("7-Zip",),
+                detached_executable,
+            )
+        self.assertTrue(detached["available"])
+        self.assertEqual(detached["processIds"], [57496, 60001])
+        self.assertEqual(detached["windows"][0]["processId"], 60001)
+
+        with (
+            mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                self.baseline, "process_group_ids", return_value=[57496]
+            ),
+            mock.patch.object(
+                self.baseline,
+                "core_graphics_window_list",
+                return_value=[prepared_window],
+            ),
+        ):
+            prepared_detached = self.baseline.observer(
+                57496,
+                ("SumatraPDF",),
+                Path("/external/bottle/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe"),
+            )
+        self.assertTrue(prepared_detached["available"])
+        self.assertEqual(prepared_detached["processIds"], [57496, 60003])
+
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-window-screenshot-", dir="/private/tmp"
+        ) as temporary:
+            target = Path(temporary) / "window.png"
+            target.write_bytes(b"png")
+            with mock.patch.object(
+                self.baseline.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, b"", b""),
+            ) as run:
+                captured = self.baseline.screenshot(target, 1541)
+            self.assertTrue(captured["available"])
+            self.assertEqual(
+                run.call_args.args[0],
+                ["/usr/sbin/screencapture", "-x", "-l1541", str(target)],
+            )
 
     def test_list_output_is_json_and_does_not_download(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-gui-assets-") as temporary:

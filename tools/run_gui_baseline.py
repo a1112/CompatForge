@@ -10,6 +10,7 @@ caller-owned external directories and are excluded from the repository.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -29,20 +30,96 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_COMMAND_SECONDS = 180
 WINDOW_APPEARANCE_SECONDS = 30
-INTERACTIVE_RUNTIME_MILLISECONDS = 60_000
-ACKNOWLEDGEMENT_WAIT_SECONDS = 60
+INTERACTIVE_RUNTIME_MILLISECONDS = 600_000
+ACKNOWLEDGEMENT_WAIT_SECONDS = 300
 ACKNOWLEDGEMENT_POLL_SECONDS = 0.25
 MAX_DIAGNOSTICS = 16
 MAX_DIAGNOSTIC_CHARS = 4096
 MAX_COMPACT_DEPTH = 8
 MAX_COMPACT_NODES = 256
 MAX_COMPACT_TEXT_CHARS = 4096
+MAX_PINNED_EVIDENCE_BYTES = 1_048_576
+PINNED_OUTPUT_NAME_ATTEMPTS = 16
+PINNED_RECEIPT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+PREPARED_WINDOW_OWNERS = frozenset(
+    {"CompatForgeCrossoverAcceptance", "CompatForgeWhiskyAcceptance"}
+)
 
 REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
-    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
 }
+
+MACOS_CJK_FONT_CANDIDATES = (
+    (
+        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        "CompatForgeCJK.ttf",
+    ),
+    (
+        Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+        "CompatForgeCJK.ttc",
+    ),
+    (
+        Path("/System/Library/Fonts/STHeiti Light.ttc"),
+        "CompatForgeCJK.ttc",
+    ),
+)
+CJK_FONT_REGISTRY_VALUES = (
+    (
+        r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Fonts",
+        "Arial Unicode MS (TrueType)",
+        "CompatForgeCJK.ttf",
+    ),
+    (
+        r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
+        "MS Shell Dlg",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
+        "MS Shell Dlg 2",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
+        "SimSun",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
+        "NSimSun",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKCU\Software\Wine\Fonts\Replacements",
+        "Tahoma",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKCU\Software\Wine\Fonts\Replacements",
+        "Segoe UI",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKCU\Software\Wine\Fonts\Replacements",
+        "SimSun",
+        "Arial Unicode MS",
+    ),
+    (
+        r"HKCU\Software\Wine\Fonts\Replacements",
+        "NSimSun",
+        "Arial Unicode MS",
+    ),
+)
+MAX_CJK_FONT_BYTES = 128 * 1024 * 1024
+MAX_NOTEPAD_STYLE_BYTES = 4 * 1024 * 1024
 
 RUNTIME_IDS = ("crossover", "whisky")
 STATUSES = ("accepted", "failed", "unverified", "blocked")
@@ -64,6 +141,7 @@ FAILURE_CLASS_BY_REASON_CODE = {
     "core-verification-failed": "core",
     "core-rollback-failed": "core",
     "desktop-launch-failed": "desktop",
+    "desktop-font-unavailable": "environment",
     "desktop-window-unobserved": "desktop",
     "application-install-failed": "application",
     "application-interaction-unverified": "application",
@@ -90,6 +168,7 @@ STATUS_BY_REASON_CODE = {
     "core-verification-failed": "failed",
     "core-rollback-failed": "failed",
     "desktop-launch-failed": "failed",
+    "desktop-font-unavailable": "blocked",
     "desktop-window-unobserved": "failed",
     "application-install-failed": "failed",
     "application-interaction-unverified": "unverified",
@@ -116,6 +195,7 @@ FAILURE_REASON_BY_STAGE = {
     "core-verification": "core-verification-failed",
     "core-rollback": "core-rollback-failed",
     "desktop-launch": "desktop-launch-failed",
+    "font-stage": "desktop-font-unavailable",
     "desktop-window": "desktop-window-unobserved",
     "installer-launch": "application-install-failed",
     "application-interaction": "application-interaction-unverified",
@@ -131,6 +211,7 @@ BLOCKED_STAGES = {
     "preflight-network",
     "preflight-rosetta",
     "runtime-descriptor",
+    "font-stage",
 }
 UNVERIFIED_STAGES = {"application-interaction"}
 
@@ -141,6 +222,10 @@ class AcceptanceError(Exception):
 
 class ExecutableIntegrityError(AcceptanceError):
     """The installed executable or its fixed Bottle path changed identity."""
+
+
+class CjkFontIntegrityError(AcceptanceError):
+    """The local macOS CJK font could not be staged safely in the Bottle."""
 
 
 class InvocationError(AcceptanceError):
@@ -629,6 +714,7 @@ def validate_compact_summary(value: object) -> None:
                 "failureClass",
                 "reasonCode",
                 "interactionChecks",
+                "installerTerminationRequested",
                 "installerExit",
                 "exit",
                 "windowAvailable",
@@ -673,6 +759,16 @@ def validate_compact_summary(value: object) -> None:
         for field in ("installerExit", "exit"):
             if field in application:
                 _validate_exit_projection(application[field], f"compact application {field}")
+        if "installerTerminationRequested" in application:
+            if (
+                app_id != "sumatrapdf"
+                or application["installerTerminationRequested"] is not True
+                or application.get("installerExit")
+                != {"present": True, "code": None, "success": False}
+            ):
+                raise AcceptanceError(
+                    "compact application installer termination relation is invalid"
+                )
         for field in ("windowAvailable", "screenshotAvailable"):
             if field in application:
                 _require_bool(application[field], f"compact application {field}")
@@ -749,6 +845,12 @@ def compact_summary(
             compact_exit = _compact_exit(application.get(source_key))
             if compact_exit is not None:
                 projected[target_key] = compact_exit
+        installer_events = application.get("installerEvents")
+        if isinstance(installer_events, list) and any(
+            isinstance(event, dict) and event.get("kind") == "terminate-requested"
+            for event in installer_events
+        ):
+            projected["installerTerminationRequested"] = True
         windows = application.get("windows")
         if isinstance(windows, dict):
             projected["windowAvailable"] = windows.get("available") is True
@@ -927,6 +1029,51 @@ def process_group_ids(process_group_id: int) -> list[int]:
     return [pid for pid, pgid, _command in process_table() if pgid == process_group_id]
 
 
+def stop_bottle_wineserver(wineserver: Path, prefix: Path) -> None:
+    """Stop and reap the Wine server bound to one exact Bottle prefix."""
+
+    if (
+        not isinstance(wineserver, Path)
+        or not wineserver.is_absolute()
+        or not wineserver.is_file()
+        or wineserver.is_symlink()
+        or not os.access(wineserver, os.X_OK)
+        or not isinstance(prefix, Path)
+        or not prefix.is_absolute()
+        or not prefix.is_dir()
+        or prefix.is_symlink()
+    ):
+        raise AcceptanceError("Bottle wineserver cleanup inputs are invalid")
+    environment = {"WINEPREFIX": str(prefix)}
+    for command in ("-k", "-w"):
+        try:
+            result = subprocess.run(
+                [str(wineserver), command],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AcceptanceError("Bottle wineserver cleanup failed") from error
+        if result.returncode != 0:
+            raise AcceptanceError("Bottle wineserver cleanup failed")
+
+
+def executable_process_ids(executable: Path) -> list[int]:
+    """Find detached clients bound to one exact Bottle executable path."""
+
+    if not isinstance(executable, Path) or not executable.is_absolute():
+        return []
+    marker = str(executable)
+    return [
+        pid
+        for pid, _pgid, command in process_table()
+        if marker in command
+    ]
+
+
 def matching_windows(output: str, title_tokens: tuple[str, ...]) -> list[dict[str, object]]:
     matching: list[dict[str, object]] = []
     for line in output.splitlines():
@@ -946,6 +1093,136 @@ def matching_windows(output: str, title_tokens: tuple[str, ...]) -> list[dict[st
     return matching
 
 
+def core_graphics_window_list() -> list[dict[str, object]] | None:
+    """Read the macOS window list without Accessibility automation."""
+
+    try:
+        import ctypes
+        import plistlib
+
+        core_graphics = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        core_graphics.CGWindowListCopyWindowInfo.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
+        core_graphics.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+        core_foundation.CFPropertyListCreateData.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        core_foundation.CFPropertyListCreateData.restype = ctypes.c_void_p
+        core_foundation.CFDataGetLength.argtypes = [ctypes.c_void_p]
+        core_foundation.CFDataGetLength.restype = ctypes.c_long
+        core_foundation.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+        core_foundation.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_ubyte)
+        core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+
+        window_list = core_graphics.CGWindowListCopyWindowInfo(1 | 16, 0)
+        if not window_list:
+            return None
+        data = None
+        error = ctypes.c_void_p()
+        try:
+            data = core_foundation.CFPropertyListCreateData(
+                None,
+                window_list,
+                100,
+                0,
+                ctypes.byref(error),
+            )
+            if not data:
+                return None
+            length = core_foundation.CFDataGetLength(data)
+            pointer = core_foundation.CFDataGetBytePtr(data)
+            if length <= 0 or not pointer:
+                return None
+            decoded = plistlib.loads(ctypes.string_at(pointer, length))
+            if not isinstance(decoded, list) or not all(
+                isinstance(item, dict) for item in decoded
+            ):
+                return None
+            return decoded
+        finally:
+            if data:
+                core_foundation.CFRelease(data)
+            if error.value:
+                core_foundation.CFRelease(error)
+            core_foundation.CFRelease(window_list)
+    except (ImportError, OSError, ValueError, TypeError):
+        return None
+
+
+def matching_core_graphics_windows(
+    windows: list[dict[str, object]],
+    process_ids: list[int],
+    title_tokens: tuple[str, ...],
+) -> list[dict[str, object]]:
+    matching: list[dict[str, object]] = []
+    allowed_processes = set(process_ids)
+    for window in windows:
+        process_id = window.get("kCGWindowOwnerPID")
+        title = window.get("kCGWindowName")
+        bounds = window.get("kCGWindowBounds")
+        window_id = window.get("kCGWindowNumber")
+        if (
+            type(process_id) is not int
+            or process_id not in allowed_processes
+            or not isinstance(title, str)
+            or not any(token.casefold() in title.casefold() for token in title_tokens)
+            or not isinstance(bounds, dict)
+            or type(window_id) is not int
+            or window.get("kCGWindowLayer") != 0
+        ):
+            continue
+        width = bounds.get("Width")
+        height = bounds.get("Height")
+        if (
+            not isinstance(width, (int, float))
+            or not isinstance(height, (int, float))
+            or width <= 0
+            or height <= 0
+        ):
+            continue
+        matching.append(
+            {
+                "processId": process_id,
+                "title": title,
+                "width": int(width),
+                "height": int(height),
+                "windowId": window_id,
+            }
+        )
+    return matching
+
+
+def matching_prepared_core_graphics_windows(
+    windows: list[dict[str, object]],
+    title_tokens: tuple[str, ...],
+) -> list[dict[str, object]]:
+    """Find one unique detached prepared-Runtime application window."""
+
+    candidate_ids = sorted(
+        {
+            process_id
+            for window in windows
+            if window.get("kCGWindowOwnerName") in PREPARED_WINDOW_OWNERS
+            and type(process_id := window.get("kCGWindowOwnerPID")) is int
+        }
+    )
+    matching = matching_core_graphics_windows(windows, candidate_ids, title_tokens)
+    if len({window["processId"] for window in matching}) != 1:
+        return []
+    return matching
+
+
 def parse_event_line(line: str, label: str) -> dict[str, object]:
     try:
         value = json.loads(line)
@@ -956,17 +1233,250 @@ def parse_event_line(line: str, label: str) -> dict[str, object]:
     return value
 
 
+def canonical_json_bytes(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise AcceptanceError("pinned evidence JSON is invalid") from error
+
+
+def parse_pinned_receipt(value: object) -> list[dict[str, object]]:
+    if (
+        type(value) is not dict
+        or set(value) != {"outputs", "recordType", "schemaVersion"}
+        or value.get("recordType") != "pinned-evidence-receipt"
+        or type(value.get("schemaVersion")) is not int
+        or value.get("schemaVersion") != 1
+    ):
+        raise AcceptanceError("pinned evidence receipt is invalid")
+    outputs = value.get("outputs")
+    if type(outputs) is not list or len(outputs) != 2:
+        raise AcceptanceError("pinned evidence receipt outputs are invalid")
+    result: list[dict[str, object]] = []
+    for output, expected_kind in zip(outputs, ("inspection", "plan"), strict=True):
+        if (
+            type(output) is not dict
+            or set(output) != {"byteLength", "kind", "sha256"}
+            or output.get("kind") != expected_kind
+            or type(output.get("byteLength")) is not int
+            or not 1 <= output["byteLength"] <= MAX_PINNED_EVIDENCE_BYTES
+            or type(output.get("sha256")) is not str
+            or PINNED_RECEIPT_DIGEST.fullmatch(output["sha256"]) is None
+        ):
+            raise AcceptanceError("pinned evidence receipt output is invalid")
+        result.append(output)
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedEvidenceBinding:
+    descriptor: int
+    identity: tuple[int, int]
+
+
+def create_anonymous_pinned_output(directory_descriptor: int) -> PinnedEvidenceBinding:
+    import fcntl
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    for _attempt in range(PINNED_OUTPUT_NAME_ATTEMPTS):
+        name = ".compatforge-pinned-output-" + secrets.token_hex(16)
+        descriptor: int | None = None
+        linked = False
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+            linked = True
+            before = os.fstat(descriptor)
+            status_flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+            identity = (before.st_dev, before.st_ino)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or before.st_size != 0
+                or before.st_uid != os.geteuid()
+                or status_flags & os.O_ACCMODE != os.O_RDWR
+                or bool(status_flags & os.O_APPEND)
+                or not bool(descriptor_flags & fcntl.FD_CLOEXEC)
+            ):
+                raise AcceptanceError("pinned evidence output creation failed")
+            os.unlink(name, dir_fd=directory_descriptor)
+            linked = False
+            after = os.fstat(descriptor)
+            if (
+                (after.st_dev, after.st_ino) != identity
+                or after.st_nlink != 0
+                or after.st_size != 0
+            ):
+                raise AcceptanceError("pinned evidence output unlink failed")
+            return PinnedEvidenceBinding(descriptor, identity)
+        except FileExistsError:
+            continue
+        except AcceptanceError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except OSError as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise AcceptanceError("pinned evidence output creation failed") from error
+        finally:
+            if linked:
+                try:
+                    os.unlink(name, dir_fd=directory_descriptor)
+                except OSError:
+                    pass
+    raise AcceptanceError("pinned evidence output collision bound exhausted")
+
+
+def create_pinned_evidence_work_root(work_root: Path) -> tuple[Path, tuple[int, int, int]]:
+    """Create a private directory whose metadata remains stable during launch."""
+
+    for _attempt in range(PINNED_OUTPUT_NAME_ATTEMPTS):
+        path = work_root / f".pinned-sumatrapdf-{secrets.token_hex(16)}"
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise AcceptanceError("pinned evidence work root creation failed") from error
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or _is_reparse(metadata)
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or metadata.st_uid != os.geteuid()
+            ):
+                raise AcceptanceError("pinned evidence work root is unsafe")
+            return path, _installed_node_identity(metadata)
+        except BaseException:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+            raise
+    raise AcceptanceError("pinned evidence work root collision bound exhausted")
+
+
+def remove_pinned_evidence_work_root(
+    path: Path | None,
+    identity: tuple[int, int, int] | None,
+) -> None:
+    if path is None and identity is None:
+        return
+    if path is None or identity is None:
+        raise AcceptanceError("pinned evidence work root cleanup state is invalid")
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or _installed_node_identity(metadata) != identity
+        ):
+            raise AcceptanceError("pinned evidence work root identity changed")
+        path.rmdir()
+    except AcceptanceError:
+        raise
+    except OSError as error:
+        raise AcceptanceError("pinned evidence work root cleanup failed") from error
+
+
+def revalidate_pinned_work_root(binding: object) -> None:
+    protocol = _acknowledgement_protocol()
+    try:
+        protocol._revalidate_directory(binding, "pinned evidence work root")
+    except (protocol.AcknowledgementError, OSError) as error:
+        raise AcceptanceError("pinned evidence work root identity changed") from error
+
+
+def read_pinned_evidence(
+    binding: PinnedEvidenceBinding,
+    receipt: dict[str, object],
+) -> dict[str, object]:
+    import fcntl
+
+    try:
+        before = os.fstat(binding.descriptor)
+        status_flags = fcntl.fcntl(binding.descriptor, fcntl.F_GETFL)
+        descriptor_flags = fcntl.fcntl(binding.descriptor, fcntl.F_GETFD)
+    except OSError as error:
+        raise AcceptanceError("pinned evidence descriptor is invalid") from error
+    if (
+        (before.st_dev, before.st_ino) != binding.identity
+        or not stat.S_ISREG(before.st_mode)
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 0
+        or status_flags & os.O_ACCMODE != os.O_RDWR
+        or bool(status_flags & os.O_APPEND)
+        or not bool(descriptor_flags & fcntl.FD_CLOEXEC)
+        or before.st_size != receipt["byteLength"]
+    ):
+        raise AcceptanceError("pinned evidence descriptor identity changed")
+    try:
+        os.lseek(binding.descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = MAX_PINNED_EVIDENCE_BYTES + 1
+        while remaining:
+            chunk = os.read(binding.descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(binding.descriptor)
+    except OSError as error:
+        raise AcceptanceError("pinned evidence could not be read") from error
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    if (
+        len(payload) != receipt["byteLength"]
+        or digest != receipt["sha256"]
+        or (after.st_dev, after.st_ino) != binding.identity
+        or after.st_nlink != 0
+        or after.st_size != before.st_size
+    ):
+        raise AcceptanceError("pinned evidence disagrees with its receipt")
+    try:
+        value = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise AcceptanceError("pinned evidence JSON is invalid") from error
+    if type(value) is not dict or canonical_json_bytes(value) != payload:
+        raise AcceptanceError("pinned evidence JSON is not canonical")
+    return value
+
+
 def observed_launch(
     argv: list[str],
     screenshot_path: Path,
     title_tokens: tuple[str, ...],
     *,
     on_window_observed: Callable[[subprocess.Popen[str], float], None] | None = None,
+    pass_fds: tuple[int, ...] = (),
+    terminal_records: list[dict[str, object]] | None = None,
+    require_empty_stderr: bool = False,
+    forbidden_transcript_values: tuple[str, ...] = (),
+    observed_executable: Path | None = None,
     timeout: int = MAX_COMMAND_SECONDS,
 ) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], int | None]:
     """Keep the Core launch process alive while collecting visual evidence."""
     if on_window_observed is not None and not callable(on_window_observed):
         raise AcceptanceError("window acknowledgement hook is invalid")
+    if observed_executable is not None and (
+        not isinstance(observed_executable, Path)
+        or not observed_executable.is_absolute()
+    ):
+        raise AcceptanceError("window executable binding is invalid")
     process = subprocess.Popen(
         argv,
         cwd=ROOT,
@@ -974,6 +1484,8 @@ def observed_launch(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=1,
+        close_fds=True,
+        pass_fds=pass_fds,
     )
     if process.stdout is None or process.stderr is None:
         process.kill()
@@ -998,18 +1510,36 @@ def observed_launch(
         root_process_id: int | None = None
         next_observation = started
         acknowledgement_hook_called = False
+        terminal_record_seen = False
+
+        def consume_line(line: str) -> None:
+            nonlocal root_process_id, terminal_record_seen
+            if any(value and value in line for value in forbidden_transcript_values):
+                raise AcceptanceError("GUI launch transcript leaked a private binding")
+            record = parse_event_line(line, "GUI launch")
+            if record.get("recordType") == "pinned-evidence-receipt":
+                if terminal_records is None or terminal_record_seen:
+                    raise AcceptanceError("GUI launch emitted an unexpected terminal record")
+                if canonical_json_bytes(record).decode("utf-8") != line.rstrip("\r\n"):
+                    raise AcceptanceError("pinned evidence receipt is not canonical")
+                terminal_record_seen = True
+                terminal_records.append(record)
+                return
+            if terminal_record_seen:
+                raise AcceptanceError("GUI launch emitted data after its terminal record")
+            events.append(record)
+            if record.get("kind") == "started" and isinstance(
+                record.get("processId"), int
+            ):
+                root_process_id = record["processId"]
+
         while process.poll() is None:
             elapsed = time.monotonic() - started
             for key, _mask in selector.select(timeout=0.1):
                 line = key.fileobj.readline()
                 if not line:
                     continue
-                event = parse_event_line(line, "GUI launch")
-                events.append(event)
-                if event.get("kind") == "started" and isinstance(
-                    event.get("processId"), int
-                ):
-                    root_process_id = event["processId"]
+                consume_line(line)
             now = time.monotonic()
             if (
                 root_process_id is not None
@@ -1017,7 +1547,15 @@ def observed_launch(
                 and elapsed <= WINDOW_APPEARANCE_SECONDS
                 and now >= next_observation
             ):
-                windows = observer(root_process_id, title_tokens)
+                windows = (
+                    observer(root_process_id, title_tokens)
+                    if observed_executable is None
+                    else observer(
+                        root_process_id,
+                        title_tokens,
+                        observed_executable,
+                    )
+                )
                 if windows.get("available") is True:
                     if (
                         on_window_observed is not None
@@ -1041,7 +1579,15 @@ def observed_launch(
                             raise InteractionUnverifiedError(
                                 "application interaction acknowledgement timed out"
                             )
-                    shot = screenshot(screenshot_path)
+                    observed_windows = windows.get("windows")
+                    window_id = None
+                    if isinstance(observed_windows, list) and observed_windows:
+                        first_window = observed_windows[0]
+                        if isinstance(first_window, dict):
+                            candidate = first_window.get("windowId")
+                            if type(candidate) is int:
+                                window_id = candidate
+                    shot = screenshot(screenshot_path, window_id)
                 next_observation = now + 0.5
             if time.monotonic() >= outer_deadline:
                 raise AcceptanceError(
@@ -1054,12 +1600,16 @@ def observed_launch(
         selector_closed = True
         for line in process.stdout.read().splitlines():
             if line.strip():
-                events.append(parse_event_line(line, "GUI launch"))
+                consume_line(line)
         stderr = process.stderr.read()
         process.wait(timeout=10)
         if process.returncode != 0:
             detail = stderr.strip().splitlines()[-1] if stderr.strip() else "no stderr"
             raise AcceptanceError(f"GUI launch failed: {detail}")
+        if require_empty_stderr and stderr:
+            raise AcceptanceError("GUI launch emitted unexpected stderr")
+        if terminal_records is not None and len(terminal_records) != 1:
+            raise AcceptanceError("GUI launch terminal record is missing")
         if not events:
             raise AcceptanceError("GUI launch emitted no RuntimeEvent")
         return events, windows, shot, root_process_id
@@ -1092,12 +1642,20 @@ def observed_launch(
         raise
 
 
-def status(events: list[dict[str, object]]) -> str:
+def status(
+    events: list[dict[str, object]],
+    *,
+    allow_requested_termination: bool = False,
+) -> str:
     exit_event = next((event for event in reversed(events) if event.get("kind") == "exited"), None)
     if exit_event is None:
         return "accepted" if any(event.get("kind") == "terminate-requested" for event in events) else "failed"
     exit_value = exit_event.get("exit")
     if isinstance(exit_value, dict) and exit_value.get("success") is True:
+        return "accepted"
+    if allow_requested_termination and any(
+        event.get("kind") == "terminate-requested" for event in events
+    ):
         return "accepted"
     return "failed"
 
@@ -1118,7 +1676,7 @@ def evaluate_application_outcome(
             diagnostic="launch left residual processes",
         )
         return
-    if status(events) != "accepted":
+    if status(events, allow_requested_termination=True) != "accepted":
         stage = (
             "cleanup-termination"
             if any(event.get("kind") == "terminate-requested" for event in events)
@@ -1190,8 +1748,13 @@ def installer_succeeded(
     evidence: dict[str, object],
     events: list[dict[str, object]],
     installed: Path | InstalledExecutableBinding,
+    *,
+    allow_requested_termination: bool = False,
 ) -> bool:
-    if status(events) != "accepted":
+    if status(
+        events,
+        allow_requested_termination=allow_requested_termination,
+    ) != "accepted":
         stage = (
             "cleanup-termination"
             if any(event.get("kind") == "terminate-requested" for event in events)
@@ -1236,12 +1799,56 @@ def asset_preflight(
     return True
 
 
-def observer(process_group_id: int, title_tokens: tuple[str, ...]) -> dict[str, object]:
+def observer(
+    process_group_id: int,
+    title_tokens: tuple[str, ...],
+    observed_executable: Path | None = None,
+) -> dict[str, object]:
     if platform.system() != "Darwin":
         return {"available": False, "reason": "window observation requires macOS"}
     target_ids = process_group_ids(process_group_id)
+    if observed_executable is not None:
+        target_ids = sorted(
+            set(target_ids) | set(executable_process_ids(observed_executable))
+        )
     if not target_ids:
         return {"available": False, "reason": "launch process group is no longer visible", "processGroupId": process_group_id}
+    native_windows = core_graphics_window_list()
+    if native_windows is not None:
+        matching_native = matching_core_graphics_windows(
+            native_windows,
+            target_ids,
+            title_tokens,
+        )
+        if matching_native:
+            return {
+                "available": True,
+                "processGroupId": process_group_id,
+                "processIds": target_ids,
+                "expectedTitleTokens": list(title_tokens),
+                "windows": matching_native[:32],
+            }
+        matching_detached = matching_prepared_core_graphics_windows(
+            native_windows,
+            title_tokens,
+        )
+        if matching_detached:
+            detached_ids = sorted(
+                set(target_ids)
+                | {int(window["processId"]) for window in matching_detached}
+            )
+            return {
+                "available": True,
+                "processGroupId": process_group_id,
+                "processIds": detached_ids,
+                "expectedTitleTokens": list(title_tokens),
+                "windows": matching_detached[:32],
+            }
+        return {
+            "available": False,
+            "reason": "target CoreGraphics window is not visible",
+            "processGroupId": process_group_id,
+        }
     ids = ",".join(str(value) for value in target_ids)
     script = (
         'tell application "System Events"\n'
@@ -1323,10 +1930,14 @@ def observer(process_group_id: int, title_tokens: tuple[str, ...]) -> dict[str, 
     }
 
 
-def screenshot(path: Path) -> dict[str, object]:
+def screenshot(path: Path, window_id: int | None = None) -> dict[str, object]:
     try:
+        command = ["/usr/sbin/screencapture", "-x"]
+        if type(window_id) is int and window_id > 0:
+            command.append(f"-l{window_id}")
+        command.append(str(path))
         result = subprocess.run(
-            ["/usr/sbin/screencapture", "-x", str(path)],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -1535,12 +2146,12 @@ class InteractionSession:
                 or protocol._is_reparse(final)
                 or final.st_nlink != 1
                 or protocol._node_identity(final) != identity[:3]
-                or final.st_size != identity[3]
+                or final.st_size != 1
                 or protocol._read_file(
                     binding.path / name,
                     "consumed interaction",
                     binding,
-                )[:1]
+                )
                 != b"!"
             ):
                 raise InteractionCleanupError("application interaction cleanup failed")
@@ -1911,6 +2522,489 @@ def close_installed_executable(
         installed.close()
 
 
+def materialize_sumatrapdf_portable(
+    source: Path,
+    bottle_root: Path,
+    expected_sha256: str,
+) -> Path:
+    """Copy the fixed portable bytes once into the owned Bottle location."""
+
+    relative = Path(EXPECTED_INSTALLED_EXECUTABLES["sumatrapdf"])
+    destination = bottle_root.joinpath(*relative.parts)
+    if (
+        not source.is_absolute()
+        or not bottle_root.is_absolute()
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+    ):
+        raise ExecutableIntegrityError("SumatraPDF portable input is invalid")
+    current = bottle_root
+    source_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    target_descriptor: int | None = None
+    target_created = False
+    complete = False
+    try:
+        for part in relative.parts[:-1]:
+            current /= part
+            current.mkdir(mode=0o700, exist_ok=True)
+            entry = current.lstat()
+            if not stat.S_ISDIR(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+                raise ExecutableIntegrityError(
+                    "SumatraPDF portable destination is unsafe"
+                )
+        source_flags = os.O_RDONLY
+        source_flags |= getattr(os, "O_CLOEXEC", 0)
+        source_flags |= getattr(os, "O_NOFOLLOW", 0)
+        source_flags |= getattr(os, "O_BINARY", 0)
+        source_flags |= getattr(os, "O_NOINHERIT", 0)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        target_flags |= getattr(os, "O_CLOEXEC", 0)
+        target_flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_flags |= getattr(os, "O_BINARY", 0)
+        target_flags |= getattr(os, "O_NOINHERIT", 0)
+        source_descriptor = os.open(source, source_flags)
+        parent_descriptor = os.open(destination.parent, directory_flags)
+        target_descriptor = os.open(
+            destination.name,
+            target_flags,
+            0o700,
+            dir_fd=parent_descriptor,
+        )
+        target_created = True
+        before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or _is_reparse(before)
+            or before.st_nlink != 1
+            or not 1 <= before.st_size <= 128 * 1024 * 1024
+        ):
+            raise ExecutableIntegrityError(
+                "SumatraPDF portable source is unsafe"
+            )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_descriptor, 65_536)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > 128 * 1024 * 1024:
+                raise ExecutableIntegrityError(
+                    "SumatraPDF portable source exceeds its bound"
+                )
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_descriptor, view)
+                if written <= 0:
+                    raise OSError("short portable write")
+                view = view[written:]
+        os.fsync(target_descriptor)
+        after = os.fstat(source_descriptor)
+        target = os.fstat(target_descriptor)
+        if (
+            digest.hexdigest() != expected_sha256
+            or copied != before.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or not stat.S_ISREG(target.st_mode)
+            or target.st_nlink != 1
+            or target.st_size != copied
+            or stat.S_IMODE(target.st_mode) != 0o700
+        ):
+            raise ExecutableIntegrityError(
+                "SumatraPDF portable materialization changed"
+            )
+        os.fsync(parent_descriptor)
+        complete = True
+        return destination
+    except ExecutableIntegrityError:
+        raise
+    except OSError as error:
+        raise ExecutableIntegrityError(
+            "SumatraPDF portable materialization failed"
+        ) from error
+    finally:
+        if target_created and not complete and parent_descriptor is not None:
+            try:
+                os.unlink(destination.name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        for descriptor in (target_descriptor, parent_descriptor, source_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def stage_macos_cjk_font(bottle_root: Path) -> dict[str, object]:
+    """Copy one fixed local system font into this temporary Bottle only."""
+
+    if platform.system() != "Darwin" or not bottle_root.is_absolute():
+        raise CjkFontIntegrityError("macOS CJK font staging is unavailable")
+    try:
+        bottle_metadata = bottle_root.lstat()
+    except OSError as error:
+        raise CjkFontIntegrityError("Bottle font destination is unavailable") from error
+    if not stat.S_ISDIR(bottle_metadata.st_mode) or stat.S_ISLNK(
+        bottle_metadata.st_mode
+    ):
+        raise CjkFontIntegrityError("Bottle font destination is unsafe")
+
+    source_descriptor: int | None = None
+    source_path: Path | None = None
+    destination_name: str | None = None
+    source_flags = os.O_RDONLY
+    source_flags |= getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_flags |= getattr(os, "O_BINARY", 0)
+    source_flags |= getattr(os, "O_NOINHERIT", 0)
+    for candidate, fixed_name in MACOS_CJK_FONT_CANDIDATES:
+        try:
+            descriptor = os.open(candidate, source_flags)
+            metadata = os.fstat(descriptor)
+        except OSError:
+            continue
+        if (
+            not candidate.is_absolute()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= MAX_CJK_FONT_BYTES
+            or re.fullmatch(r"CompatForgeCJK\.(?:ttf|ttc)", fixed_name) is None
+        ):
+            os.close(descriptor)
+            continue
+        source_descriptor = descriptor
+        source_path = candidate
+        destination_name = fixed_name
+        break
+    if source_descriptor is None or source_path is None or destination_name is None:
+        raise CjkFontIntegrityError("no safe local macOS CJK font is available")
+
+    current = bottle_root
+    parent_descriptor: int | None = None
+    target_descriptor: int | None = None
+    target_created = False
+    complete = False
+    destination = bottle_root / "windows" / "Fonts" / destination_name
+    try:
+        for part in ("windows", "Fonts"):
+            current /= part
+            current.mkdir(mode=0o700, exist_ok=True)
+            metadata = current.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise CjkFontIntegrityError("Bottle font destination is unsafe")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        target_flags |= getattr(os, "O_CLOEXEC", 0)
+        target_flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_flags |= getattr(os, "O_BINARY", 0)
+        target_flags |= getattr(os, "O_NOINHERIT", 0)
+        parent_descriptor = os.open(destination.parent, directory_flags)
+        target_descriptor = os.open(
+            destination.name,
+            target_flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        target_created = True
+        before = os.fstat(source_descriptor)
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_descriptor, 65_536)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > MAX_CJK_FONT_BYTES:
+                raise CjkFontIntegrityError("local macOS CJK font exceeds its bound")
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(target_descriptor, view)
+                if written <= 0:
+                    raise OSError("short CJK font write")
+                view = view[written:]
+        os.fsync(target_descriptor)
+        after = os.fstat(source_descriptor)
+        target = os.fstat(target_descriptor)
+        if (
+            copied != before.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or not stat.S_ISREG(target.st_mode)
+            or target.st_nlink != 1
+            or target.st_size != copied
+            or stat.S_IMODE(target.st_mode) != 0o600
+        ):
+            raise CjkFontIntegrityError("Bottle-local CJK font changed during staging")
+        os.fsync(parent_descriptor)
+        complete = True
+        return {
+            "schemaVersion": "1",
+            "scope": "bottle-local",
+            "registration": "windows-fonts-directory",
+            "fileName": destination_name,
+            "sizeBytes": copied,
+            "sha256": "sha256:" + digest.hexdigest(),
+        }
+    except CjkFontIntegrityError:
+        raise
+    except OSError as error:
+        raise CjkFontIntegrityError("Bottle-local CJK font staging failed") from error
+    finally:
+        if target_created and not complete and parent_descriptor is not None:
+            try:
+                os.unlink(destination.name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        for descriptor in (target_descriptor, parent_descriptor, source_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def register_macos_cjk_font(
+    wine: Path,
+    wineserver: Path,
+    prefix: Path,
+) -> dict[str, object]:
+    """Register and select the staged family inside one owned Wine prefix."""
+
+    if platform.system() != "Darwin":
+        raise CjkFontIntegrityError("macOS CJK font registration is unavailable")
+    for executable, label in ((wine, "Wine"), (wineserver, "wineserver")):
+        try:
+            metadata = executable.lstat()
+        except OSError as error:
+            raise CjkFontIntegrityError(f"{label} executable is unavailable") from error
+        if (
+            not executable.is_absolute()
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or _is_reparse(metadata)
+            or not os.access(executable, os.X_OK)
+        ):
+            raise CjkFontIntegrityError(f"{label} executable is unsafe")
+    try:
+        prefix_metadata = prefix.lstat()
+        font_metadata = (prefix / "drive_c" / "windows" / "Fonts" / "CompatForgeCJK.ttf").lstat()
+    except OSError as error:
+        raise CjkFontIntegrityError("Bottle-local CJK font is unavailable") from error
+    if (
+        not prefix.is_absolute()
+        or not stat.S_ISDIR(prefix_metadata.st_mode)
+        or stat.S_ISLNK(prefix_metadata.st_mode)
+        or not stat.S_ISREG(font_metadata.st_mode)
+        or stat.S_ISLNK(font_metadata.st_mode)
+        or _is_reparse(font_metadata)
+        or font_metadata.st_nlink != 1
+        or not 1 <= font_metadata.st_size <= MAX_CJK_FONT_BYTES
+    ):
+        raise CjkFontIntegrityError("Bottle-local CJK font is unsafe")
+
+    environment = {"WINEPREFIX": str(prefix)}
+    try:
+        for key, name, value in CJK_FONT_REGISTRY_VALUES:
+            result = subprocess.run(
+                [
+                    str(wine),
+                    "reg",
+                    "add",
+                    key,
+                    "/v",
+                    name,
+                    "/d",
+                    value,
+                    "/f",
+                ],
+                cwd=ROOT,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                raise CjkFontIntegrityError("Bottle-local CJK font registration failed")
+        for command in ("-k", "-w"):
+            result = subprocess.run(
+                [str(wineserver), command],
+                cwd=ROOT,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+            accepted_codes = {0, 1} if command == "-k" else {0}
+            if result.returncode not in accepted_codes:
+                raise CjkFontIntegrityError("Bottle-local CJK font cleanup failed")
+        if process_snapshot(str(prefix)):
+            raise CjkFontIntegrityError("Bottle-local CJK font cleanup failed")
+    except CjkFontIntegrityError:
+        raise
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise CjkFontIntegrityError("Bottle-local CJK font registration failed") from error
+
+    after = (prefix / "drive_c" / "windows" / "Fonts" / "CompatForgeCJK.ttf").lstat()
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or _installed_node_identity(after) != _installed_node_identity(font_metadata)
+    ):
+        raise CjkFontIntegrityError("Bottle-local CJK font changed during registration")
+    return {
+        "schemaVersion": "1",
+        "scope": "bottle-local",
+        "family": "Arial Unicode MS",
+        "registration": "wine-registry",
+        "replacementCount": len(CJK_FONT_REGISTRY_VALUES) - 1,
+    }
+
+
+def configure_notepad_cjk_font(bottle_root: Path) -> dict[str, object]:
+    """Set the fixed Notepad++ default editor style to the staged CJK font."""
+
+    style_path = (
+        bottle_root / "Program Files" / "Notepad++" / "stylers.model.xml"
+    )
+    try:
+        style_metadata = style_path.lstat()
+    except OSError as error:
+        raise CjkFontIntegrityError("Notepad++ style template is unavailable") from error
+    if (
+        not stat.S_ISREG(style_metadata.st_mode)
+        or stat.S_ISLNK(style_metadata.st_mode)
+        or _is_reparse(style_metadata)
+        or style_metadata.st_nlink != 1
+        or not 1 <= style_metadata.st_size <= MAX_NOTEPAD_STYLE_BYTES
+    ):
+        raise CjkFontIntegrityError("Notepad++ style template is unsafe")
+    current = bottle_root
+    for part in style_path.relative_to(bottle_root).parts[:-1]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            raise CjkFontIntegrityError("Notepad++ style path is unavailable") from error
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise CjkFontIntegrityError("Notepad++ style path is unsafe")
+
+    source_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    target_descriptor: int | None = None
+    temporary_name = f".compatforge-stylers-{secrets.token_hex(16)}.xml"
+    temporary_created = False
+    replaced = False
+    try:
+        source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        source_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        target_flags |= getattr(os, "O_CLOEXEC", 0)
+        target_flags |= getattr(os, "O_NOFOLLOW", 0)
+        source_descriptor = os.open(style_path, source_flags)
+        before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or not 1 <= before.st_size <= MAX_NOTEPAD_STYLE_BYTES
+        ):
+            raise CjkFontIntegrityError("Notepad++ style file is unsafe")
+        payload = b""
+        while len(payload) <= MAX_NOTEPAD_STYLE_BYTES:
+            chunk = os.read(source_descriptor, 65_536)
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) != before.st_size or len(payload) > MAX_NOTEPAD_STYLE_BYTES:
+            raise CjkFontIntegrityError("Notepad++ style file exceeds its bound")
+        source_token = b'fontName="Courier New"'
+        target_token = b'fontName="Arial Unicode MS"'
+        if payload.count(source_token) != 2 or target_token in payload:
+            raise CjkFontIntegrityError("Notepad++ default font style is unexpected")
+        updated = payload.replace(source_token, target_token)
+        parent_descriptor = os.open(style_path.parent, directory_flags)
+        target_descriptor = os.open(
+            temporary_name,
+            target_flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        temporary_created = True
+        view = memoryview(updated)
+        while view:
+            written = os.write(target_descriptor, view)
+            if written <= 0:
+                raise OSError("short Notepad++ style write")
+            view = view[written:]
+        os.fsync(target_descriptor)
+        after = os.fstat(source_descriptor)
+        target = os.fstat(target_descriptor)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or not stat.S_ISREG(target.st_mode)
+            or target.st_nlink != 1
+            or target.st_size != len(updated)
+            or stat.S_IMODE(target.st_mode) != 0o600
+        ):
+            raise CjkFontIntegrityError("Notepad++ style changed during update")
+        os.replace(
+            temporary_name,
+            style_path.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        replaced = True
+        os.fsync(parent_descriptor)
+        final = os.stat(style_path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or final.st_size != len(updated)
+        ):
+            raise CjkFontIntegrityError("Notepad++ style update was not durable")
+        return {
+            "schemaVersion": "1",
+            "scope": "bottle-local",
+            "editorFont": "Arial Unicode MS",
+            "sha256": "sha256:" + hashlib.sha256(updated).hexdigest(),
+        }
+    except CjkFontIntegrityError:
+        raise
+    except OSError as error:
+        raise CjkFontIntegrityError("Notepad++ CJK style update failed") from error
+    finally:
+        if temporary_created and not replaced and parent_descriptor is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        for descriptor in (target_descriptor, parent_descriptor, source_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
 def installed_executable(  # type: ignore[no-untyped-def]
     asset, bottle_root: Path
 ) -> InstalledExecutableBinding:
@@ -2120,6 +3214,14 @@ def main() -> int:
                 context_value,
                 arguments.storage_root,
             )
+            runtime_binding = context["runtimeBindings"][0]  # type: ignore[index]
+            cleanup_wineserver_value = runtime_binding.get("wineserverExecutable")  # type: ignore[union-attr]
+            cleanup_wineserver = (
+                Path(cleanup_wineserver_value)
+                if isinstance(cleanup_wineserver_value, str)
+                and Path(cleanup_wineserver_value).is_absolute()
+                else None
+            )
             bind_runtime_identity(runtime_id, receipt, [])
         except (
             AcceptanceError,
@@ -2139,7 +3241,9 @@ def main() -> int:
         # string-boundary validation and the filesystem observe the same path.
         arguments.storage_root = canonical_storage
         supervisor = context["supervisor"]
-        supervisor["maximumRuntimeMilliseconds"] = 120_000  # type: ignore[index]
+        supervisor["maximumRuntimeMilliseconds"] = (  # type: ignore[index]
+            INTERACTIVE_RUNTIME_MILLISECONDS
+        )
         write_json(context_path, context)
         write_json(arguments.work_root / "bootstrap-receipt.json", receipt)
         if arguments.accept_interactive:
@@ -2167,6 +3271,9 @@ def main() -> int:
             }
             failure_stage = "asset-fetch"
             installed: Path | InstalledExecutableBinding | None = None
+            pinned_descriptors: list[int] = []
+            pinned_work_root: Path | None = None
+            pinned_work_root_identity: tuple[int, int, int] | None = None
             try:
                 if interaction_session is not None:
                     interaction_session.revalidate()
@@ -2174,6 +3281,12 @@ def main() -> int:
                 if not asset_preflight(evidence, cache_entry, arguments.allow_network):
                     continue
                 installer = fetch_asset(arguments, asset.app_id)
+                if arguments.accept_interactive:
+                    # Wine inventories fonts while it initializes a fresh prefix. Stage
+                    # the Bottle-local CJK font before the installer performs that first
+                    # launch so every application can resolve the copied family.
+                    failure_stage = "font-stage"
+                    evidence["cjkFont"] = stage_macos_cjk_font(bottle_root)
                 failure_stage = "core-inspection"
                 installer_inspection = json_object(
                     invoke([str(arguments.compatforge_cli), "inspect", str(installer)]),
@@ -2183,6 +3296,14 @@ def main() -> int:
                 if not isinstance(installer_architecture, str):
                     raise AcceptanceError(f"{asset.app_id} installer inspection omitted architecture")
                 evidence["installerInspection"] = installer_inspection
+                preparation_mode = "immutableArtifact"
+                if asset.app_id == "sumatrapdf":
+                    installer = materialize_sumatrapdf_portable(
+                        installer,
+                        bottle_root,
+                        asset.sha256,
+                    )
+                    preparation_mode = "bottleInPlace"
                 inspection_request = {
                     "schemaVersion": "1",
                     "requestId": str(uuid.uuid4()),
@@ -2190,7 +3311,7 @@ def main() -> int:
                     "executable": {
                         "path": str(installer),
                         "architecture": request_architecture(installer_architecture),
-                        "mode": "immutableArtifact",
+                        "mode": preparation_mode,
                     },
                     "arguments": list(asset.install_args),
                     "constraints": {
@@ -2232,17 +3353,55 @@ def main() -> int:
                 evidence["installerEvents"] = installer_events
                 evidence["installerExit"] = exit_observation(installer_events)
                 installed = installed_executable(asset, bottle_root)
-                if not installer_succeeded(evidence, installer_events, installed):
+                if not installer_succeeded(
+                    evidence,
+                    installer_events,
+                    installed,
+                    allow_requested_termination=asset.app_id == "sumatrapdf",
+                ):
                     continue
+                if arguments.accept_interactive:
+                    failure_stage = "font-stage"
+                    registration_wineserver = cleanup_wineserver
+                    if registration_wineserver is None and all(
+                        value is not None
+                        for value in (arguments.wine_root, arguments.wineserver)
+                    ):
+                        registration_wineserver = Path(arguments.wine_root) / arguments.wineserver
+                    if registration_wineserver is None:
+                        raise CjkFontIntegrityError("wineserver executable is unavailable")
+                    wine_value = runtime_binding.get("executable")  # type: ignore[union-attr]
+                    if not isinstance(wine_value, str) and all(
+                        value is not None
+                        for value in (arguments.wine_root, arguments.wine)
+                    ):
+                        wine_value = str(Path(arguments.wine_root) / arguments.wine)
+                    if not isinstance(wine_value, str) or not Path(wine_value).is_absolute():
+                        raise CjkFontIntegrityError("Wine executable is unavailable")
+                    evidence["cjkFontRegistration"] = register_macos_cjk_font(
+                        Path(wine_value),
+                        registration_wineserver,
+                        bottle_root.parent,
+                    )
+                    if asset.app_id == "notepad-plus-plus":
+                        evidence["notepadCjkStyle"] = configure_notepad_cjk_font(
+                            bottle_root
+                        )
                 launch_request = {
                     "schemaVersion": "1",
-                    "requestId": str(uuid.uuid4()),
+                    "requestId": (
+                        "pinned-sumatrapdf"
+                        if asset.app_id == "sumatrapdf"
+                        else str(uuid.uuid4())
+                    ),
                     "bottleId": bottle_id,
                     "executable": {
                         "path": str(installed),
                         "architecture": "x86_64",
                         "mode": "bottleInPlace",
                     },
+                    "arguments": [],
+                    "environment": {},
                     "constraints": {
                         "allowVirtualMachine": False,
                         "allowRemote": False,
@@ -2250,34 +3409,37 @@ def main() -> int:
                     },
                 }
                 launch_request_path = arguments.work_root / f"{asset.app_id}-launch-request.json"
-                failure_stage = "core-inspection"
-                revalidate_installed_executable(installed)
-                gui_inspection = json_object(
-                    invoke([str(arguments.compatforge_cli), "inspect", str(installed)]),
-                    f"{asset.app_id} GUI inspection",
-                )
-                revalidate_installed_executable(installed)
-                gui_architecture = gui_inspection.get("architecture")
-                if not isinstance(gui_architecture, str):
-                    raise AcceptanceError(f"{asset.app_id} GUI inspection omitted architecture")
-                launch_request["executable"]["architecture"] = request_architecture(gui_architecture)  # type: ignore[index]
-                write_json(launch_request_path, launch_request)
-                evidence["inspection"] = gui_inspection
-                failure_stage = "core-plan"
-                revalidate_installed_executable(installed)
-                evidence["plan"] = json_object(
-                    invoke(
-                        [
-                            str(arguments.compatforge_cli),
-                            "prepared-plan",
-                            str(context_path),
-                            str(installed),
-                            str(launch_request_path),
-                        ]
-                    ),
-                    f"{asset.app_id} GUI plan",
-                )
-                revalidate_installed_executable(installed)
+                if asset.app_id == "sumatrapdf":
+                    write_json(launch_request_path, launch_request)
+                else:
+                    failure_stage = "core-inspection"
+                    revalidate_installed_executable(installed)
+                    gui_inspection = json_object(
+                        invoke([str(arguments.compatforge_cli), "inspect", str(installed)]),
+                        f"{asset.app_id} GUI inspection",
+                    )
+                    revalidate_installed_executable(installed)
+                    gui_architecture = gui_inspection.get("architecture")
+                    if not isinstance(gui_architecture, str):
+                        raise AcceptanceError(f"{asset.app_id} GUI inspection omitted architecture")
+                    launch_request["executable"]["architecture"] = request_architecture(gui_architecture)  # type: ignore[index]
+                    write_json(launch_request_path, launch_request)
+                    evidence["inspection"] = gui_inspection
+                    failure_stage = "core-plan"
+                    revalidate_installed_executable(installed)
+                    evidence["plan"] = json_object(
+                        invoke(
+                            [
+                                str(arguments.compatforge_cli),
+                                "prepared-plan",
+                                str(context_path),
+                                str(installed),
+                                str(launch_request_path),
+                            ]
+                        ),
+                        f"{asset.app_id} GUI plan",
+                    )
+                    revalidate_installed_executable(installed)
                 failure_stage = "desktop-launch"
                 interaction_state: dict[str, object] = {
                     "checks": None,
@@ -2330,15 +3492,81 @@ def main() -> int:
                 if interaction_session is not None:
                     interaction_session.revalidate()
                 revalidate_installed_executable(installed)
-                events, windows, shot, process_group_id = observed_launch(
-                    [
+                terminal_records: list[dict[str, object]] | None = None
+                pass_fds: tuple[int, ...] = ()
+                launch_command = "prepared-launch-terminate"
+                launch_arguments = [
+                    str(arguments.compatforge_cli),
+                    launch_command,
+                    str(context_path),
+                    str(installed),
+                    str(launch_request_path),
+                ]
+                forbidden_transcript_values: tuple[str, ...] = ()
+                if asset.app_id == "sumatrapdf":
+                    protocol = _acknowledgement_protocol()
+                    pinned_work_root, pinned_work_root_identity = (
+                        create_pinned_evidence_work_root(arguments.work_root)
+                    )
+                    try:
+                        work_binding = protocol._bind_directory(
+                            pinned_work_root, "pinned evidence work root"
+                        )
+                    except protocol.AcknowledgementError as error:
+                        raise AcceptanceError(
+                            "pinned evidence work root is invalid"
+                        ) from error
+                    work_descriptor = work_binding.handle
+                    if type(work_descriptor) is not int or work_descriptor < 3:
+                        protocol._close_directory(work_binding)
+                        raise AcceptanceError("pinned evidence work root is invalid")
+                    pinned_descriptors.append(work_descriptor)
+                    try:
+                        inspection_output = create_anonymous_pinned_output(
+                            work_descriptor
+                        )
+                        pinned_descriptors.append(inspection_output.descriptor)
+                        plan_output = create_anonymous_pinned_output(work_descriptor)
+                        pinned_descriptors.append(plan_output.descriptor)
+                    except BaseException:
+                        raise
+                    if (
+                        len(set(pinned_descriptors)) != 3
+                        or inspection_output.identity == plan_output.identity
+                        or any(descriptor < 3 for descriptor in pinned_descriptors)
+                    ):
+                        raise AcceptanceError("pinned evidence descriptors alias")
+                    revalidate_pinned_work_root(work_binding)
+                    launch_command = "prepared-pinned-sumatrapdf-launch-terminate"
+                    launch_arguments = [
                         str(arguments.compatforge_cli),
-                        "prepared-launch-terminate",
+                        launch_command,
                         str(context_path),
                         str(installed),
                         str(launch_request_path),
-                        str(INTERACTIVE_RUNTIME_MILLISECONDS if arguments.accept_interactive else 30_000),
-                    ],
+                        str(pinned_work_root),
+                        str(work_descriptor),
+                        str(inspection_output.descriptor),
+                        str(plan_output.descriptor),
+                    ]
+                    pass_fds = tuple(pinned_descriptors)
+                    terminal_records = []
+                    forbidden_transcript_values = (
+                        str(context_path),
+                        str(installed),
+                        str(launch_request_path),
+                        str(pinned_work_root),
+                        *(f'"{descriptor}"' for descriptor in pinned_descriptors),
+                    )
+                launch_arguments.append(
+                    str(
+                        INTERACTIVE_RUNTIME_MILLISECONDS
+                        if arguments.accept_interactive
+                        else 30_000
+                    )
+                )
+                events, windows, shot, process_group_id = observed_launch(
+                    launch_arguments,
                     arguments.work_root / f"{asset.app_id}.png",
                     asset.window_title_tokens,
                     on_window_observed=(
@@ -2346,10 +3574,26 @@ def main() -> int:
                         if interaction_session is not None
                         else None
                     ),
+                    pass_fds=pass_fds,
+                    terminal_records=terminal_records,
+                    require_empty_stderr=asset.app_id == "sumatrapdf",
+                    forbidden_transcript_values=forbidden_transcript_values,
+                    observed_executable=Path(os.fspath(installed)),
                 )
-                revalidate_installed_executable(installed)
                 if interaction_session is not None:
                     interaction_session.revalidate()
+                if asset.app_id == "sumatrapdf":
+                    revalidate_pinned_work_root(work_binding)
+                    if terminal_records is None or len(terminal_records) != 1:
+                        raise AcceptanceError("pinned evidence receipt is missing")
+                    outputs = parse_pinned_receipt(terminal_records[0])
+                    evidence["inspection"] = read_pinned_evidence(
+                        inspection_output, outputs[0]
+                    )
+                    revalidate_pinned_work_root(work_binding)
+                    evidence["plan"] = read_pinned_evidence(plan_output, outputs[1])
+                    revalidate_pinned_work_root(work_binding)
+                revalidate_installed_executable(installed)
                 evidence["events"] = events
                 evidence["exit"] = exit_observation(events)
                 evidence["windows"] = windows
@@ -2397,9 +3641,45 @@ def main() -> int:
                     diagnostic=str(error),
                 )
             finally:
+                descriptor_cleanup_failed = False
+                for descriptor in reversed(pinned_descriptors):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        descriptor_cleanup_failed = True
+                pinned_descriptors.clear()
+                if descriptor_cleanup_failed:
+                    apply_stage_outcome(
+                        evidence,
+                        "cleanup-termination",
+                        diagnostic="pinned evidence descriptor cleanup failed",
+                    )
+                try:
+                    remove_pinned_evidence_work_root(
+                        pinned_work_root,
+                        pinned_work_root_identity,
+                    )
+                except AcceptanceError as error:
+                    apply_stage_outcome(
+                        evidence,
+                        "cleanup-termination",
+                        diagnostic=str(error),
+                    )
                 close_installed_executable(installed)
                 cleanup_diagnostic = "Bottle cleanup failed"
                 try:
+                    bottle_prefix = arguments.storage_root / "bottles" / bottle_id / "prefix"
+                    residual_before_delete = process_snapshot(str(bottle_root))
+                    if residual_before_delete:
+                        if cleanup_wineserver is None:
+                            raise AcceptanceError(
+                                "Bottle wineserver cleanup binding is unavailable"
+                            )
+                        stop_bottle_wineserver(cleanup_wineserver, bottle_prefix)
+                        residual_before_delete = process_snapshot(str(bottle_root))
+                    if residual_before_delete:
+                        evidence["residualProcesses"] = residual_before_delete
+                        raise AcceptanceError("Bottle cleanup left residual processes")
                     if bottle_root.exists() or bottle_root.is_symlink():
                         if bottle_root.is_symlink():
                             raise AcceptanceError("Bottle root became a symlink")

@@ -61,13 +61,13 @@ The orchestrator and GUI runner do not read stdin. Unit and CI tests inject dete
 
 Compact evidence contains only the closed interaction booleans derived from a validated acknowledgement. Full external evidence may additionally retain the redacted challenge digest and acknowledgement outcome, but never absolute paths, nonce values, or raw diagnostics in compact stdout.
 
-## Deterministic SumatraPDF installation
+## Deterministic SumatraPDF materialization
 
-SumatraPDF is installed with its officially supported `-d` option into the fixed Bottle path `C:\CompatForge\SumatraPDF`. The reviewed installed executable is therefore `drive_c/CompatForge/SumatraPDF/SumatraPDF.exe`.
+The acceptance runner uses the official self-contained SumatraPDF 3.6.1 portable executable. It verifies the fixed SHA-256, copies those bytes exactly once with no-follow and exclusive-create semantics into `C:\CompatForge\SumatraPDF\SumatraPDF.exe`, and runs a bounded no-argument Bottle-in-place preparation smoke before the pinned GUI launch.
 
-The GUI runner removes its ambient `USER` fallback. It does not enumerate or infer Wine profiles. 7-Zip and Notepad++ retain their existing fixed Program Files paths.
+The GUI runner removes its ambient `USER` fallback. It does not enumerate or infer Wine profiles, and failed materialization removes its partial target. 7-Zip and Notepad++ retain their existing fixed Program Files paths.
 
-Reference: [SumatraPDF installer command-line arguments](https://github.com/sumatrapdfreader/sumatrapdf/blob/master/docs/md/Installer-cmd-line-arguments.md).
+Reference: [SumatraPDF portable mode](https://www.sumatrapdfreader.org/docs/SumatraPDF-portable).
 
 ## Repository integration closure
 
@@ -84,7 +84,7 @@ Tests must prove:
 - every identity field, digest, required-check set, and nonce is bound;
 - negative answers, timeout, helper interruption, replay, malformed JSON, symlink, hardlink, reparse point, and namespace substitution fail closed;
 - the helper handles exactly twelve GUI acknowledgements without blocking CI stdin;
-- SumatraPDF installation and lookup work with an empty child environment and reject path drift;
+- SumatraPDF portable materialization and lookup work with an empty child environment and reject digest or path drift;
 - the legacy Mac-Win workflow contract and the macOS CI contract both pass; and
 - repository validator, Python suites, Rust workspace, Tauri tests, clippy, formatting, DCO, LF, and artifact checks remain green.
 

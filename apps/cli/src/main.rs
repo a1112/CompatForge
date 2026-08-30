@@ -398,7 +398,7 @@ fn pinned_receipt_line(receipt: &PinnedEvidenceReceipt) -> Result<Vec<u8>, Pinne
     Ok(bytes)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PinnedSessionTranscript {
     events: Vec<Vec<u8>>,
@@ -417,19 +417,20 @@ trait ClosedPinnedSession {
     fn start_pinned(&mut self) -> Result<Self::Handle, PinnedSessionError>;
     fn post_spawn_revalidate(&mut self) -> Result<(), PinnedSessionError>;
     fn shutdown_integrity_failure(&mut self, handle: Self::Handle) -> Result<(), PinnedSessionError>;
+    #[cfg(test)]
     fn supervise_pinned(&mut self, handle: Self::Handle) -> Result<Vec<Vec<u8>>, PinnedSessionError>;
     fn finalize_session(&mut self) -> Result<(), PinnedSessionError>;
     fn evidence_receipt(&self) -> Result<PinnedEvidenceReceipt, PinnedSessionError>;
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn run_closed_pinned_session<S: ClosedPinnedSession>(
     session: &mut S,
 ) -> Result<PinnedSessionTranscript, PinnedSessionError> {
     run_closed_pinned_session_inner(session, |_| {})
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn run_closed_pinned_session_inner<S, F>(
     session: &mut S,
     after_spawn: F,
@@ -724,6 +725,7 @@ impl ClosedPinnedSession for MacOsClosedPinnedSession<'_> {
         }
     }
 
+    #[cfg(test)]
     fn supervise_pinned(&mut self, timed: Self::Handle) -> Result<Vec<Vec<u8>>, PinnedSessionError> {
         collect_pinned_runtime_events(&timed.handle, timed.started, self.terminate_after, timed.cleanup_wait)
     }
@@ -799,13 +801,28 @@ impl PinnedRuntimeHandle for LaunchHandle {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn collect_pinned_runtime_events<H: PinnedRuntimeHandle>(
     handle: &H,
     started: Instant,
     terminate_after: Duration,
     cleanup_wait: Duration,
 ) -> Result<Vec<Vec<u8>>, PinnedSessionError> {
+    collect_pinned_runtime_events_with(handle, started, terminate_after, cleanup_wait, |_| Ok(()))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn collect_pinned_runtime_events_with<H, F>(
+    handle: &H,
+    started: Instant,
+    terminate_after: Duration,
+    cleanup_wait: Duration,
+    mut publish: F,
+) -> Result<Vec<Vec<u8>>, PinnedSessionError>
+where
+    H: PinnedRuntimeHandle,
+    F: FnMut(&[u8]) -> Result<(), PinnedSessionError>,
+{
     let mut events = Vec::new();
     let mut termination_requested = false;
     let mut failed = false;
@@ -842,7 +859,9 @@ fn collect_pinned_runtime_events<H: PinnedRuntimeHandle>(
                 let terminal = event.kind == RuntimeEventKind::Exited;
                 let success = event.exit.as_ref().is_some_and(|exit| exit.success);
                 if !failed {
-                    events.push(event_json_line(&event)?);
+                    let line = event_json_line(&event)?;
+                    publish(&line)?;
+                    events.push(line);
                 }
                 if terminal {
                     let completion = handle.terminate_and_wait(cleanup_wait);
@@ -898,7 +917,7 @@ fn drain_pinned_integrity_shutdown<H: PinnedRuntimeHandle>(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn pinned_transcript_bytes(transcript: &PinnedSessionTranscript) -> Result<Vec<u8>, PinnedSessionError> {
     let receipt = pinned_receipt_line(&transcript.receipt)?;
     let total_length = transcript
@@ -957,10 +976,33 @@ fn project_pinned_runtime_event_line(line: &[u8]) -> Result<Vec<u8>, PinnedSessi
 }
 
 #[cfg(target_os = "macos")]
-fn write_pinned_transcript(transcript: &PinnedSessionTranscript) -> Result<(), PinnedSessionError> {
-    let output = pinned_transcript_bytes(transcript)?;
+fn run_streamed_macos_pinned_session(session: &mut MacOsClosedPinnedSession<'_>) -> Result<(), PinnedSessionError> {
+    session.validate_closed_inputs()?;
+    session.capture_source()?;
+    session.prepare_pinned()?;
+    session.authorize_pinned()?;
+    session.publish_evidence()?;
+    let timed = session.start_pinned()?;
+    if let Err(integrity_error) = session.post_spawn_revalidate() {
+        session.shutdown_integrity_failure(timed)?;
+        return Err(integrity_error);
+    }
+
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&output).map_err(|_| PinnedSessionError)?;
+    collect_pinned_runtime_events_with(
+        &timed.handle,
+        timed.started,
+        session.terminate_after,
+        timed.cleanup_wait,
+        |line| {
+            let projected = project_pinned_runtime_event_line(line)?;
+            stdout.write_all(&projected).map_err(|_| PinnedSessionError)?;
+            stdout.flush().map_err(|_| PinnedSessionError)
+        },
+    )?;
+    session.finalize_session()?;
+    let receipt = pinned_receipt_line(&session.evidence_receipt()?)?;
+    stdout.write_all(&receipt).map_err(|_| PinnedSessionError)?;
     stdout.flush().map_err(|_| PinnedSessionError)
 }
 
@@ -973,8 +1015,7 @@ fn run_pinned_prepared_command(command: PreparedCommand<'_>) -> Result<(), Pinne
     #[cfg(target_os = "macos")]
     {
         let mut session = MacOsClosedPinnedSession::new(command)?;
-        let transcript = run_closed_pinned_session(&mut session)?;
-        write_pinned_transcript(&transcript)
+        run_streamed_macos_pinned_session(&mut session)
     }
 }
 
@@ -2103,6 +2144,25 @@ mod tests {
         .unwrap();
         assert_eq!(events.len(), 1);
         assert!(!handle.workers_active.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pinned_success_publishes_each_event_before_returning() {
+        let handle = FakePinnedRuntimeHandle::new([pinned_exited_event()]);
+        let mut published = Vec::new();
+        let events = collect_pinned_runtime_events_with(
+            &handle,
+            Instant::now(),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            |line| {
+                published.push(line.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(published, events);
+        assert_eq!(published.len(), 1);
     }
 
     #[test]

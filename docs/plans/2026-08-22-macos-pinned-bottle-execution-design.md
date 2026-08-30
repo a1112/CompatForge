@@ -6,8 +6,8 @@
 
 ## Problem
 
-The macOS GUI acceptance runner now installs SumatraPDF at the deterministic Bottle path
-`C:\CompatForge\SumatraPDF\SumatraPDF.exe`. Holding and revalidating the pathname detects most
+The macOS GUI acceptance runner now materializes the fixed-digest official SumatraPDF portable
+executable at `C:\CompatForge\SumatraPDF\SumatraPDF.exe`. Holding and revalidating the pathname detects most
 substitutions, but it cannot prevent a foreign process from replacing or overwriting the file
 after validation and before Wine opens it. A post-launch check detects the drift too late: Wine
 may already have consumed foreign bytes.
@@ -36,13 +36,17 @@ default CI, PATH lookup, a shell, ambient environment variables, or network acce
 The logical path remains the reviewed Bottle path. It is used for Bottle containment, policy,
 working-directory selection, evidence, and sibling-resource semantics.
 
-The execution bytes are captured once through a no-follow regular-file handle after the installer
-completes. The lease also holds every directory handle from the reviewed Bottle root to the source
+The execution bytes are captured once through a no-follow regular-file handle after the portable
+artifact has been exclusively materialized and its bounded Bottle-in-place preparation smoke has
+completed. The lease also holds every directory handle from the reviewed Bottle root to the source
 entry. The capture enforces the existing size bound, single-link and reparse restrictions, and
 computes the SHA-256 digest used by inspection and planning.
 
-For each Sumatra session, the Python caller opens its already-bound repository-external work root
-no-follow and keeps that directory descriptor alive until all CLI evidence has been verified. It
+For each Sumatra session, the Python caller first creates a mode-`0700`, effective-user-owned,
+randomly named evidence directory below the repository-external work root. Screenshots and ordinary
+JSON remain in the outer work root, so their creation cannot change the full metadata identity that
+the CLI holds and revalidates. Python opens the dedicated evidence directory no-follow and keeps
+that directory descriptor alive until all CLI evidence has been verified. It
 creates two empty output files there with independent 128-bit names,
 `O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`, and mode `0600`, immediately unlinks them, and retains their
 descriptors. Python passes the reviewed work-root
@@ -83,8 +87,9 @@ pathname unlink is used for either evidence output. Rust RAII guarantees a close
 claim `OwnedFd::drop` reports close errors; `sync_all` plus canonical readback are the Rust integrity
 gate, while Python's explicit `os.close` failure remains cleanup-fatal.
 
-The acceptance-only launch command passes the inherited descriptor to Wine through
-`/dev/fd/<descriptor>`. On macOS the command uses Wine's Unix-path launch entry point. The original
+The acceptance-only launch command passes the inherited descriptor directly as Wine's first guest
+argument through `/dev/fd/<descriptor>`. It deliberately avoids `start.exe`: a second Windows
+process creation does not preserve this host descriptor boundary. The original
 Bottle directory remains the working directory so SumatraPDF retains its expected surrounding
 context.
 
@@ -118,10 +123,12 @@ context.
 
 ## Data Flow
 
-1. The installer writes the fixed SumatraPDF executable inside the current Bottle.
+1. The runner verifies the official portable asset digest, exclusively materializes it at the fixed
+   SumatraPDF path inside the current Bottle, and runs a bounded no-argument preparation smoke
+   through the prepared Bottle-in-place path.
 2. The runner rejects missing, linked, hardlinked, reparse, wrong-location, or duplicate legacy
    installations.
-3. Python holds the existing work root plus two pre-unlinked output files, then the acceptance-only
+3. Python holds a dedicated, metadata-stable evidence subdirectory plus two pre-unlinked output files, then the acceptance-only
    CLI duplicates the inherited descriptors, binds the directory to the reviewed path, and opens the
    fixed source path component-by-component with held no-follow directory handles, creates one random
    ordinary file relative to the held work-root descriptor, and unlinks it before reading source
@@ -132,7 +139,7 @@ context.
    and the same lease; it never calls the pathname-based Bottle verifier.
 6. The process supervisor revalidates the held source/directory identities and source digest,
    rewinds the unlinked file, duplicates one descriptor in the parent, clears `CLOEXEC`, and
-   launches exactly `wine start.exe /unix /dev/fd/<descriptor>`. Existing process-group setup
+   launches exactly `wine /dev/fd/<descriptor>`. Existing process-group setup
    remains the only `pre_exec` hook.
 7. The parent closes the process-owned duplicate immediately after spawn and keeps the caller-owned
    lease until process attachment succeeds or the failure path has reaped the child.
@@ -164,7 +171,7 @@ and developer paths never enter any persisted evidence.
 
 The repository can verify the descriptor lifetime, command construction, schema stability, and
 failure closure on Windows and host-independent tests. Before the Python runner selects the new
-command, a focused CrossOver and Whisky spike must verify `start.exe /unix /dev/fd/<descriptor>` on
+command, a focused CrossOver and Whisky spike must verify `wine /dev/fd/<descriptor>` on
 the real Apple Silicon acceptance host. The spike calls the same Rust capture, prepare, authorize,
 and `start_pinned_bottle` APIs as the CLI from a test-only macOS harness.
 `start_pinned_bottle` returns a live managed handle before the caller performs the post-spawn source
@@ -175,11 +182,23 @@ termination path, and requires zero residual processes. Both Runtimes must launc
 SumatraPDF build successfully. Failure stops implementation and reopens the design; it cannot be
 deferred until after runner integration.
 
+The first real-host checkpoint rejected the installed 3.6.1 executable: it requires the sibling
+`libmupdf.dll`, while `/dev/fd/<descriptor>` intentionally presents no sibling path and Sumatra
+therefore switches into installer/error behavior. The reopened design uses the official
+self-contained 3.6.1 portable executable instead. A second checkpoint then rejected the
+`start.exe /unix` hop because it did not carry the host descriptor into the process it created.
+The direct Wine descriptor launch reached the reader startup path. CrossOver 11.0 then produced a
+real SumatraPDF window, an exact-window screenshot, the terminal receipt, and zero Bottle-scoped
+residuals. The installed Whisky 7.7 Runtime exits before window creation and independently reports
+that its graphics driver cannot be loaded, including for a basic GUI probe; that remains a
+Runtime-specific acceptance blocker rather than a reason to weaken or bypass the pinned path.
+
 ## Testing
 
 Required RED/GREEN coverage includes:
 
-- same-inode overwrite after initial binding;
+- portable digest mismatch, source symlink, duplicate target, partial materialization cleanup, and
+  same-inode overwrite after initial binding;
 - no separate Sumatra inspection can be substituted between capture and planning;
 - Bottle, parent, and executable substitution before and during inspect, plan, and launch;
 - hardlink or reparse insertion after binding;
@@ -187,6 +206,8 @@ Required RED/GREEN coverage includes:
   never emitted;
 - the ordinary staging file is created relative to the held private work root, unlinked before the
   first copied byte, and verified as the same zero-link inode;
+- screenshot creation in the outer work root does not mutate the dedicated evidence directory or
+  invalidate its final metadata revalidation;
 - the acknowledged directory-search-capable principal `openat`-to-`unlinkat` trust boundary is
   documented and no test claims a stronger guarantee from mode bits alone;
 - anonymous execution bytes remain the initially captured digest;

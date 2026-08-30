@@ -175,10 +175,21 @@ def parse_json(result: subprocess.CompletedProcess[str], field: str) -> dict[str
 
 
 def run(arguments: argparse.Namespace, runner: Runner = subprocess.run) -> dict[str, object]:
-    use_rust_bootstrap = runner is subprocess.run
-    if use_rust_bootstrap:
+    explicit_runtime = (
+        arguments.wine_root,
+        arguments.wine,
+        arguments.wineserver,
+        arguments.version,
+    )
+    if any(explicit_runtime):
+        arguments = resolve_wine(arguments, runner)
+        use_rust_bootstrap = False
+        paths = validate(arguments, platform.system(), platform.machine())
+    elif runner is subprocess.run:
+        use_rust_bootstrap = True
         paths = validate(arguments, platform.system(), platform.machine(), require_runtime=False)
     else:
+        use_rust_bootstrap = False
         arguments = resolve_wine(arguments, runner)
         paths = validate(arguments, platform.system(), platform.machine())
     cli = str(paths["cli"])

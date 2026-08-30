@@ -22,6 +22,8 @@ jobs:
         run: python -S -B -m unittest tests.test_macos_headless_preview -v
       - name: Test desktop GUI baseline contracts
         run: python -S -B -m unittest tests.test_gui_baseline_contracts -v
+      - name: Test Mac-Win workflow policy contract
+        run: python -S -B -m unittest tests.test_macwin_asset_migration.MacWinMigrationWorkflowTests.test_workflow_changes_only_pins_and_read_only_migration_checks -v
       - name: Test Bottle migration contracts and independent goldens
         run: python -S -B -m unittest tests.test_bottle_migration_contracts.BottleMigrationRepositoryTests tests.test_bottle_migration_contracts.BottleMigrationGoldenTests
       - name: Check portable Mac-Win assets

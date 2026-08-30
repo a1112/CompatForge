@@ -29,7 +29,13 @@ APPLICATION_IDS = ("7zip", "sumatrapdf", "notepad-plus-plus")
 REQUIRED_CHECKS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
-    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches"),
+    "notepad-plus-plus": (
+        "open",
+        "edit",
+        "saveUtf8Chinese",
+        "cjkTextReadable",
+        "rereadMatches",
+    ),
 }
 CHALLENGE_NAMES = tuple(
     f"{round_id}--{runtime_id}--{app_id}.json"
@@ -652,6 +658,7 @@ def _invalidate_descriptor_if_owned(
     os.lseek(descriptor, 0, os.SEEK_SET)
     if os.write(descriptor, b"!") != 1:
         raise OSError("cleanup invalidation failed")
+    os.ftruncate(descriptor, 1)
     os.fsync(descriptor)
     final = os.fstat(descriptor)
     if _node_identity(final) != identity:

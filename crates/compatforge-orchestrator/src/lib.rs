@@ -1091,6 +1091,7 @@ mod tests {
         LaunchRequest,
         compatforge_guest_artifact::PinnedBottleExecutable,
         compatforge_guest_artifact::HeldExternalWorkRoot,
+        std::fs::File,
     ) {
         use compatforge_guest_artifact::{GuestArtifactStore, HeldExternalWorkRoot};
         use std::os::fd::AsRawFd;
@@ -1117,7 +1118,7 @@ mod tests {
         request.executable.mode = ExecutableMode::BottleInPlace;
         request.executable.architecture = CpuArchitecture::X86_64;
         request.executable.sha256 = None;
-        (config, root, source, request, pinned, held)
+        (config, root, source, request, pinned, held, directory)
     }
 
     fn make_object_writable(prepared: &PreparedLaunch) {
@@ -1473,7 +1474,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_same_lease_prepares_and_authorizes() {
-        let (config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-valid-same-lease");
+        let (config, root, _source, request, pinned, _held, _raw_work) = real_pinned_fixture("pinned-valid-same-lease");
         let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
 
         prepared.authorize_pinned(&config, &pinned).unwrap();
@@ -1485,7 +1486,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_preparation_revalidates_source_drift() {
-        let (config, root, source, request, pinned, _held) = real_pinned_fixture("pinned-prepare-source-drift");
+        let (config, root, source, request, pinned, _held, _raw_work) =
+            real_pinned_fixture("pinned-prepare-source-drift");
         std::fs::write(&source, b"drifted after capture").unwrap();
 
         assert!(matches!(
@@ -1500,7 +1502,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_authorization_revalidates_source_drift() {
-        let (config, root, source, request, pinned, _held) = real_pinned_fixture("pinned-authorize-source-drift");
+        let (config, root, source, request, pinned, _held, _raw_work) =
+            real_pinned_fixture("pinned-authorize-source-drift");
         let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
         std::fs::write(&source, b"drifted after preparation").unwrap();
 
@@ -1516,7 +1519,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_public_preparation_rejects_an_initial_cross_storage_root() {
-        let (mut config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-public-storage");
+        let (mut config, root, _source, request, pinned, _held, _raw_work) =
+            real_pinned_fixture("pinned-public-storage");
         config.storage_root = root.join("other-store").to_string_lossy().into_owned();
 
         assert!(matches!(
@@ -1533,7 +1537,8 @@ mod tests {
     fn pinned_public_preparation_rejects_execution_overwrite() {
         use std::io::{Seek, Write};
 
-        let (config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-execution-overwrite");
+        let (config, root, _source, request, pinned, _held, _raw_work) =
+            real_pinned_fixture("pinned-execution-overwrite");
         let mut execution = pinned.duplicate_execution_file().unwrap();
         execution.seek(std::io::SeekFrom::Start(0)).unwrap();
         execution.write_all(b"XX").unwrap();
@@ -1552,7 +1557,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pinned_public_authorization_rejects_execution_size_drift() {
-        let (config, root, _source, request, pinned, _held) = real_pinned_fixture("pinned-execution-size");
+        let (config, root, _source, request, pinned, _held, _raw_work) = real_pinned_fixture("pinned-execution-size");
         let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
         let execution = pinned.duplicate_execution_file().unwrap();
         execution.set_len(pinned.binding().size_bytes - 1).unwrap();
@@ -1573,7 +1578,7 @@ mod tests {
     fn pinned_public_authorization_rejects_another_equivalent_lease() {
         use compatforge_guest_artifact::GuestArtifactStore;
 
-        let (config, root, source, request, pinned, held) = real_pinned_fixture("pinned-public-other-lease");
+        let (config, root, source, request, pinned, held, _raw_work) = real_pinned_fixture("pinned-public-other-lease");
         let prepared = PreparedLaunch::prepare_pinned_bottle(&config, &request, &pinned).unwrap();
         drop(pinned);
         let other = GuestArtifactStore::new(&config.storage_root)

@@ -1666,8 +1666,12 @@ mod tests {
         use super::*;
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::sync::{Mutex, MutexGuard};
+
+        static PINNED_MACOS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
         struct Context {
+            _serial: MutexGuard<'static, ()>,
             root: PathBuf,
             storage: PathBuf,
             source: PathBuf,
@@ -1675,6 +1679,9 @@ mod tests {
         }
 
         fn context(label: &str) -> Context {
+            let serial = PINNED_MACOS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = temp_root(label);
             let storage = root.join("storage");
             let source = storage.join("bottles/gui-sumatrapdf/prefix/drive_c/CompatForge/SumatraPDF/SumatraPDF.exe");
@@ -1683,6 +1690,7 @@ mod tests {
             fs::create_dir(&work).unwrap();
             fs::write(&source, gui_fixture_bytes()).unwrap();
             Context {
+                _serial: serial,
                 root,
                 storage,
                 source,
@@ -1775,7 +1783,7 @@ mod tests {
             symlink(&target, &context.source).unwrap();
             assert!(matches!(
                 store.pin_sumatra_bottle_executable(PINNED_BOTTLE_ID, &context.source, &work),
-                Err(GuestArtifactError::PinnedCaptureFailed)
+                Err(GuestArtifactError::InvalidPinnedWorkRoot)
             ));
             fs::remove_dir_all(context.root).unwrap();
         }
