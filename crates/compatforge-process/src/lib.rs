@@ -39,6 +39,11 @@ const EXECUTABLE_BUSY_RETRY_LIMIT: usize = 20;
 const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const RUNTIME_EXECUTABLE_DIGEST_ENV: &str = "COMPATFORGE_RUNTIME_EXECUTABLE_SHA256";
 const WINESERVER_EXECUTABLE_DIGEST_ENV: &str = "COMPATFORGE_WINESERVER_EXECUTABLE_SHA256";
+const FONT_CONFIG_FILE_ENV: &str = "FONTCONFIG_FILE";
+const FONT_CONFIG_DIGEST_ENV: &str = "COMPATFORGE_FONT_CONFIG_SHA256";
+const BOTTLE_FONT_FILE_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FILE";
+const BOTTLE_FONT_DIGEST_ENV: &str = "COMPATFORGE_BOTTLE_FONT_SHA256";
+const BOTTLE_FONT_FILE_NAME: &str = "compatforge-cjk.ttc";
 
 #[derive(Debug)]
 pub enum ProcessError {
@@ -98,9 +103,12 @@ impl ProcessSupervisor {
             verify_in_place_binding_contents(binding).map_err(ProcessError::InvalidGuestArtifact)?;
         }
         verify_pinned_runtime(plan)?;
+        verify_pinned_font_config(plan)?;
+        verify_pinned_bottle_font(plan)?;
         materialize_launch_directories(plan)?;
         let wine_session = WineSession::acquire(plan)?;
         initialize_wine_prefix(plan)?;
+        prepare_pinned_bottle_font(plan)?;
         let guest_execution_alias = prepare_guest_execution_alias(plan)?;
         let keep_alive_after_root_exit = managed_wine_gui_requires_idle_wait(plan);
 
@@ -576,6 +584,140 @@ fn verify_pinned_runtime(plan: &LaunchPlan) -> Result<(), ProcessError> {
     Ok(())
 }
 
+fn verify_pinned_font_config(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    let path = plan.process.environment.get(FONT_CONFIG_FILE_ENV);
+    let digest = plan.process.environment.get(FONT_CONFIG_DIGEST_ENV);
+    match (path, digest) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(ProcessError::InvalidRuntimeEvidence(
+            "incomplete font configuration evidence",
+        )),
+        (Some(path), Some(digest)) => verify_pinned_regular_file(Path::new(path), digest, "font configuration"),
+    }
+}
+
+fn verify_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    let path = plan.process.environment.get(BOTTLE_FONT_FILE_ENV);
+    let digest = plan.process.environment.get(BOTTLE_FONT_DIGEST_ENV);
+    match (path, digest) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(ProcessError::InvalidRuntimeEvidence("incomplete Bottle font evidence"))
+        }
+        (Some(path), Some(digest)) => verify_pinned_regular_file(Path::new(path), digest, "Bottle font"),
+    }
+}
+
+/// Link a digest-pinned host CJK font into the managed prefix and install a
+/// fixed, product-owned set of Wine GDI substitutions. The source file is
+/// never copied or modified, and an existing non-owned target is rejected.
+fn prepare_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    let (Some(source), Some(_digest)) = (
+        plan.process.environment.get(BOTTLE_FONT_FILE_ENV),
+        plan.process.environment.get(BOTTLE_FONT_DIGEST_ENV),
+    ) else {
+        return Ok(());
+    };
+    if plan.runtime.provider != RuntimeKind::Wine || plan.lifecycle.wineserver.is_none() {
+        return Err(ProcessError::InvalidRuntimeEvidence("Bottle font Wine lifecycle"));
+    }
+    let prefix = plan
+        .process
+        .environment
+        .get("WINEPREFIX")
+        .ok_or(ProcessError::InvalidRuntimeEvidence("Bottle font WINEPREFIX"))?;
+    let fonts = Path::new(prefix).join("drive_c/windows/Fonts");
+    ensure_directory(&fonts, "Bottle fonts directory")?;
+    let target = fonts.join(BOTTLE_FONT_FILE_NAME);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let destination =
+                std::fs::read_link(&target).map_err(|_| ProcessError::InvalidRuntimeEvidence("Bottle font link"))?;
+            if destination != Path::new(source) {
+                return Err(ProcessError::InvalidRuntimeEvidence("Bottle font link"));
+            }
+        }
+        Ok(_) => return Err(ProcessError::InvalidRuntimeEvidence("Bottle font link")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(source, &target)
+                .map_err(|_| ProcessError::InvalidRuntimeEvidence("Bottle font link"))?;
+            #[cfg(not(unix))]
+            return Err(ProcessError::InvalidRuntimeEvidence("Bottle font link"));
+        }
+        Err(_) => return Err(ProcessError::InvalidRuntimeEvidence("Bottle font link")),
+    }
+    verify_pinned_bottle_font(plan)?;
+
+    const REGISTRY_KEYS: &[&str] = &[
+        r"HKCU\Software\Wine\Fonts\Replacements",
+        r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
+    ];
+    const REGISTRY_NAMES: &[&str] = &[
+        "Tahoma",
+        "Arial",
+        "Segoe UI",
+        "Microsoft Sans Serif",
+        "MS Shell Dlg",
+        "MS Shell Dlg 2",
+        "Microsoft YaHei",
+        "SimHei",
+        "SimSun",
+    ];
+    for key in REGISTRY_KEYS {
+        for name in REGISTRY_NAMES {
+            run_bounded_wine_command(plan, &["reg", "add", key, "/v", name, "/d", "Heiti SC", "/f"])?;
+        }
+    }
+    run_bounded_wine_command(
+        plan,
+        &[
+            "reg",
+            "add",
+            r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Fonts",
+            "/v",
+            "Heiti SC (TrueType)",
+            "/d",
+            BOTTLE_FONT_FILE_NAME,
+            "/f",
+        ],
+    )
+}
+
+fn run_bounded_wine_command(plan: &LaunchPlan, arguments: &[&str]) -> Result<(), ProcessError> {
+    let mut command = Command::new(&plan.process.executable);
+    command
+        .args(arguments)
+        .current_dir(&plan.process.working_directory)
+        .env_clear()
+        .envs(&plan.process.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+    let deadline = Instant::now() + WINE_PREFIX_BOOTSTRAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit)) if exit.success() => return Ok(()),
+            Ok(Some(exit)) => {
+                return Err(ProcessError::Spawn(io::Error::other(format!(
+                    "Wine compatibility preparation exited with {exit}"
+                ))));
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProcessError::Spawn(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Wine compatibility preparation timed out",
+                )));
+            }
+            Err(error) => return Err(ProcessError::Spawn(error)),
+        }
+    }
+}
+
 fn verify_pinned_executable(path: &Path, expected: &str, field: &'static str) -> Result<(), ProcessError> {
     if expected.len() != 71
         || !expected.starts_with("sha256:")
@@ -585,6 +727,25 @@ fn verify_pinned_executable(path: &Path, expected: &str, field: &'static str) ->
     }
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ProcessError::InvalidRuntimeEvidence(field))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || !is_executable(path) {
+        return Err(ProcessError::InvalidRuntimeEvidence(field));
+    }
+    let actual = sha256_file(path).map_err(|_| ProcessError::InvalidRuntimeEvidence(field))?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(ProcessError::InvalidRuntimeEvidence(field));
+    }
+    Ok(())
+}
+
+fn verify_pinned_regular_file(path: &Path, expected: &str, field: &'static str) -> Result<(), ProcessError> {
+    if !path.is_absolute()
+        || expected.len() != 71
+        || !expected.starts_with("sha256:")
+        || !expected[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ProcessError::InvalidRuntimeEvidence(field));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ProcessError::InvalidRuntimeEvidence(field))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ProcessError::InvalidRuntimeEvidence(field));
     }
     let actual = sha256_file(path).map_err(|_| ProcessError::InvalidRuntimeEvidence(field))?;
@@ -1267,10 +1428,22 @@ impl WineSession {
         // that case `-k` returns status 1, while the authoritative `-w`
         // rendezvous succeeds; cleanup is still complete and idempotent.
         let kill_result = self.run_command("-k");
+        // Wine's macOS driver may detach a GUI client from the launch process
+        // group. Some Runtime builds leave that host process blocked after
+        // wineserver exits instead of terminating it, which produces a frozen
+        // window whose Close and Exit actions no longer work. Bind the
+        // fallback to this prefix's system32 directory or ntdll mapping so
+        // another Bottle is never selected merely because it is also running
+        // Wine. Some macOS Wine builds retain the directory as their current
+        // working directory without keeping the marker file open.
+        let client_cleanup_result = platform::force_kill_wine_prefix_clients(Path::new(&self.lifecycle.prefix));
         let wait_result = self.run_command("-w");
-        let stop_result = match (kill_result, wait_result) {
-            (_, Ok(())) => Ok(()),
-            (Ok(()), Err(error)) | (Err(error), Err(_)) => Err(error),
+        let stop_result = match (kill_result, wait_result, client_cleanup_result) {
+            (_, Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error), Ok(()))
+            | (Err(error), Err(_), Ok(()))
+            | (_, Ok(()), Err(error))
+            | (_, Err(_), Err(error)) => Err(error),
         };
         self.release_lease();
         self.stop_completed.store(true, Ordering::Release);
@@ -1381,7 +1554,8 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod platform {
     use std::io;
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
     #[cfg(target_os = "macos")]
     use std::thread;
     #[cfg(target_os = "macos")]
@@ -1396,6 +1570,9 @@ mod platform {
     const SIGNAL_RETRY_LIMIT: usize = 50;
     #[cfg(target_os = "macos")]
     const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+    #[cfg(target_os = "macos")]
+    const LSOF_PATH: &str = "/usr/sbin/lsof";
 
     extern "C" {
         fn kill(process_id: i32, signal: i32) -> i32;
@@ -1449,6 +1626,69 @@ mod platform {
 
     pub struct ProcessTree {
         process_group_id: i32,
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn force_kill_wine_prefix_clients(prefix: &Path) -> io::Result<()> {
+        let system32 = prefix.join("drive_c/windows/system32");
+        let marker = system32.join("ntdll.dll");
+        if !marker.exists() {
+            return Ok(());
+        }
+        if !system32.is_dir() || system32.is_symlink() || !marker.is_file() || marker.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Wine prefix ntdll marker is unavailable",
+            ));
+        }
+        let output = Command::new(LSOF_PATH)
+            .args(["-t", "--"])
+            .arg(&marker)
+            .arg(&system32)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()?;
+        // lsof uses status 1 when no process has the file open. That is the
+        // normal result after a clean Wine shutdown.
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(io::Error::other(format!(
+                "Wine prefix client discovery exited with {}",
+                output.status
+            )));
+        }
+        if output.stdout.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Wine prefix client discovery exceeded 64 KiB",
+            ));
+        }
+        let current_process = i32::try_from(std::process::id())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "current pid does not fit in i32"))?;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let process_id = line
+                .parse::<i32>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lsof emitted an invalid pid"))?;
+            if process_id <= 1 || process_id == current_process {
+                continue;
+            }
+            // SAFETY: the positive PID was returned for an open mapping of the
+            // exact, validated prefix marker. SIGKILL does not access Rust
+            // memory, and ESRCH means the client exited between discovery and
+            // delivery.
+            if unsafe { kill(process_id, SIGKILL) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn force_kill_wine_prefix_clients(_prefix: &Path) -> io::Result<()> {
+        Ok(())
     }
 
     impl ProcessTree {
@@ -2142,6 +2382,60 @@ mod tests {
             prefix: format!("runtime-evidence-prefix-{}", std::process::id()),
         });
         verify_pinned_runtime(&plan).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_pinned_font_configuration_and_rejects_incomplete_or_tampered_evidence() {
+        let root = std::env::temp_dir().join(format!("compatforge-font-evidence-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("fonts.conf");
+        std::fs::write(&config, b"font configuration").unwrap();
+        let mut plan = fixture_plan();
+        plan.process
+            .environment
+            .insert(FONT_CONFIG_FILE_ENV.into(), config.to_string_lossy().into_owned());
+        assert!(matches!(
+            verify_pinned_font_config(&plan),
+            Err(ProcessError::InvalidRuntimeEvidence(
+                "incomplete font configuration evidence"
+            ))
+        ));
+        plan.process
+            .environment
+            .insert(FONT_CONFIG_DIGEST_ENV.into(), sha256_file(&config).unwrap());
+        verify_pinned_font_config(&plan).unwrap();
+        std::fs::write(&config, b"tampered").unwrap();
+        assert!(matches!(
+            verify_pinned_font_config(&plan),
+            Err(ProcessError::InvalidRuntimeEvidence("font configuration"))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_pinned_bottle_font_and_rejects_incomplete_or_tampered_evidence() {
+        let root = std::env::temp_dir().join(format!("compatforge-bottle-font-evidence-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let font = root.join("font.ttc");
+        std::fs::write(&font, b"font bytes").unwrap();
+        let mut plan = fixture_plan();
+        plan.process
+            .environment
+            .insert(BOTTLE_FONT_FILE_ENV.into(), font.to_string_lossy().into_owned());
+        assert!(matches!(
+            verify_pinned_bottle_font(&plan),
+            Err(ProcessError::InvalidRuntimeEvidence("incomplete Bottle font evidence"))
+        ));
+        plan.process
+            .environment
+            .insert(BOTTLE_FONT_DIGEST_ENV.into(), sha256_file(&font).unwrap());
+        verify_pinned_bottle_font(&plan).unwrap();
+        std::fs::write(&font, b"tampered").unwrap();
+        assert!(matches!(
+            verify_pinned_bottle_font(&plan),
+            Err(ProcessError::InvalidRuntimeEvidence("Bottle font"))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn helper_plan() -> LaunchPlan {
@@ -2880,6 +3174,117 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wine_prefix_cleanup_reaps_a_detached_client_holding_the_prefix_marker() {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "compatforge-wine-client-cleanup-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let system32 = directory.join("drive_c/windows/system32");
+        std::fs::create_dir_all(&system32).unwrap();
+        let marker = system32.join("ntdll.dll");
+        let mut marker_file = std::fs::File::create(&marker).unwrap();
+        marker_file.write_all(b"marker").unwrap();
+        marker_file.sync_all().unwrap();
+        drop(marker_file);
+
+        let mut client = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::supervisor_helper", "--nocapture"])
+            .env_clear()
+            .env("COMPATFORGE_PROCESS_TEST_HELPER", "hold-prefix-marker")
+            .env("COMPATFORGE_PREFIX_MARKER", &marker)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = false;
+        while Instant::now() < deadline {
+            let output = Command::new("/usr/sbin/lsof")
+                .args(["-t", "--"])
+                .arg(&marker)
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.parse::<u32>().ok() == Some(client.id()))
+            {
+                observed = true;
+                break;
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        assert!(observed, "detached Wine client did not open the prefix marker");
+
+        platform::force_kill_wine_prefix_clients(&directory).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = client.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "detached Wine client was not reaped");
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        };
+        assert!(!status.success());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wine_prefix_cleanup_reaps_a_detached_client_holding_the_system32_directory() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "compatforge-wine-directory-cleanup-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let system32 = directory.join("drive_c/windows/system32");
+        std::fs::create_dir_all(&system32).unwrap();
+        std::fs::write(system32.join("ntdll.dll"), b"marker").unwrap();
+
+        let mut client = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::supervisor_helper", "--nocapture"])
+            .current_dir(&system32)
+            .env_clear()
+            .env("COMPATFORGE_PROCESS_TEST_HELPER", "sleep")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = false;
+        while Instant::now() < deadline {
+            let output = Command::new("/usr/sbin/lsof")
+                .args(["-t", "--"])
+                .arg(&system32)
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.parse::<u32>().ok() == Some(client.id()))
+            {
+                observed = true;
+                break;
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        assert!(observed, "detached Wine client did not retain the system32 directory");
+
+        platform::force_kill_wine_prefix_clients(&directory).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = client.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "detached Wine client was not reaped");
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        };
+        assert!(!status.success());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn runtime_events_round_trip_as_versioned_json() {
         let event = RuntimeEvent {
@@ -2925,6 +3330,11 @@ mod tests {
             Ok("write-marker") => {
                 thread::sleep(Duration::from_secs(1));
                 std::fs::write(std::env::var("COMPATFORGE_DESCENDANT_MARKER").unwrap(), "escaped").unwrap();
+                thread::sleep(Duration::from_secs(30));
+            }
+            Ok("hold-prefix-marker") => {
+                let marker = std::fs::File::open(std::env::var("COMPATFORGE_PREFIX_MARKER").unwrap()).unwrap();
+                std::hint::black_box(&marker);
                 thread::sleep(Duration::from_secs(30));
             }
             _ => {}

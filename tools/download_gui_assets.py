@@ -23,7 +23,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 384 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -36,9 +36,19 @@ class GuiAsset:
     install_args: tuple[str, ...]
     installed_executable: str
     window_title_tokens: tuple[str, ...]
+    launch_args: tuple[str, ...] = ()
+    install_wait_milliseconds: int = 8_000
+    screenshot_delay_seconds: int = 0
+    runtime_environment: tuple[tuple[str, str], ...] = ()
+    window_appearance_seconds: int = 30
+    category: str = "win32"
+    toolkit: str = "win32"
+    guest_architecture: str = "x86_64"
+    alternate_installed_executables: tuple[str, ...] = ()
+    package_kind: str = "installer"
 
 
-ASSETS = (
+BASELINE_ASSETS = (
     GuiAsset(
         "7zip",
         "7-Zip 26.01",
@@ -71,6 +81,141 @@ ASSETS = (
     ),
 )
 
+EXTENDED_ASSETS = (
+    GuiAsset(
+        "firefox",
+        "Mozilla Firefox 152.0.1",
+        "Firefox_Setup_152.0.1.exe",
+        "https://download.mozilla.org/?product=firefox-152.0.1-ssl&os=win64&lang=zh-CN",
+        "5435b3117b1789eacb7443259dbea06c6e221cc676d1295b70c190bbac24d72c",
+        ("/S",),
+        "Program Files/Mozilla Firefox/firefox.exe",
+        ("Firefox", "Mozilla"),
+        (
+            "--no-remote",
+            "--new-instance",
+            "data:text/html;charset=utf-8,%3Ctitle%3ECompatForge%20Firefox%3C/title%3E%3Ch1%3ECompatForge%20%E4%B8%AD%E6%96%87%E5%85%BC%E5%AE%B9%E9%AA%8C%E8%AF%81%3C/h1%3E",
+        ),
+        20_000,
+        35,
+        category="browser",
+        toolkit="gecko",
+    ),
+    GuiAsset(
+        "krita",
+        "Krita 5.2.9",
+        "krita-x64-5.2.9-setup.exe",
+        "https://download.kde.org/stable/krita/5.2.9/krita-x64-5.2.9-setup.exe",
+        "e394029b3529a7c7411fc200e5627368ac3818a4fda4f453d18c86e220db7057",
+        ("/S",),
+        "Program Files/Krita (x64)/bin/krita.exe",
+        ("Krita",),
+        ("--nosplash",),
+        45_000,
+        30,
+        (
+            ("WINE_D3D_CONFIG", "renderer=gl,csmt=0x0"),
+            ("PYTHONHASHSEED", "0"),
+            ("MACWIN_COMPAT_PROFILE", "krita-opengl"),
+            ("MACWIN_APP_MODE_INPUT_REPAIR", "1"),
+            ("MACWIN_FORCE_MOUSE_FOCUS", "1"),
+            ("MACWIN_KRITA_OPENGL_REPAIR", "1"),
+            ("QT_ACCESSIBILITY", "0"),
+            ("QT_AUTO_SCREEN_SCALE_FACTOR", "0"),
+            ("QT_ENABLE_HIGHDPI_SCALING", "0"),
+            ("QT_FONT_DPI", "96"),
+            ("QT_OPENGL", "desktop"),
+            ("QT_SCALE_FACTOR", "1"),
+        ),
+        55,
+        category="graphics",
+        toolkit="qt-opengl",
+    ),
+)
+
+CERTIFICATION_ASSETS = (
+    GuiAsset(
+        "7zip-x86",
+        "7-Zip 26.01 x86",
+        "7z2601.exe",
+        "https://www.7-zip.org/a/7z2601.exe",
+        "615976598f800c70827c5a47e68c2b0d2b17d048b9721ba071c8af825d2476bd",
+        ("/S",),
+        "Program Files (x86)/7-Zip/7zFM.exe",
+        ("7-Zip",),
+        guest_architecture="i386",
+        alternate_installed_executables=("Program Files/7-Zip/7zFM.exe",),
+    ),
+    GuiAsset(
+        "vlc",
+        "VLC media player 3.0.21",
+        "vlc-3.0.21-win64.exe",
+        "https://ftp.osuosl.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.exe",
+        "9742689a50e96ddc04d80ceff046b28da2beefd617be18166f8c5e715ec60c59",
+        ("/S",),
+        "Program Files/VideoLAN/VLC/vlc.exe",
+        ("VLC media player", "VLC"),
+        ("--no-qt-privacy-ask", "--no-video-title-show"),
+        12_000,
+        3,
+        category="multimedia",
+        toolkit="qt",
+    ),
+    GuiAsset(
+        "winmerge",
+        "WinMerge 2.16.58 x64 portable",
+        "winmerge-2.16.58-x64-exe.zip",
+        "https://github.com/WinMerge/winmerge/releases/download/v2.16.58/winmerge-2.16.58-x64-exe.zip",
+        "58a0e36abc99b0da539d3b33b1df8a494239d53900f1ab57c305853df5da94a6",
+        (),
+        "WinMerge/WinMergeU.exe",
+        ("WinMerge",),
+        ("/noprefs",),
+        window_appearance_seconds=45,
+        category="developer-tool",
+        toolkit="mfc",
+        package_kind="portable-zip",
+    ),
+    GuiAsset(
+        "audacity-x86",
+        "Audacity 3.7.8 x86",
+        "audacity-win-3.7.8-32bit.exe",
+        "https://github.com/audacity/audacity/releases/download/Audacity-3.7.8/audacity-win-3.7.8-32bit.exe",
+        "c0482d84a05ddd26905d010daff32b79eba18673489d2cb90ee87a386d24c74f",
+        ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"),
+        "Program Files (x86)/Audacity/Audacity.exe",
+        ("Audacity",),
+        install_wait_milliseconds=20_000,
+        window_appearance_seconds=45,
+        category="audio",
+        toolkit="wxwidgets",
+        guest_architecture="i386",
+        alternate_installed_executables=("Program Files/Audacity/Audacity.exe",),
+    ),
+    GuiAsset(
+        "everything-x86",
+        "Everything 1.4.1.1032 x86",
+        "Everything-1.4.1.1032.x86-Setup.exe",
+        "https://ftp.voidtools.com/Everything-1.4.1.1032.x86-Setup.exe",
+        "781a31b440045219752a1bb40fbd204b1d96964d4bf56af01b18e3d549b037aa",
+        (
+            "/S",
+            "-install-options",
+            "-app-data -disable-run-as-admin -uninstall-run-on-system-startup -uninstall-service -uninstall-desktop-shortcut -install-start-menu-shortcuts -language 2052",
+        ),
+        "Program Files (x86)/Everything/Everything.exe",
+        ("Everything",),
+        ("-nodb",),
+        10_000,
+        category="search",
+        toolkit="win32",
+        guest_architecture="i386",
+        alternate_installed_executables=("Program Files/Everything/Everything.exe",),
+    ),
+)
+
+ASSETS = BASELINE_ASSETS + EXTENDED_ASSETS + CERTIFICATION_ASSETS
+
 ALLOWED_HOSTS = {
     "www.7-zip.org",
     "7-zip.org",
@@ -80,6 +225,12 @@ ALLOWED_HOSTS = {
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
+    "download.mozilla.org",
+    "download-installer.cdn.mozilla.net",
+    "download.kde.org",
+    "mirrors.xtom.com",
+    "ftp.osuosl.org",
+    "ftp.voidtools.com",
 }
 
 
@@ -214,6 +365,16 @@ def asset_json(asset: GuiAsset) -> dict[str, object]:
         "installArgs": list(asset.install_args),
         "installedExecutable": asset.installed_executable,
         "windowTitleTokens": list(asset.window_title_tokens),
+        "launchArgs": list(asset.launch_args),
+        "installWaitMilliseconds": asset.install_wait_milliseconds,
+        "screenshotDelaySeconds": asset.screenshot_delay_seconds,
+        "runtimeEnvironment": dict(asset.runtime_environment),
+        "windowAppearanceSeconds": asset.window_appearance_seconds,
+        "category": asset.category,
+        "toolkit": asset.toolkit,
+        "guestArchitecture": asset.guest_architecture,
+        "alternateInstalledExecutables": list(asset.alternate_installed_executables),
+        "packageKind": asset.package_kind,
     }
 
 

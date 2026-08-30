@@ -145,6 +145,12 @@ EXPECTED_CI_STEP_SURFACES = {
             "",
         ),
         (
+            "Test Phase 2.3 probe and MSI contracts",
+            "run:python -S -B -m unittest tests.test_phase_2_3_contracts -v",
+            "",
+            "",
+        ),
+        (
             "Test Bottle migration contracts and independent goldens",
             "run:python -S -B -m unittest "
             "tests.test_bottle_migration_contracts.BottleMigrationRepositoryTests "

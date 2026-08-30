@@ -23,14 +23,17 @@ import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_COMMAND_SECONDS = 180
 WINDOW_APPEARANCE_SECONDS = 30
 INTERACTIVE_RUNTIME_MILLISECONDS = 600_000
+CERTIFICATION_INTERACTIVE_RUNTIME_MILLISECONDS = 60_000
 ACKNOWLEDGEMENT_WAIT_SECONDS = 300
 ACKNOWLEDGEMENT_POLL_SECONDS = 0.25
 MAX_DIAGNOSTICS = 16
@@ -44,8 +47,12 @@ PINNED_RECEIPT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 PREPARED_WINDOW_OWNERS = frozenset(
     {"CompatForgeCrossoverAcceptance", "CompatForgeWhiskyAcceptance"}
 )
+MAX_INTERACTION_EVIDENCE_BYTES = 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 4096
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+TEST_SUITE_VERSION = "gui-interactive-v2"
 
-REQUIRED_INTERACTIONS = {
+LIVE_REQUIRED_INTERACTIONS = {
     "7zip": ("fileList", "menus"),
     "sumatrapdf": ("mainWindow", "openDialog"),
     "notepad-plus-plus": (
@@ -56,6 +63,20 @@ REQUIRED_INTERACTIONS = {
         "rereadMatches",
     ),
 }
+
+REQUIRED_INTERACTIONS = {
+    "7zip": ("fileList", "menus", "cjkTextReadable"),
+    "sumatrapdf": ("mainWindow", "openDialog", "cjkTextReadable"),
+    "notepad-plus-plus": ("open", "edit", "saveUtf8Chinese", "rereadMatches", "cjkTextReadable"),
+    "firefox": ("mainWindow", "browserContentRendered", "cjkTextReadable"),
+    "krita": ("mainWindow", "workspaceVisible", "cjkTextReadable"),
+    "7zip-x86": ("fileList", "menus", "cjkTextReadable"),
+    "vlc": ("mainWindow", "mediaControls", "cjkTextReadable"),
+    "winmerge": ("mainWindow", "compareDialog", "cjkTextReadable"),
+    "audacity-x86": ("mainWindow", "waveformWorkspace", "cjkTextReadable"),
+    "everything-x86": ("mainWindow", "searchField", "cjkTextReadable"),
+}
+BASELINE_APPLICATION_IDS = {"7zip", "sumatrapdf", "notepad-plus-plus"}
 
 MACOS_CJK_FONT_CANDIDATES = (
     (
@@ -276,6 +297,14 @@ class UniqueValueAction(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+class InfrastructureUnavailable(AcceptanceError):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def absolute(value: str, field: str, *, external: bool = False) -> Path:
     path = Path(value)
     if not path.is_absolute() or any(part in (".", "..") for part in path.parts):
@@ -299,6 +328,12 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--wineserver", action=UniqueValueAction)
     value.add_argument("--version", action=UniqueValueAction)
     value.add_argument(
+        "--app",
+        action="append",
+        dest="applications",
+        help="run only the named baseline application; repeat for multiple applications",
+    )
+    value.add_argument(
         "--accept-interactive",
         action="store_true",
         help="create post-window challenges for explicit operator acknowledgement",
@@ -317,6 +352,11 @@ def parser() -> argparse.ArgumentParser:
         "--round-id",
         choices=("round-1", "round-2"),
         action=UniqueValueAction,
+    )
+    value.add_argument(
+        "--interaction-evidence",
+        action=UniqueValueAction,
+        help="absolute v2 JSON attestation for the extended certification matrix",
     )
     return value
 
@@ -339,21 +379,33 @@ def validate_interaction_selection(
     arguments: argparse.Namespace,
     runtime_id: str | None,
 ) -> None:
-    fields = (
+    live_fields = (
         arguments.interaction_plan,
         arguments.acknowledgement_root,
         arguments.round_id,
     )
+    live_requested = any(value is not None for value in live_fields)
+    static_requested = arguments.interaction_evidence is not None
+    if live_requested and static_requested:
+        raise AcceptanceError("live acknowledgement and static interaction evidence are mutually exclusive")
     if arguments.accept_interactive:
-        if any(value is None for value in fields):
+        if not live_requested and not static_requested:
+            raise AcceptanceError(
+                "--accept-interactive requires live acknowledgement fields or interaction-evidence"
+            )
+        if live_requested and any(value is None for value in live_fields):
             raise AcceptanceError(
                 "--accept-interactive requires interaction-plan, acknowledgement-root and round-id"
             )
-        if runtime_id not in RUNTIME_IDS:
+        if live_requested and runtime_id not in RUNTIME_IDS:
             raise AcceptanceError("--accept-interactive requires an explicit Runtime identity")
-    elif any(value is not None for value in fields):
+        if static_requested and runtime_id is not None:
+            raise AcceptanceError(
+                "static interaction evidence cannot replace explicit Runtime live acknowledgement"
+            )
+    elif live_requested or static_requested:
         raise AcceptanceError(
-            "interaction-plan, acknowledgement-root and round-id require --accept-interactive"
+            "interaction evidence fields require --accept-interactive"
         )
 
 
@@ -658,7 +710,7 @@ def _validated_interaction_checks(
         return None
     if not isinstance(interactions, dict):
         raise AcceptanceError(f"{label} interaction checks must be an object")
-    required = REQUIRED_INTERACTIONS[app_id]
+    required = LIVE_REQUIRED_INTERACTIONS[app_id]
     if set(interactions) != set(required) or any(
         interactions.get(name) is not True for name in required
     ):
@@ -725,7 +777,7 @@ def validate_compact_summary(value: object) -> None:
         if application["schemaVersion"] != "1" or application["runtimeId"] != runtime_id:
             raise AcceptanceError("compact application identity is invalid")
         app_id = application["appId"]
-        if not isinstance(app_id, str) or app_id not in REQUIRED_INTERACTIONS or app_id in seen:
+        if not isinstance(app_id, str) or app_id not in LIVE_REQUIRED_INTERACTIONS or app_id in seen:
             raise AcceptanceError("compact application id is invalid")
         seen.add(app_id)
         status_value = application["status"]
@@ -829,7 +881,7 @@ def compact_summary(
             projected["failureClass"] = class_value
             projected["reasonCode"] = reason_code
         interactions = application.get("interactionChecks")
-        required_interactions = REQUIRED_INTERACTIONS.get(application.get("appId"))
+        required_interactions = LIVE_REQUIRED_INTERACTIONS.get(application.get("appId"))
         if required_interactions is None:
             raise AcceptanceError("application interaction checks are invalid")
         validated_interactions = _validated_interaction_checks(
@@ -1012,16 +1064,64 @@ def process_table() -> list[tuple[int, int, str]]:
     return rows
 
 
-def process_snapshot(marker: str, process_group_id: int | None = None) -> list[str]:
-    """List residual commands tied to either the Bottle path or launch group."""
+def prefix_process_ids(bottle_root: Path) -> set[int] | None:
+    """Return macOS clients retaining this exact prefix marker/directory."""
+    if platform.system() != "Darwin":
+        return set()
+    system32 = bottle_root / "windows" / "system32"
+    marker = system32 / "ntdll.dll"
+    if not system32.is_dir() or system32.is_symlink() or not marker.is_file() or marker.is_symlink():
+        return None
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/lsof", "-t", "--", str(marker), str(system32)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+            env={},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode not in (0, 1) or len(result.stdout.encode("utf-8")) > 64 * 1024:
+        return None
+    process_ids: set[int] = set()
+    for line in result.stdout.splitlines():
+        try:
+            process_id = int(line)
+        except ValueError:
+            return None
+        if process_id > 1:
+            process_ids.add(process_id)
+    return process_ids
+
+
+def process_snapshot(bottle_root: Path | str, process_group_id: int | None = None) -> list[str]:
+    """List residual commands or loaded clients tied to the exact Bottle."""
     current = os.getpid()
     rows = process_table()
     if not rows:
         return ["process observation unavailable"]
+    if isinstance(bottle_root, str):
+        return [
+            f"{pid} {command}"
+            for pid, pgid, command in rows
+            if pid != current
+            and (
+                bottle_root in command
+                or (process_group_id is not None and pgid == process_group_id)
+            )
+        ]
+    loaded = prefix_process_ids(bottle_root)
+    if loaded is None:
+        return ["prefix process observation unavailable"]
+    marker = str(bottle_root)
     return [
         f"{pid} {command}"
         for pid, pgid, command in rows
-        if pid != current and (marker in command or (process_group_id is not None and pgid == process_group_id))
+        if pid != current
+        and (pid in loaded or marker in command or (process_group_id is not None and pgid == process_group_id))
     ]
 
 
@@ -1074,22 +1174,98 @@ def executable_process_ids(executable: Path) -> list[int]:
     ]
 
 
+def cleanup_bottle(context: dict[str, object], storage_root: Path, bottle_id: str) -> dict[str, object]:
+    """Stop only the bound Bottle's Wine server, verify, then remove its directory."""
+    if not bottle_id or bottle_id in {".", ".."} or "/" in bottle_id or "\\" in bottle_id:
+        return {"success": False, "reason": "Bottle identifier is not a single path component"}
+    bottle_directory = storage_root / "bottles" / bottle_id
+    prefix = bottle_directory / "prefix"
+    drive_c = prefix / "drive_c"
+    if not bottle_directory.exists() and not bottle_directory.is_symlink():
+        return {"success": True, "method": "already-absent", "residualProcessIds": []}
+    if bottle_directory.is_symlink() or not bottle_directory.is_dir():
+        return {"success": False, "reason": "Bottle directory is not a regular directory"}
+
+    bindings = context.get("runtimeBindings")
+    if not isinstance(bindings, list) or len(bindings) != 1 or not isinstance(bindings[0], dict):
+        return {"success": False, "reason": "context must contain exactly one runtime binding"}
+    binding = bindings[0]
+    wineserver_value = binding.get("wineserverExecutable")
+    environment_value = binding.get("environment")
+    if not isinstance(wineserver_value, str) or not isinstance(environment_value, dict):
+        return {"success": False, "reason": "runtime binding omitted wineserver cleanup data"}
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in environment_value.items()):
+        return {"success": False, "reason": "runtime binding environment must contain only strings"}
+    wineserver = Path(wineserver_value)
+    if not wineserver.is_absolute() or not wineserver.is_file() or wineserver.is_symlink() or not os.access(wineserver, os.X_OK):
+        return {"success": False, "reason": "bound wineserver is not an absolute regular executable"}
+    expected_digest = environment_value.get("COMPATFORGE_WINESERVER_EXECUTABLE_SHA256")
+    if not isinstance(expected_digest, str) or expected_digest != f"sha256:{file_sha256(wineserver)}":
+        return {"success": False, "reason": "bound wineserver digest changed before cleanup"}
+
+    cleanup_environment = dict(environment_value)
+    cleanup_environment["WINEPREFIX"] = str(prefix)
+    try:
+        terminated = subprocess.run(
+            [str(wineserver), "-k"],
+            cwd=bottle_directory,
+            env=cleanup_environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"success": False, "reason": f"Bottle-scoped wineserver cleanup failed: {error}"}
+    if terminated.returncode not in (0, 1):
+        return {"success": False, "reason": f"Bottle-scoped wineserver returned {terminated.returncode}"}
+
+    time.sleep(0.5)
+    loaded = prefix_process_ids(drive_c)
+    command_residuals = [pid for pid, _pgid, command in process_table() if str(prefix) in command]
+    residuals = sorted((loaded or set()).union(command_residuals))
+    if residuals:
+        return {
+            "success": False,
+            "reason": "Bottle-scoped processes remained after wineserver cleanup",
+            "wineserverReturnCode": terminated.returncode,
+            "residualProcessIds": residuals,
+        }
+    try:
+        shutil.rmtree(bottle_directory)
+    except OSError as error:
+        return {"success": False, "reason": f"Bottle directory removal failed: {error}"}
+    return {
+        "success": not bottle_directory.exists() and not bottle_directory.is_symlink(),
+        "method": "bound-wineserver-kill-and-remove",
+        "wineserverReturnCode": terminated.returncode,
+        "residualProcessIds": [],
+    }
+
+
 def matching_windows(output: str, title_tokens: tuple[str, ...]) -> list[dict[str, object]]:
     matching: list[dict[str, object]] = []
     for line in output.splitlines():
-        parts = line.strip().split("|", 2)
-        if len(parts) != 3 or not any(token.casefold() in parts[1].casefold() for token in title_tokens):
+        parts = line.strip().split("|")
+        if len(parts) == 3:
+            process_id_value, title, dimensions_value = parts
+        elif len(parts) == 4:
+            _process_name, process_id_value, title, dimensions_value = parts
+        else:
             continue
-        dimensions = parts[2].split("x", 1)
+        if not any(token.casefold() in title.casefold() for token in title_tokens):
+            continue
+        dimensions = dimensions_value.split("x", 1)
         try:
-            process_id = int(parts[0])
+            process_id = int(process_id_value)
             width = int(dimensions[0])
             height = int(dimensions[1])
         except (ValueError, IndexError):
             continue
         if width <= 0 or height <= 0:
             continue
-        matching.append({"processId": process_id, "title": parts[1], "width": width, "height": height})
+        matching.append({"processId": process_id, "title": title, "width": width, "height": height})
     return matching
 
 
@@ -1461,6 +1637,8 @@ def observed_launch(
     screenshot_path: Path,
     title_tokens: tuple[str, ...],
     *,
+    screenshot_delay_seconds: int = 0,
+    window_appearance_seconds: int = WINDOW_APPEARANCE_SECONDS,
     on_window_observed: Callable[[subprocess.Popen[str], float], None] | None = None,
     pass_fds: tuple[int, ...] = (),
     terminal_records: list[dict[str, object]] | None = None,
@@ -1509,6 +1687,7 @@ def observed_launch(
         events: list[dict[str, object]] = []
         root_process_id: int | None = None
         next_observation = started
+        window_id: int | None = None
         acknowledgement_hook_called = False
         terminal_record_seen = False
 
@@ -1544,7 +1723,7 @@ def observed_launch(
             if (
                 root_process_id is not None
                 and not windows.get("available")
-                and elapsed <= WINDOW_APPEARANCE_SECONDS
+                and elapsed <= window_appearance_seconds
                 and now >= next_observation
             ):
                 windows = (
@@ -1580,15 +1759,19 @@ def observed_launch(
                                 "application interaction acknowledgement timed out"
                             )
                     observed_windows = windows.get("windows")
-                    window_id = None
                     if isinstance(observed_windows, list) and observed_windows:
                         first_window = observed_windows[0]
                         if isinstance(first_window, dict):
                             candidate = first_window.get("windowId")
                             if type(candidate) is int:
                                 window_id = candidate
-                    shot = screenshot(screenshot_path, window_id)
                 next_observation = now + 0.5
+            if (
+                windows.get("available") is True
+                and shot.get("available") is not True
+                and elapsed >= screenshot_delay_seconds
+            ):
+                shot = screenshot(screenshot_path, window_id)
             if time.monotonic() >= outer_deadline:
                 raise AcceptanceError(
                     "GUI launch exceeded the bounded observation timeout"
@@ -1640,6 +1823,17 @@ def observed_launch(
         if cleanup_error is not None:
             raise InteractionCleanupError("GUI launch cleanup failed") from primary_error
         raise
+
+
+def launch_runtime_milliseconds(
+    window_appearance_seconds: int,
+    screenshot_delay_seconds: int,
+    accept_interactive: bool,
+) -> int:
+    """Keep the guest alive long enough to consume its visual evidence budget."""
+    minimum = CERTIFICATION_INTERACTIVE_RUNTIME_MILLISECONDS if accept_interactive else 30_000
+    visual_budget = (max(window_appearance_seconds, screenshot_delay_seconds) + 5) * 1_000
+    return max(minimum, visual_budget)
 
 
 def status(
@@ -1699,7 +1893,9 @@ def evaluate_application_outcome(
             diagnostic="target window or screenshot evidence is incomplete",
         )
         return
-    interactions_complete = all(checks.get(name) is True for name in REQUIRED_INTERACTIONS[app_id])
+    interactions_complete = all(
+        checks.get(name) is True for name in LIVE_REQUIRED_INTERACTIONS[app_id]
+    )
     if not interactions_complete:
         apply_stage_outcome(
             evidence,
@@ -1799,13 +1995,117 @@ def asset_preflight(
     return True
 
 
+def desktop_session_state() -> dict[str, object]:
+    """Classify whether macOS can currently provide interactive GUI evidence."""
+    if platform.system() != "Darwin":
+        return {
+            "observable": False,
+            "state": "unsupported-host",
+            "failureClassification": "test-infrastructure",
+        }
+    try:
+        session_result = subprocess.run(
+            ["/usr/sbin/ioreg", "-n", "Root", "-d1"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        power_result = subprocess.run(
+            ["/usr/bin/pmset", "-g", "assertions"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {
+            "observable": False,
+            "state": "session-probe-unavailable",
+            "failureClassification": "test-infrastructure",
+        }
+    locked = any(
+        marker in session_result.stdout
+        for marker in (
+            '"CGSSessionScreenIsLocked"=Yes',
+            '"CGSSessionScreenIsLocked" = Yes',
+            '"CGSSessionScreenIsLocked"=true',
+            '"CGSSessionScreenIsLocked" = true',
+            '"IOConsoleLocked"=Yes',
+            '"IOConsoleLocked" = Yes',
+        )
+    )
+    on_console = '"kCGSSessionOnConsoleKey"=Yes' in session_result.stdout
+    assertions = {
+        parts[0]: parts[1] == "1"
+        for line in power_result.stdout.splitlines()
+        if len(parts := line.split()) == 2 and parts[1] in {"0", "1"}
+    }
+    user_active = assertions.get("UserIsActive") is True
+    display_held_awake = assertions.get("PreventUserIdleDisplaySleep") is True
+    observable = (
+        session_result.returncode == 0
+        and power_result.returncode == 0
+        and on_console
+        and not locked
+        and (user_active or display_held_awake)
+    )
+    if locked:
+        state = "locked"
+    elif not on_console:
+        state = "not-console-session"
+    elif not user_active and not display_held_awake:
+        state = "display-inactive"
+    elif session_result.returncode != 0 or power_result.returncode != 0:
+        state = "session-probe-unavailable"
+    else:
+        state = "interactive"
+    return {
+        "observable": observable,
+        "state": state,
+        "onConsole": on_console,
+        "userActive": user_active,
+        "displayHeldAwake": display_held_awake,
+        **({"failureClassification": "test-infrastructure"} if not observable else {}),
+    }
+
+
+def observation_diagnostic(windows: dict[str, object], shot: dict[str, object]) -> dict[str, object]:
+    if windows.get("available") is True and shot.get("available") is True:
+        return {"state": "observed"}
+    reason = str(windows.get("reason") or shot.get("reason") or "visual evidence incomplete")
+    infrastructure = windows.get("failureClassification") == "test-infrastructure" or any(
+        token in reason.casefold()
+        for token in ("locked", "inactive", "console-session", "accessibility", "osascript", "screencapture", "unavailable")
+    )
+    return {
+        "state": "infrastructure-unavailable" if infrastructure else "target-not-observed",
+        "failureClassification": "test-infrastructure" if infrastructure else "runtime-regression",
+        "reason": reason,
+    }
+
+
 def observer(
     process_group_id: int,
     title_tokens: tuple[str, ...],
     observed_executable: Path | None = None,
 ) -> dict[str, object]:
     if platform.system() != "Darwin":
-        return {"available": False, "reason": "window observation requires macOS"}
+        return {
+            "available": False,
+            "reason": "window observation requires macOS",
+            "failureClassification": "test-infrastructure",
+        }
+    session = desktop_session_state()
+    if session.get("observable") is not True:
+        return {
+            "available": False,
+            "reason": f"desktop session is {session.get('state')}",
+            "session": session,
+            "failureClassification": "test-infrastructure",
+        }
     target_ids = process_group_ids(process_group_id)
     if observed_executable is not None:
         target_ids = sorted(
@@ -1877,9 +2177,17 @@ def observer(
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {"available": False, "reason": "osascript unavailable"}
+        return {
+            "available": False,
+            "reason": "osascript unavailable",
+            "failureClassification": "test-infrastructure",
+        }
     if result.returncode != 0:
-        return {"available": False, "reason": "Accessibility permission unavailable"}
+        return {
+            "available": False,
+            "reason": "Accessibility permission unavailable",
+            "failureClassification": "test-infrastructure",
+        }
     matching = matching_windows(result.stdout, title_tokens)
     if matching:
         return {
@@ -1925,8 +2233,10 @@ def observer(
             }
     return {
         "available": False,
-        "reason": "launch process group is no longer visible",
+        "reason": "target window was not observed",
         "processGroupId": process_group_id,
+        "processIds": target_ids,
+        "failureClassification": "runtime-regression",
     }
 
 
@@ -1944,8 +2254,21 @@ def screenshot(path: Path, window_id: int | None = None) -> dict[str, object]:
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {"available": False, "reason": "screencapture unavailable"}
-    return {"available": result.returncode == 0 and path.is_file() and path.stat().st_size > 0, "path": str(path)}
+        return {
+            "available": False,
+            "reason": "screencapture unavailable",
+            "failureClassification": "test-infrastructure",
+        }
+    available = result.returncode == 0 and path.is_file() and path.stat().st_size > 0
+    return {
+        "available": available,
+        "path": str(path),
+        **(
+            {}
+            if available
+            else {"reason": "screencapture returned no image", "failureClassification": "test-infrastructure"}
+        ),
+    }
 
 
 def write_json(path: Path, value: object) -> None:
@@ -1992,10 +2315,10 @@ def read_interaction_plan(
     ):
         raise InteractionInvalidError("interaction plan is invalid")
     applications = value.get("applications")
-    if type(applications) is not dict or set(applications) != set(REQUIRED_INTERACTIONS):
+    if type(applications) is not dict or set(applications) != set(LIVE_REQUIRED_INTERACTIONS):
         raise InteractionInvalidError("interaction plan is invalid")
     result: dict[str, dict[str, list[str]]] = {}
-    for app_id, required in REQUIRED_INTERACTIONS.items():
+    for app_id, required in LIVE_REQUIRED_INTERACTIONS.items():
         application = applications.get(app_id)
         if (
             type(application) is not dict
@@ -2184,7 +2507,7 @@ class InteractionSession:
         if window_observed is not True:
             return {}
         if (
-            app_id not in REQUIRED_INTERACTIONS
+            app_id not in LIVE_REQUIRED_INTERACTIONS
             or type(deadline_seconds) not in (int, float)
             or isinstance(deadline_seconds, bool)
             or not 0 < deadline_seconds <= ACKNOWLEDGEMENT_WAIT_SECONDS
@@ -2410,10 +2733,92 @@ def open_interaction_session(
         ) from error
 
 
+def load_interaction_evidence(
+    path: Path | None,
+    accept_interactive: bool,
+    application_ids: set[str] | None = None,
+) -> tuple[dict[str, dict[str, bool]], dict[str, str]]:
+    application_ids = application_ids or BASELINE_APPLICATION_IDS
+    if not accept_interactive:
+        if path is not None:
+            raise AcceptanceError("--interaction-evidence requires --accept-interactive")
+        return {}, {}
+    if path is None:
+        raise AcceptanceError("--accept-interactive requires --interaction-evidence")
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_INTERACTION_EVIDENCE_BYTES:
+        raise AcceptanceError("interaction evidence must be a bounded regular file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise AcceptanceError("interaction evidence is not readable JSON") from error
+    if not isinstance(value, dict) or value.get("schemaVersion") != "2":
+        raise AcceptanceError("interaction evidence must use schemaVersion 2")
+    if set(value) != {"schemaVersion", "attestation", "applications"}:
+        raise AcceptanceError("interaction evidence contains unknown fields")
+    attestation = value.get("attestation")
+    if not isinstance(attestation, dict) or set(attestation) != {"mode", "observer", "observedAt"}:
+        raise AcceptanceError("interaction evidence omitted the closed attestation")
+    if attestation.get("mode") != "human":
+        raise AcceptanceError("interactive acceptance requires a human attestation")
+    observer_name = attestation.get("observer")
+    observed_at = attestation.get("observedAt")
+    if not isinstance(observer_name, str) or not observer_name.strip() or len(observer_name.encode("utf-8")) > 256:
+        raise AcceptanceError("interaction observer is invalid")
+    if not isinstance(observed_at, str):
+        raise AcceptanceError("interaction observedAt is invalid")
+    try:
+        parsed_observed_at = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise AcceptanceError("interaction observedAt is invalid") from error
+    if parsed_observed_at.tzinfo is None:
+        raise AcceptanceError("interaction observedAt must include a timezone")
+    applications = value.get("applications")
+    if not isinstance(applications, dict):
+        raise AcceptanceError("interaction evidence omitted applications")
+    result: dict[str, dict[str, bool]] = {}
+    for app_id in application_ids:
+        required = REQUIRED_INTERACTIONS[app_id]
+        checks = applications.get(app_id)
+        if (
+            not isinstance(checks, dict)
+            or set(checks) != set(required)
+            or any(checks.get(name) is not True for name in required)
+        ):
+            raise AcceptanceError(f"interaction evidence is incomplete for {app_id}")
+        result[app_id] = {name: True for name in required}
+    return result, {
+        "mode": "human",
+        "observer": observer_name.strip(),
+        "observedAt": observed_at,
+    }
+
+
+def interaction_evidence(
+    path: Path | None,
+    accept_interactive: bool,
+    application_ids: set[str] | None = None,
+) -> dict[str, dict[str, bool]]:
+    """Return validated checks for callers that do not need attestation metadata."""
+    return load_interaction_evidence(path, accept_interactive, application_ids)[0]
+
+
 EXPECTED_INSTALLED_EXECUTABLES = {
     "7zip": "Program Files/7-Zip/7zFM.exe",
     "sumatrapdf": "CompatForge/SumatraPDF/SumatraPDF.exe",
     "notepad-plus-plus": "Program Files/Notepad++/notepad++.exe",
+    "firefox": "Program Files/Mozilla Firefox/firefox.exe",
+    "krita": "Program Files/Krita (x64)/bin/krita.exe",
+    "7zip-x86": "Program Files (x86)/7-Zip/7zFM.exe",
+    "vlc": "Program Files/VideoLAN/VLC/vlc.exe",
+    "winmerge": "WinMerge/WinMergeU.exe",
+    "audacity-x86": "Program Files (x86)/Audacity/Audacity.exe",
+    "everything-x86": "Program Files (x86)/Everything/Everything.exe",
+}
+
+EXPECTED_ALTERNATE_INSTALLED_EXECUTABLES = {
+    "7zip-x86": ("Program Files/7-Zip/7zFM.exe",),
+    "audacity-x86": ("Program Files/Audacity/Audacity.exe",),
+    "everything-x86": ("Program Files/Everything/Everything.exe",),
 }
 
 KNOWN_LEGACY_INSTALLED_EXECUTABLES = {
@@ -3010,14 +3415,34 @@ def installed_executable(  # type: ignore[no-untyped-def]
 ) -> InstalledExecutableBinding:
     """Return the one verified executable path fixed by the asset descriptor."""
     expected_relative = EXPECTED_INSTALLED_EXECUTABLES.get(asset.app_id)
-    if expected_relative is None or asset.installed_executable != expected_relative:
+    expected_alternates = EXPECTED_ALTERNATE_INSTALLED_EXECUTABLES.get(
+        asset.app_id, ()
+    )
+    if (
+        expected_relative is None
+        or asset.installed_executable != expected_relative
+        or tuple(asset.alternate_installed_executables) != expected_alternates
+    ):
         raise ExecutableIntegrityError(
             "GUI asset installed executable location is invalid"
         )
     if not bottle_root.is_absolute():
         raise ExecutableIntegrityError("Bottle root must be absolute")
 
-    relative = Path(expected_relative)
+    allowed_relatives = tuple(
+        Path(value) for value in (expected_relative, *expected_alternates)
+    )
+    present_relatives = tuple(
+        relative
+        for relative in allowed_relatives
+        if bottle_root.joinpath(*relative.parts).exists()
+        or bottle_root.joinpath(*relative.parts).is_symlink()
+    )
+    if len(present_relatives) > 1:
+        raise ExecutableIntegrityError(
+            "multiple GUI executable locations are present"
+        )
+    relative = present_relatives[0] if present_relatives else allowed_relatives[0]
     candidate = bottle_root.joinpath(*relative.parts)
     legacy_paths = tuple(
         bottle_root.joinpath(*Path(value).parts)
@@ -3111,6 +3536,81 @@ def installed_executable(  # type: ignore[no-untyped-def]
                 protocol._close_directory(directory)
 
 
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as source:
+        return stream_sha256(source)
+
+
+def stream_sha256(source) -> str:  # type: ignore[no-untyped-def]
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: source.read(64 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def materialize_portable_zip(archive: Path, bottle_root: Path, expected_sha256: str) -> dict[str, object]:
+    """Extract a fixed-digest portable ZIP without links, traversal, or overwrites."""
+    descriptor = os.open(archive, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as pinned:
+        metadata = os.fstat(pinned.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise AcceptanceError("portable archive is not a regular file")
+        if stream_sha256(pinned) != expected_sha256:
+            raise AcceptanceError("portable archive digest changed before materialization")
+        pinned.seek(0)
+        with zipfile.ZipFile(pinned) as bundle:
+            entries = bundle.infolist()
+            if not entries or len(entries) > MAX_ARCHIVE_ENTRIES:
+                raise AcceptanceError("portable archive entry count is outside the fixed bound")
+            total = sum(entry.file_size for entry in entries)
+            if total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                raise AcceptanceError("portable archive exceeds the uncompressed size bound")
+            seen: set[str] = set()
+            for entry in entries:
+                if "\\" in entry.filename:
+                    raise AcceptanceError("portable archive contains a non-canonical path")
+                relative = PurePosixPath(entry.filename)
+                if relative.is_absolute() or not relative.parts or any(
+                    part in ("", ".", "..") for part in relative.parts
+                ):
+                    raise AcceptanceError("portable archive contains path traversal")
+                folded = "/".join(relative.parts).casefold().rstrip("/")
+                if folded in seen and not entry.is_dir():
+                    raise AcceptanceError("portable archive contains a duplicate path")
+                seen.add(folded)
+                mode = entry.external_attr >> 16
+                if stat.S_ISLNK(mode):
+                    raise AcceptanceError("portable archive contains a symbolic link")
+                destination = bottle_root.joinpath(*relative.parts)
+                if entry.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    if destination.is_symlink():
+                        raise AcceptanceError("portable archive directory became a symbolic link")
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists() or destination.is_symlink():
+                    raise AcceptanceError("portable archive would overwrite an existing path")
+                with bundle.open(entry) as source, destination.open("xb") as output:
+                    shutil.copyfileobj(source, output, length=64 * 1024)
+                if destination.stat().st_size != entry.file_size:
+                    raise AcceptanceError("portable archive entry size changed during extraction")
+        final_metadata = os.fstat(pinned.fileno())
+        if (metadata.st_dev, metadata.st_ino, metadata.st_size) != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+        ):
+            raise AcceptanceError("portable archive identity changed during materialization")
+    return {
+        "schemaVersion": "1",
+        "format": "zip",
+        "fileDigest": "sha256:" + expected_sha256,
+        "fileSizeBytes": metadata.st_size,
+        "entryCount": len(entries),
+        "uncompressedBytes": total,
+    }
+
+
 def request_architecture(value: str) -> str:
     # PE inspection uses the human-readable x86 label; the public schema
     # intentionally uses the stable i386 enum.
@@ -3132,6 +3632,113 @@ def fetch_asset(arguments: argparse.Namespace, app_id: str) -> Path:
     except (AssetError, OSError) as error:
         raise AssetFetchError(str(error)) from error
     return absolute(str(path), f"{app_id} asset")
+
+
+def matrix_entry_digest(asset) -> str:  # type: ignore[no-untyped-def]
+    value = {
+        "appId": asset.app_id,
+        "displayName": asset.display_name,
+        "installerSha256": asset.sha256,
+        "installArgs": list(asset.install_args),
+        "installedExecutable": asset.installed_executable,
+        "alternateInstalledExecutables": list(asset.alternate_installed_executables),
+        "launchArgs": list(asset.launch_args),
+        "runtimeEnvironment": dict(asset.runtime_environment),
+        "installWaitMilliseconds": asset.install_wait_milliseconds,
+        "screenshotDelaySeconds": asset.screenshot_delay_seconds,
+        "windowAppearanceSeconds": asset.window_appearance_seconds,
+        "category": asset.category,
+        "toolkit": asset.toolkit,
+        "guestArchitecture": asset.guest_architecture,
+        "packageKind": asset.package_kind,
+        "requiredInteractions": list(REQUIRED_INTERACTIONS[asset.app_id]),
+    }
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def check_outcome(passed: bool, *, blocked: bool = False) -> str:
+    if passed:
+        return "passed"
+    return "blocked" if blocked else "failed"
+
+
+def compatibility_result(
+    asset,  # type: ignore[no-untyped-def]
+    evidence: dict[str, object],
+    receipt: dict[str, object],
+    started_at: str,
+    finished_at: str,
+) -> dict[str, object]:
+    status_value = evidence.get("status")
+    blocked = status_value == "unverified"
+    accepted = status_value == "accepted"
+    windows = evidence.get("windows") if isinstance(evidence.get("windows"), dict) else {}
+    shot = evidence.get("screenshot") if isinstance(evidence.get("screenshot"), dict) else {}
+    exit_value = evidence.get("exit") if isinstance(evidence.get("exit"), dict) else {}
+    interactions = evidence.get("interactionChecks") if isinstance(evidence.get("interactionChecks"), dict) else {}
+    residual = evidence.get("residualProcesses") if isinstance(evidence.get("residualProcesses"), list) else []
+    failure_classification = evidence.get("failureClassification")
+    if not accepted and failure_classification is None:
+        failure_classification = "policy-blocked" if blocked else "runtime-regression"
+    checks = [
+        {
+            "id": "installer-inspection",
+            "outcome": check_outcome(isinstance(evidence.get("installerInspection"), dict)),
+        },
+        {
+            "id": "window-visible",
+            "outcome": check_outcome(windows.get("available") is True, blocked=blocked),
+            **({"message": str(windows.get("reason"))} if windows.get("reason") else {}),
+        },
+        {
+            "id": "screenshot",
+            "outcome": check_outcome(shot.get("available") is True, blocked=blocked),
+            **(
+                {"artifacts": [Path(str(shot["path"])).name]}
+                if shot.get("available") is True and isinstance(shot.get("path"), str)
+                else {}
+            ),
+        },
+        {
+            "id": "interactive-behavior",
+            "outcome": check_outcome(
+                all(interactions.get(name) is True for name in REQUIRED_INTERACTIONS[asset.app_id]),
+                blocked=True,
+            ),
+        },
+        {
+            "id": "lifecycle-exit",
+            "outcome": check_outcome(exit_value.get("present") is True),
+        },
+        {
+            "id": "bottle-cleanup",
+            "outcome": check_outcome(evidence.get("cleanup") is True),
+        },
+        {
+            "id": "no-residual-processes",
+            "outcome": check_outcome(not residual),
+        },
+    ]
+    return {
+        "schemaVersion": "1",
+        "runId": str(uuid.uuid4()),
+        "recipeId": asset.app_id,
+        "recipeDigest": matrix_entry_digest(asset),
+        "installerDigest": "sha256:" + asset.sha256,
+        "testSuiteVersion": TEST_SUITE_VERSION,
+        "host": {
+            "os": "macos",
+            "version": platform.mac_ver()[0],
+            "architecture": platform.machine(),
+        },
+        "runtimePackDigest": receipt.get("packDigest"),
+        "outcome": "passed" if accepted else ("blocked" if blocked else "failed"),
+        **({"failureClassification": failure_classification} if failure_classification is not None else {}),
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "checks": checks,
+    }
 
 
 def main() -> int:
@@ -3184,6 +3791,32 @@ def main() -> int:
                 "Rosetta x86_64 execution is unavailable",
             )
         explicit = [arguments.wine_root, arguments.wine, arguments.wineserver, arguments.version]
+        static_evidence_path = (
+            absolute(arguments.interaction_evidence, "interaction-evidence", external=True)
+            if arguments.interaction_evidence
+            else None
+        )
+        from download_gui_assets import ASSETS, BASELINE_ASSETS  # type: ignore[import-not-found]
+
+        known_applications = {asset.app_id for asset in ASSETS}
+        default_applications = tuple(
+            asset.app_id
+            for asset in BASELINE_ASSETS
+            if asset.app_id in known_applications
+        )
+        selected_applications = set(arguments.applications or default_applications)
+        unknown_applications = selected_applications - known_applications
+        if unknown_applications:
+            raise AcceptanceError(f"unknown baseline application: {sorted(unknown_applications)[0]}")
+        live_interaction = arguments.interaction_plan is not None
+        certification_mode = arguments.applications is not None or static_evidence_path is not None
+        if live_interaction and selected_applications != BASELINE_APPLICATION_IDS:
+            raise AcceptanceError("live acknowledgement requires the complete baseline application set")
+        manual_checks, manual_attestation = load_interaction_evidence(
+            static_evidence_path,
+            static_evidence_path is not None,
+            selected_applications,
+        )
         request = {
             "schemaVersion": "1",
             "runtimeStoreRoot": str(arguments.runtime_store),
@@ -3243,10 +3876,12 @@ def main() -> int:
         supervisor = context["supervisor"]
         supervisor["maximumRuntimeMilliseconds"] = (  # type: ignore[index]
             INTERACTIVE_RUNTIME_MILLISECONDS
+            if live_interaction
+            else CERTIFICATION_INTERACTIVE_RUNTIME_MILLISECONDS
         )
         write_json(context_path, context)
         write_json(arguments.work_root / "bootstrap-receipt.json", receipt)
-        if arguments.accept_interactive:
+        if live_interaction:
             interaction_session = open_interaction_session(
                 arguments.interaction_plan,
                 arguments.acknowledgement_root,
@@ -3254,19 +3889,29 @@ def main() -> int:
                 runtime_id,
             )
 
-        from download_gui_assets import ASSETS, asset_for  # type: ignore[import-not-found]
-
         results: list[dict[str, object]] = []
+        compatibility_results: list[dict[str, object]] = []
         for asset in ASSETS:
+            if asset.app_id not in selected_applications:
+                continue
             bottle_id = f"gui-{asset.app_id}"
             bottle_root = arguments.storage_root / "bottles" / bottle_id / "prefix" / "drive_c"
             bottle_root.mkdir(parents=True, exist_ok=True)
+            started_at = utc_now()
             evidence: dict[str, object] = {
                 "schemaVersion": "1",
                 "runtimeId": runtime_id,
                 "appId": asset.app_id,
                 "assetSha256": asset.sha256,
                 "bottleId": bottle_id,
+                "matrix": {
+                    "category": asset.category,
+                    "toolkit": asset.toolkit,
+                    "guestArchitecture": asset.guest_architecture,
+                    "recipeDigest": matrix_entry_digest(asset),
+                },
+                "startedAt": started_at,
+                "status": "unverified",
                 "cleanup": False,
             }
             failure_stage = "asset-fetch"
@@ -3277,10 +3922,26 @@ def main() -> int:
             try:
                 if interaction_session is not None:
                     interaction_session.revalidate()
+                if static_evidence_path is not None:
+                    desktop_preflight = desktop_session_state()
+                    evidence["desktopPreflight"] = desktop_preflight
+                    if desktop_preflight.get("observable") is not True:
+                        raise InfrastructureUnavailable(
+                            f"desktop session is {desktop_preflight.get('state')}"
+                        )
                 cache_entry = arguments.cache_root / asset.filename
                 if not asset_preflight(evidence, cache_entry, arguments.allow_network):
                     continue
                 installer = fetch_asset(arguments, asset.app_id)
+                if asset.package_kind not in {"installer", "portable-zip"}:
+                    raise AcceptanceError(f"{asset.app_id} package kind is unsupported")
+                if asset.package_kind == "portable-zip":
+                    evidence["packageMaterialization"] = materialize_portable_zip(
+                        installer,
+                        bottle_root,
+                        asset.sha256,
+                    )
+                    installer = bottle_root.joinpath(*Path(asset.installed_executable).parts)
                 if arguments.accept_interactive:
                     # Wine inventories fonts while it initializes a fresh prefix. Stage
                     # the Bottle-local CJK font before the installer performs that first
@@ -3304,6 +3965,8 @@ def main() -> int:
                         asset.sha256,
                     )
                     preparation_mode = "bottleInPlace"
+                elif asset.package_kind == "portable-zip":
+                    preparation_mode = "bottleInPlace"
                 inspection_request = {
                     "schemaVersion": "1",
                     "requestId": str(uuid.uuid4()),
@@ -3314,6 +3977,7 @@ def main() -> int:
                         "mode": preparation_mode,
                     },
                     "arguments": list(asset.install_args),
+                    "environment": dict(asset.runtime_environment),
                     "constraints": {
                         "allowVirtualMachine": False,
                         "allowRemote": False,
@@ -3345,7 +4009,7 @@ def main() -> int:
                             str(context_path),
                             str(installer),
                             str(installer_request_path),
-                            "8000",
+                            str(asset.install_wait_milliseconds),
                         ]
                     ),
                     f"{asset.app_id} installer",
@@ -3400,8 +4064,8 @@ def main() -> int:
                         "architecture": "x86_64",
                         "mode": "bottleInPlace",
                     },
-                    "arguments": [],
-                    "environment": {},
+                    "arguments": list(asset.launch_args),
+                    "environment": dict(asset.runtime_environment),
                     "constraints": {
                         "allowVirtualMachine": False,
                         "allowRemote": False,
@@ -3422,6 +4086,10 @@ def main() -> int:
                     gui_architecture = gui_inspection.get("architecture")
                     if not isinstance(gui_architecture, str):
                         raise AcceptanceError(f"{asset.app_id} GUI inspection omitted architecture")
+                    if request_architecture(gui_architecture) != asset.guest_architecture:
+                        raise AcceptanceError(
+                            f"{asset.app_id} GUI architecture does not match the fixed matrix"
+                        )
                     launch_request["executable"]["architecture"] = request_architecture(gui_architecture)  # type: ignore[index]
                     write_json(launch_request_path, launch_request)
                     evidence["inspection"] = gui_inspection
@@ -3561,8 +4229,12 @@ def main() -> int:
                 launch_arguments.append(
                     str(
                         INTERACTIVE_RUNTIME_MILLISECONDS
-                        if arguments.accept_interactive
-                        else 30_000
+                        if live_interaction
+                        else launch_runtime_milliseconds(
+                            asset.window_appearance_seconds,
+                            asset.screenshot_delay_seconds,
+                            arguments.accept_interactive,
+                        )
                     )
                 )
                 events, windows, shot, process_group_id = observed_launch(
@@ -3579,6 +4251,8 @@ def main() -> int:
                     require_empty_stderr=asset.app_id == "sumatrapdf",
                     forbidden_transcript_values=forbidden_transcript_values,
                     observed_executable=Path(os.fspath(installed)),
+                    screenshot_delay_seconds=asset.screenshot_delay_seconds,
+                    window_appearance_seconds=asset.window_appearance_seconds,
                 )
                 if interaction_session is not None:
                     interaction_session.revalidate()
@@ -3598,26 +4272,64 @@ def main() -> int:
                 evidence["exit"] = exit_observation(events)
                 evidence["windows"] = windows
                 evidence["screenshot"] = shot
-                evidence["residualProcesses"] = process_snapshot(str(bottle_root), process_group_id)
-                interaction_error = interaction_state["error"]
-                checks = interaction_state["checks"]
-                if isinstance(
-                    interaction_error,
-                    (InteractionIntegrityError, InteractionCleanupError),
-                ):
-                    raise interaction_error
-                evaluate_live_interaction_outcome(
-                    evidence,
-                    asset.app_id,
-                    events,
-                    windows,
-                    shot,
-                    evidence["residualProcesses"],
-                    checks if isinstance(checks, dict) else None,
-                    interaction_error
-                    if isinstance(interaction_error, AcceptanceError)
-                    else None,
+                evidence["observation"] = observation_diagnostic(windows, shot)
+                process_marker: Path | str = (
+                    bottle_root if certification_mode else str(bottle_root)
                 )
+                evidence["residualProcesses"] = process_snapshot(
+                    process_marker, process_group_id
+                )
+                if not certification_mode:
+                    interaction_error = interaction_state["error"]
+                    checks = interaction_state["checks"]
+                    if isinstance(
+                        interaction_error,
+                        (InteractionIntegrityError, InteractionCleanupError),
+                    ):
+                        raise interaction_error
+                    evaluate_live_interaction_outcome(
+                        evidence,
+                        asset.app_id,
+                        events,
+                        windows,
+                        shot,
+                        evidence["residualProcesses"],
+                        checks if isinstance(checks, dict) else None,
+                        interaction_error
+                        if isinstance(interaction_error, AcceptanceError)
+                        else None,
+                    )
+                else:
+                    evidence["interactionChecks"] = manual_checks.get(asset.app_id, {})
+                    if manual_attestation:
+                        evidence["interactionAttestation"] = manual_attestation
+                    basic = (
+                        status(events) == "accepted"
+                        and windows.get("available") is True
+                        and shot.get("available") is True
+                        and not evidence["residualProcesses"]
+                    )
+                    interactions_complete = all(
+                        evidence["interactionChecks"].get(name) is True
+                        for name in REQUIRED_INTERACTIONS[asset.app_id]
+                    )
+                    evidence["status"] = (
+                        "accepted" if basic and interactions_complete else "unverified"
+                    )
+                    if not basic:
+                        evidence["reason"] = (
+                            "target window/screenshot/exit cleanup evidence is incomplete"
+                        )
+                        diagnostic = evidence["observation"]
+                        if isinstance(diagnostic, dict):
+                            evidence["failureClassification"] = diagnostic.get(
+                                "failureClassification", "runtime-regression"
+                            )
+                    elif not interactions_complete:
+                        evidence["reason"] = (
+                            "required per-application interaction evidence was not supplied"
+                        )
+                        evidence["failureClassification"] = "policy-blocked"
             except NetworkUnavailableError as error:
                 apply_stage_outcome(
                     evidence,
@@ -3634,7 +4346,11 @@ def main() -> int:
                 raise
             except (InteractionIntegrityError, InteractionCleanupError):
                 raise
-            except (AcceptanceError, OSError, subprocess.TimeoutExpired) as error:
+            except InfrastructureUnavailable as error:
+                evidence["status"] = "unverified"
+                evidence["reason"] = str(error)
+                evidence["failureClassification"] = "test-infrastructure"
+            except (AcceptanceError, OSError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
                 apply_stage_outcome(
                     evidence,
                     failure_stage,
@@ -3669,14 +4385,17 @@ def main() -> int:
                 cleanup_diagnostic = "Bottle cleanup failed"
                 try:
                     bottle_prefix = arguments.storage_root / "bottles" / bottle_id / "prefix"
-                    residual_before_delete = process_snapshot(str(bottle_root))
+                    cleanup_marker: Path | str = (
+                        bottle_root if certification_mode else str(bottle_root)
+                    )
+                    residual_before_delete = process_snapshot(cleanup_marker)
                     if residual_before_delete:
                         if cleanup_wineserver is None:
                             raise AcceptanceError(
                                 "Bottle wineserver cleanup binding is unavailable"
                             )
                         stop_bottle_wineserver(cleanup_wineserver, bottle_prefix)
-                        residual_before_delete = process_snapshot(str(bottle_root))
+                        residual_before_delete = process_snapshot(cleanup_marker)
                     if residual_before_delete:
                         evidence["residualProcesses"] = residual_before_delete
                         raise AcceptanceError("Bottle cleanup left residual processes")
@@ -3697,17 +4416,45 @@ def main() -> int:
                     )
                 if interaction_session is not None:
                     interaction_session.revalidate()
+                finished_at = utc_now()
+                evidence["finishedAt"] = finished_at
+                result = compatibility_result(asset, evidence, receipt, started_at, finished_at)
                 write_json(arguments.work_root / f"{asset.app_id}-evidence.json", evidence)
+                write_json(arguments.work_root / f"{asset.app_id}-compatibility-result.json", result)
                 results.append(evidence)
+                compatibility_results.append(result)
 
-        if interaction_session is not None:
-            interaction_session.revalidate()
-        bind_runtime_identity(runtime_id, receipt, results)
-        summary = compact_summary(receipt, results)
+        if not certification_mode:
+            if interaction_session is not None:
+                interaction_session.revalidate()
+            bind_runtime_identity(runtime_id, receipt, results)
+            summary = compact_summary(receipt, results)
+            stdout = compact_json(summary)
+        else:
+            summary = {
+                "schemaVersion": "1",
+                "testSuiteVersion": TEST_SUITE_VERSION,
+                "receipt": receipt,
+                "applications": results,
+                "compatibilityResults": compatibility_results,
+            }
+            stdout = json.dumps(
+                summary,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         write_json(arguments.work_root / "summary.json", summary)
-        print(compact_json(summary))
+        print(stdout)
         return 0 if all(value["status"] == "accepted" for value in results) else 1
-    except (AcceptanceError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ImportError) as error:
+    except (
+        AcceptanceError,
+        OSError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        ImportError,
+        zipfile.BadZipFile,
+    ) as error:
         print(f"compatforge-gui-baseline: {error}", file=sys.stderr)
         return 1
     finally:

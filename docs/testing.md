@@ -41,6 +41,7 @@ recipe digest
 - 工业：PLC、串口/USB 只在隔离实验室和合法设备上；
 - 32 位：i386 安装器与运行程序；
 - 字体/IME/本地化：中日韩输入、时区、文件名和系统字体。
+- macOS Wine GUI 的中文字体验收必须同时证明：宿主字体与 Fontconfig 摘要在 spawn 前复验、Bottle 专用字体链接/注册表准备成功、截图与人工交互证据中无方框或缺字。仅 `fc-match` 成功不能作为 Win32 GDI 渲染通过。
 
 应用清单需要可公开分发或由测试环境合法提供。CI 不提交商业安装包。
 
@@ -70,6 +71,8 @@ recipe digest
 ## 失败分类
 
 每个失败至少归入：unsupported、runtime-regression、recipe-regression、host-driver、translator、graphics、installer-upstream、policy-blocked、test-infrastructure。未知失败不能自动发布为兼容 Recipe。
+
+GUI 认证工具把结果写为 `compatibility-result.schema.json`：矩阵/Recipe 摘要、安装器摘要、Runtime Pack 摘要、主机版本/架构和测试套件版本共同构成复现边界。锁屏、Accessibility 和 screencapture 不可用只允许归入 `test-infrastructure`；缺少人工签署归入 `policy-blocked`；可观察桌面上的目标窗口缺失才进入 Runtime/Recipe 调查。`tools/summarize_gui_compatibility.py` 不把 blocked 结果升级为 passed。
 
 ## Mac-Win portable asset 离线门禁
 
@@ -168,3 +171,43 @@ python3 -S -B tools/discover_macos_wine.py --all
 ```
 
 真实 Mac 的固定资产 opt-in、四份只读交互计划、一次启动的第二终端 helper、窗口出现后的即时确认、12 个 GUI receipts + 4 个 Console 自动结果、精确双轮命令、仓库外根、负向隔离检查与 `16 accepted + projections equal + zero cleanup failure` 退出条件见[双 Runtime 本地验收指南](guides/macos-local-dual-runtime-acceptance.md)。本机复核结果见[脱敏阶段报告](reports/2026-08-21-macos-local-dual-runtime-acceptance.md)。默认 CI 不下载或运行 CrossOver、Whisky、安装器或真实 Windows 应用。
+
+## GUI certification soak
+
+长期 GUI 测试是 Apple Silicon macOS 上的显式门禁，不进入默认 CI：
+
+```text
+python3 -S -B tools/run_gui_soak.py \
+  --compatforge-cli /absolute/path/to/compatforge-cli \
+  --cache-root /absolute/external/cache \
+  --output-root /absolute/external/soak-60 \
+  --cycles 60
+```
+
+每轮必须使用新 Bottle，并保留固定包摘要、PE inspection、目标窗口、非空截图、退出事件、Bottle 清理和空残留进程证据。`policy-blocked` 的人工交互项不构成 soak 硬失败，但 soak 通过也不能替代 schemaVersion 2 的人工签署。锁屏或桌面观察基础设施不可用必须保持 `unverified`。
+
+下一轮 MSI、.NET/WPF、D3D probes、真实生产力应用和 Linux x86_64 验证采用 capability-first 顺序；范围、信任边界与退出门禁见 [Phase 2.3 跨宿主能力验证设计](plans/2026-08-18-phase-2-3-cross-host-validation-design.md)。
+
+Phase 2.3 的首个离线合同门禁不执行 probe 或 MSI：
+
+```text
+python3 -S -B -m unittest tests.test_phase_2_3_contracts -v
+python3 -S -B tools/validate_capability_probe.py /absolute/probe-manifest.json --result /absolute/probe-result.json
+python3 -S -B tools/validate_install_request.py /absolute/install-request.json
+```
+
+Probe validator 交叉绑定 manifest、构建 artifact 和 result 摘要；MSI validator 只接受本地固定包与闭合 `msiexec` 语义字段，不接受任意 argv，也没有执行能力。
+
+首个 Win32 GUI probe 只提交 C 源码。使用固定 MinGW 工具链在仓库外生成 EXE 和 manifest 后，显式运行：
+
+```text
+python3 -S -B tools/run_macos_capability_probe.py \
+  --compatforge-cli /absolute/compatforge-cli \
+  --manifest /absolute/external/probe-manifest.json \
+  --artifact /absolute/external/win32-window-text-x64.exe \
+  --runtime-store /absolute/external/runtime \
+  --storage-root /absolute/external/storage \
+  --work-root /absolute/external/work
+```
+
+Runner 复验 manifest/artifact、PE inspection、PreparedLaunch、目标窗口、截图、退出、Bottle 清理和前缀残留。`cjk-text-readable` 未经人工签署时，结果保持 `policy-blocked`。

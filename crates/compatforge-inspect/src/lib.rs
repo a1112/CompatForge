@@ -12,7 +12,10 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-pub const MAX_PE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Large signed installers routinely embed payloads beyond 64 MiB. Keep the
+/// parser bounded while admitting the fixed extended GUI matrix (Firefox and
+/// Krita) and similarly sized desktop software.
+pub const MAX_PE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_PE_SECTIONS: u16 = 96;
 pub const MAX_IMPORT_LIBRARIES: usize = 256;
 
@@ -552,10 +555,13 @@ fn parse_section_name(bytes: &[u8]) -> Result<String, InspectionError> {
         return Err(InspectionError::InvalidSectionName);
     }
     let value = std::str::from_utf8(&bytes[..end]).map_err(|_| InspectionError::InvalidSectionName)?;
-    if !value
+    let inline_name = value
         .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'$' | b'_' | b'-'))
-    {
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'$' | b'_' | b'-'));
+    let coff_string_table_reference = value
+        .strip_prefix('/')
+        .is_some_and(|offset| !offset.is_empty() && offset.bytes().all(|byte| byte.is_ascii_digit()));
+    if !inline_name && !coff_string_table_reference {
         return Err(InspectionError::InvalidSectionName);
     }
     Ok(value.to_owned())
@@ -913,6 +919,19 @@ mod tests {
         assert!(matches!(
             inspect_bytes(&bytes),
             Err(InspectionError::UnsupportedMachine { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_decimal_coff_string_table_section_references_only() {
+        assert_eq!(parse_section_name(b"/2013\0\0\0").unwrap(), "/2013");
+        assert!(matches!(
+            parse_section_name(b"/../bad\0"),
+            Err(InspectionError::InvalidSectionName)
+        ));
+        assert!(matches!(
+            parse_section_name(b"/12a\0\0\0\0"),
+            Err(InspectionError::InvalidSectionName)
         ));
     }
 

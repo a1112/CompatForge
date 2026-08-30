@@ -2,6 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod fontconfig;
+
+pub use fontconfig::MacOsFontFallbackReceipt;
+
 use compatforge_domain::{
     validate_digest, validate_id, validate_portable_relative_path, validate_schema_version, CapabilityObservation,
     CapabilityReport, CapabilityValue, ContractError, CoreConfig, CpuArchitecture, HostOs, ProbeSource, ProbeStatus,
@@ -135,6 +139,7 @@ pub struct MacOsLocalContextReceipt {
     pub pack_id: String,
     pub pack_digest: String,
     pub capabilities: Vec<String>,
+    pub font_fallback: MacOsFontFallbackReceipt,
 }
 
 #[derive(Debug, Clone)]
@@ -515,9 +520,32 @@ pub fn create_local_context_with(
     };
     let snapshot =
         MacOsProviderSet::probe_with(host_report, &provider_config, command).map_err(MacOsBootstrapError::Provider)?;
-    let config = snapshot
+    let installed_font_fallback = fontconfig::install(&storage_root)?;
+    let mut config = snapshot
         .core_config(storage_root.to_string_lossy().into_owned())
         .map_err(MacOsBootstrapError::Provider)?;
+    let binding = config
+        .runtime_bindings
+        .first_mut()
+        .ok_or(MacOsBootstrapError::RegistrationFailed("font config Runtime binding"))?;
+    binding
+        .environment
+        .insert("FONTCONFIG_FILE".into(), installed_font_fallback.config_path.clone());
+    binding.environment.insert(
+        "COMPATFORGE_FONT_CONFIG_SHA256".into(),
+        installed_font_fallback.receipt.config_digest.clone(),
+    );
+    binding.environment.insert(
+        "COMPATFORGE_BOTTLE_FONT_FILE".into(),
+        installed_font_fallback.bottle_font_path.clone(),
+    );
+    binding.environment.insert(
+        "COMPATFORGE_BOTTLE_FONT_SHA256".into(),
+        installed_font_fallback.receipt.bottle_font_digest.clone(),
+    );
+    binding.environment.insert("FC_LANG".into(), "zh-cn".into());
+    binding.environment.insert("LANG".into(), "zh_CN.UTF-8".into());
+    binding.environment.insert("LC_ALL".into(), "zh_CN.UTF-8".into());
     let mut capabilities = provider_config.wine_runtime.capabilities.clone();
     capabilities.push("windows-gui".into());
     capabilities.sort();
@@ -532,6 +560,7 @@ pub fn create_local_context_with(
             pack_id: AUTO_PACK_ID.into(),
             pack_digest,
             capabilities,
+            font_fallback: installed_font_fallback.receipt,
         },
     })
 }

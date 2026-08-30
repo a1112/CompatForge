@@ -4,16 +4,21 @@
   "title": "CompatForge Compatibility Test Result",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "runId", "recipeId", "host", "runtimePackDigest", "outcome", "startedAt", "finishedAt", "checks"],
+  "required": ["schemaVersion", "runId", "recipeId", "recipeDigest", "installerDigest", "testSuiteVersion", "host", "runtimePackDigest", "outcome", "startedAt", "finishedAt", "checks"],
   "properties": {
     "schemaVersion": { "const": "1" },
     "runId": { "type": "string", "format": "uuid" },
     "recipeId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$" },
+    "recipeDigest": { "type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$" },
+    "installerDigest": { "type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$" },
+    "testSuiteVersion": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$" },
     "host": {
       "type": "object",
-      "required": ["os", "architecture"],
+      "additionalProperties": false,
+      "required": ["os", "version", "architecture"],
       "properties": {
         "os": { "enum": ["macos", "linux", "android"] },
+        "version": { "type": "string", "minLength": 1 },
         "architecture": { "enum": ["x86_64", "arm64"] },
         "gpu": { "type": "string" },
         "driver": { "type": "string" }
@@ -21,6 +26,9 @@
     },
     "runtimePackDigest": { "type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$" },
     "outcome": { "enum": ["passed", "failed", "blocked", "skipped"] },
+    "failureClassification": {
+      "enum": ["unsupported", "runtime-regression", "recipe-regression", "host-driver", "translator", "graphics", "installer-upstream", "policy-blocked", "test-infrastructure"]
+    },
     "startedAt": { "type": "string", "format": "date-time" },
     "finishedAt": { "type": "string", "format": "date-time" },
     "checks": {
@@ -42,5 +50,15 @@
       "type": "object",
       "additionalProperties": { "type": "integer", "minimum": 0 }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "enum": ["failed", "blocked"] } }, "required": ["outcome"] },
+      "then": { "required": ["failureClassification"] }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "passed" } }, "required": ["outcome"] },
+      "then": { "not": { "required": ["failureClassification"] } }
+    }
+  ]
 }

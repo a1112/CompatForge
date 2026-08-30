@@ -541,7 +541,7 @@ impl PolicyEngine {
             return Err(PlanError::InvalidHostPath("runtimeBindings.workingDirectory"));
         }
 
-        let decision_trace = vec![
+        let mut decision_trace = vec![
             format!(
                 "runtime provider {} selected as {}",
                 runtime_provider.id,
@@ -551,6 +551,14 @@ impl PolicyEngine {
             format!("graphics backend {} selected", graphics.backend.as_str()),
             format!("runtime pack {} pinned by digest", binding.pack_id),
         ];
+        if environment.contains_key("FONTCONFIG_FILE") && environment.contains_key("COMPATFORGE_FONT_CONFIG_SHA256") {
+            decision_trace.push("font fallback configuration pinned by digest".into());
+        }
+        if environment.contains_key("COMPATFORGE_BOTTLE_FONT_FILE")
+            && environment.contains_key("COMPATFORGE_BOTTLE_FONT_SHA256")
+        {
+            decision_trace.push("Bottle CJK font pinned by digest".into());
+        }
 
         Ok(LaunchPlan {
             schema_version: SCHEMA_VERSION_V1.into(),

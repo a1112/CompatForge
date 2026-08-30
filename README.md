@@ -2,7 +2,7 @@
 
 CompatForge 是从 [Mac-Win](https://github.com/a1112/Mac-Win) 演进而来的跨平台 Windows 应用兼容运行控制平面。它不重写 Wine，而是统一编排 Wine、CPU 二进制翻译、图形转换、虚拟机和远程 Windows，并用签名运行包、兼容配方与可重复测试交付“可验证的兼容性”。
 
-> 当前状态：Core/API `0.12.0`，ABI major `1`。Rust Core 统一负责受限 macOS Wine 自动发现、Preview Pack 登记、GUI/Console PE inspection、`bottleInPlace` 路径/哈希复验，以及持久化 Application/Bottle/Settings/Job 服务。C ABI 新增 `cf_service_create/cf_service_call/cf_service_release`，CLI 提供单次 `api` 与常驻 JSON Lines `api-session`。`apps/desktop` 是只消费同一 Service API 的 Tauri 2 薄壳：主窗口专注应用启动与管理，设置使用独立的 macOS 风格窗口。默认 CI 不下载或运行真实 Windows GUI 应用；真实窗口、应用行为和清理证据不扩大为通用兼容结论。
+> 当前状态：Core/API `0.12.0`，ABI major `1`。Rust Core 统一负责受限 macOS Wine 自动发现、Preview Pack 登记、GUI/Console PE inspection、`bottleInPlace` 路径/哈希复验、摘要绑定的 CJK 字体准备，以及持久化 Application/Bottle/Settings/Job 服务。C ABI 新增 `cf_service_create/cf_service_call/cf_service_release`，CLI 提供单次 `api` 与常驻 JSON Lines `api-session`。`apps/desktop` 是只消费同一 Service API 的 Tauri 2 薄壳：主窗口专注应用启动与管理，设置使用独立的 macOS 风格窗口。默认 CI 不下载或运行真实 Windows GUI 应用；真实窗口、应用行为和清理证据不扩大为通用兼容结论。
 
 > 工程方向：`CompatForge` 是唯一主工程；桌面 UI 使用 Tauri 2 + TypeScript，当前里程碑优先 macOS ARM64，同时保留 Rust Core 的跨平台能力。`Mac-Win` 暂停维护，仅作为迁移知识与测试资产来源。
 
@@ -110,7 +110,7 @@ COMPATFORGE_DESKTOP_SMOKE=1 \
 ```bash
 python tools/download_gui_assets.py list --cache-root /absolute/external/cache
 python tools/run_gui_baseline.py \
-  --compatforge-cli target/release/compatforge-cli \
+  --compatforge-cli /absolute/path/to/compatforge-cli \
   --cache-root /absolute/external/cache \
   --runtime-store /absolute/external/runtime-store \
   --storage-root /absolute/external/storage \
@@ -125,6 +125,31 @@ Console 自动结果；固定计划、命令与清理边界见
 [双 Runtime 指南](docs/guides/macos-local-dual-runtime-acceptance.md)。截图和
 RuntimeEvent 证据不会进入 Git，也不由默认 CI 生成。
 
+人工验收先生成 fail-safe 工作表；所有检查默认是 `false`，观察者必须填写带时区的 `observedAt`
+并逐项确认后才能用于 `accepted`：
+
+```bash
+python tools/prepare_gui_interaction_evidence.py \
+  --output /absolute/external/interactions.json \
+  --observer "Compatibility Lab" \
+  --app 7zip
+python tools/summarize_gui_compatibility.py \
+  --input /absolute/external/gui-evidence/summary.json \
+  --output /absolute/external/gui-evidence/release-gate.json
+```
+
+默认只运行三个基线应用。显式认证矩阵共十项：Firefox/Gecko、Krita/Qt/OpenGL、7-Zip x86、VLC、WinMerge、Audacity x86 和 Everything x86 均须通过重复 `--app` 选择，不会静默进入默认发布门禁。
+
+扩展矩阵的生命周期 soak 使用逐轮新 Bottle，并把可恢复的 `cycles.jsonl` 和汇总写到仓库外。默认运行五个认证扩展应用和 60 轮；该门禁只证明窗口、截图、退出与零残留，不能替代人工功能验收：
+
+```bash
+python3 -S -B tools/run_gui_soak.py \
+  --compatforge-cli /absolute/path/to/compatforge-cli \
+  --cache-root /absolute/external/cache \
+  --output-root /absolute/external/soak-60 \
+  --cycles 60
+```
+
 ## 设计入口
 
 - [总体架构](docs/architecture/overview.md)
@@ -138,6 +163,7 @@ RuntimeEvent 证据不会进入 Git，也不由默认 CI 生成。
 - [PE inspection 纵向切片](docs/implementation/phase-1-pe-inspection.md)
 - [Trusted Launch Preparation 纵向切片](docs/implementation/phase-1-trusted-launch-preparation.md)
 - [Tauri 桌面壳与 GUI 基线](docs/implementation/phase-2-tauri-gui-baseline.md)
+- [Phase 2.1 交互式兼容认证](docs/implementation/phase-2-1-interactive-certification.md)
 - [Apple Silicon 本地无头预览指南](docs/guides/macos-headless-preview.md)
 - [Apple Silicon 双 Runtime 本地验收指南](docs/guides/macos-local-dual-runtime-acceptance.md)（developer-local；CrossOver + Whisky；不进入默认 CI 或 public beta）
 - [进程树与 Wine 生命周期决策](docs/decisions/0006-process-tree-and-wine-lifecycle.md)

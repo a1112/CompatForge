@@ -13913,8 +13913,8 @@ class MacWinMigrationWorkflowTests(unittest.TestCase):
     WORKFLOW = ROOT / ".github/workflows/ci.yml"
     CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
     SETUP_PYTHON = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
-    BASELINE_SHA256 = "7fcbf5c3bee4bcdfb30a8e3db1dc31a4777cc1cd0123ee2e456404b1b8fb6265"
-    APPROVED_RUN_COMMANDS_SHA256 = "7378e55bb45062d569ed56838cdbb486f90a199cc603ba17cc21ff07af5de300"
+    BASELINE_SHA256 = "020b84ecb2fb60aa6604c26896ec0f6827e05f794353ad8d10f2c5f72a952b24"
+    APPROVED_RUN_COMMANDS_SHA256 = "8e6117b1795ce247dcc598a717f27cd566d4961230d584674b34ec748d0f1f59"
     MIGRATION_STEP = (
         "      - name: Check portable Mac-Win assets\n"
         "        run: python -B tools/convert_macwin_assets.py --check\n"

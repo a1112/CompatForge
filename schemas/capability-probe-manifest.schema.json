@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/capability-probe-manifest.schema.json",
+  "title": "CompatForge Capability Probe Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "probeId", "displayName", "category", "guestArchitecture", "source", "build", "artifact", "requiredObservations"],
+  "properties": {
+    "schemaVersion": { "const": "1" },
+    "probeId": { "$ref": "#/$defs/id" },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "category": { "enum": ["win32", "dotnet-wpf", "d3d9", "d3d11", "d3d12", "msi"] },
+    "guestArchitecture": { "enum": ["i386", "x86_64"] },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit", "path", "sha256"],
+      "properties": {
+        "repository": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["toolchain", "toolchainVersion", "arguments"],
+      "properties": {
+        "toolchain": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "toolchainVersion": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "arguments": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "maxLength": 4096 }
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileName", "sha256", "sizeBytes", "architecture", "subsystem"],
+      "properties": {
+        "fileName": { "$ref": "#/$defs/fileName" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sizeBytes": { "type": "integer", "minimum": 1, "maximum": 67108864 },
+        "architecture": { "enum": ["i386", "x86_64"] },
+        "subsystem": { "enum": ["windowsConsole", "windowsGui"] }
+      }
+    },
+    "requiredObservations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "fileName": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^/\\\\]+$" },
+    "relativePath": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\\\]+$" }
+  }
+}
