@@ -827,21 +827,40 @@ def validate_compact_summary(value: object) -> None:
     _scan_compact_scalars(value)
 
 
+def compact_runtime_receipt(receipt: dict[str, object]) -> dict[str, object]:
+    if not isinstance(receipt, dict):
+        raise AcceptanceError("bootstrap receipt is invalid")
+    required_receipt = (
+        "schemaVersion",
+        "runtimeId",
+        "packId",
+        "version",
+        "packDigest",
+        "source",
+    )
+    if any(key not in receipt for key in required_receipt):
+        raise AcceptanceError("bootstrap receipt omitted compact identity")
+    compact_receipt = {key: receipt[key] for key in required_receipt}
+    if "activated" in receipt:
+        compact_receipt["activated"] = receipt["activated"]
+    validate_compact_summary(
+        {
+            "schemaVersion": "1",
+            "receipt": compact_receipt,
+            "applications": [],
+        }
+    )
+    return compact_receipt
+
+
 def compact_summary(
     receipt: dict[str, object],
     applications: list[dict[str, object]],
 ) -> dict[str, object]:
     if not isinstance(receipt, dict) or not isinstance(applications, list):
         raise AcceptanceError("full summary inputs are invalid")
-    runtime_id = receipt.get("runtimeId")
-    if runtime_id is not None and runtime_id not in RUNTIME_IDS:
-        raise AcceptanceError("receipt Runtime identity is not recognized")
-    required_receipt = ("schemaVersion", "runtimeId", "packId", "version", "packDigest", "source")
-    if any(key not in receipt for key in required_receipt):
-        raise AcceptanceError("bootstrap receipt omitted compact identity")
-    compact_receipt = {key: receipt[key] for key in required_receipt}
-    if "activated" in receipt:
-        compact_receipt["activated"] = receipt["activated"]
+    compact_receipt = compact_runtime_receipt(receipt)
+    runtime_id = compact_receipt["runtimeId"]
     compact_applications: list[dict[str, object]] = []
     for application in applications:
         if not isinstance(application, dict) or not isinstance(application.get("appId"), str):
@@ -918,6 +937,22 @@ def compact_summary(
 def compact_json(value: object) -> str:
     validate_compact_summary(value)
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def certification_summary(
+    receipt: dict[str, object],
+    applications: list[dict[str, object]],
+    compatibility_results: list[dict[str, object]],
+) -> dict[str, object]:
+    if not isinstance(applications, list) or not isinstance(compatibility_results, list):
+        raise AcceptanceError("certification summary inputs are invalid")
+    return {
+        "schemaVersion": "1",
+        "testSuiteVersion": TEST_SUITE_VERSION,
+        "receipt": compact_runtime_receipt(receipt),
+        "applications": applications,
+        "compatibilityResults": compatibility_results,
+    }
 
 
 def compact_preflight(evidence: dict[str, object]) -> dict[str, object]:
@@ -1938,6 +1973,47 @@ def evaluate_live_interaction_outcome(
             "application-interaction-invalid",
             diagnostic="application interaction acknowledgement was invalid",
         )
+
+
+def evaluate_certification_outcome(
+    evidence: dict[str, object],
+    app_id: str,
+    events: list[dict[str, object]],
+    windows: dict[str, object],
+    shot: dict[str, object],
+    residual: list[str],
+    checks: dict[str, bool],
+) -> None:
+    required = REQUIRED_INTERACTIONS.get(app_id)
+    if required is None:
+        raise AcceptanceError("certification application is not recognized")
+    evidence["interactionChecks"] = checks
+    basic = (
+        status(events, allow_requested_termination=True) == "accepted"
+        and windows.get("available") is True
+        and shot.get("available") is True
+        and not residual
+    )
+    interactions_complete = all(checks.get(name) is True for name in required)
+    evidence["status"] = "accepted" if basic and interactions_complete else "unverified"
+    if not basic:
+        evidence["reason"] = "target window/screenshot/exit cleanup evidence is incomplete"
+        diagnostic = observation_diagnostic(windows, shot)
+        evidence["observation"] = diagnostic
+        evidence["failureClassification"] = diagnostic.get(
+            "failureClassification", "runtime-regression"
+        )
+    elif not interactions_complete:
+        evidence["reason"] = "required per-application interaction evidence was not supplied"
+        evidence["failureClassification"] = "policy-blocked"
+
+
+def installer_allows_requested_termination(
+    asset,  # type: ignore[no-untyped-def]
+    *,
+    certification_mode: bool,
+) -> bool:
+    return certification_mode or asset.app_id == "sumatrapdf"
 
 
 def installer_succeeded(
@@ -3957,73 +4033,79 @@ def main() -> int:
                 if not isinstance(installer_architecture, str):
                     raise AcceptanceError(f"{asset.app_id} installer inspection omitted architecture")
                 evidence["installerInspection"] = installer_inspection
-                preparation_mode = "immutableArtifact"
-                if asset.app_id == "sumatrapdf":
-                    installer = materialize_sumatrapdf_portable(
-                        installer,
-                        bottle_root,
-                        asset.sha256,
+                if asset.package_kind == "portable-zip":
+                    installed = installed_executable(asset, bottle_root)
+                else:
+                    preparation_mode = "immutableArtifact"
+                    if asset.app_id == "sumatrapdf":
+                        installer = materialize_sumatrapdf_portable(
+                            installer,
+                            bottle_root,
+                            asset.sha256,
+                        )
+                        preparation_mode = "bottleInPlace"
+                    inspection_request = {
+                        "schemaVersion": "1",
+                        "requestId": str(uuid.uuid4()),
+                        "bottleId": bottle_id,
+                        "executable": {
+                            "path": str(installer),
+                            "architecture": request_architecture(installer_architecture),
+                            "mode": preparation_mode,
+                        },
+                        "arguments": list(asset.install_args),
+                        "environment": dict(asset.runtime_environment),
+                        "constraints": {
+                            "allowVirtualMachine": False,
+                            "allowRemote": False,
+                            "networkPolicy": "deny",
+                        },
+                    }
+                    installer_request_path = (
+                        arguments.work_root / f"{asset.app_id}-installer-request.json"
                     )
-                    preparation_mode = "bottleInPlace"
-                elif asset.package_kind == "portable-zip":
-                    preparation_mode = "bottleInPlace"
-                inspection_request = {
-                    "schemaVersion": "1",
-                    "requestId": str(uuid.uuid4()),
-                    "bottleId": bottle_id,
-                    "executable": {
-                        "path": str(installer),
-                        "architecture": request_architecture(installer_architecture),
-                        "mode": preparation_mode,
-                    },
-                    "arguments": list(asset.install_args),
-                    "environment": dict(asset.runtime_environment),
-                    "constraints": {
-                        "allowVirtualMachine": False,
-                        "allowRemote": False,
-                        "networkPolicy": "deny",
-                    },
-                }
-                installer_request_path = arguments.work_root / f"{asset.app_id}-installer-request.json"
-                write_json(installer_request_path, inspection_request)
-                failure_stage = "core-plan"
-                plan = json_object(
-                    invoke(
-                        [
-                            str(arguments.compatforge_cli),
-                            "prepared-plan",
-                            str(context_path),
-                            str(installer),
-                            str(installer_request_path),
-                        ]
-                    ),
-                    f"{asset.app_id} installer plan",
-                )
-                evidence["installerPlan"] = plan
-                failure_stage = "installer-launch"
-                installer_events = run_events(
-                    invoke(
-                        [
-                            str(arguments.compatforge_cli),
-                            "prepared-launch-terminate",
-                            str(context_path),
-                            str(installer),
-                            str(installer_request_path),
-                            str(asset.install_wait_milliseconds),
-                        ]
-                    ),
-                    f"{asset.app_id} installer",
-                )
-                evidence["installerEvents"] = installer_events
-                evidence["installerExit"] = exit_observation(installer_events)
-                installed = installed_executable(asset, bottle_root)
-                if not installer_succeeded(
-                    evidence,
-                    installer_events,
-                    installed,
-                    allow_requested_termination=asset.app_id == "sumatrapdf",
-                ):
-                    continue
+                    write_json(installer_request_path, inspection_request)
+                    failure_stage = "core-plan"
+                    plan = json_object(
+                        invoke(
+                            [
+                                str(arguments.compatforge_cli),
+                                "prepared-plan",
+                                str(context_path),
+                                str(installer),
+                                str(installer_request_path),
+                            ]
+                        ),
+                        f"{asset.app_id} installer plan",
+                    )
+                    evidence["installerPlan"] = plan
+                    failure_stage = "installer-launch"
+                    installer_events = run_events(
+                        invoke(
+                            [
+                                str(arguments.compatforge_cli),
+                                "prepared-launch-terminate",
+                                str(context_path),
+                                str(installer),
+                                str(installer_request_path),
+                                str(asset.install_wait_milliseconds),
+                            ]
+                        ),
+                        f"{asset.app_id} installer",
+                    )
+                    evidence["installerEvents"] = installer_events
+                    evidence["installerExit"] = exit_observation(installer_events)
+                    installed = installed_executable(asset, bottle_root)
+                    if not installer_succeeded(
+                        evidence,
+                        installer_events,
+                        installed,
+                        allow_requested_termination=installer_allows_requested_termination(
+                            asset,
+                            certification_mode=certification_mode,
+                        ),
+                    ):
+                        continue
                 if arguments.accept_interactive:
                     failure_stage = "font-stage"
                     registration_wineserver = cleanup_wineserver
@@ -4300,36 +4382,17 @@ def main() -> int:
                         else None,
                     )
                 else:
-                    evidence["interactionChecks"] = manual_checks.get(asset.app_id, {})
                     if manual_attestation:
                         evidence["interactionAttestation"] = manual_attestation
-                    basic = (
-                        status(events) == "accepted"
-                        and windows.get("available") is True
-                        and shot.get("available") is True
-                        and not evidence["residualProcesses"]
+                    evaluate_certification_outcome(
+                        evidence,
+                        asset.app_id,
+                        events,
+                        windows,
+                        shot,
+                        evidence["residualProcesses"],
+                        manual_checks.get(asset.app_id, {}),
                     )
-                    interactions_complete = all(
-                        evidence["interactionChecks"].get(name) is True
-                        for name in REQUIRED_INTERACTIONS[asset.app_id]
-                    )
-                    evidence["status"] = (
-                        "accepted" if basic and interactions_complete else "unverified"
-                    )
-                    if not basic:
-                        evidence["reason"] = (
-                            "target window/screenshot/exit cleanup evidence is incomplete"
-                        )
-                        diagnostic = evidence["observation"]
-                        if isinstance(diagnostic, dict):
-                            evidence["failureClassification"] = diagnostic.get(
-                                "failureClassification", "runtime-regression"
-                            )
-                    elif not interactions_complete:
-                        evidence["reason"] = (
-                            "required per-application interaction evidence was not supplied"
-                        )
-                        evidence["failureClassification"] = "policy-blocked"
             except NetworkUnavailableError as error:
                 apply_stage_outcome(
                     evidence,
@@ -4431,13 +4494,11 @@ def main() -> int:
             summary = compact_summary(receipt, results)
             stdout = compact_json(summary)
         else:
-            summary = {
-                "schemaVersion": "1",
-                "testSuiteVersion": TEST_SUITE_VERSION,
-                "receipt": receipt,
-                "applications": results,
-                "compatibilityResults": compatibility_results,
-            }
+            summary = certification_summary(
+                receipt,
+                results,
+                compatibility_results,
+            )
             stdout = json.dumps(
                 summary,
                 ensure_ascii=False,

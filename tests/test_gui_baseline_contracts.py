@@ -1775,6 +1775,313 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             installer["reasonCode"], "cleanup-termination-failed"
         )
 
+    def test_certification_lifecycle_accepts_requested_cli_termination(self) -> None:
+        events = [
+            {"kind": "terminate-requested"},
+            {"kind": "exited", "exit": {"code": None, "success": False}},
+        ]
+        observed = {"available": True}
+
+        policy_blocked: dict[str, object] = {}
+        self.baseline.evaluate_certification_outcome(
+            policy_blocked,
+            "7zip-x86",
+            events,
+            observed,
+            observed,
+            [],
+            {},
+        )
+        self.assertEqual(policy_blocked["status"], "unverified")
+        self.assertEqual(policy_blocked["failureClassification"], "policy-blocked")
+        self.assertEqual(
+            policy_blocked["reason"],
+            "required per-application interaction evidence was not supplied",
+        )
+
+        accepted: dict[str, object] = {}
+        self.baseline.evaluate_certification_outcome(
+            accepted,
+            "7zip-x86",
+            events,
+            observed,
+            observed,
+            [],
+            {
+                "fileList": True,
+                "menus": True,
+                "cjkTextReadable": True,
+            },
+        )
+        self.assertEqual(accepted["status"], "accepted")
+        self.assertNotIn("failureClassification", accepted)
+
+        runtime_failure: dict[str, object] = {}
+        self.baseline.evaluate_certification_outcome(
+            runtime_failure,
+            "7zip-x86",
+            events,
+            {"available": False, "reason": "target window was not observed"},
+            observed,
+            [],
+            {},
+        )
+        self.assertEqual(runtime_failure["status"], "unverified")
+        self.assertEqual(runtime_failure["failureClassification"], "runtime-regression")
+
+        for name, failed_events, residual in (
+            (
+                "nonzero-exit",
+                [{"kind": "exited", "exit": {"code": 7, "success": False}}],
+                [],
+            ),
+            ("residual-process", events, ["wineserver residual"]),
+        ):
+            with self.subTest(name=name):
+                failed: dict[str, object] = {}
+                self.baseline.evaluate_certification_outcome(
+                    failed,
+                    "7zip-x86",
+                    failed_events,
+                    observed,
+                    observed,
+                    residual,
+                    {},
+                )
+                self.assertEqual(failed["status"], "unverified")
+                self.assertEqual(
+                    failed["failureClassification"], "runtime-regression"
+                )
+
+    def test_certification_installer_termination_policy_is_explicit_and_bound(self) -> None:
+        certification_assets = {
+            asset.app_id: asset for asset in self.assets.CERTIFICATION_ASSETS
+        }
+        for app_id, asset in certification_assets.items():
+            with self.subTest(app_id=app_id):
+                self.assertTrue(
+                    self.baseline.installer_allows_requested_termination(
+                        asset,
+                        certification_mode=True,
+                    )
+                )
+        self.assertTrue(
+            self.baseline.installer_allows_requested_termination(
+                self.assets.asset_for("sumatrapdf"),
+                certification_mode=False,
+            )
+        )
+        self.assertFalse(
+            self.baseline.installer_allows_requested_termination(
+                certification_assets["vlc"],
+                certification_mode=False,
+            )
+        )
+
+        events = [
+            {"kind": "terminate-requested"},
+            {"kind": "exited", "exit": {"code": None, "success": False}},
+        ]
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-certification-installer-"
+        ) as temporary:
+            installed = Path(temporary) / "installed.exe"
+            installed.write_bytes(b"MZ")
+            evidence: dict[str, object] = {}
+            self.assertTrue(
+                self.baseline.installer_succeeded(
+                    evidence,
+                    events,
+                    installed,
+                    allow_requested_termination=(
+                        self.baseline.installer_allows_requested_termination(
+                            certification_assets["vlc"],
+                            certification_mode=True,
+                        )
+                    ),
+                )
+            )
+            self.assertEqual(evidence, {})
+
+            missing_evidence: dict[str, object] = {}
+            self.assertFalse(
+                self.baseline.installer_succeeded(
+                    missing_evidence,
+                    events,
+                    Path(temporary) / "missing.exe",
+                    allow_requested_termination=True,
+                )
+            )
+            self.assertEqual(
+                missing_evidence["reasonCode"],
+                "application-install-failed",
+            )
+
+    def test_portable_zip_is_materialized_without_an_installer_launch(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="compatforge-portable-certification-"
+        ) as temporary:
+            root = Path(temporary)
+            cli = root / "compatforge-cli"
+            cli.write_bytes(b"placeholder")
+            archive = root / "winmerge.zip"
+            archive.write_bytes(b"placeholder")
+            work = root / "work"
+            storage = root / "storage"
+            runtime = root / "runtime"
+            argv = [
+                str(BASELINE_TOOL),
+                "--compatforge-cli",
+                str(cli),
+                "--cache-root",
+                str(root / "cache"),
+                "--runtime-store",
+                str(root / "runtime-store"),
+                "--storage-root",
+                str(storage),
+                "--work-root",
+                str(work),
+                "--runtime-id",
+                "crossover",
+                "--wine-root",
+                str(runtime),
+                "--wine",
+                "bin/wine",
+                "--wineserver",
+                "bin/wineserver",
+                "--version",
+                "11.0-8726-g2e2f5fca349",
+                "--app",
+                "winmerge",
+                "--allow-network",
+            ]
+            commands: list[list[str]] = []
+
+            def fake_invoke(
+                command: list[str], *, timeout: int = 0
+            ) -> subprocess.CompletedProcess[str]:
+                del timeout
+                commands.append(command)
+                if command[1:4] == ["local", "macos", "context"]:
+                    receipt = {
+                        **self.descriptor_receipt(),
+                        "architecture": "x86_64",
+                        "capabilities": ["guest-x86_64", "windows-gui"],
+                        "fontFallback": {"available": True},
+                    }
+                    Path(command[-1]).write_text(
+                        json.dumps(self.descriptor_context(storage, receipt)),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(
+                        command, 0, json.dumps(receipt), ""
+                    )
+                if command[1] == "inspect":
+                    return subprocess.CompletedProcess(
+                        command, 0, '{"architecture":"x86_64"}', ""
+                    )
+                if command[1] == "prepared-plan":
+                    return subprocess.CompletedProcess(command, 0, "{}", "")
+                raise AssertionError(f"unexpected command: {command}")
+
+            def materialize(
+                _archive: Path,
+                bottle_root: Path,
+                _expected_sha256: str,
+            ) -> dict[str, object]:
+                installed = bottle_root / "WinMerge" / "WinMergeU.exe"
+                installed.parent.mkdir(parents=True)
+                installed.write_bytes(b"MZ")
+                return {
+                    "schemaVersion": "1",
+                    "format": "zip",
+                    "fileDigest": "sha256:" + "a" * 64,
+                    "fileSizeBytes": 1,
+                    "entryCount": 1,
+                    "uncompressedBytes": 2,
+                }
+
+            def observed_launch(
+                command: list[str],
+                screenshot_path: Path,
+                _title_tokens: tuple[str, ...],
+                **_options: object,
+            ) -> tuple[
+                list[dict[str, object]],
+                dict[str, object],
+                dict[str, object],
+                int,
+            ]:
+                self.assertEqual(command[1], "prepared-launch-terminate")
+                return (
+                    [
+                        {"kind": "terminate-requested"},
+                        {
+                            "kind": "exited",
+                            "exit": {"code": None, "success": False},
+                        },
+                    ],
+                    {"available": True},
+                    {"available": True, "path": str(screenshot_path)},
+                    321,
+                )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(self.baseline.platform, "system", return_value="Darwin"),
+                mock.patch.object(self.baseline.platform, "machine", return_value="arm64"),
+                mock.patch.object(self.baseline.platform, "mac_ver", return_value=("15.6", ("", "", ""), "")),
+                mock.patch.object(self.baseline.os, "access", return_value=True),
+                mock.patch.object(self.baseline, "rosetta_available", return_value=True),
+                mock.patch.object(self.baseline, "fetch_asset", return_value=archive),
+                mock.patch.object(
+                    self.baseline,
+                    "materialize_portable_zip",
+                    side_effect=materialize,
+                ),
+                mock.patch.object(self.baseline, "invoke", side_effect=fake_invoke),
+                mock.patch.object(
+                    self.baseline,
+                    "observed_launch",
+                    side_effect=observed_launch,
+                ) as launch,
+                mock.patch.object(self.baseline, "process_snapshot", return_value=[]),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = self.baseline.main()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(launch.call_count, 1)
+            self.assertFalse(
+                any(command[1] == "prepared-launch-terminate" for command in commands)
+            )
+            self.assertEqual(
+                sum(command[1] == "prepared-plan" for command in commands),
+                1,
+            )
+            self.assertFalse((work / "winmerge-installer-request.json").exists())
+            summary = json.loads((work / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["applications"][0]["status"], "unverified")
+            self.assertEqual(
+                summary["applications"][0]["failureClassification"],
+                "policy-blocked",
+            )
+            self.assertEqual(
+                set(summary["receipt"]),
+                {
+                    "schemaVersion",
+                    "runtimeId",
+                    "packId",
+                    "version",
+                    "packDigest",
+                    "source",
+                },
+            )
+
     def test_live_ack_error_never_masks_process_window_or_cleanup_failure(self) -> None:
         accepted_events = [{"kind": "exited", "exit": {"code": 0, "success": True}}]
         failed_events = [{"kind": "exited", "exit": {"code": 9, "success": False}}]
@@ -2688,6 +2995,121 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         for mutant in compact_mutants:
             with self.subTest(mutant=mutant), self.assertRaises(self.baseline.AcceptanceError):
                 self.baseline.compact_json(mutant)
+
+    def test_certification_summary_projects_real_provider_receipt_for_soak(self) -> None:
+        digest = "sha256:" + "c" * 64
+        receipt = {
+            "schemaVersion": "1",
+            "runtimeId": "crossover",
+            "packId": "macos-explicit",
+            "version": "11.0-8726-g2e2f5fca349",
+            "packDigest": digest,
+            "source": "explicit-override",
+            "architecture": "x86_64",
+            "capabilities": ["guest-i386", "guest-x86_64", "windows-gui"],
+            "fontFallback": {"available": True},
+        }
+        original_receipt = json.loads(json.dumps(receipt))
+        asset = self.assets.asset_for("everything-x86")
+        compatibility_result = self.baseline.compatibility_result(
+            asset,
+            {
+                "status": "unverified",
+                "cleanup": True,
+                "failureClassification": "policy-blocked",
+                "windows": {"available": True},
+                "screenshot": {
+                    "available": True,
+                    "path": "/external/everything.png",
+                },
+                "exit": {"present": True},
+                "interactionChecks": {},
+                "residualProcesses": [],
+                "installerInspection": {"architecture": "i386"},
+            },
+            receipt,
+            "2026-08-31T09:00:00Z",
+            "2026-08-31T09:00:01Z",
+        )
+        compatibility_result["host"] = {
+            "os": "macos",
+            "version": "15.6",
+            "architecture": "arm64",
+        }
+        compatibility_results = [compatibility_result]
+        summary = self.baseline.certification_summary(
+            receipt,
+            [],
+            compatibility_results,
+        )
+        self.assertEqual(
+            summary["receipt"],
+            {
+                "schemaVersion": "1",
+                "runtimeId": "crossover",
+                "packId": "macos-explicit",
+                "version": "11.0-8726-g2e2f5fca349",
+                "packDigest": digest,
+                "source": "explicit-override",
+            },
+        )
+        self.assertEqual(receipt, original_receipt)
+        self.assertEqual(
+            set(summary["receipt"]),
+            {
+                "schemaVersion",
+                "runtimeId",
+                "packId",
+                "version",
+                "packDigest",
+                "source",
+            },
+        )
+        self.assertNotIn("architecture", summary["receipt"])
+        self.assertNotIn("capabilities", summary["receipt"])
+        self.assertNotIn("fontFallback", summary["receipt"])
+        self.assertEqual(
+            self.soak_tool.runtime_projection(
+                summary,
+                {
+                    "runtimeId": "crossover",
+                    "version": "11.0-8726-g2e2f5fca349",
+                },
+            ),
+            {
+                "runtimeId": "crossover",
+                "version": "11.0-8726-g2e2f5fca349",
+                "architecture": "arm64",
+                "packDigest": digest,
+            },
+        )
+        classified = self.soak_tool.classify_summary(
+            summary,
+            {"everything-x86"},
+            {
+                "runtimeId": "crossover",
+                "version": "11.0-8726-g2e2f5fca349",
+            },
+        )
+        self.assertEqual(classified["status"], "verified")
+        self.assertFalse(classified["hardFailure"])
+        self.assertEqual(classified["applications"][0]["outcome"], "blocked")
+
+        poisoned = {**receipt, "source": "/Users/developer/runtime"}
+        with self.assertRaises(self.baseline.AcceptanceError):
+            self.baseline.certification_summary(
+                poisoned,
+                [],
+                compatibility_results,
+            )
+
+        activated = {**receipt, "activated": True}
+        activated_summary = self.baseline.certification_summary(
+            activated,
+            [],
+            compatibility_results,
+        )
+        self.assertIs(activated_summary["receipt"]["activated"], True)
 
     def test_compact_summary_preserves_sumatrapdf_requested_installer_termination(self) -> None:
         receipt = {
