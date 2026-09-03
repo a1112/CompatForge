@@ -996,6 +996,15 @@ fn validate_then_bootstrap(
     }
     cleanup_result?;
 
+    let installed_ref = observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)?;
+    if installed_ref
+        .state
+        .as_ref()
+        .map_or(true, |state| state.active_digest != prepared.manifest.digest)
+    {
+        return Err(LinuxBootstrapError::ConflictingActiveRef);
+    }
+
     // RuntimePackStore has now completed an exact, verified registration and
     // may have published its active ref. A later re-probe or Storage failure
     // returns no Context/receipt, but deliberately does not roll that ref back:
@@ -1009,7 +1018,7 @@ fn validate_then_bootstrap(
 
     let final_preflight = prepare_bootstrap(host_report, request, owner)?;
     ensure_same_preflight(&prepared, &final_preflight)?;
-    require_expected_active_ref(&prepared)?;
+    require_unchanged_active_ref(&prepared, &installed_ref)?;
 
     operations.prepare_storage(&prepared.roots.storage, prepared.owner)?;
     let canonical_storage =
@@ -1020,7 +1029,7 @@ fn validate_then_bootstrap(
     if canonical_storage.as_os_str() != prepared.storage_text.as_str() {
         return Err(LinuxBootstrapError::InvalidRequest("storageRoot"));
     }
-    require_expected_active_ref(&prepared)?;
+    require_unchanged_active_ref(&prepared, &installed_ref)?;
     let config = snapshot
         .core_config(prepared.storage_text)
         .map_err(LinuxBootstrapError::Provider)?;
@@ -1038,13 +1047,12 @@ fn validate_then_bootstrap(
     })
 }
 
-fn require_expected_active_ref(prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+fn require_unchanged_active_ref(
+    prepared: &PreparedBootstrap,
+    expected: &ActiveRefObservation,
+) -> Result<(), LinuxBootstrapError> {
     let observation = observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)?;
-    if observation
-        .state
-        .as_ref()
-        .map_or(true, |state| state.active_digest != prepared.manifest.digest)
-    {
+    if &observation != expected {
         return Err(LinuxBootstrapError::ConflictingActiveRef);
     }
     Ok(())
@@ -1295,7 +1303,7 @@ fn validate_store_controls(store_root: &Path, owner: OwnerIdentity) -> Result<()
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
                 }
-                validate_private_metadata(&metadata, "runtimeStoreRoot", owner)?;
+                validate_private_directory(&directory, "runtimeStoreRoot", owner)?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
@@ -1511,7 +1519,7 @@ fn decode_mountinfo_path(value: &str) -> Option<String> {
     while index < bytes.len() {
         if bytes[index] == b'\\' {
             let octal = bytes.get(index + 1..index + 4)?;
-            if !octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+            if !matches!(octal, b"011" | b"012" | b"040" | b"134") {
                 return None;
             }
             decoded.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
@@ -1537,10 +1545,10 @@ fn parse_mountinfo(contents: &str) -> Option<Vec<MountEntry>> {
         device.split_once(':')?;
         let root = decode_mountinfo_path(fields[3])?;
         let mount_point = decode_mountinfo_path(fields[4])?;
-        if !serialized_linux_absolute_path(&root) && root != "/" {
+        if !root.starts_with('/') || root.as_bytes().contains(&0) {
             return None;
         }
-        if !serialized_linux_absolute_path(&mount_point) && mount_point != "/" {
+        if !mount_point.starts_with('/') || mount_point.as_bytes().contains(&0) {
             return None;
         }
         entries.push(MountEntry {
@@ -1620,7 +1628,7 @@ fn require_physical_disjoint_roots(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
-    if roots.iter().any(|root| {
+    if roots[..2].iter().any(|root| {
         mount_snapshot
             .entries
             .iter()
@@ -3104,10 +3112,56 @@ int main(void) {
     #[test]
     fn mountinfo_parser_is_bounded_and_fail_closed() {
         assert!(parse_mountinfo("not mountinfo").is_none());
-        let escaped = parse_mountinfo("24 1 8:1 /source\\040dir /mount\\040point rw - ext4 /dev/root rw\n")
-            .expect("parse escaped mount paths");
-        assert_eq!(escaped[0].root, "/source dir");
-        assert_eq!(escaped[0].mount_point, "/mount point");
+        for (escape, decoded) in [("040", ' '), ("011", '\t'), ("012", '\n'), ("134", '\\')] {
+            let line = format!("24 1 8:1 /source\\{escape}dir /mount\\{escape}point rw - ext4 /dev/root rw\n");
+            let escaped = parse_mountinfo(&line).expect("parse legal escaped mount paths");
+            assert_eq!(escaped[0].root, format!("/source{decoded}dir"));
+            assert_eq!(escaped[0].mount_point, format!("/mount{decoded}point"));
+        }
+        for malformed in [
+            "24 1 8:1 relative /mount rw - ext4 /dev/root rw\n",
+            "24 1 8:1 /source /mount\\000bad rw - ext4 /dev/root rw\n",
+            "24 1 8:1 /source /mount\\777bad rw - ext4 /dev/root rw\n",
+        ] {
+            assert!(parse_mountinfo(malformed).is_none(), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn mount_writability_applies_only_to_store_and_storage() {
+        fn snapshot(read_only_mount: &str) -> MountSnapshot {
+            let contents = format!(
+                "24 1 8:1 / / rw - ext4 /dev/root rw\n\
+                 25 24 8:2 / /private/store {} - ext4 /dev/store {}\n\
+                 26 24 8:3 / /private/storage {} - ext4 /dev/storage {}\n\
+                 27 24 8:4 / /private/runtime {} - squashfs runtime {}\n",
+                if read_only_mount == "store" { "ro" } else { "rw" },
+                if read_only_mount == "store" { "ro" } else { "rw" },
+                if read_only_mount == "storage" { "ro" } else { "rw" },
+                if read_only_mount == "storage" { "ro" } else { "rw" },
+                if read_only_mount == "runtime" { "ro" } else { "rw" },
+                if read_only_mount == "runtime" { "ro" } else { "rw" },
+            );
+            MountSnapshot {
+                raw_digest: read_only_mount.into(),
+                entries: parse_mountinfo(&contents).unwrap(),
+            }
+        }
+        assert!(require_physical_disjoint_roots(
+            ["/private/store", "/private/storage", "/private/runtime"],
+            &snapshot("runtime")
+        )
+        .is_ok());
+        assert!(require_physical_disjoint_roots(
+            ["/private/store", "/private/storage", "/private/runtime"],
+            &snapshot("store")
+        )
+        .is_err());
+        assert!(require_physical_disjoint_roots(
+            ["/private/store", "/private/storage", "/private/runtime"],
+            &snapshot("storage")
+        )
+        .is_err());
     }
 
     #[test]
@@ -4099,6 +4153,48 @@ int main(void) {
     }
 
     #[cfg(target_os = "linux")]
+    struct MutateRefDuringStorageOperations {
+        system: SystemBootstrapOperations,
+        active_ref: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl BootstrapOperations for MutateRefDuringStorageOperations {
+        fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.prepare_store(store_root, owner)
+        }
+
+        fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
+            self.system.create_staging(store_root, owner)
+        }
+
+        fn populate_staging(&self, staging: &Path, prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+            self.system.populate_staging(staging, prepared)
+        }
+
+        fn install_pack(
+            &self,
+            store_root: &Path,
+            staging: &Path,
+            manifest: &RuntimePackManifest,
+        ) -> Result<(), LinuxBootstrapError> {
+            self.system.install_pack(store_root, staging, manifest)
+        }
+
+        fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.cleanup_staging(staging, owner)
+        }
+
+        fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.prepare_storage(storage_root, owner)?;
+            let mut raw = fs::read(&self.active_ref).expect("Storage fault reads active ref");
+            raw.extend_from_slice(b" \n");
+            fs::write(&self.active_ref, raw).expect("Storage fault reformats active ref");
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn bootstrap_allows_only_documented_immutable_leftovers_after_install_failure() {
         for fault in [BootstrapFault::Install, BootstrapFault::RefWrite] {
@@ -4286,12 +4382,70 @@ int main(void) {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_active_ref_raw_drift_during_storage_preparation() {
+        let fixture = LinuxPublicProviderFixture::new();
+        let store = fixture.directory.root.join("storage-ref-drift-store");
+        let storage = fixture.directory.root.join("storage-ref-drift-storage");
+        let request = bootstrap_request(&fixture, &store, &storage);
+        let active_ref = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+
+        let result = validate_then_bootstrap(
+            &fixture.host,
+            &request,
+            &SystemProbeCommand,
+            &MutateRefDuringStorageOperations {
+                system: SystemBootstrapOperations,
+                active_ref,
+            },
+        );
+
+        assert!(matches!(result, Err(LinuxBootstrapError::ConflictingActiveRef)));
+        assert!(
+            storage.exists(),
+            "Storage operation completed before final ref comparison"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum ActiveRefMutation {
+        Delete,
+        WrongPack,
+        History,
+        RawFormatting,
+    }
+
+    #[cfg(target_os = "linux")]
     struct RefDeletingProbeCommand {
         system: SystemProbeCommand,
         calls: RefCell<usize>,
         mutate_after_call: usize,
         active_ref: PathBuf,
-        replace_with_wrong_pack: bool,
+        mutation: ActiveRefMutation,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ControlChmodProbeCommand {
+        system: SystemProbeCommand,
+        calls: RefCell<usize>,
+        control: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProbeCommand for ControlChmodProbeCommand {
+        fn run(&self, specification: &ProbeCommandSpec) -> Result<ProbeCommandOutput, ProbeCommandFailure> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let output = self.system.run(specification)?;
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                fs::set_permissions(&self.control, fs::Permissions::from_mode(0o500))
+                    .expect("malicious helper removes owner write from control");
+            }
+            Ok(output)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -4301,15 +4455,28 @@ int main(void) {
             let mut calls = self.calls.borrow_mut();
             *calls += 1;
             if *calls == self.mutate_after_call {
-                if self.replace_with_wrong_pack {
-                    let mut value: serde_json::Value =
-                        serde_json::from_slice(&fs::read(&self.active_ref).expect("malicious helper reads active ref"))
-                            .unwrap();
-                    value["packId"] = serde_json::json!("wrong-pack");
-                    fs::write(&self.active_ref, serde_json::to_vec(&value).unwrap())
-                        .expect("malicious helper replaces active ref");
-                } else {
-                    fs::remove_file(&self.active_ref).expect("malicious helper deletes active ref");
+                match self.mutation {
+                    ActiveRefMutation::Delete => {
+                        fs::remove_file(&self.active_ref).expect("malicious helper deletes active ref");
+                    }
+                    ActiveRefMutation::WrongPack | ActiveRefMutation::History => {
+                        let mut value: serde_json::Value = serde_json::from_slice(
+                            &fs::read(&self.active_ref).expect("malicious helper reads active ref"),
+                        )
+                        .unwrap();
+                        if matches!(self.mutation, ActiveRefMutation::WrongPack) {
+                            value["packId"] = serde_json::json!("wrong-pack");
+                        } else {
+                            value["history"] = serde_json::json!([value["activeDigest"].clone()]);
+                        }
+                        fs::write(&self.active_ref, serde_json::to_vec(&value).unwrap())
+                            .expect("malicious helper replaces active ref");
+                    }
+                    ActiveRefMutation::RawFormatting => {
+                        let mut raw = fs::read(&self.active_ref).expect("malicious helper reads active ref");
+                        raw.extend_from_slice(b" \n");
+                        fs::write(&self.active_ref, raw).expect("malicious helper reformats active ref");
+                    }
                 }
             }
             Ok(output)
@@ -4319,9 +4486,12 @@ int main(void) {
     #[cfg(target_os = "linux")]
     #[test]
     fn bootstrap_detects_active_ref_deletion_during_either_probe_round() {
-        for (label, mutate_after_call, seed_ref, replace) in
-            [("first-delete", 1, true, false), ("second-replace", 3, false, true)]
-        {
+        for (label, mutate_after_call, seed_ref, mutation) in [
+            ("first-delete", 1, true, ActiveRefMutation::Delete),
+            ("second-wrong-pack", 3, false, ActiveRefMutation::WrongPack),
+            ("second-history", 3, false, ActiveRefMutation::History),
+            ("second-raw", 3, false, ActiveRefMutation::RawFormatting),
+        ] {
             let fixture = LinuxPublicProviderFixture::new();
             let store = fixture.directory.root.join(format!("{label}-probe-ref-store"));
             let storage = fixture.directory.root.join(format!("{label}-probe-ref-storage"));
@@ -4335,7 +4505,7 @@ int main(void) {
                 calls: RefCell::new(0),
                 mutate_after_call,
                 active_ref: active_ref.clone(),
-                replace_with_wrong_pack: replace,
+                mutation,
             };
 
             let result = create_local_context_with(&fixture.host, &request, &command);
@@ -4343,13 +4513,41 @@ int main(void) {
             assert!(result.is_err(), "{label} probe mutation must not return Context");
             assert_eq!(
                 active_ref.exists(),
-                replace,
+                !matches!(mutation, ActiveRefMutation::Delete),
                 "malicious mutation occurred in {label} round"
             );
             if !seed_ref {
                 assert!(!storage.exists(), "second-round mutation must not produce Storage");
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_revalidates_control_permissions_after_first_probe_round() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = LinuxPublicProviderFixture::new();
+        let store = fixture.directory.root.join("probe-chmod-store");
+        let control = store.join("refs").join(LOCAL_PREVIEW_PACK_ID);
+        fs::create_dir_all(&control).expect("create late control");
+        let storage = fixture.directory.root.join("probe-chmod-storage");
+        let request = bootstrap_request(&fixture, &store, &storage);
+        let command = ControlChmodProbeCommand {
+            system: SystemProbeCommand,
+            calls: RefCell::new(0),
+            control: control.clone(),
+        };
+
+        let result = create_local_context_with(&fixture.host, &request, &command);
+
+        assert!(result.is_err());
+        assert!(!storage.exists());
+        assert_eq!(fs::metadata(control).unwrap().permissions().mode() & 0o777, 0o500);
+        assert!(
+            !store.join("objects").exists(),
+            "Store mutation must not begin after chmod"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4433,6 +4631,59 @@ int main(void) {
         let before = snapshot_tree(&fixture.directory.root);
         assert!(create_local_context_with(&fixture.host, &request, &PanicProbeCommand).is_err());
         assert_eq!(snapshot_tree(&fixture.directory.root), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_every_non_owner_writable_control_before_probe_or_mkdir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let controls = [
+            "",
+            "objects",
+            "objects/sha256",
+            "manifests",
+            "manifests/sha256",
+            "refs",
+            "refs/wine-linux-x86-64-local-preview",
+        ];
+        for control in controls {
+            for mode in [0o500, 0o555] {
+                let fixture = LinuxPublicProviderFixture::new();
+                let store = fixture
+                    .directory
+                    .root
+                    .join(format!("control-{}-{mode:o}", control.replace('/', "-")));
+                fs::create_dir_all(store.join(control)).expect("create selected control");
+                fs::set_permissions(store.join(control), fs::Permissions::from_mode(mode))
+                    .expect("remove owner write from selected control");
+                let storage = fixture.directory.root.join("control-storage");
+                let request = bootstrap_request(&fixture, &store, &storage);
+                let before = snapshot_tree(&fixture.directory.root);
+
+                assert!(
+                    create_local_context_with(&fixture.host, &request, &PanicProbeCommand).is_err(),
+                    "{control} {mode:o}"
+                );
+                assert_eq!(snapshot_tree(&fixture.directory.root), before, "{control} {mode:o}");
+                assert!(!storage.exists());
+            }
+        }
+
+        let fixture = LinuxPublicProviderFixture::new();
+        let store = fixture.directory.root.join("missing-early-control");
+        let late = store.join("refs").join(LOCAL_PREVIEW_PACK_ID);
+        fs::create_dir_all(&late).expect("create only a later control");
+        fs::set_permissions(&late, fs::Permissions::from_mode(0o500)).unwrap();
+        let storage = fixture.directory.root.join("missing-early-storage");
+        let request = bootstrap_request(&fixture, &store, &storage);
+        let before = snapshot_tree(&fixture.directory.root);
+        assert!(create_local_context_with(&fixture.host, &request, &PanicProbeCommand).is_err());
+        assert_eq!(snapshot_tree(&fixture.directory.root), before);
+        assert!(
+            !store.join("objects").exists(),
+            "preflight must not fill earlier controls"
+        );
     }
 
     #[cfg(target_os = "linux")]
