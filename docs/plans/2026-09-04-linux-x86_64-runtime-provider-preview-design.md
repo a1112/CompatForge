@@ -200,6 +200,21 @@ Pack ID/digest 与入口 digest 均进入绑定。PreparedLaunch 在每次命令
 
 WINESERVER 环境值必须与 lifecycle 中的 Wineserver 绝对路径相同；Pack ID/digest 环境值必须与 LaunchPlan.runtime 相同；Wine/Wineserver 摘要环境值必须成对出现。任一不变量不成立都必须在 spawn 前失败。
 
+## ProcessSupervisor 可信完成边界
+
+真实 Console canary 依赖通用进程层给出完整完成确认，而不是在收到首个 exited 或 failed 事件时立即返回：
+
+- WineSession acquire 之后、LaunchHandle 建立之前的 wineboot、Guest alias、进程树 attach 或 main spawn 失败必须进入事务式启动清理；
+- wineboot 必须受进程组、有界 timeout 与 reap 约束；进入 Guest spawn 前再次复验 Guest、Wine 与 Wineserver；
+- 每次用 Wineserver 执行 -k/-w 前都必须复验固定摘要，已替换的清理入口不得执行；
+- cleanup 失败是终态失败，不能被原始启动错误或 Guest 的零退出码遮蔽；相同 Bottle prefix 的 lease 必须在清理后可重新获取；
+- stdout/stderr 使用一个固定的合并字节预算，cap+1、无换行洪泛、后代持有 pipe、reader/worker join 与最终 reap 都必须有界；
+- generic prepared-launch 在任何 terminal/failed/stream-close 路径都必须调用并等待 terminate_and_wait，继续有界 drain 事件，并以 cleanup acknowledgement 决定最终 CLI 状态。
+
+supervisor.maximumRuntimeMilliseconds 只约束 Guest 运行期，不覆盖同步 wineboot。Runner 必须另有覆盖 bootstrap、Guest、CLI cleanup 与外部残留观察的端到端 deadline；公开证据不得把 60 秒 Guest budget 描述成整个 canary 的时限。
+
+入口复验仍是基于 pathname 的“hash 后再执行”，无法消除同 UID、可写 Runtime root 对手在复验与 exec 之间的 TOCTOU。完整消除需要可信只读 Runtime 与 FD-pinned execution，留到正式 materializer 检查点。
+
 ## Console canary Runner
 
 新增 tools/run_linux_console_preview.py，只由用户显式调用。它要求显式的：
@@ -243,7 +258,9 @@ networkPolicy: deny 在此阶段只记录策略意图；由于完整 Linux 网�
 - stdout 中 COMPATFORGE_WINDOWS_CONSOLE_OK 恰好出现一次；
 - 最终 exited 事件为 code 0、success: true；
 - 没有 failed、timed-out 或 grace-period-expired；
+- CLI 已完成 terminate_and_wait、事件 drain 与 worker join 的 cleanup acknowledgement；
 - Bottle-scoped Wineserver stop 完成，精确 Wineserver -w 成功，Linux /proc 与进程组观察均未发现唯一测试 prefix 的受管残留；
+- Runner 的端到端 deadline 与 stdout/stderr/JSONL 上限均未触发；
 - cleanup 失败不会被成功退出码覆盖；
 - 所有证据位于仓库外，Git 工作区保持干净。
 
@@ -274,7 +291,10 @@ networkPolicy: deny 在此阶段只记录策略意图；由于完整 Linux 网�
 - Linux x86_64 host gate；
 - 精确 probe argv、空环境、cwd、超时、输出上限及版本匹配；
 - CapabilityReport、RuntimeBinding 和 path-free receipt；
-- bootstrap 后、spawn 前的 Runtime 与 Guest mutation。
+- bootstrap 后、wineboot 后和 spawn 前的 Runtime 与 Guest mutation；
+- startup failure 的 Wineserver 清理、prefix lease 复用与 cleanup error precedence；
+- 合并输出 cap、无换行洪泛、后代持有 pipe、reader/worker bounded join；
+- generic CLI terminal/failed/stream-close 路径的 terminate-and-wait handshake。
 
 命令执行通过可注入的 ProbeCommand 边界测试；Windows/macOS CI 不需要伪装为 Linux 或执行 ELF。
 
