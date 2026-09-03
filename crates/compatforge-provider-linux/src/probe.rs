@@ -1135,21 +1135,47 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_probe_fixture_has_same_drive_fallback_without_target_environment() {
-        let executable = std::env::current_exe().expect("resolve current test executable");
-        let unique = format!(
-            "missing-target-env-{}-{}",
-            std::process::id(),
-            NEXT_PROBE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+    fn windows_probe_fixture_fallback_tracks_the_resolution_volume() {
+        let resolution_base = Path::new(r"L:\project\FOS\.worktrees\provider-preview");
+        let unique = "missing-target-env";
+
+        let same_volume = windows_probe_fixture_candidates_for_base(
+            None,
+            Path::new(r"L:\cargo-target\debug\deps\probe-tests.exe"),
+            resolution_base,
+            unique,
         );
-        let resolution_base = std::env::current_dir().expect("resolve Windows serialized-path base");
-        let candidates = windows_probe_fixture_candidates_for_base(None, &executable, &resolution_base, &unique);
-        assert_eq!(candidates.len(), 1);
-        let fallback = &candidates[0];
-        assert!(fallback.starts_with(executable.parent().expect("test executable parent")));
-        assert_ne!(fallback.parent(), fallback.ancestors().last());
-        fs::create_dir_all(fallback).expect("fallback directory must be writable without CARGO_TARGET_DIR");
-        fs::remove_dir_all(fallback).expect("remove unique fallback directory");
+        assert_eq!(
+            same_volume,
+            [PathBuf::from(
+                r"L:\cargo-target\debug\deps\compatforge-test-fixtures\missing-target-env"
+            )]
+        );
+        for rejected_target in [r"relative\target", r"L:\"] {
+            assert_eq!(
+                windows_probe_fixture_candidates_for_base(
+                    Some(std::ffi::OsStr::new(rejected_target)),
+                    Path::new(r"L:\cargo-target\debug\deps\probe-tests.exe"),
+                    resolution_base,
+                    unique,
+                ),
+                same_volume,
+                "reject unsafe target candidate {rejected_target}"
+            );
+        }
+
+        let cross_volume = windows_probe_fixture_candidates_for_base(
+            None,
+            Path::new(r"G:\cargo-target\debug\deps\probe-tests.exe"),
+            resolution_base,
+            unique,
+        );
+        assert_eq!(
+            cross_volume,
+            [PathBuf::from(
+                r"L:\project\FOS\.worktrees\.compatforge-test-fixtures\missing-target-env"
+            )]
+        );
     }
 
     #[cfg(windows)]
