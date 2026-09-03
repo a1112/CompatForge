@@ -189,6 +189,55 @@ class LinuxProviderSchemaTests(unittest.TestCase):
             ):
                 self.assertFalse(accepts_string(relative, value), value)
 
+    def test_path_patterns_use_ecma_safe_all_character_scans(self) -> None:
+        schemas = (document(PROVIDER_SCHEMA), document(BOOTSTRAP_SCHEMA))
+        patterns_by_kind: dict[str, list[str]] = {
+            "absoluteLinuxPath": [],
+            "relativePath": [],
+        }
+
+        for schema in schemas:
+            for definition_name, expected_scan_count in (
+                ("absoluteLinuxPath", 4),
+                ("relativePath", 3),
+            ):
+                pattern = schema["$defs"][definition_name]["pattern"]
+                patterns_by_kind[definition_name].append(pattern)
+                self.assertNotIn(".*", pattern, definition_name)
+                self.assertEqual(
+                    pattern.count(r"[\s\S]*"),
+                    expected_scan_count,
+                    definition_name,
+                )
+
+            absolute = schema["$defs"]["absoluteLinuxPath"]
+            relative = schema["$defs"]["relativePath"]
+            for separator in ("\u2028", "\u2029"):
+                self.assertTrue(
+                    accepts_string(absolute, f"/safe{separator}name"), separator
+                )
+                self.assertTrue(
+                    accepts_string(relative, f"safe{separator}name"), separator
+                )
+                for suffix in (
+                    "/../escape",
+                    "\\escape",
+                    "\0escape",
+                    "\rescape",
+                    "\nescape",
+                ):
+                    self.assertFalse(
+                        accepts_string(absolute, f"/safe{separator}{suffix}"),
+                        repr(separator + suffix),
+                    )
+                    self.assertFalse(
+                        accepts_string(relative, f"safe{separator}{suffix}"),
+                        repr(separator + suffix),
+                    )
+
+        for definition_name, patterns in patterns_by_kind.items():
+            self.assertEqual(patterns[0], patterns[1], definition_name)
+
     def test_identifier_version_and_digest_constraints(self) -> None:
         provider = document(PROVIDER_SCHEMA)
         bootstrap = document(BOOTSTRAP_SCHEMA)

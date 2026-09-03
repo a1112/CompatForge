@@ -251,17 +251,21 @@ Create schemas/linux-bootstrap-request.schema.json. Use the same canonical prett
       "type": "string",
       "minLength": 2,
       "maxLength": 4096,
-      "pattern": "^/(?!\\.\\.?(?:/|$))(?!.*(?:/\\.\\.?)(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\u0000\\r\\n])[^/]+(?:/[^/]+)*$"
+      "pattern": "^/(?!\\.\\.?(?:/|$))(?![\\s\\S]*(?:/\\.\\.?)(?:/|$))(?![\\s\\S]*//)(?![\\s\\S]*\\\\)(?![\\s\\S]*[\\u0000\\r\\n])[^/]+(?:/[^/]+)*$"
     },
     "relativePath": {
       "type": "string",
       "minLength": 1,
       "maxLength": 1024,
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*[\\\\:])(?!.*[\\u0000\\r\\n])[^/]+(?:/[^/]+)*$"
+      "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))(?![\\s\\S]*[\\\\:])(?![\\s\\S]*[\\u0000\\r\\n])[^/]+(?:/[^/]+)*$"
     }
   }
 }
 ~~~
+
+The `[\s\S]*` scans are deliberate: unlike the dot wildcard, they cross U+2028
+and U+2029 under ECMA-262 regular-expression semantics, so later unsafe
+components and characters cannot escape the negative lookaheads.
 
 Format the actual file with the repository's established two-space indentation and one final newline.
 
