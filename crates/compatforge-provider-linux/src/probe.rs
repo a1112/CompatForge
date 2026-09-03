@@ -105,8 +105,8 @@ fn probe_runtime_with_verifier(
 ) -> Result<RuntimeProbeObservation, LinuxProviderError> {
     config.validate()?;
     let runtime = &config.wine_runtime;
-    let materialized_root = Path::new(&runtime.materialized_root);
-    let canonical_root = std::fs::canonicalize(materialized_root).map_err(|_| EvidenceFailure::MaterializedRoot)?;
+    let canonical_root =
+        std::fs::canonicalize(Path::new(&runtime.materialized_root)).map_err(|_| EvidenceFailure::MaterializedRoot)?;
     if !canonical_root
         .metadata()
         .map_err(|_| EvidenceFailure::MaterializedRoot)?
@@ -115,8 +115,8 @@ fn probe_runtime_with_verifier(
         return Err(EvidenceFailure::MaterializedRoot.into());
     }
 
-    let wine = verifier.verify(materialized_root, &runtime.wine)?;
-    let wineserver = verifier.verify(materialized_root, &runtime.wineserver)?;
+    let wine = verifier.verify(&canonical_root, &runtime.wine)?;
+    let wineserver = verifier.verify(&canonical_root, &runtime.wineserver)?;
 
     let wine_output = run_version_command(command, &wine, &canonical_root)?;
     let wine_version = parse_wine_version(&wine_output.stdout, &wine_output.stderr, &runtime.version)?;
@@ -127,8 +127,8 @@ fn probe_runtime_with_verifier(
         return Err(EvidenceFailure::Version.into());
     }
 
-    let wine_after = verifier.verify(materialized_root, &runtime.wine)?;
-    let wineserver_after = verifier.verify(materialized_root, &runtime.wineserver)?;
+    let wine_after = verifier.verify(&canonical_root, &runtime.wine)?;
+    let wineserver_after = verifier.verify(&canonical_root, &runtime.wineserver)?;
     if wine_after != wine || wineserver_after != wineserver {
         return Err(EvidenceFailure::Digest.into());
     }
@@ -145,6 +145,9 @@ fn run_version_command(
     executable: &Path,
     working_directory: &Path,
 ) -> Result<ProbeCommandOutput, LinuxProviderError> {
+    if !executable.is_absolute() || !working_directory.is_absolute() || !executable.starts_with(working_directory) {
+        return Err(EvidenceFailure::Command.into());
+    }
     let specification = ProbeCommandSpec {
         executable: executable.to_owned(),
         arguments: vec![OsString::from("--version")],
@@ -157,7 +160,14 @@ fn run_version_command(
         deadline: Instant::now() + PROBE_TIMEOUT,
         combined_output_limit: MAX_COMBINED_OUTPUT_BYTES,
     };
-    let output = command.run(&specification).map_err(|_| EvidenceFailure::Command)?;
+    let output = match command.run(&specification) {
+        Ok(output) => output,
+        Err(ProbeCommandFailure::UnsupportedHost) => return Err(LinuxProviderError::UnsupportedHost),
+        Err(_) => return Err(EvidenceFailure::Command.into()),
+    };
+    if Instant::now() >= specification.deadline {
+        return Err(EvidenceFailure::Command.into());
+    }
     let output_too_large = match output.stdout.len().checked_add(output.stderr.len()) {
         Some(length) => length > specification.combined_output_limit,
         None => true,
@@ -386,6 +396,7 @@ mod linux_system_probe {
             std::fs::canonicalize(&specification.working_directory).map_err(|_| ProbeCommandFailure::Spawn)?;
         if executable != specification.executable
             || working_directory != specification.working_directory
+            || !executable.starts_with(&working_directory)
             || !executable.metadata().map_err(|_| ProbeCommandFailure::Spawn)?.is_file()
             || !working_directory
                 .metadata()
@@ -461,12 +472,18 @@ mod linux_system_probe {
                 }
             }
             if status.is_some() && capture.finished() {
+                if Instant::now() >= absolute_deadline {
+                    break ProbeCommandFailure::Deadline;
+                }
                 let group_absent = match group.is_absent() {
                     Ok(absent) => absent,
                     Err(_) => break ProbeCommandFailure::Cleanup,
                 };
                 if group_absent {
                     finish_readers(readers, absolute_deadline)?;
+                    if Instant::now() >= absolute_deadline {
+                        return Err(ProbeCommandFailure::Deadline);
+                    }
                     return Ok(ProbeCommandOutput {
                         status: ProbeCommandStatus::Success,
                         stdout: capture.stdout,
@@ -609,6 +626,42 @@ mod tests {
     };
 
     static NEXT_PROBE_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(windows)]
+    fn windows_probe_fixture_candidates(
+        target_directory: Option<&std::ffi::OsStr>,
+        test_executable: &Path,
+        unique_name: &str,
+    ) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(target_directory) = target_directory {
+            let target_directory = PathBuf::from(target_directory);
+            if target_directory.is_absolute() && target_directory.parent().is_some() {
+                candidates.push(target_directory.join("test-fixtures").join(unique_name));
+            }
+        }
+        let fallback = test_executable
+            .parent()
+            .expect("current test executable must have a parent")
+            .join("compatforge-test-fixtures")
+            .join(unique_name);
+        if !candidates.contains(&fallback) {
+            candidates.push(fallback);
+        }
+        candidates
+    }
+
+    #[cfg(windows)]
+    fn create_windows_probe_fixture_base(
+        target_directory: Option<&std::ffi::OsStr>,
+        test_executable: &Path,
+        unique_name: &str,
+    ) -> PathBuf {
+        windows_probe_fixture_candidates(target_directory, test_executable, unique_name)
+            .into_iter()
+            .find(|candidate| fs::create_dir_all(candidate).is_ok())
+            .expect("create probe fixture in target or same-drive fallback")
+    }
 
     #[derive(Clone, Copy)]
     enum Parser {
@@ -802,12 +855,15 @@ mod tests {
         fn new() -> Self {
             let sequence = NEXT_PROBE_FIXTURE.fetch_add(1, Ordering::Relaxed);
             #[cfg(windows)]
-            let base = PathBuf::from(
-                std::env::var_os("CARGO_TARGET_DIR")
-                    .expect("portable probe fixture requires the external Cargo target"),
-            )
-            .join("test-fixtures")
-            .join(format!("compatforge-linux-probe-{}-{sequence}", std::process::id()));
+            let base = {
+                let unique_name = format!("compatforge-linux-probe-{}-{sequence}", std::process::id());
+                let executable = std::env::current_exe().expect("resolve current probe test executable");
+                create_windows_probe_fixture_base(
+                    std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+                    &executable,
+                    &unique_name,
+                )
+            };
             #[cfg(not(windows))]
             let base = std::env::temp_dir().join(format!("compatforge-linux-probe-{}-{sequence}", std::process::id()));
             let root = base.join("runtime");
@@ -887,6 +943,8 @@ mod tests {
     enum ScriptedBehavior {
         Success,
         CommandError,
+        UnsupportedHost,
+        LateSuccess,
         NonZero,
         InvalidWineStream,
         InvalidWineserverStream,
@@ -959,6 +1017,14 @@ mod tests {
             if matches!(self.behavior, ScriptedBehavior::CommandError) {
                 return Err(ProbeCommandFailure::Spawn);
             }
+            if matches!(self.behavior, ScriptedBehavior::UnsupportedHost) {
+                return Err(ProbeCommandFailure::UnsupportedHost);
+            }
+            if matches!(self.behavior, ScriptedBehavior::LateSuccess) && call_index == 0 {
+                std::thread::sleep(
+                    specification.deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+                );
+            }
 
             let status = if matches!(self.behavior, ScriptedBehavior::NonZero) {
                 ProbeCommandStatus::Failure
@@ -987,7 +1053,7 @@ mod tests {
     }
 
     struct RecordingEntrypointVerifier {
-        calls: Mutex<Vec<String>>,
+        calls: Mutex<Vec<(PathBuf, String)>>,
     }
 
     impl RecordingEntrypointVerifier {
@@ -1007,7 +1073,7 @@ mod tests {
             self.calls
                 .lock()
                 .expect("recording verifier lock")
-                .push(entrypoint.path.clone());
+                .push((materialized_root.to_owned(), entrypoint.path.clone()));
             verify_entrypoint(materialized_root, entrypoint)
         }
     }
@@ -1027,6 +1093,43 @@ mod tests {
         for output in invalid_version_outputs() {
             assert!(output.parse().is_err(), "{}", output.name);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_fixture_has_same_drive_fallback_without_target_environment() {
+        let executable = std::env::current_exe().expect("resolve current test executable");
+        let unique = format!(
+            "missing-target-env-{}-{}",
+            std::process::id(),
+            NEXT_PROBE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        );
+        let candidates = windows_probe_fixture_candidates(None, &executable, &unique);
+        assert_eq!(candidates.len(), 1);
+        let fallback = &candidates[0];
+        assert!(fallback.starts_with(executable.parent().expect("test executable parent")));
+        assert_ne!(fallback.parent(), fallback.ancestors().last());
+        fs::create_dir_all(fallback).expect("fallback directory must be writable without CARGO_TARGET_DIR");
+        fs::remove_dir_all(fallback).expect("remove unique fallback directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_fixture_falls_back_when_target_directory_is_unusable() {
+        let executable = std::env::current_exe().expect("resolve current test executable");
+        let holder = executable.parent().expect("test executable parent").join(format!(
+            "compatforge-fixture-selection-{}-{}",
+            std::process::id(),
+            NEXT_PROBE_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&holder).expect("create fixture selection holder");
+        let blocked_target = holder.join("blocked-target");
+        fs::write(&blocked_target, b"not a directory").expect("create unusable target marker");
+        let fake_executable = holder.join("probe-tests.exe");
+        let selected =
+            create_windows_probe_fixture_base(Some(blocked_target.as_os_str()), &fake_executable, "fallback-case");
+        assert_eq!(selected, holder.join("compatforge-test-fixtures").join("fallback-case"));
+        fs::remove_dir_all(&holder).expect("remove fixture selection holder");
     }
 
     #[test]
@@ -1054,6 +1157,12 @@ mod tests {
             assert_eq!(call.specification.working_directory, canonical_root);
             assert_eq!(call.specification.environment, expected_environment);
             assert_eq!(call.specification.combined_output_limit, 65_536);
+            assert!(
+                call.specification
+                    .executable
+                    .starts_with(&call.specification.working_directory),
+                "canonical executable must remain inside canonical cwd"
+            );
             let remaining = call.specification.deadline.saturating_duration_since(call.observed_at);
             assert!(
                 remaining > Duration::from_secs(4),
@@ -1069,7 +1178,12 @@ mod tests {
             .expect("four digest-bound verifications");
         assert_eq!(
             *verifier.calls.lock().expect("recording verifier lock"),
-            ["bin/wine", "bin/wineserver", "bin/wine", "bin/wineserver"]
+            [
+                (canonical_root.clone(), "bin/wine".into()),
+                (canonical_root.clone(), "bin/wineserver".into()),
+                (canonical_root.clone(), "bin/wine".into()),
+                (canonical_root.clone(), "bin/wineserver".into()),
+            ]
         );
 
         for relative in ["bin/wine", "bin/wineserver"] {
@@ -1113,6 +1227,28 @@ mod tests {
             assert!(!error.to_string().contains("persistent-mutation"));
             assert!(!error.to_string().contains(&rejected.root.to_string_lossy().to_string()));
         }
+    }
+
+    #[test]
+    fn injected_probe_rejects_success_returned_after_its_absolute_deadline() {
+        let fixture = ProbeFixture::new();
+        let command = RecordingProbeCommand::scripted(ScriptedBehavior::LateSuccess);
+        assert_eq!(
+            probe_runtime_with(&fixture.config, &command),
+            Err(LinuxProviderError::Evidence(EvidenceFailure::Command))
+        );
+        assert_eq!(command.calls().len(), 1, "late first probe must stop the transaction");
+    }
+
+    #[test]
+    fn injected_unsupported_host_preserves_the_provider_error_category() {
+        let fixture = ProbeFixture::new();
+        let command = RecordingProbeCommand::scripted(ScriptedBehavior::UnsupportedHost);
+        assert_eq!(
+            probe_runtime_with(&fixture.config, &command),
+            Err(LinuxProviderError::UnsupportedHost)
+        );
+        assert_eq!(command.calls().len(), 1);
     }
 
     #[cfg(not(target_os = "linux"))]
