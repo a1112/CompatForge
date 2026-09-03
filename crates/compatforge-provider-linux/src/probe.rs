@@ -628,25 +628,53 @@ mod tests {
     static NEXT_PROBE_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(windows)]
-    fn windows_probe_fixture_candidates(
+    fn windows_volume(path: &Path) -> Option<u8> {
+        use std::path::{Component, Prefix};
+
+        match path.components().next()? {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => Some(drive.to_ascii_uppercase()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_probe_fixture_candidates_for_base(
         target_directory: Option<&std::ffi::OsStr>,
         test_executable: &Path,
+        resolution_base: &Path,
         unique_name: &str,
     ) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
+        let resolution_volume =
+            windows_volume(resolution_base).expect("Windows serialized-path resolution base must have a disk volume");
         if let Some(target_directory) = target_directory {
             let target_directory = PathBuf::from(target_directory);
-            if target_directory.is_absolute() && target_directory.parent().is_some() {
+            if target_directory.is_absolute()
+                && target_directory.parent().is_some()
+                && windows_volume(&target_directory) == Some(resolution_volume)
+            {
                 candidates.push(target_directory.join("test-fixtures").join(unique_name));
             }
         }
-        let fallback = test_executable
-            .parent()
-            .expect("current test executable must have a parent")
-            .join("compatforge-test-fixtures")
-            .join(unique_name);
-        if !candidates.contains(&fallback) {
-            candidates.push(fallback);
+        if windows_volume(test_executable) == Some(resolution_volume) {
+            let executable_fallback = test_executable
+                .parent()
+                .expect("current test executable must have a parent")
+                .join("compatforge-test-fixtures")
+                .join(unique_name);
+            if !candidates.contains(&executable_fallback) {
+                candidates.push(executable_fallback);
+            }
+        } else {
+            let workspace_fallback = resolution_base
+                .parent()
+                .expect("Windows serialized-path resolution base must not be a drive root")
+                .join(".compatforge-test-fixtures")
+                .join(unique_name);
+            candidates.push(workspace_fallback);
         }
         candidates
     }
@@ -655,12 +683,20 @@ mod tests {
     fn create_windows_probe_fixture_base(
         target_directory: Option<&std::ffi::OsStr>,
         test_executable: &Path,
+        resolution_base: &Path,
         unique_name: &str,
     ) -> PathBuf {
-        windows_probe_fixture_candidates(target_directory, test_executable, unique_name)
+        windows_probe_fixture_candidates_for_base(target_directory, test_executable, resolution_base, unique_name)
             .into_iter()
             .find(|candidate| fs::create_dir_all(candidate).is_ok())
             .expect("create probe fixture in target or same-drive fallback")
+    }
+
+    fn system_probe_helper_paths(working_directory: &Path, name: &str) -> (PathBuf, PathBuf) {
+        (
+            working_directory.join(format!("{name}.c")),
+            working_directory.join(name),
+        )
     }
 
     #[derive(Clone, Copy)]
@@ -858,9 +894,11 @@ mod tests {
             let base = {
                 let unique_name = format!("compatforge-linux-probe-{}-{sequence}", std::process::id());
                 let executable = std::env::current_exe().expect("resolve current probe test executable");
+                let resolution_base = std::env::current_dir().expect("resolve Windows serialized-path base");
                 create_windows_probe_fixture_base(
                     std::env::var_os("CARGO_TARGET_DIR").as_deref(),
                     &executable,
+                    &resolution_base,
                     &unique_name,
                 )
             };
@@ -1104,7 +1142,8 @@ mod tests {
             std::process::id(),
             NEXT_PROBE_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
-        let candidates = windows_probe_fixture_candidates(None, &executable, &unique);
+        let resolution_base = std::env::current_dir().expect("resolve Windows serialized-path base");
+        let candidates = windows_probe_fixture_candidates_for_base(None, &executable, &resolution_base, &unique);
         assert_eq!(candidates.len(), 1);
         let fallback = &candidates[0];
         assert!(fallback.starts_with(executable.parent().expect("test executable parent")));
@@ -1126,10 +1165,41 @@ mod tests {
         let blocked_target = holder.join("blocked-target");
         fs::write(&blocked_target, b"not a directory").expect("create unusable target marker");
         let fake_executable = holder.join("probe-tests.exe");
-        let selected =
-            create_windows_probe_fixture_base(Some(blocked_target.as_os_str()), &fake_executable, "fallback-case");
+        let selected = create_windows_probe_fixture_base(
+            Some(blocked_target.as_os_str()),
+            &fake_executable,
+            &holder,
+            "fallback-case",
+        );
         assert_eq!(selected, holder.join("compatforge-test-fixtures").join("fallback-case"));
         fs::remove_dir_all(&holder).expect("remove fixture selection holder");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_fixture_rejects_cross_volume_target_and_executable() {
+        let candidates = windows_probe_fixture_candidates_for_base(
+            Some(std::ffi::OsStr::new(r"G:\compatforge-task05-cross-drive-review")),
+            Path::new(r"G:\cargo-target\debug\deps\probe-tests.exe"),
+            Path::new(r"L:\project\FOS\.worktrees\provider-preview"),
+            "cross-volume-case",
+        );
+        assert_eq!(
+            candidates,
+            [PathBuf::from(
+                r"L:\project\FOS\.worktrees\.compatforge-test-fixtures\cross-volume-case"
+            )]
+        );
+    }
+
+    #[test]
+    fn system_probe_helper_paths_are_inside_the_working_directory() {
+        let working_directory = Path::new("canonical-runtime-root");
+        let (source, executable) = system_probe_helper_paths(working_directory, "wine-helper");
+        assert_eq!(source, working_directory.join("wine-helper.c"));
+        assert_eq!(executable, working_directory.join("wine-helper"));
+        assert!(source.starts_with(working_directory));
+        assert!(executable.starts_with(working_directory));
     }
 
     #[test]
@@ -1300,8 +1370,9 @@ mod tests {
             }
 
             fn compile(&self, name: &str, body: &str) -> PathBuf {
-                let source = self.base.join(format!("{name}.c"));
-                let executable = self.base.join(name);
+                let (source, executable) = system_probe_helper_paths(&self.working_directory, name);
+                assert!(source.starts_with(&self.working_directory));
+                assert!(executable.starts_with(&self.working_directory));
                 fs::write(&source, body).expect("write controlled Linux probe helper source");
                 let status = Command::new("/usr/bin/cc")
                     .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-o"])
