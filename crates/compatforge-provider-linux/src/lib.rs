@@ -3,6 +3,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod elf;
+mod probe;
+#[cfg(target_os = "linux")]
+mod unix_process_group;
+
+pub use probe::{
+    probe_runtime_with, ProbeCommand, ProbeCommandFailure, ProbeCommandOutput, ProbeCommandSpec, ProbeCommandStatus,
+    RuntimeProbeObservation, SystemProbeCommand,
+};
 
 use compatforge_domain::{
     validate_digest, validate_id, validate_portable_relative_path, validate_schema_version, ContractError, CoreConfig,
@@ -318,6 +326,8 @@ pub enum LinuxProviderError {
     Contract(ContractError),
     InvalidConfig(&'static str),
     InvalidRequest(&'static str),
+    UnsupportedHost,
+    Evidence(EvidenceFailure),
 }
 
 impl fmt::Display for LinuxProviderError {
@@ -330,6 +340,8 @@ impl fmt::Display for LinuxProviderError {
             Self::InvalidRequest(field) => {
                 write!(formatter, "invalid Linux local context request: {field}")
             }
+            Self::UnsupportedHost => formatter.write_str("Linux Provider requires a Linux host"),
+            Self::Evidence(failure) => write!(formatter, "{failure}"),
         }
     }
 }
@@ -338,7 +350,8 @@ impl std::error::Error for LinuxProviderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Contract(error) => Some(error),
-            Self::InvalidConfig(_) | Self::InvalidRequest(_) => None,
+            Self::Evidence(failure) => Some(failure),
+            Self::InvalidConfig(_) | Self::InvalidRequest(_) | Self::UnsupportedHost => None,
         }
     }
 }
@@ -346,6 +359,12 @@ impl std::error::Error for LinuxProviderError {
 impl From<ContractError> for LinuxProviderError {
     fn from(error: ContractError) -> Self {
         Self::Contract(error)
+    }
+}
+
+impl From<EvidenceFailure> for LinuxProviderError {
+    fn from(failure: EvidenceFailure) -> Self {
+        Self::Evidence(failure)
     }
 }
 
