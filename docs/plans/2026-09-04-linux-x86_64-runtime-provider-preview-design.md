@@ -246,6 +246,16 @@ Runner 不下载工具或 Runtime，不扫描 PATH，也不在仓库内写证据
 13. 复验事件顺序、stdout marker、退出码和 cleanup；
 14. 生成无路径 public summary。
 
+Runner 杀掉 prepared-launch 的外层 CLI 进程组并不等于清理了 ProcessSupervisor 创建的内层 Wine/Guest 进程组。取得固定 prefix/context 后、启动 prepared-launch 前，Runner 必须 fsync run-start marker，并为总 deadline 预留固定 cleanup 窗口。marker 之后的成功、命令非零、输出溢出、读取错误与总超时都进入同一个有界 finalizer：
+
+- 流式解析 started 事件并记录 Guest PID；若进程仍存活，立即从 /proc 记录同 UID、精确 WINEPREFIX 与进程 start-time 身份。固定 Console fixture 可能在事件抵达 Runner 前已退出，因此 ENOENT 或已确认 zombie 记为 exited-before-snapshot，不是失败，但该数值 PGID 永远不可被 Runner 发信号；
+- 外层命令异常时，先终止并 reap 只属于 Runner 的 CLI 进程组；外层 PGID 消失不能作为内层 cleanup 证据；
+- 只有仍存活 leader PID 的 UID、start-time 与精确 prefix 全部匹配时，才允许 finalizer 对该内层进程组发信号；exited-before-snapshot、身份缺失或漂移时不得对可能复用的 PGID 发信号。除 ENOENT/已确认 zombie 外，活进程身份不可读仍是 test-infrastructure/cleanup 失败；
+- 复验固定 Wineserver 摘要后，失败路径执行精确 -k 再 -w，正常路径执行精确 -w；随后始终运行同 UID、精确 WINEPREFIX 的 /proc 扫描和已记录内层 PGID 消失检查；
+- 摘要漂移、任何命令/观察超时、残留进程或无法证明 cleanup 都归为 cleanup/integrity 失败，保留私有 failure evidence 且绝不生成 public success summary。
+
+如果 prepared-launch 在 started 前中止，finalizer 仍以固定 Wineserver/prefix 执行 -k/-w 并检查 /proc；它不得因为没有内层 PGID 就把外层 kill 当成成功。正常的短进程 exited-before-snapshot 只有在 CLI cleanup acknowledgement、固定 Wineserver -w、精确 prefix 的 /proc 空集以及数值进程组 ESRCH 全部成立时才可通过；若数值组仍存在则失败关闭但不发信号。此机制是 Preview Runner 的故障清理与证据边界，不宣称产品已经实现通用 Linux orphan recovery。
+
 networkPolicy: deny 在此阶段只记录策略意图；由于完整 Linux 网络隔离尚未实现，固定 fixture 本身不得包含网络行为。
 
 两个 prepared-plan 与 prepared-launch 是三个独立 CLI 进程；pre/post canonical equality 只能证明可观察输入和确定性计划没有漂移，并不等同于执行进程返回了其内部 LaunchPlan receipt。Summary 必须把这种关系记为 planCorrelation: pre-post-canonical-match，不得声称保存的 plan 对象被直接执行。
@@ -264,6 +274,7 @@ networkPolicy: deny 在此阶段只记录策略意图；由于完整 Linux 网�
 - CLI 已完成 terminate_and_wait、事件 drain 与 worker join 的 cleanup acknowledgement；
 - Bottle-scoped Wineserver stop 完成，精确 Wineserver -w 成功，Linux /proc 与进程组观察均未发现唯一测试 prefix 的受管残留；
 - Runner 的端到端 deadline 与 stdout/stderr/JSONL 上限均未触发；
+- run-start marker 之后所有路径均执行有界 finalizer；外层 CLI PGID 与内层 Wine/Guest PGID 分别核验，且为 cleanup 预留的 deadline 未被业务步骤占用；
 - cleanup 失败不会被成功退出码覆盖；
 - 所有证据位于仓库外，Git 工作区保持干净。
 
