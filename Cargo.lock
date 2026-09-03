@@ -122,6 +122,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "compatforge-provider-linux"
+version = "0.12.0"
+dependencies = [
+ "compatforge-domain",
+ "compatforge-orchestrator",
+ "compatforge-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "compatforge-provider-macos"
 version = "0.12.0"
 dependencies = [
