@@ -166,6 +166,8 @@ Preview Pack 只绑定两个入口文件，不绑定 Wine 随后加载的 ntdll�
 
 Provider 使用显式 packDigest 读取并复验 manifest/object，不依赖该 Pack ID 当前的 active ref。即使 active ref 后来指向另一 digest，本次 Context 也只能继续使用显式 pin；对应行为必须有负向测试。
 
+当前 RuntimePackStore 只有进程内写锁，Preview bootstrap 因此要求调用期间由调用者保证 Store 单写者。它会在 install 前检查冲突 active ref，但不声称跨进程 compare-and-install 原子性；install/ref 失败可以留下内容寻址的不可变 object/manifest，却不得覆盖预先存在的冲突 ref、产出 Context 或公开成功 receipt。真实 Runner 总是使用一个新的独占 Store root。跨进程 Store 锁留给正式 materializer 检查点。
+
 ## 入口与版本复验
 
 在执行任何 Provider 入口前必须完成：
@@ -198,7 +200,7 @@ Provider 使用显式 packDigest 读取并复验 manifest/object，不依赖该 
 
 Pack ID/digest 与入口 digest 均进入绑定。PreparedLaunch 在每次命令中重新准备并授权 Guest 与 CoreConfig；Runtime 入口的最终摘要检查发生在 ProcessSupervisor::start、位于进程创建之前。Runtime Store manifest/object 不会在该 spawn 边界再次复验，完整外部 Runtime 树也未被固定，所以证据必须保持 Preview 限定。
 
-WINESERVER 环境值必须与 lifecycle 中的 Wineserver 绝对路径相同；Pack ID/digest 环境值必须与 LaunchPlan.runtime 相同；Wine/Wineserver 摘要环境值必须成对出现。任一不变量不成立都必须在 spawn 前失败。
+WINESERVER 环境值必须与 lifecycle 中的 Wineserver 绝对路径相同；WINEPREFIX 必须与同一 lifecycle prefix 相同；Pack ID/digest 环境值必须与 LaunchPlan.runtime 相同；Wine/Wineserver 摘要环境值必须成对出现。任一受管不变量不成立都必须在 spawn 前失败。现有 FFI 的 Pack/WINEPREFIX-only 合成 smoke 保留为明确的未受管兼容路径，不能被解释为本 Preview 的 Runtime 证据。
 
 ## ProcessSupervisor 可信完成边界
 
@@ -207,9 +209,10 @@ WINESERVER 环境值必须与 lifecycle 中的 Wineserver 绝对路径相同；P
 - WineSession acquire 之后、LaunchHandle 建立之前的 wineboot、Guest alias、进程树 attach 或 main spawn 失败必须进入事务式启动清理；
 - wineboot 必须受进程组、有界 timeout 与 reap 约束；进入 Guest spawn 前再次复验 Guest、Wine 与 Wineserver；
 - 每次用 Wineserver 执行 -k/-w 前都必须复验固定摘要，已替换的清理入口不得执行；
-- cleanup 失败是终态失败，不能被原始启动错误或 Guest 的零退出码遮蔽；相同 Bottle prefix 的 lease 必须在清理后可重新获取；
+- cleanup 失败是终态失败，不能被原始启动错误或 Guest 的零退出码遮蔽；只有 cleanup 成功才释放 canonical Bottle prefix lease，失败时该 prefix 在当前进程内保持 poisoned/quarantined；
 - stdout/stderr 使用一个固定的合并字节预算，cap+1、无换行洪泛、后代持有 pipe、reader/worker join 与最终 reap 都必须有界；
-- generic prepared-launch 在任何 terminal/failed/stream-close 路径都必须调用并等待 terminate_and_wait，继续有界 drain 事件，并以 cleanup acknowledgement 决定最终 CLI 状态。
+- Unix 进程组只能由显式 live-tree 事务发信号；保存整数 PGID 的 Drop 不得盲目 kill 可能已经复用的进程组；
+- generic prepared-launch 在任何 terminal/failed/stream-close 或 handle-finished 路径都必须调用并等待 terminate_and_wait，继续有界 drain 事件，并以 cleanup acknowledgement 决定最终 CLI 状态。显式 *-terminate 命令保留“已请求终止”的退出语义，但同样不能忽略 Failed、timeout 或 cleanup failure。
 
 supervisor.maximumRuntimeMilliseconds 只约束 Guest 运行期，不覆盖同步 wineboot。Runner 必须另有覆盖 bootstrap、Guest、CLI cleanup 与外部残留观察的端到端 deadline；公开证据不得把 60 秒 Guest budget 描述成整个 canary 的时限。
 
