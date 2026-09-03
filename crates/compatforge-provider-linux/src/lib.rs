@@ -42,6 +42,49 @@ const BOOTSTRAP_STAGING_PARENT: &str = ".compatforge-bootstrap";
 const BOOTSTRAP_STAGING_PREFIX: &str = ".compatforge-bootstrap-";
 const WINE_BUNDLE_ARTIFACT: &str = "components/wine-entrypoint.bin";
 const WINESERVER_BUNDLE_ARTIFACT: &str = "components/wineserver-entrypoint.bin";
+const MAX_ACTIVE_REF_BYTES: u64 = 64 * 1024;
+const MAX_ACTIVATION_HISTORY: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExactActiveRef {
+    schema_version: String,
+    pack_id: String,
+    active_digest: String,
+    #[serde(default)]
+    history: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRefObservation {
+    raw: Option<Vec<u8>>,
+    state: Option<ExactActiveRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnerIdentity {
+    filesystem_uid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountEntry {
+    device: String,
+    root: String,
+    mount_point: String,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountSnapshot {
+    raw_digest: String,
+    entries: Vec<MountEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhysicalIdentity {
+    device: String,
+    path: String,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -779,6 +822,8 @@ struct ResolvedDestination {
 #[derive(Debug, Clone)]
 struct PreparedBootstrap {
     roots: ResolvedBootstrapRoots,
+    owner: OwnerIdentity,
+    mount_snapshot: MountSnapshot,
     storage_text: String,
     wine_source: PathBuf,
     wineserver_source: PathBuf,
@@ -787,9 +832,8 @@ struct PreparedBootstrap {
 }
 
 trait BootstrapOperations {
-    fn active_digest(&self, store_root: &Path, pack_id: &str) -> Result<Option<String>, LinuxBootstrapError>;
-    fn prepare_store(&self, store_root: &Path) -> Result<(), LinuxBootstrapError>;
-    fn create_staging(&self, store_root: &Path) -> Result<PathBuf, LinuxBootstrapError>;
+    fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError>;
+    fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError>;
     fn populate_staging(&self, staging: &Path, prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError>;
     fn install_pack(
         &self,
@@ -797,21 +841,15 @@ trait BootstrapOperations {
         staging: &Path,
         manifest: &RuntimePackManifest,
     ) -> Result<(), LinuxBootstrapError>;
-    fn cleanup_staging(&self, staging: &Path) -> Result<(), LinuxBootstrapError>;
-    fn prepare_storage(&self, storage_root: &Path) -> Result<(), LinuxBootstrapError>;
+    fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError>;
+    fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError>;
 }
 
 struct SystemBootstrapOperations;
 
 impl BootstrapOperations for SystemBootstrapOperations {
-    fn active_digest(&self, store_root: &Path, pack_id: &str) -> Result<Option<String>, LinuxBootstrapError> {
-        RuntimePackStore::new(store_root)
-            .active_digest(pack_id)
-            .map_err(|_| LinuxBootstrapError::RegistrationFailed("active ref read"))
-    }
-
-    fn prepare_store(&self, store_root: &Path) -> Result<(), LinuxBootstrapError> {
-        create_private_directory_tree(store_root, "runtimeStoreRoot")?;
+    fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+        create_private_directory_tree(store_root, "runtimeStoreRoot", owner)?;
         for control in [
             store_root.join("objects"),
             store_root.join("objects/sha256"),
@@ -821,21 +859,20 @@ impl BootstrapOperations for SystemBootstrapOperations {
             store_root.join("refs").join(LOCAL_PREVIEW_PACK_ID),
             store_root.join(BOOTSTRAP_STAGING_PARENT),
         ] {
-            create_private_directory_tree(&control, "runtimeStoreRoot")?;
+            create_private_directory_tree(&control, "runtimeStoreRoot", owner)?;
         }
-        validate_exact_private_directory(&store_root.join(BOOTSTRAP_STAGING_PARENT), "runtimeStoreRoot")?;
-        validate_store_controls(store_root)
+        validate_exact_private_directory(&store_root.join(BOOTSTRAP_STAGING_PARENT), "runtimeStoreRoot", owner)?;
+        validate_store_controls(store_root, owner)
     }
 
-    fn create_staging(&self, store_root: &Path) -> Result<PathBuf, LinuxBootstrapError> {
+    fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
         let staging_parent = store_root.join(BOOTSTRAP_STAGING_PARENT);
-        validate_exact_private_directory(&staging_parent, "runtimeStoreRoot")?;
+        validate_exact_private_directory(&staging_parent, "runtimeStoreRoot", owner)?;
         for _ in 0..128_u8 {
             let staging = staging_parent.join(format!("{BOOTSTRAP_STAGING_PREFIX}{}", random_staging_token()?));
             match create_new_private_directory(&staging) {
                 Ok(()) => {
-                    validate_new_private_directory(&staging, "runtimeStoreRoot")?;
-                    return Ok(staging);
+                    return accept_created_staging(&staging, owner, &validate_new_private_directory);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(_) => return Err(LinuxBootstrapError::RegistrationFailed("staging create")),
@@ -848,7 +885,7 @@ impl BootstrapOperations for SystemBootstrapOperations {
         let components = staging.join("components");
         create_new_private_directory(&components)
             .map_err(|_| LinuxBootstrapError::RegistrationFailed("staging components"))?;
-        validate_new_private_directory(&components, "runtimeStoreRoot")?;
+        validate_new_private_directory(&components, "runtimeStoreRoot", prepared.owner)?;
         copy_to_new_private_file(&prepared.wine_source, &staging.join(WINE_BUNDLE_ARTIFACT), "wine copy")?;
         copy_to_new_private_file(
             &prepared.wineserver_source,
@@ -876,14 +913,28 @@ impl BootstrapOperations for SystemBootstrapOperations {
         Ok(())
     }
 
-    fn cleanup_staging(&self, staging: &Path) -> Result<(), LinuxBootstrapError> {
-        remove_owned_staging_directory(staging)
+    fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+        remove_owned_staging_directory(staging, owner)
     }
 
-    fn prepare_storage(&self, storage_root: &Path) -> Result<(), LinuxBootstrapError> {
-        create_private_directory_tree(storage_root, "storageRoot")?;
-        validate_private_directory(storage_root, "storageRoot")
+    fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+        create_private_directory_tree(storage_root, "storageRoot", owner)?;
+        validate_private_directory(storage_root, "storageRoot", owner)
     }
+}
+
+fn accept_created_staging(
+    staging: &Path,
+    owner: OwnerIdentity,
+    validate: &dyn Fn(&Path, &'static str, OwnerIdentity) -> Result<(), LinuxBootstrapError>,
+) -> Result<PathBuf, LinuxBootstrapError> {
+    if let Err(error) = validate(staging, "runtimeStoreRoot", owner) {
+        return match fs::remove_dir(staging) {
+            Ok(()) => Err(error),
+            Err(_) => Err(LinuxBootstrapError::RegistrationFailed("staging cleanup")),
+        };
+    }
+    Ok(staging.to_path_buf())
 }
 
 /// Register an explicit Linux x86_64 Wine Runtime and return a context that
@@ -915,21 +966,31 @@ fn validate_then_bootstrap(
     command: &dyn ProbeCommand,
     operations: &dyn BootstrapOperations,
 ) -> Result<LinuxLocalContext, LinuxBootstrapError> {
-    let prepared = prepare_bootstrap(host_report, request, command)?;
-    let active = operations.active_digest(&prepared.roots.runtime_store, LOCAL_PREVIEW_PACK_ID)?;
-    if active
-        .as_deref()
-        .is_some_and(|digest| !digest.eq_ignore_ascii_case(&prepared.manifest.digest))
+    let owner = OwnerIdentity {
+        filesystem_uid: current_effective_uid()?,
+    };
+    let prepared = prepare_bootstrap(host_report, request, owner)?;
+    let initial_ref = observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)?;
+    if initial_ref
+        .state
+        .as_ref()
+        .is_some_and(|state| state.active_digest != prepared.manifest.digest)
     {
         return Err(LinuxBootstrapError::ConflictingActiveRef);
     }
+    probe_prepared(&prepared, command)?;
+    let revalidated = prepare_bootstrap(host_report, request, owner)?;
+    ensure_same_preflight(&prepared, &revalidated)?;
+    if observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)? != initial_ref {
+        return Err(LinuxBootstrapError::ConflictingActiveRef);
+    }
 
-    operations.prepare_store(&prepared.roots.runtime_store)?;
-    let staging = operations.create_staging(&prepared.roots.runtime_store)?;
+    operations.prepare_store(&prepared.roots.runtime_store, prepared.owner)?;
+    let staging = operations.create_staging(&prepared.roots.runtime_store, prepared.owner)?;
     let install_result = operations
         .populate_staging(&staging, &prepared)
         .and_then(|()| operations.install_pack(&prepared.roots.runtime_store, &staging, &prepared.manifest));
-    let cleanup_result = operations.cleanup_staging(&staging);
+    let cleanup_result = operations.cleanup_staging(&staging, prepared.owner);
     if let Err(error) = install_result {
         return cleanup_result.and(Err(error));
     }
@@ -946,7 +1007,11 @@ fn validate_then_bootstrap(
         return Err(LinuxBootstrapError::Provider(LinuxProviderError::ProviderUnavailable));
     }
 
-    operations.prepare_storage(&prepared.roots.storage)?;
+    let final_preflight = prepare_bootstrap(host_report, request, owner)?;
+    ensure_same_preflight(&prepared, &final_preflight)?;
+    require_expected_active_ref(&prepared)?;
+
+    operations.prepare_storage(&prepared.roots.storage, prepared.owner)?;
     let canonical_storage =
         fs::canonicalize(&prepared.roots.storage).map_err(|_| LinuxBootstrapError::InvalidRequest("storageRoot"))?;
     if canonical_storage != prepared.roots.storage {
@@ -955,6 +1020,7 @@ fn validate_then_bootstrap(
     if canonical_storage.as_os_str() != prepared.storage_text.as_str() {
         return Err(LinuxBootstrapError::InvalidRequest("storageRoot"));
     }
+    require_expected_active_ref(&prepared)?;
     let config = snapshot
         .core_config(prepared.storage_text)
         .map_err(LinuxBootstrapError::Provider)?;
@@ -972,10 +1038,22 @@ fn validate_then_bootstrap(
     })
 }
 
+fn require_expected_active_ref(prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+    let observation = observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)?;
+    if observation
+        .state
+        .as_ref()
+        .map_or(true, |state| state.active_digest != prepared.manifest.digest)
+    {
+        return Err(LinuxBootstrapError::ConflictingActiveRef);
+    }
+    Ok(())
+}
+
 fn prepare_bootstrap(
     host_report: &CapabilityReport,
     request: &LinuxLocalContextRequest,
-    command: &dyn ProbeCommand,
+    owner: OwnerIdentity,
 ) -> Result<PreparedBootstrap, LinuxBootstrapError> {
     request.validate().map_err(map_bootstrap_request_error)?;
     host_report.validate().map_err(LinuxBootstrapError::Contract)?;
@@ -985,18 +1063,17 @@ fn prepare_bootstrap(
     {
         return Err(LinuxBootstrapError::UnsupportedHost);
     }
-
     let store_request = Path::new(&request.runtime_store_root);
     validate_store_path_components(store_request)?;
     let runtime_store = resolve_destination(store_request, false, "runtimeStoreRoot")?;
     if runtime_store.existed {
-        validate_private_directory(&runtime_store.path, "runtimeStoreRoot")?;
+        validate_private_directory(&runtime_store.path, "runtimeStoreRoot", owner)?;
     }
-    validate_store_controls(&runtime_store.path)?;
+    validate_store_controls(&runtime_store.path, owner)?;
 
     let storage = resolve_destination(Path::new(&request.storage_root), false, "storageRoot")?;
     if storage.existed {
-        validate_private_directory(&storage.path, "storageRoot")?;
+        validate_private_directory(&storage.path, "storageRoot", owner)?;
     }
     let materialized = resolve_destination(Path::new(&request.materialized_root), true, "materializedRoot")?;
     require_disjoint_roots([&runtime_store.path, &storage.path, &materialized.path])?;
@@ -1004,6 +1081,8 @@ fn prepare_bootstrap(
     let store_text = validated_resolved_path(&runtime_store.path, "runtimeStoreRoot")?;
     let storage_text = validated_resolved_path(&storage.path, "storageRoot")?;
     let materialized_text = validated_resolved_path(&materialized.path, "materializedRoot")?;
+    let mount_snapshot = read_mount_snapshot()?;
+    require_physical_disjoint_roots([&store_text, &storage_text, &materialized_text], &mount_snapshot)?;
     let (wine, wine_source) = inspect_bootstrap_entrypoint(&materialized.path, &request.wine)?;
     let (wineserver, wineserver_source) = inspect_bootstrap_entrypoint(&materialized.path, &request.wineserver)?;
     validated_resolved_path(&wine_source, "wine canonical path")?;
@@ -1049,7 +1128,7 @@ fn prepare_bootstrap(
         .map_err(|_| LinuxBootstrapError::RegistrationFailed("manifest serialize"))?;
     manifest.digest = sha256_digest_bytes(&canonical_manifest);
     manifest.validate().map_err(LinuxBootstrapError::Contract)?;
-    validate_store_artifact_paths(&runtime_store.path, &manifest)?;
+    validate_store_artifact_paths(&runtime_store.path, &manifest, owner)?;
 
     let provider_config = LinuxProviderConfig {
         schema_version: SCHEMA_VERSION_V1.into(),
@@ -1068,25 +1147,46 @@ fn prepare_bootstrap(
         },
     };
     provider_config.validate().map_err(LinuxBootstrapError::Provider)?;
-    let observation = probe_runtime_with(&provider_config, command).map_err(map_bootstrap_probe_error)?;
-    if observation.wine != wine_source
-        || observation.wineserver != wineserver_source
-        || observation.version != request.version
-    {
-        return Err(LinuxBootstrapError::Evidence(EvidenceFailure::Version));
-    }
-
     Ok(PreparedBootstrap {
         roots: ResolvedBootstrapRoots {
             runtime_store: runtime_store.path,
             storage: storage.path,
         },
+        owner,
+        mount_snapshot,
         storage_text,
         wine_source,
         wineserver_source,
         provider_config,
         manifest,
     })
+}
+
+fn probe_prepared(prepared: &PreparedBootstrap, command: &dyn ProbeCommand) -> Result<(), LinuxBootstrapError> {
+    let observation = probe_runtime_with(&prepared.provider_config, command).map_err(map_bootstrap_probe_error)?;
+    if observation.wine != prepared.wine_source
+        || observation.wineserver != prepared.wineserver_source
+        || observation.version != prepared.provider_config.wine_runtime.version
+    {
+        return Err(LinuxBootstrapError::Evidence(EvidenceFailure::Version));
+    }
+    Ok(())
+}
+
+fn ensure_same_preflight(first: &PreparedBootstrap, second: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+    if first.roots.runtime_store != second.roots.runtime_store
+        || first.roots.storage != second.roots.storage
+        || first.storage_text != second.storage_text
+        || first.wine_source != second.wine_source
+        || first.wineserver_source != second.wineserver_source
+        || first.provider_config != second.provider_config
+        || first.manifest != second.manifest
+        || first.owner != second.owner
+        || first.mount_snapshot != second.mount_snapshot
+    {
+        return Err(LinuxBootstrapError::InvalidRequest("bootstrap evidence changed"));
+    }
+    Ok(())
 }
 
 fn map_bootstrap_request_error(error: LinuxProviderError) -> LinuxBootstrapError {
@@ -1180,7 +1280,7 @@ fn validate_store_path_components(path: &Path) -> Result<(), LinuxBootstrapError
     Ok(())
 }
 
-fn validate_store_controls(store_root: &Path) -> Result<(), LinuxBootstrapError> {
+fn validate_store_controls(store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
     for directory in [
         store_root.to_path_buf(),
         store_root.join("objects"),
@@ -1195,7 +1295,7 @@ fn validate_store_controls(store_root: &Path) -> Result<(), LinuxBootstrapError>
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
                 }
-                validate_private_metadata(&metadata, "runtimeStoreRoot")?;
+                validate_private_metadata(&metadata, "runtimeStoreRoot", owner)?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
@@ -1203,7 +1303,7 @@ fn validate_store_controls(store_root: &Path) -> Result<(), LinuxBootstrapError>
     }
     let staging_parent = store_root.join(BOOTSTRAP_STAGING_PARENT);
     match fs::symlink_metadata(&staging_parent) {
-        Ok(_) => validate_exact_private_directory(&staging_parent, "runtimeStoreRoot")?,
+        Ok(_) => validate_exact_private_directory(&staging_parent, "runtimeStoreRoot", owner)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
     }
@@ -1213,14 +1313,60 @@ fn validate_store_controls(store_root: &Path) -> Result<(), LinuxBootstrapError>
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
             }
-            validate_owned_metadata(&metadata, "runtimeStoreRoot")
+            validate_private_metadata(&metadata, "runtimeStoreRoot", owner)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
     }
 }
 
-fn validate_store_artifact_paths(store_root: &Path, manifest: &RuntimePackManifest) -> Result<(), LinuxBootstrapError> {
+fn observe_exact_active_ref(
+    store_root: &Path,
+    owner: OwnerIdentity,
+) -> Result<ActiveRefObservation, LinuxBootstrapError> {
+    let path = store_root.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ActiveRefObservation { raw: None, state: None });
+        }
+        Err(_) => return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_ACTIVE_REF_BYTES {
+        return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
+    }
+    validate_private_metadata(&metadata, "runtimeStoreRoot", owner)?;
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    File::open(&path)
+        .and_then(|file| file.take(MAX_ACTIVE_REF_BYTES + 1).read_to_end(&mut raw))
+        .map_err(|_| LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"))?;
+    if raw.len() as u64 > MAX_ACTIVE_REF_BYTES {
+        return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
+    }
+    let state: ExactActiveRef =
+        serde_json::from_slice(&raw).map_err(|_| LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"))?;
+    if state.schema_version != SCHEMA_VERSION_V1
+        || state.pack_id != LOCAL_PREVIEW_PACK_ID
+        || validate_digest("runtimePack.digest", &state.active_digest).is_err()
+        || state.history.len() > MAX_ACTIVATION_HISTORY
+        || state
+            .history
+            .iter()
+            .any(|digest| validate_digest("runtimePack.history.digest", digest).is_err())
+    {
+        return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
+    }
+    Ok(ActiveRefObservation {
+        raw: Some(raw),
+        state: Some(state),
+    })
+}
+
+fn validate_store_artifact_paths(
+    store_root: &Path,
+    manifest: &RuntimePackManifest,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
     let mut paths = manifest
         .components
         .iter()
@@ -1240,7 +1386,7 @@ fn validate_store_artifact_paths(store_root: &Path, manifest: &RuntimePackManife
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
             }
-            Ok(metadata) => validate_owned_metadata(&metadata, "runtimeStoreRoot")?,
+            Ok(metadata) => validate_private_metadata(&metadata, "runtimeStoreRoot", owner)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
         }
@@ -1248,15 +1394,31 @@ fn validate_store_artifact_paths(store_root: &Path, manifest: &RuntimePackManife
     Ok(())
 }
 
-fn validate_private_directory(path: &Path, field: &'static str) -> Result<(), LinuxBootstrapError> {
+fn validate_private_directory(
+    path: &Path,
+    field: &'static str,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| LinuxBootstrapError::InvalidRequest(field))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(LinuxBootstrapError::InvalidRequest(field));
     }
-    validate_private_metadata(&metadata, field)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.mode() & 0o700 != 0o700 {
+            return Err(LinuxBootstrapError::InvalidRequest(field));
+        }
+    }
+    validate_private_metadata(&metadata, field, owner)
 }
 
-fn validate_private_metadata(metadata: &fs::Metadata, field: &'static str) -> Result<(), LinuxBootstrapError> {
+fn validate_private_metadata(
+    metadata: &fs::Metadata,
+    field: &'static str,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1265,21 +1427,25 @@ fn validate_private_metadata(metadata: &fs::Metadata, field: &'static str) -> Re
             return Err(LinuxBootstrapError::InvalidRequest(field));
         }
     }
-    validate_owned_metadata(metadata, field)?;
-    let _ = (metadata, field);
+    validate_owned_metadata(metadata, field, owner)?;
+    let _ = (metadata, field, owner);
     Ok(())
 }
 
-fn validate_owned_metadata(metadata: &fs::Metadata, field: &'static str) -> Result<(), LinuxBootstrapError> {
+fn validate_owned_metadata(
+    metadata: &fs::Metadata,
+    field: &'static str,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
 
-        if metadata.uid() != current_effective_uid()? {
+        if metadata.uid() != owner.filesystem_uid {
             return Err(LinuxBootstrapError::InvalidRequest(field));
         }
     }
-    let _ = (metadata, field);
+    let _ = (metadata, field, owner);
     Ok(())
 }
 
@@ -1287,7 +1453,7 @@ fn validate_owned_metadata(metadata: &fs::Metadata, field: &'static str) -> Resu
 fn current_effective_uid() -> Result<u32, LinuxBootstrapError> {
     const MAX_STATUS_BYTES: u64 = 64 * 1024;
 
-    let status = File::open("/proc/self/status")
+    let status = File::open("/proc/thread-self/status")
         .map(|file| file.take(MAX_STATUS_BYTES + 1))
         .and_then(|mut file| {
             let mut status = String::new();
@@ -1300,6 +1466,11 @@ fn current_effective_uid() -> Result<u32, LinuxBootstrapError> {
     parse_effective_uid(&status).ok_or(LinuxBootstrapError::InvalidRequest("private directory owner"))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn current_effective_uid() -> Result<u32, LinuxBootstrapError> {
+    Ok(0)
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn parse_effective_uid(status: &str) -> Option<u32> {
     let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
@@ -1309,13 +1480,13 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
     }
     let mut fields = uid_line.split_whitespace();
     let _real = fields.next()?.parse::<u32>().ok()?;
-    let effective = fields.next()?.parse::<u32>().ok()?;
+    let _effective = fields.next()?.parse::<u32>().ok()?;
     let _saved = fields.next()?.parse::<u32>().ok()?;
-    let _filesystem = fields.next()?.parse::<u32>().ok()?;
+    let filesystem = fields.next()?.parse::<u32>().ok()?;
     if fields.next().is_some() {
         return None;
     }
-    Some(effective)
+    Some(filesystem)
 }
 
 fn require_disjoint_roots(roots: [&Path; 3]) -> Result<(), LinuxBootstrapError> {
@@ -1326,6 +1497,158 @@ fn require_disjoint_roots(roots: [&Path; 3]) -> Result<(), LinuxBootstrapError> 
                 || roots[right].starts_with(roots[left])
             {
                 return Err(LinuxBootstrapError::InvalidRequest("runtime/storage root overlap"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn decode_mountinfo_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let octal = bytes.get(index + 1..index + 4)?;
+            if !octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                return None;
+            }
+            decoded.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_mountinfo(contents: &str) -> Option<Vec<MountEntry>> {
+    let mut entries = Vec::new();
+    for line in contents.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let separator = fields.iter().position(|field| *field == "-")?;
+        if separator < 6 || separator + 3 >= fields.len() {
+            return None;
+        }
+        let device = fields[2];
+        device.split_once(':')?;
+        let root = decode_mountinfo_path(fields[3])?;
+        let mount_point = decode_mountinfo_path(fields[4])?;
+        if !serialized_linux_absolute_path(&root) && root != "/" {
+            return None;
+        }
+        if !serialized_linux_absolute_path(&mount_point) && mount_point != "/" {
+            return None;
+        }
+        entries.push(MountEntry {
+            device: device.to_owned(),
+            root,
+            mount_point,
+            read_only: fields[5].split(',').any(|option| option == "ro")
+                || fields[separator + 3].split(',').any(|option| option == "ro"),
+        });
+    }
+    (!entries.is_empty()).then_some(entries)
+}
+
+fn linux_path_contains(parent: &str, child: &str) -> bool {
+    parent == "/" || child == parent || child.strip_prefix(parent).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn physical_identity(path: &str, entries: &[MountEntry]) -> Option<PhysicalIdentity> {
+    let mount = entries
+        .iter()
+        .filter(|entry| linux_path_contains(&entry.mount_point, path))
+        .max_by_key(|entry| entry.mount_point.len())?;
+    let relative = if mount.mount_point == "/" {
+        path.trim_start_matches('/')
+    } else {
+        path.strip_prefix(&mount.mount_point)?.trim_start_matches('/')
+    };
+    let physical_path = if relative.is_empty() {
+        mount.root.clone()
+    } else if mount.root == "/" {
+        format!("/{relative}")
+    } else {
+        format!("{}/{relative}", mount.root.trim_end_matches('/'))
+    };
+    Some(PhysicalIdentity {
+        device: mount.device.clone(),
+        path: physical_path,
+    })
+}
+
+fn read_mount_snapshot() -> Result<MountSnapshot, LinuxBootstrapError> {
+    #[cfg(target_os = "linux")]
+    {
+        const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
+        let mut raw = String::new();
+        File::open("/proc/self/mountinfo")
+            .map(|file| file.take(MAX_MOUNTINFO_BYTES + 1))
+            .and_then(|mut file| file.read_to_string(&mut raw))
+            .map_err(|_| LinuxBootstrapError::InvalidRequest("mount topology"))?;
+        if raw.len() as u64 > MAX_MOUNTINFO_BYTES {
+            return Err(LinuxBootstrapError::InvalidRequest("mount topology"));
+        }
+        let entries = parse_mountinfo(&raw).ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
+        Ok(MountSnapshot {
+            raw_digest: sha256_digest_bytes(raw.as_bytes()),
+            entries,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(MountSnapshot {
+            raw_digest: "non-linux".into(),
+            entries: Vec::new(),
+        })
+    }
+}
+
+fn require_physical_disjoint_roots(
+    roots: [&str; 3],
+    mount_snapshot: &MountSnapshot,
+) -> Result<(), LinuxBootstrapError> {
+    if mount_snapshot.entries.is_empty() {
+        return Ok(());
+    }
+    let identities = roots
+        .map(|root| physical_identity(root, &mount_snapshot.entries))
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
+    if roots.iter().any(|root| {
+        mount_snapshot
+            .entries
+            .iter()
+            .filter(|entry| linux_path_contains(&entry.mount_point, root))
+            .max_by_key(|entry| entry.mount_point.len())
+            .map_or(true, |entry| entry.read_only)
+    }) {
+        return Err(LinuxBootstrapError::InvalidRequest("read-only destination"));
+    }
+    for left in 0..identities.len() {
+        for right in (left + 1)..identities.len() {
+            if identities[left].device == identities[right].device
+                && (linux_path_contains(&identities[left].path, &identities[right].path)
+                    || linux_path_contains(&identities[right].path, &identities[left].path))
+            {
+                return Err(LinuxBootstrapError::InvalidRequest("runtime/storage root overlap"));
+            }
+        }
+    }
+    let store = roots[0];
+    for entry in &mount_snapshot.entries {
+        if entry.mount_point != store && linux_path_contains(store, &entry.mount_point) {
+            let relative = entry.mount_point[store.len()..].trim_start_matches('/');
+            if ["objects", "manifests", "refs", BOOTSTRAP_STAGING_PARENT]
+                .iter()
+                .any(|control| relative == *control || relative.starts_with(&format!("{control}/")))
+            {
+                return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
             }
         }
     }
@@ -1361,9 +1684,13 @@ fn inspect_bootstrap_entrypoint(
     Ok((entrypoint, canonical))
 }
 
-fn create_private_directory_tree(path: &Path, field: &'static str) -> Result<(), LinuxBootstrapError> {
+fn create_private_directory_tree(
+    path: &Path,
+    field: &'static str,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => return validate_private_directory(path, field),
+        Ok(_) => return validate_private_directory(path, field, owner),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return Err(LinuxBootstrapError::InvalidRequest(field)),
     }
@@ -1390,14 +1717,14 @@ fn create_private_directory_tree(path: &Path, field: &'static str) -> Result<(),
     }
     for directory in missing.into_iter().rev() {
         match create_new_private_directory(&directory) {
-            Ok(()) => validate_new_private_directory(&directory, field)?,
+            Ok(()) => validate_new_private_directory(&directory, field, owner)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                validate_private_directory(&directory, field)?
+                validate_private_directory(&directory, field, owner)?
             }
             Err(_) => return Err(LinuxBootstrapError::RegistrationFailed("private directory create")),
         }
     }
-    validate_private_directory(path, field)
+    validate_private_directory(path, field, owner)
 }
 
 fn create_new_private_directory(path: &Path) -> io::Result<()> {
@@ -1415,12 +1742,20 @@ fn create_new_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn validate_new_private_directory(path: &Path, field: &'static str) -> Result<(), LinuxBootstrapError> {
-    validate_exact_private_directory(path, field)
+fn validate_new_private_directory(
+    path: &Path,
+    field: &'static str,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
+    validate_exact_private_directory(path, field, owner)
 }
 
-fn validate_exact_private_directory(path: &Path, field: &'static str) -> Result<(), LinuxBootstrapError> {
-    validate_private_directory(path, field)?;
+fn validate_exact_private_directory(
+    path: &Path,
+    field: &'static str,
+    owner: OwnerIdentity,
+) -> Result<(), LinuxBootstrapError> {
+    validate_private_directory(path, field, owner)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1480,7 +1815,7 @@ fn new_private_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn remove_owned_staging_directory(staging: &Path) -> Result<(), LinuxBootstrapError> {
+fn remove_owned_staging_directory(staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
     let name = staging
         .file_name()
         .and_then(|name| name.to_str())
@@ -1505,7 +1840,7 @@ fn remove_owned_staging_directory(staging: &Path) -> Result<(), LinuxBootstrapEr
     let canonical_parent = canonical
         .parent()
         .ok_or(LinuxBootstrapError::RegistrationFailed("staging cleanup"))?;
-    validate_exact_private_directory(&parent, "runtimeStoreRoot")?;
+    validate_exact_private_directory(&parent, "runtimeStoreRoot", owner)?;
     if canonical_parent != parent || canonical.file_name() != staging.file_name() {
         return Err(LinuxBootstrapError::RegistrationFailed("staging cleanup"));
     }
@@ -2744,6 +3079,38 @@ int main(void) {
     }
 
     #[test]
+    fn mountinfo_identity_detects_bind_aliases_and_descendants() {
+        let entries = parse_mountinfo(
+            "24 1 8:1 / / rw - ext4 /dev/root rw\n\
+             25 24 8:1 /runtime/source /private/runtime rw - ext4 /dev/root rw\n\
+             26 24 8:1 /runtime/source /private/store rw - ext4 /dev/root rw\n\
+             27 24 8:1 /runtime/source/child /private/storage rw - ext4 /dev/root rw\n",
+        )
+        .expect("parse bounded mountinfo fixture");
+        let snapshot = MountSnapshot {
+            raw_digest: "fixture".into(),
+            entries,
+        };
+        assert!(
+            require_physical_disjoint_roots(["/private/store", "/private/other", "/private/runtime"], &snapshot)
+                .is_err()
+        );
+        assert!(
+            require_physical_disjoint_roots(["/private/store", "/private/storage", "/private/other"], &snapshot)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mountinfo_parser_is_bounded_and_fail_closed() {
+        assert!(parse_mountinfo("not mountinfo").is_none());
+        let escaped = parse_mountinfo("24 1 8:1 /source\\040dir /mount\\040point rw - ext4 /dev/root rw\n")
+            .expect("parse escaped mount paths");
+        assert_eq!(escaped[0].root, "/source dir");
+        assert_eq!(escaped[0].mount_point, "/mount point");
+    }
+
+    #[test]
     fn configuration_rejects_every_closed_contract_mutation() {
         let mut value = valid_config_json();
         value["unexpected"] = serde_json::json!(true);
@@ -3218,15 +3585,11 @@ int main(void) {
     }
 
     impl BootstrapOperations for RecordingBootstrapOperations {
-        fn active_digest(&self, _store_root: &Path, _pack_id: &str) -> Result<Option<String>, LinuxBootstrapError> {
-            self.record("active-ref-read")
-        }
-
-        fn prepare_store(&self, _store_root: &Path) -> Result<(), LinuxBootstrapError> {
+        fn prepare_store(&self, _store_root: &Path, _owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             self.record("store-create")
         }
 
-        fn create_staging(&self, _store_root: &Path) -> Result<PathBuf, LinuxBootstrapError> {
+        fn create_staging(&self, _store_root: &Path, _owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
             self.record("staging-create")
         }
 
@@ -3243,11 +3606,11 @@ int main(void) {
             self.record("pack-install")
         }
 
-        fn cleanup_staging(&self, _staging: &Path) -> Result<(), LinuxBootstrapError> {
+        fn cleanup_staging(&self, _staging: &Path, _owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             self.record("staging-cleanup")
         }
 
-        fn prepare_storage(&self, _storage_root: &Path) -> Result<(), LinuxBootstrapError> {
+        fn prepare_storage(&self, _storage_root: &Path, _owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             self.record("storage-create")
         }
     }
@@ -3294,7 +3657,17 @@ int main(void) {
             };
             fs::create_dir_all(&target).expect("create non-file Store artifact");
 
-            assert!(validate_store_artifact_paths(&store, &manifest).is_err(), "{kind}");
+            assert!(
+                validate_store_artifact_paths(
+                    &store,
+                    &manifest,
+                    OwnerIdentity {
+                        filesystem_uid: current_effective_uid().unwrap()
+                    }
+                )
+                .is_err(),
+                "{kind}"
+            );
         }
     }
 
@@ -3302,7 +3675,7 @@ int main(void) {
     fn bootstrap_effective_uid_parser_is_closed() {
         assert_eq!(
             parse_effective_uid("Name:\ttest\nUid:\t1000\t1001\t1002\t1003\nGid:\t5\t6\t7\t8\n"),
-            Some(1001)
+            Some(1003)
         );
         for malformed in [
             "Name:\ttest\n",
@@ -3313,6 +3686,74 @@ int main(void) {
         ] {
             assert_eq!(parse_effective_uid(malformed), None, "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn bootstrap_exact_active_ref_rejects_wrong_pack_and_duplicate_fields() {
+        for (label, contents) in [
+            (
+                "wrong-pack",
+                format!(
+                    r#"{{"schemaVersion":"1","packId":"wrong-pack","activeDigest":"sha256:{}","history":[]}}"#,
+                    "a".repeat(64)
+                ),
+            ),
+            (
+                "duplicate",
+                format!(
+                    r#"{{"schemaVersion":"1","packId":"{LOCAL_PREVIEW_PACK_ID}","packId":"{LOCAL_PREVIEW_PACK_ID}","activeDigest":"sha256:{}","history":[]}}"#,
+                    "a".repeat(64)
+                ),
+            ),
+        ] {
+            let fixture = DirectoryFixture::new(label);
+            let store = fixture.root.join("store");
+            let reference = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+            fs::create_dir_all(reference.parent().unwrap()).expect("create ref parent");
+            fs::write(&reference, contents).expect("write malformed exact ref");
+            assert!(
+                observe_exact_active_ref(
+                    &store,
+                    OwnerIdentity {
+                        filesystem_uid: current_effective_uid().unwrap()
+                    }
+                )
+                .is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_staging_post_create_failure_removes_only_the_empty_directory() {
+        let fixture = DirectoryFixture::new("staging-post-create");
+        let staging = fixture.root.join(".compatforge-bootstrap-injected");
+        fs::create_dir(&staging).expect("create exclusive staging fixture");
+        let result = accept_created_staging(
+            &staging,
+            OwnerIdentity {
+                filesystem_uid: current_effective_uid().unwrap(),
+            },
+            &|_, _, _| Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
+        );
+        assert_eq!(result, Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")));
+        assert!(!staging.exists());
+        assert!(fixture.root.exists());
+
+        let nonempty = fixture.root.join(".compatforge-bootstrap-nonempty");
+        fs::create_dir(&nonempty).expect("create second exclusive staging fixture");
+        fs::write(nonempty.join("attacker-file"), b"do not recursively remove").unwrap();
+        assert_eq!(
+            accept_created_staging(
+                &nonempty,
+                OwnerIdentity {
+                    filesystem_uid: current_effective_uid().unwrap(),
+                },
+                &|_, _, _| Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot")),
+            ),
+            Err(LinuxBootstrapError::RegistrationFailed("staging cleanup"))
+        );
+        assert!(nonempty.join("attacker-file").exists());
     }
 
     #[test]
@@ -3565,16 +4006,12 @@ int main(void) {
 
     #[cfg(target_os = "linux")]
     impl BootstrapOperations for FaultingBootstrapOperations {
-        fn active_digest(&self, store_root: &Path, pack_id: &str) -> Result<Option<String>, LinuxBootstrapError> {
-            self.system.active_digest(store_root, pack_id)
+        fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.prepare_store(store_root, owner)
         }
 
-        fn prepare_store(&self, store_root: &Path) -> Result<(), LinuxBootstrapError> {
-            self.system.prepare_store(store_root)
-        }
-
-        fn create_staging(&self, store_root: &Path) -> Result<PathBuf, LinuxBootstrapError> {
-            self.system.create_staging(store_root)
+        fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
+            self.system.create_staging(store_root, owner)
         }
 
         fn populate_staging(&self, staging: &Path, prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
@@ -3604,19 +4041,19 @@ int main(void) {
             self.system.install_pack(store_root, staging, manifest)
         }
 
-        fn cleanup_staging(&self, staging: &Path) -> Result<(), LinuxBootstrapError> {
+        fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             if matches!(self.fault, BootstrapFault::StagingCleanup) {
                 Err(LinuxBootstrapError::RegistrationFailed("staging cleanup"))
             } else {
-                self.system.cleanup_staging(staging)
+                self.system.cleanup_staging(staging, owner)
             }
         }
 
-        fn prepare_storage(&self, storage_root: &Path) -> Result<(), LinuxBootstrapError> {
+        fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             if matches!(self.fault, BootstrapFault::Storage) {
                 Err(LinuxBootstrapError::RegistrationFailed("storage create"))
             } else {
-                self.system.prepare_storage(storage_root)
+                self.system.prepare_storage(storage_root, owner)
             }
         }
     }
@@ -3629,16 +4066,12 @@ int main(void) {
 
     #[cfg(target_os = "linux")]
     impl BootstrapOperations for MutateEntrypointAfterInstallOperations {
-        fn active_digest(&self, store_root: &Path, pack_id: &str) -> Result<Option<String>, LinuxBootstrapError> {
-            self.system.active_digest(store_root, pack_id)
+        fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.prepare_store(store_root, owner)
         }
 
-        fn prepare_store(&self, store_root: &Path) -> Result<(), LinuxBootstrapError> {
-            self.system.prepare_store(store_root)
-        }
-
-        fn create_staging(&self, store_root: &Path) -> Result<PathBuf, LinuxBootstrapError> {
-            self.system.create_staging(store_root)
+        fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
+            self.system.create_staging(store_root, owner)
         }
 
         fn populate_staging(&self, staging: &Path, prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
@@ -3654,14 +4087,14 @@ int main(void) {
             self.system.install_pack(store_root, staging, manifest)
         }
 
-        fn cleanup_staging(&self, staging: &Path) -> Result<(), LinuxBootstrapError> {
-            self.system.cleanup_staging(staging)?;
+        fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.cleanup_staging(staging, owner)?;
             fs::write(&self.entrypoint, b"mutated after Pack installation")
                 .map_err(|_| LinuxBootstrapError::RegistrationFailed("test mutation"))
         }
 
-        fn prepare_storage(&self, storage_root: &Path) -> Result<(), LinuxBootstrapError> {
-            self.system.prepare_storage(storage_root)
+        fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            self.system.prepare_storage(storage_root, owner)
         }
     }
 
@@ -3853,6 +4286,97 @@ int main(void) {
     }
 
     #[cfg(target_os = "linux")]
+    struct RefDeletingProbeCommand {
+        system: SystemProbeCommand,
+        calls: RefCell<usize>,
+        mutate_after_call: usize,
+        active_ref: PathBuf,
+        replace_with_wrong_pack: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProbeCommand for RefDeletingProbeCommand {
+        fn run(&self, specification: &ProbeCommandSpec) -> Result<ProbeCommandOutput, ProbeCommandFailure> {
+            let output = self.system.run(specification)?;
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls == self.mutate_after_call {
+                if self.replace_with_wrong_pack {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&self.active_ref).expect("malicious helper reads active ref"))
+                            .unwrap();
+                    value["packId"] = serde_json::json!("wrong-pack");
+                    fs::write(&self.active_ref, serde_json::to_vec(&value).unwrap())
+                        .expect("malicious helper replaces active ref");
+                } else {
+                    fs::remove_file(&self.active_ref).expect("malicious helper deletes active ref");
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_detects_active_ref_deletion_during_either_probe_round() {
+        for (label, mutate_after_call, seed_ref, replace) in
+            [("first-delete", 1, true, false), ("second-replace", 3, false, true)]
+        {
+            let fixture = LinuxPublicProviderFixture::new();
+            let store = fixture.directory.root.join(format!("{label}-probe-ref-store"));
+            let storage = fixture.directory.root.join(format!("{label}-probe-ref-storage"));
+            let request = bootstrap_request(&fixture, &store, &storage);
+            if seed_ref {
+                create_local_context(&fixture.host, &request).expect("seed same-digest active ref");
+            }
+            let active_ref = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+            let command = RefDeletingProbeCommand {
+                system: SystemProbeCommand,
+                calls: RefCell::new(0),
+                mutate_after_call,
+                active_ref: active_ref.clone(),
+                replace_with_wrong_pack: replace,
+            };
+
+            let result = create_local_context_with(&fixture.host, &request, &command);
+
+            assert!(result.is_err(), "{label} probe mutation must not return Context");
+            assert_eq!(
+                active_ref.exists(),
+                replace,
+                "malicious mutation occurred in {label} round"
+            );
+            if !seed_ref {
+                assert!(!storage.exists(), "second-round mutation must not produce Storage");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_same_digest_ref_with_wrong_pack_before_probe_or_mutation() {
+        let fixture = LinuxPublicProviderFixture::new();
+        let store = fixture.directory.root.join("wrong-pack-ref-store");
+        let storage = fixture.directory.root.join("wrong-pack-ref-storage");
+        let request = bootstrap_request(&fixture, &store, &storage);
+        create_local_context(&fixture.host, &request).expect("seed exact active ref");
+        let active_ref = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&active_ref).expect("read seeded active ref")).unwrap();
+        value["packId"] = serde_json::json!("wrong-pack");
+        fs::write(&active_ref, serde_json::to_vec_pretty(&value).unwrap()).expect("replace ref packId");
+        let before = snapshot_tree(&fixture.directory.root);
+
+        let result = create_local_context_with(&fixture.host, &request, &PanicProbeCommand);
+
+        assert!(matches!(
+            result,
+            Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"))
+        ));
+        assert_eq!(snapshot_tree(&fixture.directory.root), before);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn bootstrap_rejects_unsafe_store_control_paths() {
         use std::os::unix::fs::{symlink, PermissionsExt};
@@ -3938,6 +4462,46 @@ int main(void) {
             );
             assert_eq!(snapshot_tree(&fixture.directory.root), before, "{label}");
             assert!(!store.exists(), "{label}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_non_writable_storage_and_writable_store_files_before_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = LinuxPublicProviderFixture::new();
+        let store = fixture.directory.root.join("permission-store");
+        let storage = fixture.directory.root.join("permission-storage");
+        fs::create_dir(&storage).expect("create storage");
+        fs::set_permissions(&storage, fs::Permissions::from_mode(0o500)).expect("make storage non-writable");
+        let request = bootstrap_request(&fixture, &store, &storage);
+        let before = snapshot_tree(&fixture.directory.root);
+        assert!(create_local_context(&fixture.host, &request).is_err());
+        assert_eq!(snapshot_tree(&fixture.directory.root), before);
+        assert!(!store.exists());
+
+        for artifact in ["ref", "object", "manifest"] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let store = fixture.directory.root.join(format!("writable-{artifact}-store"));
+            let storage = fixture.directory.root.join(format!("writable-{artifact}-storage"));
+            let request = bootstrap_request(&fixture, &store, &storage);
+            let local = create_local_context(&fixture.host, &request).expect("seed exact bootstrap");
+            let path = match artifact {
+                "ref" => store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json"),
+                "object" => store
+                    .join("objects/sha256")
+                    .join(fixture.config.wine_runtime.wine.digest.trim_start_matches("sha256:")),
+                "manifest" => store.join("manifests/sha256").join(format!(
+                    "{}.json",
+                    local.receipt.pack_digest.trim_start_matches("sha256:")
+                )),
+                _ => unreachable!(),
+            };
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("make Store file writable");
+            let before = snapshot_tree(&fixture.directory.root);
+            assert!(create_local_context(&fixture.host, &request).is_err(), "{artifact}");
+            assert_eq!(snapshot_tree(&fixture.directory.root), before, "{artifact}");
         }
     }
 
