@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/linux-bootstrap-request.schema.json",
+  "title": "CompatForge Linux Local Context Bootstrap Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runtimeStoreRoot",
+    "storageRoot",
+    "materializedRoot",
+    "wine",
+    "wineserver",
+    "version"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "1"},
+    "runtimeStoreRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
+    "storageRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
+    "materializedRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
+    "wine": {"$ref": "#/$defs/relativePath"},
+    "wineserver": {"$ref": "#/$defs/relativePath"},
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[0-9][0-9A-Za-z._+-]{0,127}$"
+    }
+  },
+  "$defs": {
+    "absoluteLinuxPath": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 4096,
+      "pattern": "^/(?!\\.\\.?(?:/|$))(?!.*(?:/\\.\\.?)(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\u0000\\r\\n])[^/]+(?:/[^/]+)*$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*[\\\\:])(?!.*[\\u0000\\r\\n])[^/]+(?:/[^/]+)*$"
+    }
+  }
+}
