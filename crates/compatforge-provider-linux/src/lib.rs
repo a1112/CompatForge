@@ -110,6 +110,9 @@ impl LinuxProviderConfig {
 impl WineRuntimeConfig {
     fn validate(&self) -> Result<(), LinuxProviderError> {
         validate_linux_id("wineRuntime.providerId", &self.provider_id)?;
+        if matches!(self.provider_id.as_str(), NATIVE_PROVIDER_ID | WINED3D_PROVIDER_ID) {
+            return Err(LinuxProviderError::InvalidConfig("wineRuntime.providerId"));
+        }
         validate_linux_id("wineRuntime.packId", &self.pack_id)?;
         validate_linux_digest("wineRuntime.packDigest", &self.pack_digest)?;
         if !valid_version(&self.version) {
@@ -422,6 +425,7 @@ impl LinuxProviderSnapshot {
         {
             return Err(LinuxProviderError::InvalidConfig("storageRoot"));
         }
+        let canonical_storage_text = validated_canonical_storage_text(&canonical_storage)?;
         let protected_roots = self
             .protected_roots
             .as_ref()
@@ -437,12 +441,21 @@ impl LinuxProviderSnapshot {
             schema_version: compatforge_domain::SCHEMA_VERSION_V1.into(),
             capabilities: self.capabilities.clone(),
             runtime_bindings: vec![runtime_binding],
-            storage_root: canonical_storage.to_string_lossy().into_owned(),
+            storage_root: canonical_storage_text.to_owned(),
             sandbox_profile: compatforge_domain::SandboxProfile::Desktop,
             supervisor: compatforge_domain::SupervisorPolicy::default(),
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+fn validated_canonical_storage_text(path: &Path) -> Result<&str, LinuxProviderError> {
+    let value = path.to_str().ok_or(LinuxProviderError::InvalidConfig("storageRoot"))?;
+    if serialized_linux_absolute_path(value) {
+        Ok(value)
+    } else {
+        Err(LinuxProviderError::InvalidConfig("storageRoot"))
     }
 }
 
@@ -1321,6 +1334,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reserved_descriptor_ids_fail_before_provider_evidence() {
+        let host = linux_host_report();
+        for provider_id in [NATIVE_PROVIDER_ID, WINED3D_PROVIDER_ID] {
+            let mut config = valid_config();
+            config.wine_runtime.provider_id = provider_id.into();
+            assert_eq!(
+                config.validate(),
+                Err(LinuxProviderError::InvalidConfig("wineRuntime.providerId"))
+            );
+            assert_eq!(
+                LinuxProviderSet::probe_with(&host, &config, &PanicProbeCommand),
+                Err(LinuxProviderError::InvalidConfig("wineRuntime.providerId"))
+            );
+            assert_eq!(
+                build_provider_snapshot(&host, &config, Err(EvidenceFailure::Command)),
+                Err(LinuxProviderError::InvalidConfig("wineRuntime.providerId")),
+                "an evidence failure must not be replaced by a duplicate Provider ID contract error"
+            );
+        }
+    }
+
     fn successful_snapshot() -> (LinuxProviderConfig, LinuxProviderSnapshot) {
         let config = valid_config();
         let snapshot = build_provider_snapshot(&linux_host_report(), &config, Ok(successful_bound_evidence(&config)))
@@ -1485,6 +1520,43 @@ mod tests {
         let public_receipt = serde_json::to_string(&receipt).unwrap();
         assert!(!public_receipt.contains("/private/provider-store"));
         assert!(!public_receipt.contains("/private/provider-runtime"));
+    }
+
+    #[test]
+    fn canonical_storage_text_rejects_linux_separator_confusion() {
+        assert_eq!(
+            validated_canonical_storage_text(Path::new("/private/storage\\alias")),
+            Err(LinuxProviderError::InvalidConfig("storageRoot"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core_config_rejects_non_utf8_and_backslash_canonical_storage() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = DirectoryFixture::new("canonical-storage-text");
+        let (_config, snapshot) = successful_snapshot();
+
+        let non_utf8_target = fixture.root.join(OsString::from_vec(b"storage-non-utf8-\xff".to_vec()));
+        fs::create_dir(&non_utf8_target).expect("create non-UTF-8 storage target");
+        let non_utf8_link = fixture.root.join("non-utf8-storage-link");
+        symlink(&non_utf8_target, &non_utf8_link).expect("link non-UTF-8 storage target");
+        assert_eq!(
+            snapshot.core_config(non_utf8_link.to_string_lossy().into_owned()),
+            Err(LinuxProviderError::InvalidConfig("storageRoot"))
+        );
+
+        let backslash_target = fixture.root.join("storage\\alias");
+        fs::create_dir(&backslash_target).expect("create backslash storage target");
+        let backslash_link = fixture.root.join("backslash-storage-link");
+        symlink(&backslash_target, &backslash_link).expect("link backslash storage target");
+        assert_eq!(
+            snapshot.core_config(backslash_link.to_string_lossy().into_owned()),
+            Err(LinuxProviderError::InvalidConfig("storageRoot"))
+        );
     }
 
     #[cfg(target_os = "linux")]
