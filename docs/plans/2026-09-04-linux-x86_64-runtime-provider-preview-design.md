@@ -162,6 +162,10 @@ Receipt 不包含 Runtime、Storage、Wine、Wineserver、临时目录或输出�
 - 复验 Store manifest 及其全部对象；
 - 复验外部物化入口的 containment、类型、权限、摘要、ELF 与版本。
 
+Preview Pack 只绑定两个入口文件，不绑定 Wine 随后加载的 ntdll、Unix/Windows DLL 或其他共享库。因此公开 canary summary 必须记录 runtimeEvidenceScope: entrypoints-only 与 runtimeTreeValidated: false。完整 Runtime 树清单、FD-pinned Runtime 执行和跨进程 Store 锁均留给正式 materializer 检查点；本检查点不得把入口证据描述成整个 Runtime 不可变。
+
+Provider 使用显式 packDigest 读取并复验 manifest/object，不依赖该 Pack ID 当前的 active ref。即使 active ref 后来指向另一 digest，本次 Context 也只能继续使用显式 pin；对应行为必须有负向测试。
+
 ## 入口与版本复验
 
 在执行任何 Provider 入口前必须完成：
@@ -189,8 +193,12 @@ Receipt 不包含 Runtime、Storage、Wine、Wineserver、临时目录或输出�
 - COMPATFORGE_WINESERVER_EXECUTABLE_SHA256
 - WINEDEBUG=-all
 - WINESERVER=<canonical absolute path>
+- WINEARCH=win64
+- WINEDLLOVERRIDES=mscoree,mshtml=
 
-Pack ID/digest 与入口 digest 均进入不可变绑定。PreparedLaunch 在真正 spawn 前重新编译与授权计划，并由现有 Guest/Runtime 复验拒绝引导后发生的内容替换。
+Pack ID/digest 与入口 digest 均进入绑定。PreparedLaunch 在每次命令中重新准备并授权 Guest 与 CoreConfig；Runtime 入口的最终摘要检查发生在 ProcessSupervisor::start、位于进程创建之前。Runtime Store manifest/object 不会在该 spawn 边界再次复验，完整外部 Runtime 树也未被固定，所以证据必须保持 Preview 限定。
+
+WINESERVER 环境值必须与 lifecycle 中的 Wineserver 绝对路径相同；Pack ID/digest 环境值必须与 LaunchPlan.runtime 相同；Wine/Wineserver 摘要环境值必须成对出现。任一不变量不成立都必须在 spawn 前失败。
 
 ## Console canary Runner
 
@@ -212,12 +220,17 @@ Runner 不下载工具或 Runtime，不扫描 PATH，也不在仓库内写证据
 5. 调用 local linux context，保存公开 bootstrap receipt 与私有 context；
 6. 写入摘要绑定、无参数、无额外环境、networkPolicy: deny 的 LaunchRequest；
 7. 把 supervisor.maximumRuntimeMilliseconds 固定为 60,000；
-8. 运行 prepared-plan 并保存计划；
-9. 运行 prepared-launch 并保存 RuntimeEvent JSONL；
-10. 复验事件顺序、stdout marker、退出码和 cleanup；
-11. 生成无路径 public summary。
+8. 运行 prepared-plan，保存 canonical plan 与 planDigest；
+9. 记录 Context、Request 与 Guest 的执行前摘要；
+10. 运行 prepared-launch 并保存 RuntimeEvent JSONL；
+11. 再次计算输入摘要并重新运行 prepared-plan，要求执行前后 canonical plan 完全相同；
+12. 对固定 Wineserver/WINEPREFIX 执行有界 -w rendezvous，并用 Linux /proc 与进程组观察确认无受管残留；
+13. 复验事件顺序、stdout marker、退出码和 cleanup；
+14. 生成无路径 public summary。
 
 networkPolicy: deny 在此阶段只记录策略意图；由于完整 Linux 网络隔离尚未实现，固定 fixture 本身不得包含网络行为。
+
+两个 prepared-plan 与 prepared-launch 是三个独立 CLI 进程；pre/post canonical equality 只能证明可观察输入和确定性计划没有漂移，并不等同于执行进程返回了其内部 LaunchPlan receipt。Summary 必须把这种关系记为 planCorrelation: pre-post-canonical-match，不得声称保存的 plan 对象被直接执行。
 
 ## 成功条件
 
@@ -230,9 +243,11 @@ networkPolicy: deny 在此阶段只记录策略意图；由于完整 Linux 网�
 - stdout 中 COMPATFORGE_WINDOWS_CONSOLE_OK 恰好出现一次；
 - 最终 exited 事件为 code 0、success: true；
 - 没有 failed、timed-out 或 grace-period-expired；
-- Bottle-scoped Wineserver stop 完成，唯一测试 prefix 不再有受管进程；
+- Bottle-scoped Wineserver stop 完成，精确 Wineserver -w 成功，Linux /proc 与进程组观察均未发现唯一测试 prefix 的受管残留；
 - cleanup 失败不会被成功退出码覆盖；
 - 所有证据位于仓库外，Git 工作区保持干净。
+
+如果 /proc 因 hidepid 或权限策略不可读，则结果为 test-infrastructure，而不是跳过残留检查。当前 Linux 产品侧 force_kill_wine_prefix_clients 仍为空实现；本检查点的 /proc 检查属于 test evidence，不得被宣传为已经完成产品级 Linux client cleanup。
 
 ## 失败分类
 
@@ -281,19 +296,23 @@ CI 不下载 Wine，不扫描 Runner 已安装 Wine，也不把合成 helper 结
 
 ### Linux x86_64 实机 canary
 
-真实 canary 必须在用户控制的 Linux x86_64 主机上运行，显式提供固定 Wine 与 MinGW。X11/display 会话只记录为 metadata，不是 Console 成功前提。
+真实 canary 必须在用户控制的 Linux x86_64 主机上运行，显式提供固定 Wine 与 MinGW。由于执行环境会 env_clear 且本切片不转发 DISPLAY，宿主是否检测到 DISPLAY 只能记录为 hostDisplayDetected，不能标记为实际 X11 执行会话。
 
 公开 summary 只包含：
 
 - schemaVersion 与 checkpoint；
 - host OS/architecture；
-- x11 或 headless session 标签；
+- hostDisplayDetected 与 displayForwarded: false；
 - Runtime Pack ID、版本、digest；
 - Guest digest；
+- planDigest 与 planCorrelation: pre-post-canonical-match；
 - RuntimeEvent kinds；
 - exit code 与 cleanup 状态；
 - consoleValidated: true；
-- graphicsValidated: false。
+- graphicsValidated: false；
+- runtimeEvidenceScope: entrypoints-only；
+- runtimeTreeValidated: false；
+- networkIsolationValidated: false。
 
 绝对路径、私有 CoreConfig、LaunchPlan 和详细日志只保存在仓库外 evidence root。
 
