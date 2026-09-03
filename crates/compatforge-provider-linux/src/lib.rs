@@ -576,10 +576,22 @@ fn build_provider_snapshot(
         Err(failure) => return unavailable_provider_snapshot(host_report, config, failure),
     };
     let runtime = &config.wine_runtime;
-    let Some(wine) = evidence.observation.wine.to_str().map(str::to_owned) else {
+    let Some(wine) = evidence
+        .observation
+        .wine
+        .to_str()
+        .filter(|value| serialized_linux_absolute_path(value))
+        .map(str::to_owned)
+    else {
         return unavailable_provider_snapshot(host_report, config, EvidenceFailure::Entrypoint);
     };
-    let Some(wineserver) = evidence.observation.wineserver.to_str().map(str::to_owned) else {
+    let Some(wineserver) = evidence
+        .observation
+        .wineserver
+        .to_str()
+        .filter(|value| serialized_linux_absolute_path(value))
+        .map(str::to_owned)
+    else {
         return unavailable_provider_snapshot(host_report, config, EvidenceFailure::Entrypoint);
     };
     let report = provider_report(host_report, runtime, None)?;
@@ -767,6 +779,7 @@ struct ResolvedDestination {
 #[derive(Debug, Clone)]
 struct PreparedBootstrap {
     roots: ResolvedBootstrapRoots,
+    storage_text: String,
     wine_source: PathBuf,
     wineserver_source: PathBuf,
     provider_config: LinuxProviderConfig,
@@ -939,12 +952,11 @@ fn validate_then_bootstrap(
     if canonical_storage != prepared.roots.storage {
         return Err(LinuxBootstrapError::InvalidRequest("storageRoot"));
     }
-    let storage = canonical_storage
-        .to_str()
-        .filter(|value| serialized_linux_absolute_path(value))
-        .ok_or(LinuxBootstrapError::InvalidRequest("storageRoot"))?;
+    if canonical_storage.as_os_str() != prepared.storage_text.as_str() {
+        return Err(LinuxBootstrapError::InvalidRequest("storageRoot"));
+    }
     let config = snapshot
-        .core_config(storage.to_owned())
+        .core_config(prepared.storage_text)
         .map_err(LinuxBootstrapError::Provider)?;
     Ok(LinuxLocalContext {
         config,
@@ -990,9 +1002,12 @@ fn prepare_bootstrap(
     require_disjoint_roots([&runtime_store.path, &storage.path, &materialized.path])?;
 
     let store_text = validated_resolved_path(&runtime_store.path, "runtimeStoreRoot")?;
+    let storage_text = validated_resolved_path(&storage.path, "storageRoot")?;
     let materialized_text = validated_resolved_path(&materialized.path, "materializedRoot")?;
     let (wine, wine_source) = inspect_bootstrap_entrypoint(&materialized.path, &request.wine)?;
     let (wineserver, wineserver_source) = inspect_bootstrap_entrypoint(&materialized.path, &request.wineserver)?;
+    validated_resolved_path(&wine_source, "wine canonical path")?;
+    validated_resolved_path(&wineserver_source, "wineserver canonical path")?;
 
     let mut manifest = RuntimePackManifest {
         schema_version: SCHEMA_VERSION_V1.into(),
@@ -1066,6 +1081,7 @@ fn prepare_bootstrap(
             runtime_store: runtime_store.path,
             storage: storage.path,
         },
+        storage_text,
         wine_source,
         wineserver_source,
         provider_config,
@@ -2123,6 +2139,55 @@ mod tests {
             snapshot.capabilities.runtime_providers[0].reason.as_deref(),
             Some(EvidenceFailure::Version.to_string().as_str())
         );
+    }
+
+    #[test]
+    fn provider_rejects_non_serializable_observation_paths_without_binding() {
+        let host = linux_host_report();
+        let config = valid_config();
+        for field in ["wine", "wineserver"] {
+            let mut evidence = successful_bound_evidence(&config);
+            let invalid = PathBuf::from("/private/provider-runtime/bin/bad\\entrypoint");
+            if field == "wine" {
+                evidence.observation.wine = invalid;
+            } else {
+                evidence.observation.wineserver = invalid;
+            }
+
+            let snapshot = build_provider_snapshot(&host, &config, Ok(evidence))
+                .expect("invalid observed path must yield an unavailable Provider");
+            assert!(snapshot.runtime_binding.is_none(), "{field}");
+            assert!(!snapshot.capabilities.runtime_providers[0].available, "{field}");
+            assert_eq!(
+                snapshot.capabilities.runtime_providers[0].reason.as_deref(),
+                Some(EvidenceFailure::Entrypoint.to_string().as_str()),
+                "{field}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn provider_rejects_non_utf8_observation_paths_without_binding() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let host = linux_host_report();
+        let config = valid_config();
+        for field in ["wine", "wineserver"] {
+            let mut evidence = successful_bound_evidence(&config);
+            let invalid = PathBuf::from(OsString::from_vec(b"/private/runtime/non-utf8-\xff".to_vec()));
+            if field == "wine" {
+                evidence.observation.wine = invalid;
+            } else {
+                evidence.observation.wineserver = invalid;
+            }
+
+            let snapshot = build_provider_snapshot(&host, &config, Ok(evidence))
+                .expect("non-UTF-8 observed path must yield an unavailable Provider");
+            assert!(snapshot.runtime_binding.is_none(), "{field}");
+            assert!(!snapshot.capabilities.runtime_providers[0].available, "{field}");
+        }
     }
 
     #[test]
@@ -3844,6 +3909,94 @@ int main(void) {
         let before = snapshot_tree(&fixture.directory.root);
         assert!(create_local_context_with(&fixture.host, &request, &PanicProbeCommand).is_err());
         assert_eq!(snapshot_tree(&fixture.directory.root), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_non_serializable_canonical_storage_before_mutation() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        for (label, target_name) in [
+            ("non-utf8", OsString::from_vec(b"storage-\xff".to_vec())),
+            ("backslash", OsString::from("storage\\private")),
+        ] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let target = fixture.directory.root.join(target_name);
+            fs::create_dir(&target).expect("create private storage target");
+            let storage_alias = fixture.directory.root.join(format!("{label}-storage-alias"));
+            symlink(&target, &storage_alias).expect("create storage alias");
+            let store = fixture.directory.root.join(format!("{label}-bootstrap-store"));
+            let request = bootstrap_request(&fixture, &store, &storage_alias);
+            let before = snapshot_tree(&fixture.directory.root);
+
+            assert_eq!(
+                create_local_context(&fixture.host, &request),
+                Err(LinuxBootstrapError::InvalidRequest("storageRoot")),
+                "{label}"
+            );
+            assert_eq!(snapshot_tree(&fixture.directory.root), before, "{label}");
+            assert!(!store.exists(), "{label}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_non_serializable_canonical_entrypoints_before_mutation() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        for field in ["wine", "wineserver"] {
+            for (label, target_name) in [
+                (
+                    "non-utf8",
+                    OsString::from_vec(format!("{field}-").into_bytes().into_iter().chain([0xff]).collect()),
+                ),
+                ("backslash", OsString::from(format!("{field}\\private"))),
+                ("carriage-return", OsString::from(format!("{field}\rprivate"))),
+                ("line-feed", OsString::from(format!("{field}\nprivate"))),
+            ] {
+                let fixture = LinuxPublicProviderFixture::new();
+                let (entrypoint, relative) = if field == "wine" {
+                    (&fixture.wine_entrypoint, fixture.config.wine_runtime.wine.path.clone())
+                } else {
+                    (
+                        &fixture.wineserver_entrypoint,
+                        fixture.config.wine_runtime.wineserver.path.clone(),
+                    )
+                };
+                let target = entrypoint.parent().unwrap().join(target_name);
+                fs::rename(entrypoint, &target).expect("move entrypoint to non-serializable target");
+                symlink(&target, entrypoint).expect("restore requested entrypoint as symlink");
+                let store = fixture.directory.root.join(format!("{field}-{label}-bootstrap-store"));
+                let storage = fixture
+                    .directory
+                    .root
+                    .join(format!("{field}-{label}-bootstrap-storage"));
+                let mut request = bootstrap_request(&fixture, &store, &storage);
+                if field == "wine" {
+                    request.wine = relative;
+                } else {
+                    request.wineserver = relative;
+                }
+                let before = snapshot_tree(&fixture.directory.root);
+
+                assert_eq!(
+                    create_local_context(&fixture.host, &request),
+                    Err(LinuxBootstrapError::InvalidRequest(if field == "wine" {
+                        "wine canonical path"
+                    } else {
+                        "wineserver canonical path"
+                    })),
+                    "{field} {label}"
+                );
+                assert_eq!(snapshot_tree(&fixture.directory.root), before, "{field} {label}");
+                assert!(!store.exists(), "{field} {label}");
+                assert!(!storage.exists(), "{field} {label}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
