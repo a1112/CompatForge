@@ -21,7 +21,7 @@ use compatforge_runtime::{sha256_digest_bytes, RejectAllSignatures, RuntimePackS
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -68,22 +68,39 @@ struct OwnerIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountEntry {
-    device: String,
-    root: String,
-    mount_point: String,
+    mount_id: u64,
+    parent_id: u64,
+    device: Vec<u8>,
+    root: Vec<u8>,
+    mount_point: Vec<u8>,
     read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MountSnapshot {
-    raw_digest: String,
     entries: Vec<MountEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PhysicalIdentity {
-    device: String,
-    path: String,
+    device: Vec<u8>,
+    path: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelevantMount {
+    mount_id: u64,
+    parent_id: u64,
+    device: Vec<u8>,
+    root: Vec<u8>,
+    mount_point: Vec<u8>,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountEvidence {
+    selected: Vec<RelevantMount>,
+    store_control_mounts: Vec<RelevantMount>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -823,7 +840,7 @@ struct ResolvedDestination {
 struct PreparedBootstrap {
     roots: ResolvedBootstrapRoots,
     owner: OwnerIdentity,
-    mount_snapshot: MountSnapshot,
+    mount_evidence: MountEvidence,
     storage_text: String,
     wine_source: PathBuf,
     wineserver_source: PathBuf,
@@ -1016,8 +1033,6 @@ fn validate_then_bootstrap(
         return Err(LinuxBootstrapError::Provider(LinuxProviderError::ProviderUnavailable));
     }
 
-    let final_preflight = prepare_bootstrap(host_report, request, owner)?;
-    ensure_same_preflight(&prepared, &final_preflight)?;
     require_unchanged_active_ref(&prepared, &installed_ref)?;
 
     operations.prepare_storage(&prepared.roots.storage, prepared.owner)?;
@@ -1028,6 +1043,16 @@ fn validate_then_bootstrap(
     }
     if canonical_storage.as_os_str() != prepared.storage_text.as_str() {
         return Err(LinuxBootstrapError::InvalidRequest("storageRoot"));
+    }
+    let final_preflight = prepare_bootstrap(host_report, request, owner)?;
+    ensure_same_preflight(&prepared, &final_preflight)?;
+    let installed_manifest = load_associated_manifest(
+        &RuntimePackStore::new(&prepared.roots.runtime_store),
+        &prepared.provider_config.wine_runtime,
+    )
+    .map_err(|failure| LinuxBootstrapError::Provider(LinuxProviderError::Evidence(failure)))?;
+    if installed_manifest != prepared.manifest {
+        return Err(LinuxBootstrapError::RegistrationFailed("Runtime Pack changed"));
     }
     require_unchanged_active_ref(&prepared, &installed_ref)?;
     let config = snapshot
@@ -1089,12 +1114,16 @@ fn prepare_bootstrap(
     let store_text = validated_resolved_path(&runtime_store.path, "runtimeStoreRoot")?;
     let storage_text = validated_resolved_path(&storage.path, "storageRoot")?;
     let materialized_text = validated_resolved_path(&materialized.path, "materializedRoot")?;
-    let mount_snapshot = read_mount_snapshot()?;
-    require_physical_disjoint_roots([&store_text, &storage_text, &materialized_text], &mount_snapshot)?;
     let (wine, wine_source) = inspect_bootstrap_entrypoint(&materialized.path, &request.wine)?;
     let (wineserver, wineserver_source) = inspect_bootstrap_entrypoint(&materialized.path, &request.wineserver)?;
-    validated_resolved_path(&wine_source, "wine canonical path")?;
-    validated_resolved_path(&wineserver_source, "wineserver canonical path")?;
+    let wine_text = validated_resolved_path(&wine_source, "wine canonical path")?;
+    let wineserver_text = validated_resolved_path(&wineserver_source, "wineserver canonical path")?;
+    let mount_snapshot = read_mount_snapshot()?;
+    let mount_evidence = derive_mount_evidence(
+        [&store_text, &storage_text, &materialized_text],
+        [&wine_text, &wineserver_text],
+        &mount_snapshot,
+    )?;
 
     let mut manifest = RuntimePackManifest {
         schema_version: SCHEMA_VERSION_V1.into(),
@@ -1161,7 +1190,7 @@ fn prepare_bootstrap(
             storage: storage.path,
         },
         owner,
-        mount_snapshot,
+        mount_evidence,
         storage_text,
         wine_source,
         wineserver_source,
@@ -1190,7 +1219,7 @@ fn ensure_same_preflight(first: &PreparedBootstrap, second: &PreparedBootstrap) 
         || first.provider_config != second.provider_config
         || first.manifest != second.manifest
         || first.owner != second.owner
-        || first.mount_snapshot != second.mount_snapshot
+        || first.mount_evidence != second.mount_evidence
     {
         return Err(LinuxBootstrapError::InvalidRequest("bootstrap evidence changed"));
     }
@@ -1512,76 +1541,167 @@ fn require_disjoint_roots(roots: [&Path; 3]) -> Result<(), LinuxBootstrapError> 
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn decode_mountinfo_path(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
+fn decode_mountinfo_path(value: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(value.len());
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            let octal = bytes.get(index + 1..index + 4)?;
+    while index < value.len() {
+        if value[index] == b'\\' {
+            let octal = value.get(index + 1..index + 4)?;
             if !matches!(octal, b"011" | b"012" | b"040" | b"134") {
                 return None;
             }
             decoded.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
             index += 4;
         } else {
-            decoded.push(bytes[index]);
+            decoded.push(value[index]);
             index += 1;
         }
     }
-    String::from_utf8(decoded).ok()
+    (decoded.first() == Some(&b'/') && !decoded.contains(&0)).then_some(decoded)
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn parse_mountinfo(contents: &str) -> Option<Vec<MountEntry>> {
+fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountEntry>> {
     let mut entries = Vec::new();
-    for line in contents.lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let separator = fields.iter().position(|field| *field == "-")?;
+    for line in contents.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let fields = line
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
+        let separator = fields.iter().position(|field| *field == b"-")?;
         if separator < 6 || separator + 3 >= fields.len() {
             return None;
         }
-        let device = fields[2];
-        device.split_once(':')?;
+        let mount_id = parse_ascii_u64(fields[0])?;
+        let parent_id = parse_ascii_u64(fields[1])?;
+        let (major, minor) = split_once_byte(fields[2], b':')?;
+        parse_ascii_u64(major)?;
+        parse_ascii_u64(minor)?;
         let root = decode_mountinfo_path(fields[3])?;
         let mount_point = decode_mountinfo_path(fields[4])?;
-        if !root.starts_with('/') || root.as_bytes().contains(&0) {
-            return None;
-        }
-        if !mount_point.starts_with('/') || mount_point.as_bytes().contains(&0) {
-            return None;
-        }
         entries.push(MountEntry {
-            device: device.to_owned(),
+            mount_id,
+            parent_id,
+            device: fields[2].to_vec(),
             root,
             mount_point,
-            read_only: fields[5].split(',').any(|option| option == "ro")
-                || fields[separator + 3].split(',').any(|option| option == "ro"),
+            read_only: ascii_option(fields[5], b"ro") || ascii_option(fields[separator + 3], b"ro"),
         });
     }
     (!entries.is_empty()).then_some(entries)
 }
 
-fn linux_path_contains(parent: &str, child: &str) -> bool {
-    parent == "/" || child == parent || child.strip_prefix(parent).is_some_and(|suffix| suffix.starts_with('/'))
+#[cfg(any(target_os = "linux", test))]
+fn parse_ascii_u64(value: &[u8]) -> Option<u64> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    value.iter().try_fold(0_u64, |number, digit| {
+        number.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+    })
 }
 
-fn physical_identity(path: &str, entries: &[MountEntry]) -> Option<PhysicalIdentity> {
-    let mount = entries
+#[cfg(any(target_os = "linux", test))]
+fn split_once_byte(value: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
+    let index = value.iter().position(|byte| *byte == separator)?;
+    Some((&value[..index], &value[index + 1..]))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ascii_option(options: &[u8], expected: &[u8]) -> bool {
+    options.split(|byte| *byte == b',').any(|option| option == expected)
+}
+
+fn linux_path_contains(parent: &[u8], child: &[u8]) -> bool {
+    parent == b"/"
+        || child == parent
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with(b"/"))
+}
+
+fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
+    let mut by_id = BTreeMap::new();
+    for entry in entries {
+        if by_id.insert(entry.mount_id, entry).is_some() || entry.mount_id == entry.parent_id {
+            return None;
+        }
+    }
+    for entry in entries {
+        let mut seen = BTreeSet::new();
+        let mut cursor = entry;
+        while let Some(parent) = by_id.get(&cursor.parent_id) {
+            if !seen.insert(cursor.mount_id) {
+                return None;
+            }
+            cursor = parent;
+        }
+    }
+    let hidden_at_same_point = entries
         .iter()
-        .filter(|entry| linux_path_contains(&entry.mount_point, path))
-        .max_by_key(|entry| entry.mount_point.len())?;
-    let relative = if mount.mount_point == "/" {
-        path.trim_start_matches('/')
+        .filter(|candidate| {
+            entries
+                .iter()
+                .any(|entry| entry.parent_id == candidate.mount_id && entry.mount_point == candidate.mount_point)
+        })
+        .map(|entry| entry.mount_id)
+        .collect::<BTreeSet<_>>();
+    let mut visible = Vec::new();
+    for entry in entries {
+        if hidden_at_same_point.contains(&entry.mount_id) {
+            continue;
+        }
+        let mut cursor = entry;
+        let mut hidden = false;
+        while let Some(parent) = by_id.get(&cursor.parent_id) {
+            if parent.mount_point != cursor.mount_point && hidden_at_same_point.contains(&parent.mount_id) {
+                hidden = true;
+                break;
+            }
+            cursor = parent;
+        }
+        if !hidden {
+            visible.push(entry.clone());
+        }
+    }
+    visible.sort_by_key(|entry| entry.mount_id);
+    Some(visible)
+}
+
+fn selected_mount<'a>(path: &[u8], entries: &'a [MountEntry]) -> Option<&'a MountEntry> {
+    let mut matches = entries
+        .iter()
+        .filter(|entry| linux_path_contains(&entry.mount_point, path));
+    let first = matches.next()?;
+    matches.try_fold(first, |selected, entry| {
+        if entry.mount_point.len() > selected.mount_point.len() {
+            Some(entry)
+        } else if entry.mount_point.len() == selected.mount_point.len() {
+            None
+        } else {
+            Some(selected)
+        }
+    })
+}
+
+fn physical_identity(path: &[u8], entries: &[MountEntry]) -> Option<PhysicalIdentity> {
+    let mount = selected_mount(path, entries)?;
+    let relative = if mount.mount_point == b"/" {
+        path.strip_prefix(b"/")?
     } else {
-        path.strip_prefix(&mount.mount_point)?.trim_start_matches('/')
+        path.strip_prefix(mount.mount_point.as_slice())?
+            .strip_prefix(b"/")
+            .unwrap_or_default()
     };
     let physical_path = if relative.is_empty() {
         mount.root.clone()
-    } else if mount.root == "/" {
-        format!("/{relative}")
     } else {
-        format!("{}/{relative}", mount.root.trim_end_matches('/'))
+        let mut joined = mount.root.clone();
+        if joined != b"/" {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(relative);
+        joined
     };
     Some(PhysicalIdentity {
         device: mount.device.clone(),
@@ -1593,49 +1713,56 @@ fn read_mount_snapshot() -> Result<MountSnapshot, LinuxBootstrapError> {
     #[cfg(target_os = "linux")]
     {
         const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
-        let mut raw = String::new();
+        let mut raw = Vec::new();
         File::open("/proc/self/mountinfo")
             .map(|file| file.take(MAX_MOUNTINFO_BYTES + 1))
-            .and_then(|mut file| file.read_to_string(&mut raw))
+            .and_then(|mut file| file.read_to_end(&mut raw))
             .map_err(|_| LinuxBootstrapError::InvalidRequest("mount topology"))?;
         if raw.len() as u64 > MAX_MOUNTINFO_BYTES {
             return Err(LinuxBootstrapError::InvalidRequest("mount topology"));
         }
         let entries = parse_mountinfo(&raw).ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
-        Ok(MountSnapshot {
-            raw_digest: sha256_digest_bytes(raw.as_bytes()),
-            entries,
-        })
+        Ok(MountSnapshot { entries })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(MountSnapshot {
-            raw_digest: "non-linux".into(),
-            entries: Vec::new(),
-        })
+        Ok(MountSnapshot { entries: Vec::new() })
     }
 }
 
-fn require_physical_disjoint_roots(
-    roots: [&str; 3],
-    mount_snapshot: &MountSnapshot,
-) -> Result<(), LinuxBootstrapError> {
-    if mount_snapshot.entries.is_empty() {
-        return Ok(());
+fn relevant_mount(entry: &MountEntry) -> RelevantMount {
+    RelevantMount {
+        mount_id: entry.mount_id,
+        parent_id: entry.parent_id,
+        device: entry.device.clone(),
+        root: entry.root.clone(),
+        mount_point: entry.mount_point.clone(),
+        read_only: entry.read_only,
     }
+}
+
+fn derive_mount_evidence(
+    roots: [&str; 3],
+    entrypoints: [&str; 2],
+    mount_snapshot: &MountSnapshot,
+) -> Result<MountEvidence, LinuxBootstrapError> {
+    if mount_snapshot.entries.is_empty() {
+        return Ok(MountEvidence {
+            selected: Vec::new(),
+            store_control_mounts: Vec::new(),
+        });
+    }
+    let visible =
+        visible_mounts(&mount_snapshot.entries).ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
     let identities = roots
-        .map(|root| physical_identity(root, &mount_snapshot.entries))
+        .map(|root| physical_identity(root.as_bytes(), &visible))
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
-    if roots[..2].iter().any(|root| {
-        mount_snapshot
-            .entries
-            .iter()
-            .filter(|entry| linux_path_contains(&entry.mount_point, root))
-            .max_by_key(|entry| entry.mount_point.len())
-            .map_or(true, |entry| entry.read_only)
-    }) {
+    if roots[..2]
+        .iter()
+        .any(|root| selected_mount(root.as_bytes(), &visible).map_or(true, |entry| entry.read_only))
+    {
         return Err(LinuxBootstrapError::InvalidRequest("read-only destination"));
     }
     for left in 0..identities.len() {
@@ -1648,19 +1775,40 @@ fn require_physical_disjoint_roots(
             }
         }
     }
-    let store = roots[0];
-    for entry in &mount_snapshot.entries {
+    let store = roots[0].as_bytes();
+    let mut store_control_mounts = Vec::new();
+    for entry in &visible {
         if entry.mount_point != store && linux_path_contains(store, &entry.mount_point) {
-            let relative = entry.mount_point[store.len()..].trim_start_matches('/');
-            if ["objects", "manifests", "refs", BOOTSTRAP_STAGING_PARENT]
-                .iter()
-                .any(|control| relative == *control || relative.starts_with(&format!("{control}/")))
+            let relative = entry.mount_point[store.len()..].strip_prefix(b"/").unwrap_or_default();
+            if [
+                b"objects".as_slice(),
+                b"manifests",
+                b"refs",
+                BOOTSTRAP_STAGING_PARENT.as_bytes(),
+            ]
+            .iter()
+            .any(|control| relative == *control || linux_path_contains(control, relative))
             {
-                return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
+                store_control_mounts.push(relevant_mount(entry));
             }
         }
     }
-    Ok(())
+    if !store_control_mounts.is_empty() {
+        return Err(LinuxBootstrapError::InvalidRequest("runtimeStoreRoot"));
+    }
+    let mut selected = roots
+        .iter()
+        .chain(entrypoints.iter())
+        .map(|path| selected_mount(path.as_bytes(), &visible).map(relevant_mount))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(LinuxBootstrapError::InvalidRequest("mount topology"))?;
+    selected.sort_by_key(|entry| entry.mount_id);
+    selected.dedup();
+    store_control_mounts.sort_by_key(|entry| entry.mount_id);
+    Ok(MountEvidence {
+        selected,
+        store_control_mounts,
+    })
 }
 
 fn inspect_bootstrap_entrypoint(
@@ -3089,41 +3237,42 @@ int main(void) {
     #[test]
     fn mountinfo_identity_detects_bind_aliases_and_descendants() {
         let entries = parse_mountinfo(
-            "24 1 8:1 / / rw - ext4 /dev/root rw\n\
+            b"24 1 8:1 / / rw - ext4 /dev/root rw\n\
              25 24 8:1 /runtime/source /private/runtime rw - ext4 /dev/root rw\n\
              26 24 8:1 /runtime/source /private/store rw - ext4 /dev/root rw\n\
              27 24 8:1 /runtime/source/child /private/storage rw - ext4 /dev/root rw\n",
         )
         .expect("parse bounded mountinfo fixture");
-        let snapshot = MountSnapshot {
-            raw_digest: "fixture".into(),
-            entries,
-        };
-        assert!(
-            require_physical_disjoint_roots(["/private/store", "/private/other", "/private/runtime"], &snapshot)
-                .is_err()
-        );
-        assert!(
-            require_physical_disjoint_roots(["/private/store", "/private/storage", "/private/other"], &snapshot)
-                .is_err()
-        );
+        let snapshot = MountSnapshot { entries };
+        assert!(derive_mount_evidence(
+            ["/private/store", "/private/other", "/private/runtime"],
+            ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"],
+            &snapshot
+        )
+        .is_err());
+        assert!(derive_mount_evidence(
+            ["/private/store", "/private/storage", "/private/other"],
+            ["/private/other/bin/wine", "/private/other/bin/wineserver"],
+            &snapshot
+        )
+        .is_err());
     }
 
     #[test]
     fn mountinfo_parser_is_bounded_and_fail_closed() {
-        assert!(parse_mountinfo("not mountinfo").is_none());
+        assert!(parse_mountinfo(b"not mountinfo").is_none());
         for (escape, decoded) in [("040", ' '), ("011", '\t'), ("012", '\n'), ("134", '\\')] {
             let line = format!("24 1 8:1 /source\\{escape}dir /mount\\{escape}point rw - ext4 /dev/root rw\n");
-            let escaped = parse_mountinfo(&line).expect("parse legal escaped mount paths");
-            assert_eq!(escaped[0].root, format!("/source{decoded}dir"));
-            assert_eq!(escaped[0].mount_point, format!("/mount{decoded}point"));
+            let escaped = parse_mountinfo(line.as_bytes()).expect("parse legal escaped mount paths");
+            assert_eq!(escaped[0].root, format!("/source{decoded}dir").into_bytes());
+            assert_eq!(escaped[0].mount_point, format!("/mount{decoded}point").into_bytes());
         }
         for malformed in [
             "24 1 8:1 relative /mount rw - ext4 /dev/root rw\n",
             "24 1 8:1 /source /mount\\000bad rw - ext4 /dev/root rw\n",
             "24 1 8:1 /source /mount\\777bad rw - ext4 /dev/root rw\n",
         ] {
-            assert!(parse_mountinfo(malformed).is_none(), "{malformed:?}");
+            assert!(parse_mountinfo(malformed.as_bytes()).is_none(), "{malformed:?}");
         }
     }
 
@@ -3143,25 +3292,133 @@ int main(void) {
                 if read_only_mount == "runtime" { "ro" } else { "rw" },
             );
             MountSnapshot {
-                raw_digest: read_only_mount.into(),
-                entries: parse_mountinfo(&contents).unwrap(),
+                entries: parse_mountinfo(contents.as_bytes()).unwrap(),
             }
         }
-        assert!(require_physical_disjoint_roots(
+        assert!(derive_mount_evidence(
             ["/private/store", "/private/storage", "/private/runtime"],
+            ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"],
             &snapshot("runtime")
         )
         .is_ok());
-        assert!(require_physical_disjoint_roots(
+        assert!(derive_mount_evidence(
             ["/private/store", "/private/storage", "/private/runtime"],
+            ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"],
             &snapshot("store")
         )
         .is_err());
-        assert!(require_physical_disjoint_roots(
+        assert!(derive_mount_evidence(
             ["/private/store", "/private/storage", "/private/runtime"],
+            ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"],
             &snapshot("storage")
         )
         .is_err());
+    }
+
+    #[test]
+    fn mount_visibility_resolves_stacks_independent_of_record_order() {
+        let records = [
+            b"40 30 8:4 /hidden-child /private/runtime/child rw - ext4 /dev/a rw\n".as_slice(),
+            b"31 30 8:3 /top /private/runtime rw - ext4 /dev/b rw\n",
+            b"1 0 8:1 / / rw - ext4 /dev/root rw\n",
+            b"30 1 8:2 /under /private/runtime rw - ext4 /dev/a rw\n",
+            b"41 31 8:3 /visible-child /private/runtime/visible rw - ext4 /dev/b rw\n",
+        ];
+        let bytes = records.concat();
+        let parsed = parse_mountinfo(&bytes).unwrap();
+        let visible = visible_mounts(&parsed).unwrap();
+        assert!(visible.iter().any(|entry| entry.mount_id == 31));
+        assert!(!visible.iter().any(|entry| entry.mount_id == 30));
+        assert!(!visible.iter().any(|entry| entry.mount_id == 40));
+        assert!(visible.iter().any(|entry| entry.mount_id == 41));
+        assert_eq!(
+            selected_mount(b"/private/runtime/child/file", &visible)
+                .unwrap()
+                .mount_id,
+            31
+        );
+        assert_eq!(
+            selected_mount(b"/private/runtime/visible/file", &visible)
+                .unwrap()
+                .mount_id,
+            41
+        );
+
+        let mut reversed = parsed;
+        reversed.reverse();
+        assert_eq!(visible_mounts(&reversed), Some(visible));
+
+        let duplicate =
+            parse_mountinfo(b"1 0 8:1 / / rw - ext4 /dev/root rw\n1 0 8:2 / /other rw - ext4 /dev/other rw\n").unwrap();
+        assert!(visible_mounts(&duplicate).is_none());
+        let cycle =
+            parse_mountinfo(b"1 2 8:1 / / rw - ext4 /dev/root rw\n2 1 8:2 / /other rw - ext4 /dev/other rw\n").unwrap();
+        assert!(visible_mounts(&cycle).is_none());
+
+        let top_store_read_only = MountSnapshot {
+            entries: parse_mountinfo(
+                b"1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                  2 1 8:2 /under /private/store rw - ext4 /dev/a rw\n\
+                  3 2 8:3 /top /private/store ro - squashfs top ro\n",
+            )
+            .unwrap(),
+        };
+        assert!(derive_mount_evidence(
+            ["/private/store", "/private/storage", "/private/runtime"],
+            ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"],
+            &top_store_read_only
+        )
+        .is_err());
+
+        let top_runtime_read_only = MountSnapshot {
+            entries: parse_mountinfo(
+                b"1 0 8:1 / / rw - ext4 /dev/root rw\n\
+                  2 1 8:2 /under /private/runtime rw - ext4 /dev/a rw\n\
+                  3 2 8:3 /top /private/runtime ro - squashfs top ro\n",
+            )
+            .unwrap(),
+        };
+        assert!(derive_mount_evidence(
+            ["/private/store", "/private/storage", "/private/runtime"],
+            ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"],
+            &top_runtime_read_only
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn mount_evidence_ignores_unrelated_records_but_freezes_related_identity() {
+        let base = parse_mountinfo(b"1 0 8:1 / / rw - ext4 /dev/root rw\n").unwrap();
+        let roots = ["/private/store", "/private/storage", "/private/runtime"];
+        let entrypoints = ["/private/runtime/bin/wine", "/private/runtime/bin/wineserver"];
+        let baseline = derive_mount_evidence(roots, entrypoints, &MountSnapshot { entries: base.clone() }).unwrap();
+        let mut unrelated = base.clone();
+        unrelated.push(
+            parse_mountinfo(b"2 1 9:1 / /unrelated rw - tmpfs tmpfs rw\n")
+                .unwrap()
+                .remove(0),
+        );
+        unrelated.reverse();
+        assert_eq!(
+            derive_mount_evidence(roots, entrypoints, &MountSnapshot { entries: unrelated }).unwrap(),
+            baseline
+        );
+        let related =
+            parse_mountinfo(b"1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 9:1 / /private/storage rw - tmpfs tmpfs rw\n")
+                .unwrap();
+        assert_ne!(
+            derive_mount_evidence(roots, entrypoints, &MountSnapshot { entries: related }).unwrap(),
+            baseline
+        );
+    }
+
+    #[test]
+    fn mountinfo_byte_parser_accepts_unrelated_non_utf8_and_non_ascii_whitespace() {
+        let mut bytes = b"1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 9:1 / /unrelated-".to_vec();
+        bytes.extend_from_slice(&[0xff, 0x0b, 0x0d, 0xc2, 0xa0]);
+        bytes.extend_from_slice(b" rw - tmpfs tmpfs rw\n");
+        let parsed = parse_mountinfo(&bytes).expect("non-UTF-8 and non-ASCII whitespace stay inside path field");
+        assert_eq!(parsed.len(), 2);
     }
 
     #[test]
@@ -4153,9 +4410,16 @@ int main(void) {
     }
 
     #[cfg(target_os = "linux")]
+    enum StorageMutation {
+        RefRaw(PathBuf),
+        File(PathBuf),
+        ControlMode(PathBuf),
+    }
+
+    #[cfg(target_os = "linux")]
     struct MutateRefDuringStorageOperations {
         system: SystemBootstrapOperations,
-        active_ref: PathBuf,
+        mutation: StorageMutation,
     }
 
     #[cfg(target_os = "linux")]
@@ -4187,9 +4451,22 @@ int main(void) {
 
         fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             self.system.prepare_storage(storage_root, owner)?;
-            let mut raw = fs::read(&self.active_ref).expect("Storage fault reads active ref");
-            raw.extend_from_slice(b" \n");
-            fs::write(&self.active_ref, raw).expect("Storage fault reformats active ref");
+            match &self.mutation {
+                StorageMutation::RefRaw(active_ref) => {
+                    let mut raw = fs::read(active_ref).expect("Storage fault reads active ref");
+                    raw.extend_from_slice(b" \n");
+                    fs::write(active_ref, raw).expect("Storage fault reformats active ref");
+                }
+                StorageMutation::File(path) => {
+                    fs::write(path, b"mutated during Storage preparation")
+                        .expect("Storage fault mutates evidence file");
+                }
+                StorageMutation::ControlMode(path) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+                        .expect("Storage fault mutates control mode");
+                }
+            }
             Ok(())
         }
     }
@@ -4383,28 +4660,54 @@ int main(void) {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bootstrap_rejects_active_ref_raw_drift_during_storage_preparation() {
-        let fixture = LinuxPublicProviderFixture::new();
-        let store = fixture.directory.root.join("storage-ref-drift-store");
-        let storage = fixture.directory.root.join("storage-ref-drift-storage");
-        let request = bootstrap_request(&fixture, &store, &storage);
-        let active_ref = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+    fn bootstrap_revalidates_all_evidence_after_storage_preparation() {
+        for kind in ["ref-raw", "wine", "wineserver-object", "manifest", "control-mode"] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let store = fixture.directory.root.join(format!("storage-{kind}-store"));
+            let storage = fixture.directory.root.join(format!("storage-{kind}"));
+            let request = bootstrap_request(&fixture, &store, &storage);
+            let owner = OwnerIdentity {
+                filesystem_uid: current_effective_uid().unwrap(),
+            };
+            let prepared = prepare_bootstrap(&fixture.host, &request, owner).expect("derive expected Pack paths");
+            let mutation = match kind {
+                "ref-raw" => {
+                    StorageMutation::RefRaw(store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json"))
+                }
+                "wine" => StorageMutation::File(fixture.wine_entrypoint.clone()),
+                "wineserver-object" => StorageMutation::File(
+                    store.join("objects/sha256").join(
+                        prepared
+                            .manifest
+                            .components
+                            .iter()
+                            .find(|component| component.name == "wineserver-entrypoint")
+                            .unwrap()
+                            .digest
+                            .trim_start_matches("sha256:"),
+                    ),
+                ),
+                "manifest" => StorageMutation::File(store.join("manifests/sha256").join(format!(
+                    "{}.json",
+                    prepared.manifest.digest.trim_start_matches("sha256:")
+                ))),
+                "control-mode" => StorageMutation::ControlMode(store.join("objects")),
+                _ => unreachable!(),
+            };
 
-        let result = validate_then_bootstrap(
-            &fixture.host,
-            &request,
-            &SystemProbeCommand,
-            &MutateRefDuringStorageOperations {
-                system: SystemBootstrapOperations,
-                active_ref,
-            },
-        );
+            let result = validate_then_bootstrap(
+                &fixture.host,
+                &request,
+                &SystemProbeCommand,
+                &MutateRefDuringStorageOperations {
+                    system: SystemBootstrapOperations,
+                    mutation,
+                },
+            );
 
-        assert!(matches!(result, Err(LinuxBootstrapError::ConflictingActiveRef)));
-        assert!(
-            storage.exists(),
-            "Storage operation completed before final ref comparison"
-        );
+            assert!(result.is_err(), "{kind} must not return Context or receipt");
+            assert!(storage.exists(), "Storage seam ran for {kind}");
+        }
     }
 
     #[cfg(target_os = "linux")]
