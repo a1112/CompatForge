@@ -1623,14 +1623,35 @@ fn linux_path_contains(parent: &[u8], child: &[u8]) -> bool {
 fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
     let mut by_id = BTreeMap::new();
     for entry in entries {
-        if by_id.insert(entry.mount_id, entry).is_some() || entry.mount_id == entry.parent_id {
+        if by_id.insert(entry.mount_id, entry).is_some()
+            || (entry.mount_id == entry.parent_id && entry.mount_point != b"/")
+        {
             return None;
         }
+    }
+    if entries.iter().any(|candidate| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.mount_id != candidate.mount_id
+                    && entry.parent_id == candidate.mount_id
+                    && entry.mount_point == candidate.mount_point
+            })
+            .count()
+            > 1
+    }) {
+        return None;
     }
     for entry in entries {
         let mut seen = BTreeSet::new();
         let mut cursor = entry;
-        while let Some(parent) = by_id.get(&cursor.parent_id) {
+        loop {
+            if cursor.mount_id == cursor.parent_id && cursor.mount_point == b"/" {
+                break;
+            }
+            let Some(parent) = by_id.get(&cursor.parent_id) else {
+                break;
+            };
             if !seen.insert(cursor.mount_id) {
                 return None;
             }
@@ -1640,9 +1661,11 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
     let hidden_at_same_point = entries
         .iter()
         .filter(|candidate| {
-            entries
-                .iter()
-                .any(|entry| entry.parent_id == candidate.mount_id && entry.mount_point == candidate.mount_point)
+            entries.iter().any(|entry| {
+                entry.mount_id != candidate.mount_id
+                    && entry.parent_id == candidate.mount_id
+                    && entry.mount_point == candidate.mount_point
+            })
         })
         .map(|entry| entry.mount_id)
         .collect::<BTreeSet<_>>();
@@ -1653,7 +1676,13 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
         }
         let mut cursor = entry;
         let mut hidden = false;
-        while let Some(parent) = by_id.get(&cursor.parent_id) {
+        loop {
+            if cursor.mount_id == cursor.parent_id && cursor.mount_point == b"/" {
+                break;
+            }
+            let Some(parent) = by_id.get(&cursor.parent_id) else {
+                break;
+            };
             if parent.mount_point != cursor.mount_point && hidden_at_same_point.contains(&parent.mount_id) {
                 hidden = true;
                 break;
@@ -3384,6 +3413,42 @@ int main(void) {
             &top_runtime_read_only
         )
         .is_ok());
+    }
+
+    #[test]
+    fn mount_visibility_accepts_only_root_self_parent_and_keeps_stacks_deterministic() {
+        let bytes = b"1 1 8:1 / / rw - ext4 /dev/root rw\n\
+                      2 1 8:2 /old /private/runtime rw - ext4 /dev/a rw\n\
+                      3 2 8:3 /middle /private/runtime rw - ext4 /dev/b rw\n\
+                      4 3 8:4 /top /private/runtime rw - ext4 /dev/c rw\n\
+                      5 2 8:2 /hidden /private/runtime/child rw - ext4 /dev/a rw\n";
+        let parsed = parse_mountinfo(bytes).unwrap();
+        let visible = visible_mounts(&parsed).expect("self-parent namespace root is a valid terminus");
+        assert!(visible.iter().any(|entry| entry.mount_id == 1));
+        assert!(visible.iter().any(|entry| entry.mount_id == 4));
+        assert!(!visible.iter().any(|entry| matches!(entry.mount_id, 2 | 3 | 5)));
+        assert_eq!(
+            selected_mount(b"/private/runtime/child/file", &visible)
+                .unwrap()
+                .mount_id,
+            4
+        );
+        let mut reversed = parsed;
+        reversed.reverse();
+        assert_eq!(visible_mounts(&reversed), Some(visible));
+
+        let non_root_self =
+            parse_mountinfo(b"1 1 8:1 / / rw - ext4 /dev/root rw\n2 2 8:2 / /private rw - ext4 /dev/a rw\n").unwrap();
+        assert!(visible_mounts(&non_root_self).is_none());
+
+        let branch = parse_mountinfo(
+            b"1 1 8:1 / / rw - ext4 /dev/root rw\n\
+              2 1 8:2 /old /private/runtime rw - ext4 /dev/a rw\n\
+              3 2 8:3 /left /private/runtime rw - ext4 /dev/b rw\n\
+              4 2 8:4 /right /private/runtime rw - ext4 /dev/c rw\n",
+        )
+        .unwrap();
+        assert!(visible_mounts(&branch).is_none());
     }
 
     #[test]
