@@ -1035,11 +1035,12 @@ fn validate_then_bootstrap(
     operations.prepare_store(&prepared.roots.runtime_store, prepared.owner)?;
     let post_store = prepare_bootstrap(host_report, request, owner)?;
     ensure_same_preflight(&prepared, &post_store)?;
-    ensure_destination_snapshots(
-        &post_store,
+    let post_store_destination = accept_destination_transition(
+        &prepared.runtime_store_destination,
         &post_store.runtime_store_destination,
-        &prepared.storage_destination,
+        &prepared.roots.runtime_store,
     )?;
+    ensure_destination_snapshots(&post_store, &post_store_destination, &prepared.storage_destination)?;
     let staging = operations.create_staging(&prepared.roots.runtime_store, prepared.owner)?;
     let install_result = operations
         .populate_staging(&staging, &prepared)
@@ -1073,11 +1074,7 @@ fn validate_then_bootstrap(
     require_unchanged_active_ref(&prepared, &installed_ref)?;
     let post_probe = prepare_bootstrap(host_report, request, owner)?;
     ensure_same_preflight(&prepared, &post_probe)?;
-    ensure_destination_snapshots(
-        &post_probe,
-        &post_store.runtime_store_destination,
-        &prepared.storage_destination,
-    )?;
+    ensure_destination_snapshots(&post_probe, &post_store_destination, &prepared.storage_destination)?;
 
     operations.prepare_storage(&prepared.roots.storage, prepared.owner)?;
     let canonical_storage =
@@ -1090,18 +1087,15 @@ fn validate_then_bootstrap(
     }
     let post_storage = prepare_bootstrap(host_report, request, owner)?;
     ensure_same_preflight(&prepared, &post_storage)?;
-    ensure_destination_snapshots(
-        &post_storage,
-        &post_store.runtime_store_destination,
+    let post_storage_destination = accept_destination_transition(
+        &prepared.storage_destination,
         &post_storage.storage_destination,
+        &prepared.roots.storage,
     )?;
+    ensure_destination_snapshots(&post_storage, &post_store_destination, &post_storage_destination)?;
     let final_preflight = prepare_bootstrap(host_report, request, owner)?;
     ensure_same_preflight(&prepared, &final_preflight)?;
-    ensure_destination_snapshots(
-        &final_preflight,
-        &post_store.runtime_store_destination,
-        &post_storage.storage_destination,
-    )?;
+    ensure_destination_snapshots(&final_preflight, &post_store_destination, &post_storage_destination)?;
     let installed_manifest = load_associated_manifest(
         &RuntimePackStore::new(&prepared.roots.runtime_store),
         &prepared.provider_config.wine_runtime,
@@ -1304,6 +1298,22 @@ fn ensure_destination_snapshots(
         return Err(LinuxBootstrapError::InvalidRequest("bootstrap destination changed"));
     }
     Ok(())
+}
+
+fn accept_destination_transition(
+    initial: &DestinationSnapshot,
+    current: &DestinationSnapshot,
+    intended_root: &Path,
+) -> Result<DestinationSnapshot, LinuxBootstrapError> {
+    let valid = if initial.existed {
+        current == initial
+    } else {
+        current.existed && current.existing_ancestor == intended_root
+    };
+    if !valid {
+        return Err(LinuxBootstrapError::InvalidRequest("bootstrap destination changed"));
+    }
+    Ok(current.clone())
 }
 
 fn map_bootstrap_request_error(error: LinuxProviderError) -> LinuxBootstrapError {
@@ -5152,6 +5162,65 @@ int main(void) {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum PreparedRootReplacement {
+        Store,
+        Storage,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReplacingPreparedRootOperations {
+        replacement: PreparedRootReplacement,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_tree_with_same_content(root: &Path) {
+        let displaced = root.with_extension("prepared-displaced");
+        fs::rename(root, &displaced).expect("displace prepared root");
+        copy_tree_preserving_permissions(&displaced, root);
+    }
+
+    #[cfg(target_os = "linux")]
+    impl BootstrapOperations for ReplacingPreparedRootOperations {
+        fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.prepare_store(store_root, owner)?;
+            if matches!(self.replacement, PreparedRootReplacement::Store) {
+                replace_tree_with_same_content(store_root);
+            }
+            Ok(())
+        }
+
+        fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
+            SystemBootstrapOperations.create_staging(store_root, owner)
+        }
+
+        fn populate_staging(&self, staging: &Path, prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.populate_staging(staging, prepared)
+        }
+
+        fn install_pack(
+            &self,
+            store_root: &Path,
+            staging: &Path,
+            manifest: &RuntimePackManifest,
+        ) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.install_pack(store_root, staging, manifest)
+        }
+
+        fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.cleanup_staging(staging, owner)
+        }
+
+        fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.prepare_storage(storage_root, owner)?;
+            if matches!(self.replacement, PreparedRootReplacement::Storage) {
+                replace_tree_with_same_content(storage_root);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     impl BootstrapOperations for StorageObservingOperations {
         fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
             SystemBootstrapOperations.prepare_store(store_root, owner)
@@ -5416,6 +5485,46 @@ int main(void) {
             .join(LOCAL_PREVIEW_PACK_ID)
             .join("current.json")
             .exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_existing_root_replacement_inside_prepare_steps() {
+        use std::os::unix::fs::MetadataExt;
+
+        for replacement in [PreparedRootReplacement::Store, PreparedRootReplacement::Storage] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let label = match replacement {
+                PreparedRootReplacement::Store => "store",
+                PreparedRootReplacement::Storage => "storage",
+            };
+            let store = fixture.directory.root.join(format!("prepare-replace-{label}-store"));
+            let storage = fixture.directory.root.join(format!("prepare-replace-{label}-storage"));
+            let request = bootstrap_request(&fixture, &store, &storage);
+            create_local_context(&fixture.host, &request).expect("seed existing Store and Storage");
+            let target = match replacement {
+                PreparedRootReplacement::Store => &store,
+                PreparedRootReplacement::Storage => &storage,
+            };
+            let original_inode = fs::metadata(target).unwrap().ino();
+            let active_ref = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
+            let expected_ref = fs::read(&active_ref).unwrap();
+
+            let result = validate_then_bootstrap(
+                &fixture.host,
+                &request,
+                &SystemProbeCommand,
+                &ReplacingPreparedRootOperations { replacement },
+            );
+
+            assert!(result.is_err(), "{label} replacement must not return Context");
+            assert_ne!(fs::metadata(target).unwrap().ino(), original_inode);
+            assert!(target.with_extension("prepared-displaced").exists());
+            assert_eq!(fs::read(active_ref).unwrap(), expected_ref);
+            if matches!(replacement, PreparedRootReplacement::Store) {
+                assert!(!store.join("staging").exists(), "staging must not start");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
