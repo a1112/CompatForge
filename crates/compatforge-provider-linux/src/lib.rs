@@ -5171,6 +5171,7 @@ int main(void) {
     #[cfg(target_os = "linux")]
     struct ReplacingPreparedRootOperations {
         replacement: PreparedRootReplacement,
+        staging_calls: RefCell<usize>,
     }
 
     #[cfg(target_os = "linux")]
@@ -5191,6 +5192,7 @@ int main(void) {
         }
 
         fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
+            *self.staging_calls.borrow_mut() += 1;
             SystemBootstrapOperations.create_staging(store_root, owner)
         }
 
@@ -5510,19 +5512,18 @@ int main(void) {
             let active_ref = store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json");
             let expected_ref = fs::read(&active_ref).unwrap();
 
-            let result = validate_then_bootstrap(
-                &fixture.host,
-                &request,
-                &SystemProbeCommand,
-                &ReplacingPreparedRootOperations { replacement },
-            );
+            let operations = ReplacingPreparedRootOperations {
+                replacement,
+                staging_calls: RefCell::new(0),
+            };
+            let result = validate_then_bootstrap(&fixture.host, &request, &SystemProbeCommand, &operations);
 
             assert!(result.is_err(), "{label} replacement must not return Context");
             assert_ne!(fs::metadata(target).unwrap().ino(), original_inode);
             assert!(target.with_extension("prepared-displaced").exists());
             assert_eq!(fs::read(active_ref).unwrap(), expected_ref);
             if matches!(replacement, PreparedRootReplacement::Store) {
-                assert!(!store.join("staging").exists(), "staging must not start");
+                assert_eq!(*operations.staging_calls.borrow(), 0, "staging must not start");
             }
         }
     }
