@@ -851,9 +851,26 @@ struct ResolvedDestination {
     existed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationSnapshot {
+    existed: bool,
+    existing_ancestor: PathBuf,
+    ancestor_identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
 #[derive(Debug, Clone)]
 struct PreparedBootstrap {
     roots: ResolvedBootstrapRoots,
+    runtime_store_destination: DestinationSnapshot,
+    storage_destination: DestinationSnapshot,
     owner: OwnerIdentity,
     mount_evidence: MountEvidence,
     storage_text: String,
@@ -1010,7 +1027,7 @@ fn validate_then_bootstrap(
     }
     probe_prepared(&prepared, command)?;
     let revalidated = prepare_bootstrap(host_report, request, owner)?;
-    ensure_same_preflight(&prepared, &revalidated)?;
+    ensure_same_pre_mutation(&prepared, &revalidated)?;
     if observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)? != initial_ref {
         return Err(LinuxBootstrapError::ConflictingActiveRef);
     }
@@ -1112,6 +1129,7 @@ fn prepare_bootstrap(
     let store_request = Path::new(&request.runtime_store_root);
     validate_store_path_components(store_request)?;
     let runtime_store = resolve_destination(store_request, false, "runtimeStoreRoot")?;
+    let runtime_store_destination = destination_snapshot(&runtime_store, "runtimeStoreRoot")?;
     if runtime_store.existed {
         validate_private_directory(&runtime_store.path, "runtimeStoreRoot", owner)?;
     } else {
@@ -1120,6 +1138,7 @@ fn prepare_bootstrap(
     validate_store_controls(&runtime_store.path, owner)?;
 
     let storage = resolve_destination(Path::new(&request.storage_root), false, "storageRoot")?;
+    let storage_destination = destination_snapshot(&storage, "storageRoot")?;
     if storage.existed {
         validate_private_directory(&storage.path, "storageRoot", owner)?;
     } else {
@@ -1206,6 +1225,8 @@ fn prepare_bootstrap(
             runtime_store: runtime_store.path,
             storage: storage.path,
         },
+        runtime_store_destination,
+        storage_destination,
         owner,
         mount_evidence,
         storage_text,
@@ -1243,6 +1264,16 @@ fn ensure_same_preflight(first: &PreparedBootstrap, second: &PreparedBootstrap) 
     Ok(())
 }
 
+fn ensure_same_pre_mutation(first: &PreparedBootstrap, second: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+    ensure_same_preflight(first, second)?;
+    if first.runtime_store_destination != second.runtime_store_destination
+        || first.storage_destination != second.storage_destination
+    {
+        return Err(LinuxBootstrapError::InvalidRequest("bootstrap destination changed"));
+    }
+    Ok(())
+}
+
 fn map_bootstrap_request_error(error: LinuxProviderError) -> LinuxBootstrapError {
     match error {
         LinuxProviderError::Contract(error) => LinuxBootstrapError::Contract(error),
@@ -1265,6 +1296,33 @@ fn validated_resolved_path(path: &Path, field: &'static str) -> Result<String, L
         .filter(|value| serialized_linux_absolute_path(value))
         .map(str::to_owned)
         .ok_or(LinuxBootstrapError::InvalidRequest(field))
+}
+
+fn destination_snapshot(
+    destination: &ResolvedDestination,
+    field: &'static str,
+) -> Result<DestinationSnapshot, LinuxBootstrapError> {
+    let metadata =
+        fs::metadata(&destination.existing_ancestor).map_err(|_| LinuxBootstrapError::InvalidRequest(field))?;
+    #[cfg(unix)]
+    let ancestor_identity = {
+        use std::os::unix::fs::MetadataExt;
+
+        FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    };
+    #[cfg(not(unix))]
+    let ancestor_identity = {
+        let _ = metadata;
+        FileIdentity {}
+    };
+    Ok(DestinationSnapshot {
+        existed: destination.existed,
+        existing_ancestor: destination.existing_ancestor.clone(),
+        ancestor_identity,
+    })
 }
 
 fn resolve_destination(
@@ -1744,12 +1802,12 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
         })
         .map(|entry| entry.mount_id)
         .collect::<BTreeSet<_>>();
-    let covered_by_later_ancestor = entries
+    let covered_by_ancestor = entries
         .iter()
         .filter(|candidate| {
             entries.iter().any(|cover| {
                 cover.parent_id == candidate.parent_id
-                    && cover.mount_id > candidate.mount_id
+                    && cover.mount_id != candidate.parent_id
                     && cover.mount_point != candidate.mount_point
                     && linux_path_contains(&cover.mount_point, &candidate.mount_point)
             })
@@ -1758,7 +1816,7 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
         .collect::<BTreeSet<_>>();
     let mut visible = Vec::new();
     for entry in entries {
-        if hidden_at_same_point.contains(&entry.mount_id) || covered_by_later_ancestor.contains(&entry.mount_id) {
+        if hidden_at_same_point.contains(&entry.mount_id) || covered_by_ancestor.contains(&entry.mount_id) {
             continue;
         }
         let mut cursor = entry;
@@ -1771,8 +1829,7 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
                 break;
             };
             if parent.mount_point != cursor.mount_point
-                && (hidden_at_same_point.contains(&parent.mount_id)
-                    || covered_by_later_ancestor.contains(&parent.mount_id))
+                && (hidden_at_same_point.contains(&parent.mount_id) || covered_by_ancestor.contains(&parent.mount_id))
             {
                 hidden = true;
                 break;
@@ -3572,6 +3629,31 @@ int main(void) {
         reversed.reverse();
         assert!(derive_mount_evidence(roots, entrypoints, &MountSnapshot { entries: reversed }).is_err());
         assert!(derive_mount_evidence(roots, entrypoints, &snapshot(b"ro")).is_err());
+
+        let reused_ids = MountSnapshot {
+            entries: parse_mountinfo(
+                b"21 20 8:2 /old-child /storage/sub/child rw - ext4 /dev/a rw\n\
+                  20 1 8:2 /old /storage/sub rw - ext4 /dev/a rw\n\
+                  3 1 8:3 /source/sub /store rw - ext4 /dev/b rw\n\
+                  2 1 8:3 /source /storage rw - ext4 /dev/b rw\n\
+                  1 1 8:1 / / rw - ext4 /dev/root rw\n",
+            )
+            .unwrap(),
+        };
+        let visible = visible_mounts(&reused_ids.entries).unwrap();
+        assert!(!visible.iter().any(|entry| matches!(entry.mount_id, 20 | 21)));
+        assert!(derive_mount_evidence(roots, entrypoints, &reused_ids).is_err());
+
+        let smaller_id_ro = MountSnapshot {
+            entries: parse_mountinfo(
+                b"20 1 8:2 /old /storage/sub rw - ext4 /dev/a rw\n\
+                  3 1 8:3 /source/sub /store rw - ext4 /dev/b rw\n\
+                  2 1 8:3 /source /storage ro - ext4 /dev/b ro\n\
+                  1 1 8:1 / / rw - ext4 /dev/root rw\n",
+            )
+            .unwrap(),
+        };
+        assert!(derive_mount_evidence(roots, entrypoints, &smaller_id_ro).is_err());
     }
 
     #[test]
@@ -4973,6 +5055,26 @@ int main(void) {
     }
 
     #[cfg(target_os = "linux")]
+    struct DestinationCreatingProbeCommand {
+        system: SystemProbeCommand,
+        calls: RefCell<usize>,
+        path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProbeCommand for DestinationCreatingProbeCommand {
+        fn run(&self, specification: &ProbeCommandSpec) -> Result<ProbeCommandOutput, ProbeCommandFailure> {
+            let output = self.system.run(specification)?;
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                fs::create_dir_all(&self.path).expect("malicious helper creates destination state");
+            }
+            Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     impl ProbeCommand for ControlChmodProbeCommand {
         fn run(&self, specification: &ProbeCommandSpec) -> Result<ProbeCommandOutput, ProbeCommandFailure> {
             use std::os::unix::fs::PermissionsExt;
@@ -5088,6 +5190,51 @@ int main(void) {
             !store.join("objects").exists(),
             "Store mutation must not begin after chmod"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_freezes_missing_destination_state_before_first_probe() {
+        for (field, create_target) in [
+            ("runtimeStoreRoot", true),
+            ("runtimeStoreRoot", false),
+            ("storageRoot", true),
+            ("storageRoot", false),
+        ] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let store = fixture
+                .directory
+                .root
+                .join(format!("freeze-{field}-{create_target}-store/target"));
+            let storage = fixture
+                .directory
+                .root
+                .join(format!("freeze-{field}-{create_target}-storage/target"));
+            let request = bootstrap_request(&fixture, &store, &storage);
+            let selected = if field == "runtimeStoreRoot" { &store } else { &storage };
+            let created = if create_target {
+                selected.clone()
+            } else {
+                selected.parent().unwrap().to_path_buf()
+            };
+            let operations = RecordingBootstrapOperations::default();
+            let command = DestinationCreatingProbeCommand {
+                system: SystemProbeCommand,
+                calls: RefCell::new(0),
+                path: created.clone(),
+            };
+
+            let result = validate_then_bootstrap(&fixture.host, &request, &command, &operations);
+
+            assert!(result.is_err(), "{field} target={create_target}");
+            assert!(created.exists(), "helper mutation occurred");
+            assert!(
+                operations.recorded().is_empty(),
+                "control-plane mutation must not start"
+            );
+            assert!(!store.join("objects").exists());
+            assert!(!store.join("refs").exists());
+        }
     }
 
     #[cfg(target_os = "linux")]
