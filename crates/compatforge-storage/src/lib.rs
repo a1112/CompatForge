@@ -157,11 +157,7 @@ impl JsonStore {
 
         let temporary = temporary_path(&path)?;
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(StoreError::Io)?;
+            let mut file = create_private_temporary(&temporary)?;
             file.write_all(&bytes).map_err(StoreError::Io)?;
             file.sync_all().map_err(StoreError::Io)?;
             replace_file(&temporary, &path)?;
@@ -191,6 +187,29 @@ impl JsonStore {
         }
         Ok(self.root.join(relative_path))
     }
+}
+
+fn create_private_temporary(path: &Path) -> Result<fs::File, StoreError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(StoreError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(StoreError::Io(error));
+        }
+    }
+    Ok(file)
 }
 
 fn temporary_path(target: &Path) -> Result<PathBuf, StoreError> {
@@ -323,5 +342,53 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, StoreError::InvalidRelativePath));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn json_store_private_mode_is_independent_of_umask() {
+        use std::process::Command;
+
+        for mask in ["0000", "0002"] {
+            let root = temporary_directory(&format!("umask-{mask}"));
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; export COMPATFORGE_STORAGE_UMASK_ROOT=\"$2\"; exec \"$3\" --ignored --exact tests::json_store_private_mode_child --nocapture")
+                .arg("compatforge-storage-umask")
+                .arg(mask)
+                .arg(&root)
+                .arg(std::env::current_exe().unwrap())
+                .status()
+                .expect("run isolated umask child");
+            assert!(status.success(), "umask {mask}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn json_store_private_mode_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from(std::env::var_os("COMPATFORGE_STORAGE_UMASK_ROOT").expect("child root"));
+        let store = JsonStore::new(&root);
+        store
+            .write(
+                "state.json",
+                &Fixture {
+                    schema_version: "1".into(),
+                    value: 7,
+                },
+            )
+            .unwrap();
+        let target = root.join("state.json");
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(store.read::<Fixture>("state.json").unwrap().value, 7);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
     }
 }

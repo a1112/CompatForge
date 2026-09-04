@@ -227,11 +227,7 @@ impl RuntimePackStore {
         let temporary = temporary_path(&target)?;
         let result = (|| {
             let mut input = File::open(source).map_err(RuntimePackError::Io)?;
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(RuntimePackError::Io)?;
+            let mut output = create_private_temporary(&temporary)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0_u8; COPY_BUFFER_SIZE];
             loop {
@@ -482,11 +478,7 @@ fn publish_bytes(target: &Path, bytes: &[u8]) -> Result<(), RuntimePackError> {
     fs::create_dir_all(parent).map_err(RuntimePackError::Io)?;
     let temporary = temporary_path(target)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(RuntimePackError::Io)?;
+        let mut file = create_private_temporary(&temporary)?;
         file.write_all(bytes).map_err(RuntimePackError::Io)?;
         file.sync_all().map_err(RuntimePackError::Io)?;
         fs::rename(&temporary, target).map_err(RuntimePackError::Io)?;
@@ -496,6 +488,29 @@ fn publish_bytes(target: &Path, bytes: &[u8]) -> Result<(), RuntimePackError> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn create_private_temporary(path: &Path) -> Result<File, RuntimePackError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(RuntimePackError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(RuntimePackError::Io(error));
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -607,6 +622,8 @@ impl From<ContractError> for RuntimePackError {
 mod tests {
     use super::*;
     use compatforge_domain::{CpuArchitecture, HostOs, RuntimeComponent, RuntimeHost};
+    #[cfg(unix)]
+    use compatforge_storage::JsonStore;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -695,6 +712,65 @@ mod tests {
         );
         assert_eq!(store.verify_installed(&manifest.digest).unwrap().verified_objects, 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_store_private_modes_are_independent_of_umask() {
+        use std::process::Command;
+
+        for mask in ["0000", "0002"] {
+            let root = temporary_directory(&format!("umask-{mask}"));
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; export COMPATFORGE_RUNTIME_UMASK_ROOT=\"$2\"; exec \"$3\" --ignored --exact tests::runtime_store_private_mode_child --nocapture")
+                .arg("compatforge-runtime-umask")
+                .arg(mask)
+                .arg(&root)
+                .arg(std::env::current_exe().unwrap())
+                .status()
+                .expect("run isolated umask child");
+            assert!(status.success(), "umask {mask}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn runtime_store_private_mode_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from(std::env::var_os("COMPATFORGE_RUNTIME_UMASK_ROOT").expect("child root"));
+        let bundle = root.join("bundle");
+        let store_root = root.join("store");
+        let store = RuntimePackStore::new(&store_root);
+        let manifest = write_bundle(&bundle, b"private-runtime", "1.0.0", RuntimeChannel::Preview);
+        store.install(&bundle, &manifest, &RejectAllSignatures).unwrap();
+        store.verified_manifest(&manifest.digest).unwrap();
+        let digest_hex = manifest.components[0].digest.trim_start_matches("sha256:");
+        let manifest_hex = manifest.digest.trim_start_matches("sha256:");
+        for path in [
+            store_root.join("objects/sha256").join(digest_hex),
+            store_root.join("manifests/sha256").join(format!("{manifest_hex}.json")),
+            store_root.join("refs/test-runtime/current.json"),
+        ] {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let json = JsonStore::new(root.join("json"));
+        json.write("state.json", &manifest).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("json/state.json")).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fn no_temps(path: &Path) -> bool {
+            fs::read_dir(path).unwrap().all(|entry| {
+                let entry = entry.unwrap();
+                !entry.file_name().to_string_lossy().contains(".tmp-")
+                    && (!entry.path().is_dir() || no_temps(&entry.path()))
+            })
+        }
+        assert!(no_temps(&root));
     }
 
     #[test]
