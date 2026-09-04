@@ -1033,6 +1033,13 @@ fn validate_then_bootstrap(
     }
 
     operations.prepare_store(&prepared.roots.runtime_store, prepared.owner)?;
+    let post_store = prepare_bootstrap(host_report, request, owner)?;
+    ensure_same_preflight(&prepared, &post_store)?;
+    ensure_destination_snapshots(
+        &post_store,
+        &post_store.runtime_store_destination,
+        &prepared.storage_destination,
+    )?;
     let staging = operations.create_staging(&prepared.roots.runtime_store, prepared.owner)?;
     let install_result = operations
         .populate_staging(&staging, &prepared)
@@ -1064,6 +1071,13 @@ fn validate_then_bootstrap(
     }
 
     require_unchanged_active_ref(&prepared, &installed_ref)?;
+    let post_probe = prepare_bootstrap(host_report, request, owner)?;
+    ensure_same_preflight(&prepared, &post_probe)?;
+    ensure_destination_snapshots(
+        &post_probe,
+        &post_store.runtime_store_destination,
+        &prepared.storage_destination,
+    )?;
 
     operations.prepare_storage(&prepared.roots.storage, prepared.owner)?;
     let canonical_storage =
@@ -1074,8 +1088,20 @@ fn validate_then_bootstrap(
     if canonical_storage.as_os_str() != prepared.storage_text.as_str() {
         return Err(LinuxBootstrapError::InvalidRequest("storageRoot"));
     }
+    let post_storage = prepare_bootstrap(host_report, request, owner)?;
+    ensure_same_preflight(&prepared, &post_storage)?;
+    ensure_destination_snapshots(
+        &post_storage,
+        &post_store.runtime_store_destination,
+        &post_storage.storage_destination,
+    )?;
     let final_preflight = prepare_bootstrap(host_report, request, owner)?;
     ensure_same_preflight(&prepared, &final_preflight)?;
+    ensure_destination_snapshots(
+        &final_preflight,
+        &post_store.runtime_store_destination,
+        &post_storage.storage_destination,
+    )?;
     let installed_manifest = load_associated_manifest(
         &RuntimePackStore::new(&prepared.roots.runtime_store),
         &prepared.provider_config.wine_runtime,
@@ -1266,9 +1292,15 @@ fn ensure_same_preflight(first: &PreparedBootstrap, second: &PreparedBootstrap) 
 
 fn ensure_same_pre_mutation(first: &PreparedBootstrap, second: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
     ensure_same_preflight(first, second)?;
-    if first.runtime_store_destination != second.runtime_store_destination
-        || first.storage_destination != second.storage_destination
-    {
+    ensure_destination_snapshots(second, &first.runtime_store_destination, &first.storage_destination)
+}
+
+fn ensure_destination_snapshots(
+    current: &PreparedBootstrap,
+    expected_store: &DestinationSnapshot,
+    expected_storage: &DestinationSnapshot,
+) -> Result<(), LinuxBootstrapError> {
+    if &current.runtime_store_destination != expected_store || &current.storage_destination != expected_storage {
         return Err(LinuxBootstrapError::InvalidRequest("bootstrap destination changed"));
     }
     Ok(())
@@ -5058,7 +5090,47 @@ int main(void) {
     struct DestinationCreatingProbeCommand {
         system: SystemProbeCommand,
         calls: RefCell<usize>,
+        mutate_after_call: usize,
         path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct StoreReplacingProbeCommand {
+        system: SystemProbeCommand,
+        calls: RefCell<usize>,
+        store: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn copy_tree_preserving_permissions(source: &Path, destination: &Path) {
+        fs::create_dir(destination).expect("create replacement directory");
+        fs::set_permissions(destination, fs::metadata(source).unwrap().permissions()).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree_preserving_permissions(&source_path, &destination_path);
+            } else {
+                fs::copy(&source_path, &destination_path).unwrap();
+                fs::set_permissions(&destination_path, fs::metadata(&source_path).unwrap().permissions()).unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProbeCommand for StoreReplacingProbeCommand {
+        fn run(&self, specification: &ProbeCommandSpec) -> Result<ProbeCommandOutput, ProbeCommandFailure> {
+            let output = self.system.run(specification)?;
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls == 3 {
+                let displaced = self.store.with_extension("displaced");
+                fs::rename(&self.store, &displaced).expect("displace installed Store");
+                copy_tree_preserving_permissions(&displaced, &self.store);
+            }
+            Ok(output)
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5067,10 +5139,48 @@ int main(void) {
             let output = self.system.run(specification)?;
             let mut calls = self.calls.borrow_mut();
             *calls += 1;
-            if *calls == 1 {
+            if *calls == self.mutate_after_call {
                 fs::create_dir_all(&self.path).expect("malicious helper creates destination state");
             }
             Ok(output)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct StorageObservingOperations {
+        storage_started: RefCell<bool>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl BootstrapOperations for StorageObservingOperations {
+        fn prepare_store(&self, store_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.prepare_store(store_root, owner)
+        }
+
+        fn create_staging(&self, store_root: &Path, owner: OwnerIdentity) -> Result<PathBuf, LinuxBootstrapError> {
+            SystemBootstrapOperations.create_staging(store_root, owner)
+        }
+
+        fn populate_staging(&self, staging: &Path, prepared: &PreparedBootstrap) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.populate_staging(staging, prepared)
+        }
+
+        fn install_pack(
+            &self,
+            store_root: &Path,
+            staging: &Path,
+            manifest: &RuntimePackManifest,
+        ) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.install_pack(store_root, staging, manifest)
+        }
+
+        fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            SystemBootstrapOperations.cleanup_staging(staging, owner)
+        }
+
+        fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            *self.storage_started.borrow_mut() = true;
+            SystemBootstrapOperations.prepare_storage(storage_root, owner)
         }
     }
 
@@ -5221,6 +5331,7 @@ int main(void) {
             let command = DestinationCreatingProbeCommand {
                 system: SystemProbeCommand,
                 calls: RefCell::new(0),
+                mutate_after_call: 1,
                 path: created.clone(),
             };
 
@@ -5235,6 +5346,76 @@ int main(void) {
             assert!(!store.join("objects").exists());
             assert!(!store.join("refs").exists());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_freezes_absent_storage_through_the_second_probe_round() {
+        for create_target in [true, false] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let store = fixture.directory.root.join(format!("late-{create_target}-store"));
+            let storage = fixture
+                .directory
+                .root
+                .join(format!("late-{create_target}-storage/target"));
+            let created = if create_target {
+                storage.clone()
+            } else {
+                storage.parent().unwrap().to_path_buf()
+            };
+            let request = bootstrap_request(&fixture, &store, &storage);
+            let operations = StorageObservingOperations {
+                storage_started: RefCell::new(false),
+            };
+            let command = DestinationCreatingProbeCommand {
+                system: SystemProbeCommand,
+                calls: RefCell::new(0),
+                mutate_after_call: 3,
+                path: created.clone(),
+            };
+
+            let result = validate_then_bootstrap(&fixture.host, &request, &command, &operations);
+
+            assert!(result.is_err(), "target={create_target}");
+            assert!(created.exists(), "second-round helper mutation occurred");
+            assert!(!*operations.storage_started.borrow(), "Storage mutation must not start");
+            assert!(store
+                .join("refs")
+                .join(LOCAL_PREVIEW_PACK_ID)
+                .join("current.json")
+                .exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_rejects_same_content_store_inode_replacement_during_second_probe() {
+        let fixture = LinuxPublicProviderFixture::new();
+        let store = fixture.directory.root.join("replaced-store");
+        let storage = fixture.directory.root.join("replaced-storage");
+        let request = bootstrap_request(&fixture, &store, &storage);
+        let operations = StorageObservingOperations {
+            storage_started: RefCell::new(false),
+        };
+        let command = StoreReplacingProbeCommand {
+            system: SystemProbeCommand,
+            calls: RefCell::new(0),
+            store: store.clone(),
+        };
+
+        let result = validate_then_bootstrap(&fixture.host, &request, &command, &operations);
+
+        assert!(result.is_err());
+        assert!(
+            store.with_extension("displaced").exists(),
+            "second-round replacement occurred"
+        );
+        assert!(!*operations.storage_started.borrow(), "Storage mutation must not start");
+        assert!(store
+            .join("refs")
+            .join(LOCAL_PREVIEW_PACK_ID)
+            .join("current.json")
+            .exists());
     }
 
     #[cfg(target_os = "linux")]
