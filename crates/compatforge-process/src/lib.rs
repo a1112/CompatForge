@@ -45,6 +45,30 @@ const BOTTLE_FONT_FILE_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FILE";
 const BOTTLE_FONT_DIGEST_ENV: &str = "COMPATFORGE_BOTTLE_FONT_SHA256";
 const BOTTLE_FONT_FILE_NAME: &str = "compatforge-cjk.ttc";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupStage {
+    Wineboot,
+    FontPreparation,
+    GuestAlias,
+    GuestVerification,
+    RuntimeVerification,
+    PinnedExecution,
+    ProcessTreePreparation,
+    GuestSpawn,
+    ProcessTreeAttachment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupStage {
+    RuntimeVerification,
+    ServerSpawn,
+    ServerWait,
+    ServerExit,
+    ClientCleanup,
+    TreeTermination,
+    RootReap,
+}
+
 #[derive(Debug)]
 pub enum ProcessError {
     InvalidPlan(ContractError),
@@ -55,6 +79,11 @@ pub enum ProcessError {
     Spawn(io::Error),
     Terminate(io::Error),
     WinePrefixBusy(String),
+    Startup(StartupStage),
+    StartupCleanup {
+        startup: StartupStage,
+        cleanup: CleanupStage,
+    },
 }
 
 impl fmt::Display for ProcessError {
@@ -68,6 +97,10 @@ impl fmt::Display for ProcessError {
             Self::Spawn(error) => write!(formatter, "process spawn failed: {error}"),
             Self::Terminate(error) => write!(formatter, "process termination failed: {error}"),
             Self::WinePrefixBusy(prefix) => write!(formatter, "Wine prefix already has an active launch: {prefix}"),
+            Self::Startup(startup) => write!(formatter, "Wine startup failed: {startup:?}"),
+            Self::StartupCleanup { startup, cleanup } => {
+                write!(formatter, "Wine startup cleanup failed: {startup:?}; {cleanup:?}")
+            }
         }
     }
 }
@@ -78,7 +111,11 @@ impl std::error::Error for ProcessError {
             Self::InvalidPlan(error) => Some(error),
             Self::InvalidGuestArtifact(error) => Some(error),
             Self::Isolation(error) | Self::Spawn(error) | Self::Terminate(error) => Some(error),
-            Self::InvalidRuntimeEvidence(_) | Self::UnsafeDirectory(_) | Self::WinePrefixBusy(_) => None,
+            Self::InvalidRuntimeEvidence(_)
+            | Self::UnsafeDirectory(_)
+            | Self::WinePrefixBusy(_)
+            | Self::Startup(_)
+            | Self::StartupCleanup { .. } => None,
         }
     }
 }
@@ -95,21 +132,42 @@ pub struct ProcessSupervisor;
 impl ProcessSupervisor {
     /// Start a plan that has already been authorized against a trusted context.
     pub fn start(plan: &LaunchPlan) -> Result<LaunchHandle, ProcessError> {
+        Self::start_with_operations(plan, &SystemStartupOperations)
+    }
+
+    fn start_with_operations(
+        plan: &LaunchPlan,
+        operations: &impl StartupOperations,
+    ) -> Result<LaunchHandle, ProcessError> {
         plan.validate().map_err(ProcessError::InvalidPlan)?;
-        if let Some(binding) = &plan.guest_artifact {
-            verify_binding_contents(binding).map_err(ProcessError::InvalidGuestArtifact)?;
-        }
-        if let Some(binding) = &plan.bottle_executable {
-            verify_in_place_binding_contents(binding).map_err(ProcessError::InvalidGuestArtifact)?;
-        }
+        verify_guest_inputs(plan)?;
         verify_pinned_runtime(plan)?;
         verify_pinned_font_config(plan)?;
         verify_pinned_bottle_font(plan)?;
         materialize_launch_directories(plan)?;
         let wine_session = WineSession::acquire(plan)?;
-        initialize_wine_prefix(plan)?;
-        prepare_pinned_bottle_font(plan)?;
-        let guest_execution_alias = prepare_guest_execution_alias(plan)?;
+        let mut startup_guard = wine_session.map(StartupWineSessionGuard::new);
+        startup_step(&mut startup_guard, StartupStage::Wineboot, operations.wineboot(plan))?;
+        startup_step(
+            &mut startup_guard,
+            StartupStage::GuestVerification,
+            verify_guest_inputs(plan),
+        )?;
+        startup_step(
+            &mut startup_guard,
+            StartupStage::RuntimeVerification,
+            verify_pinned_runtime(plan),
+        )?;
+        startup_step(
+            &mut startup_guard,
+            StartupStage::FontPreparation,
+            operations.fonts(plan),
+        )?;
+        let guest_execution_alias = startup_step(
+            &mut startup_guard,
+            StartupStage::GuestAlias,
+            operations.guest_alias(plan),
+        )?;
         let keep_alive_after_root_exit = managed_wine_gui_requires_idle_wait(plan);
 
         let mut command = Command::new(&plan.process.executable);
@@ -130,7 +188,13 @@ impl ProcessSupervisor {
                 Stdio::piped()
             });
 
-        supervise_command(plan, command, wine_session, ())
+        supervise_command_with_operations(plan, command, startup_guard, (), operations, || {
+            verify_guest_inputs(plan)?;
+            // Recheck the actual alias too; the binding source alone cannot
+            // prove that a replaced alias still names the approved bytes.
+            prepare_guest_execution_alias(plan)?;
+            verify_pinned_runtime(plan)
+        })
     }
 
     /// Start the fixed, captured SumatraPDF Bottle executable without reopening
@@ -150,6 +214,232 @@ impl ProcessSupervisor {
         #[cfg(target_os = "macos")]
         start_pinned_bottle_macos(plan, pinned)
     }
+}
+
+trait StartupOperations {
+    fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+        initialize_wine_prefix(plan)
+    }
+
+    fn fonts(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+        prepare_pinned_bottle_font(plan)
+    }
+
+    fn guest_alias(&self, plan: &LaunchPlan) -> Result<Option<PathBuf>, ProcessError> {
+        prepare_guest_execution_alias(plan)
+    }
+
+    fn spawn(&self, command: &mut Command) -> io::Result<Child> {
+        command.spawn()
+    }
+
+    fn attach(&self, prepared: platform::PreparedProcessTree, child: &Child) -> io::Result<platform::ProcessTree> {
+        prepared.attach(child)
+    }
+}
+
+trait PollClock {
+    fn now(&self) -> Instant;
+    fn wait(&self);
+}
+
+struct SystemPollClock;
+
+impl PollClock for SystemPollClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn wait(&self) {
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+}
+
+trait BoundedChild {
+    fn poll(&mut self) -> io::Result<Option<bool>>;
+    fn force_kill_tree(&mut self) -> io::Result<()>;
+}
+
+#[derive(Debug)]
+struct AuxiliaryFailure {
+    cleanup: Option<CleanupStage>,
+}
+
+impl AuxiliaryFailure {
+    fn into_process_error(self, startup: StartupStage) -> ProcessError {
+        match self.cleanup {
+            Some(cleanup) => ProcessError::StartupCleanup { startup, cleanup },
+            None => ProcessError::Startup(startup),
+        }
+    }
+}
+
+fn reap_bounded<C: BoundedChild>(child: &mut C, clock: &impl PollClock, timeout: Duration) -> Result<(), CleanupStage> {
+    let signal_error = child.force_kill_tree().err();
+    let deadline = clock.now() + timeout;
+    loop {
+        match child.poll() {
+            Ok(Some(_)) => {
+                return if signal_error.is_some() {
+                    Err(CleanupStage::TreeTermination)
+                } else {
+                    Ok(())
+                }
+            }
+            _ if clock.now() >= deadline => return Err(CleanupStage::RootReap),
+            _ => clock.wait(),
+        }
+    }
+}
+
+fn wait_bounded<C: BoundedChild>(
+    child: &mut C,
+    clock: &impl PollClock,
+    timeout: Duration,
+) -> Result<bool, AuxiliaryFailure> {
+    let deadline = clock.now() + timeout;
+    loop {
+        match child.poll() {
+            Ok(Some(success)) => return Ok(success),
+            Ok(None) if clock.now() < deadline => clock.wait(),
+            _ => {
+                return Err(AuxiliaryFailure {
+                    cleanup: reap_bounded(child, clock, WINE_SERVER_COMMAND_TIMEOUT).err(),
+                })
+            }
+        }
+    }
+}
+
+impl BoundedChild for Child {
+    fn poll(&mut self) -> io::Result<Option<bool>> {
+        self.try_wait().map(|status| status.map(|status| status.success()))
+    }
+    fn force_kill_tree(&mut self) -> io::Result<()> {
+        platform::force_kill_unattached(self)
+    }
+}
+
+struct AuxiliaryProcess {
+    child: Child,
+    tree: platform::ProcessTree,
+    cleanup_failure: Option<CleanupStage>,
+}
+
+impl BoundedChild for AuxiliaryProcess {
+    fn poll(&mut self) -> io::Result<Option<bool>> {
+        self.child.poll()
+    }
+    fn force_kill_tree(&mut self) -> io::Result<()> {
+        self.tree.force_kill()
+    }
+}
+
+fn spawn_auxiliary(command: &mut Command) -> Result<AuxiliaryProcess, AuxiliaryFailure> {
+    spawn_auxiliary_with(command, Command::spawn)
+}
+
+fn spawn_auxiliary_with(
+    command: &mut Command,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+) -> Result<AuxiliaryProcess, AuxiliaryFailure> {
+    let prepared = platform::PreparedProcessTree::prepare(command).map_err(|_| AuxiliaryFailure { cleanup: None })?;
+    let child = spawn(command).map_err(|_| AuxiliaryFailure { cleanup: None })?;
+    attach_auxiliary(child, prepared)
+}
+
+fn attach_auxiliary(
+    mut child: Child,
+    prepared: platform::PreparedProcessTree,
+) -> Result<AuxiliaryProcess, AuxiliaryFailure> {
+    match prepared.attach(&child) {
+        Ok(tree) => Ok(AuxiliaryProcess {
+            child,
+            tree,
+            cleanup_failure: None,
+        }),
+        Err(_) => Err(AuxiliaryFailure {
+            cleanup: reap_bounded(&mut child, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT).err(),
+        }),
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn read_auxiliary_chunk(reader: &mut impl Read, output: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
+    let mut buffer = [0_u8; 4096];
+    let available = limit.saturating_sub(output.len());
+    let read_length = buffer.len().min(available.saturating_add(1));
+    match reader.read(&mut buffer[..read_length]) {
+        Ok(0) => Ok(true),
+        Ok(count) if count > available => Err(io::Error::other("auxiliary output limit exceeded")),
+        Ok(count) => {
+            output.extend_from_slice(&buffer[..count]);
+            Ok(false)
+        }
+        Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn capture_auxiliary(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<(ExitStatus, Vec<u8>)> {
+    use std::os::fd::AsRawFd;
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    let mut process = spawn_auxiliary(command).map_err(|_| io::Error::other("auxiliary spawn failed"))?;
+    let result = (|| {
+        let mut stdout = process
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("auxiliary output unavailable"))?;
+        let descriptor = stdout.as_raw_fd();
+        // SAFETY: stdout owns this live descriptor. These flag operations do
+        // not close or transfer it; nonblocking reads make the deadline real
+        // even when a descendant retains the write end after the root exits.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::other("auxiliary output setup failed"));
+        }
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::with_capacity(limit);
+        let mut eof = false;
+        loop {
+            if !eof {
+                eof = read_auxiliary_chunk(&mut stdout, &mut output, limit)?;
+            }
+            let status = process.child.try_wait()?;
+            if eof {
+                if let Some(status) = status {
+                    return Ok((status, output));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("auxiliary capture timed out"));
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+    })();
+    let cleanup = reap_bounded(&mut process, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT);
+    match cleanup {
+        Err(stage) => Err(io::Error::other(format!("auxiliary cleanup failed: {stage:?}"))),
+        Ok(()) => result,
+    }
+}
+
+struct SystemStartupOperations;
+
+impl StartupOperations for SystemStartupOperations {}
+
+fn verify_guest_inputs(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    if let Some(binding) = &plan.guest_artifact {
+        verify_binding_contents(binding).map_err(ProcessError::InvalidGuestArtifact)?;
+    }
+    if let Some(binding) = &plan.bottle_executable {
+        verify_in_place_binding_contents(binding).map_err(ProcessError::InvalidGuestArtifact)?;
+    }
+    Ok(())
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -239,8 +529,17 @@ fn start_pinned_bottle_macos(plan: &LaunchPlan, pinned: &PinnedBottleExecutable)
     verify_pinned_runtime(plan).map_err(|_| pinned_launch_failed())?;
     validate_existing_pinned_directory(Path::new(&plan.process.working_directory))?;
     let wine_session = WineSession::acquire(plan).map_err(|_| pinned_launch_failed())?;
-    let execution = ProcessOwnedPinnedExecution::duplicate(pinned)?;
-    let command_spec = pinned_command_spec(plan, pinned.binding(), execution.descriptor())?;
+    let mut startup_guard = wine_session.map(StartupWineSessionGuard::new);
+    let execution = startup_step(
+        &mut startup_guard,
+        StartupStage::PinnedExecution,
+        ProcessOwnedPinnedExecution::duplicate(pinned),
+    )?;
+    let command_spec = startup_step(
+        &mut startup_guard,
+        StartupStage::PinnedExecution,
+        pinned_command_spec(plan, pinned.binding(), execution.descriptor()),
+    )?;
     let mut command = Command::new(command_spec.executable);
     command
         .args(command_spec.arguments)
@@ -251,7 +550,18 @@ fn start_pinned_bottle_macos(plan: &LaunchPlan, pinned: &PinnedBottleExecutable)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    supervise_command(plan, command, wine_session, execution).map_err(sanitize_pinned_launch_error)
+    supervise_command_with_operations(
+        plan,
+        command,
+        startup_guard,
+        execution,
+        &SystemStartupOperations,
+        || {
+            pinned.revalidate().map_err(|_| pinned_launch_failed())?;
+            verify_pinned_runtime(plan)
+        },
+    )
+    .map_err(sanitize_pinned_launch_error)
 }
 
 #[cfg(target_os = "macos")]
@@ -293,8 +603,11 @@ fn pinned_launch_failed() -> ProcessError {
 }
 
 #[cfg(any(test, target_os = "macos"))]
-fn sanitize_pinned_launch_error(_error: ProcessError) -> ProcessError {
-    pinned_launch_failed()
+fn sanitize_pinned_launch_error(error: ProcessError) -> ProcessError {
+    match error {
+        ProcessError::Startup(_) | ProcessError::StartupCleanup { .. } => error,
+        _ => pinned_launch_failed(),
+    }
 }
 
 fn release_parent_duplicate_after_spawn_attempt<G, T, E>(
@@ -306,22 +619,44 @@ fn release_parent_duplicate_after_spawn_attempt<G, T, E>(
     result
 }
 
-fn supervise_command<G>(
+fn supervise_command_with_operations<G>(
     plan: &LaunchPlan,
     mut command: Command,
-    wine_session: Option<Arc<WineSession>>,
+    mut startup_guard: Option<StartupWineSessionGuard>,
     parent_execution_guard: G,
+    operations: &impl StartupOperations,
+    before_spawn: impl FnOnce() -> Result<(), ProcessError>,
 ) -> Result<LaunchHandle, ProcessError> {
     let keep_alive_after_root_exit = managed_wine_gui_requires_idle_wait(plan);
-    let prepared_tree = platform::PreparedProcessTree::prepare(&mut command).map_err(ProcessError::Isolation)?;
-    let mut child = release_parent_duplicate_after_spawn_attempt(parent_execution_guard, || command.spawn())
-        .map_err(ProcessError::Spawn)?;
-    let process_tree = match prepared_tree.attach(&child) {
+    let prepared_tree = startup_step(
+        &mut startup_guard,
+        StartupStage::ProcessTreePreparation,
+        platform::PreparedProcessTree::prepare(&mut command).map_err(ProcessError::Isolation),
+    )?;
+    let verification = before_spawn();
+    let stage = match &verification {
+        Err(ProcessError::InvalidGuestArtifact(_)) => StartupStage::GuestVerification,
+        _ => StartupStage::RuntimeVerification,
+    };
+    startup_step(&mut startup_guard, stage, verification)?;
+    let mut child = startup_step(
+        &mut startup_guard,
+        StartupStage::GuestSpawn,
+        release_parent_duplicate_after_spawn_attempt(parent_execution_guard, || operations.spawn(&mut command))
+            .map_err(ProcessError::Spawn),
+    )?;
+    let process_tree = match operations.attach(prepared_tree, &child) {
         Ok(process_tree) => Arc::new(process_tree),
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ProcessError::Isolation(error));
+            let rollback = reap_bounded(&mut child, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT);
+            let error = match rollback {
+                Ok(()) => ProcessError::Isolation(error),
+                Err(cleanup) => ProcessError::StartupCleanup {
+                    startup: StartupStage::ProcessTreeAttachment,
+                    cleanup,
+                },
+            };
+            return startup_step(&mut startup_guard, StartupStage::ProcessTreeAttachment, Err(error));
         }
     };
 
@@ -335,6 +670,7 @@ fn supervise_command<G>(
     let cleanup_failed = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
     let emitter = Arc::new(EventEmitter::new(plan.request_id.clone(), sender));
+    let wine_session = startup_guard.as_ref().map(|guard| Arc::clone(&guard.session));
     let controller = Arc::new(TerminationController {
         child: Arc::clone(&child),
         process_tree: Arc::clone(&process_tree),
@@ -375,6 +711,11 @@ fn supervise_command<G>(
         },
     );
     controller.register_worker(exit_watcher);
+    // Both long-lived owners now hold clones of this exact session. Until
+    // this point an unwind quarantines the lease without executing commands.
+    if let Some(guard) = startup_guard.take() {
+        guard.commit();
+    }
     if let Some(maximum_runtime) = plan.lifecycle.maximum_runtime_milliseconds {
         let timeout_watcher = spawn_timeout_watcher(
             Arc::downgrade(&controller),
@@ -452,6 +793,18 @@ fn prepare_guest_execution_alias(plan: &LaunchPlan) -> Result<Option<PathBuf>, P
 /// shell, and it runs only when the prefix has not yet produced Wine's
 /// system32 marker. Existing prefixes are left untouched.
 fn initialize_wine_prefix(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    initialize_wine_prefix_with_timeout(plan, WINE_PREFIX_BOOTSTRAP_TIMEOUT)
+}
+
+fn initialize_wine_prefix_with_timeout(plan: &LaunchPlan, timeout: Duration) -> Result<(), ProcessError> {
+    initialize_wine_prefix_with_spawn(plan, timeout, Command::spawn)
+}
+
+fn initialize_wine_prefix_with_spawn(
+    plan: &LaunchPlan,
+    timeout: Duration,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+) -> Result<(), ProcessError> {
     if plan.runtime.provider != RuntimeKind::Wine {
         return Ok(());
     }
@@ -483,34 +836,19 @@ fn initialize_wine_prefix(plan: &LaunchPlan) -> Result<(), ProcessError> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-    let deadline = Instant::now() + WINE_PREFIX_BOOTSTRAP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(exit)) if exit.success() => {
-                let metadata = std::fs::symlink_metadata(&marker)
-                    .map_err(|_| ProcessError::UnsafeDirectory("Wine prefix marker"))?;
-                if metadata.is_file() && !metadata.file_type().is_symlink() {
-                    return Ok(());
-                }
-                return Err(ProcessError::UnsafeDirectory("Wine prefix marker"));
+    let mut child =
+        spawn_auxiliary_with(&mut command, spawn).map_err(|error| error.into_process_error(StartupStage::Wineboot))?;
+    match wait_bounded(&mut child, &SystemPollClock, timeout) {
+        Ok(true) => {
+            let metadata =
+                std::fs::symlink_metadata(&marker).map_err(|_| ProcessError::UnsafeDirectory("Wine prefix marker"))?;
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                return Ok(());
             }
-            Ok(Some(exit)) => {
-                return Err(ProcessError::Spawn(io::Error::other(format!(
-                    "wineboot exited with {exit}"
-                ))));
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProcessError::Spawn(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "wineboot did not initialize the prefix within 90 seconds",
-                )));
-            }
-            Err(error) => return Err(ProcessError::Spawn(error)),
+            Err(ProcessError::UnsafeDirectory("Wine prefix marker"))
         }
+        Ok(false) => Err(ProcessError::Spawn(io::Error::other("wineboot exited unsuccessfully"))),
+        Err(error) => Err(error.into_process_error(StartupStage::Wineboot)),
     }
 }
 
@@ -710,6 +1048,7 @@ fn prepare_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
 }
 
 fn run_bounded_wine_command(plan: &LaunchPlan, arguments: &[&str]) -> Result<(), ProcessError> {
+    verify_pinned_runtime(plan)?;
     let mut command = Command::new(&plan.process.executable);
     command
         .args(arguments)
@@ -719,27 +1058,12 @@ fn run_bounded_wine_command(plan: &LaunchPlan, arguments: &[&str]) -> Result<(),
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(ProcessError::Spawn)?;
-    let deadline = Instant::now() + WINE_PREFIX_BOOTSTRAP_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(exit)) if exit.success() => return Ok(()),
-            Ok(Some(exit)) => {
-                return Err(ProcessError::Spawn(io::Error::other(format!(
-                    "Wine compatibility preparation exited with {exit}"
-                ))));
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProcessError::Spawn(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Wine compatibility preparation timed out",
-                )));
-            }
-            Err(error) => return Err(ProcessError::Spawn(error)),
-        }
+    let mut child =
+        spawn_auxiliary(&mut command).map_err(|error| error.into_process_error(StartupStage::FontPreparation))?;
+    match wait_bounded(&mut child, &SystemPollClock, WINE_PREFIX_BOOTSTRAP_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ProcessError::Startup(StartupStage::FontPreparation)),
+        Err(error) => Err(error.into_process_error(StartupStage::FontPreparation)),
     }
 }
 
@@ -1302,13 +1626,81 @@ fn emit_exit(emitter: &EventEmitter, status: ExitStatus) {
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaseState {
+    Live,
+    Released,
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopOutcome {
+    Complete,
+    Failed(CleanupStage),
+}
+
+struct StartupWineSessionGuard {
+    session: Arc<WineSession>,
+    armed: bool,
+}
+
+impl StartupWineSessionGuard {
+    fn new(session: Arc<WineSession>) -> Self {
+        Self { session, armed: true }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+
+    fn abort(mut self, startup: StartupStage) -> Result<(), ProcessError> {
+        let outcome = self.session.stop_core(None);
+        self.armed = false;
+        match outcome {
+            StopOutcome::Complete => Err(ProcessError::Startup(startup)),
+            StopOutcome::Failed(cleanup) => Err(ProcessError::StartupCleanup { startup, cleanup }),
+        }
+    }
+}
+
+impl Drop for StartupWineSessionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.poison_lease();
+        }
+    }
+}
+
+fn startup_step<T>(
+    guard: &mut Option<StartupWineSessionGuard>,
+    stage: StartupStage,
+    result: Result<T, ProcessError>,
+) -> Result<T, ProcessError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(guard) = guard.take() {
+                if let ProcessError::StartupCleanup { cleanup, .. } = error {
+                    let _ = guard.session.prior_cleanup_failure.set(cleanup);
+                }
+                guard.abort(stage)?;
+                unreachable!("aborting startup always returns an error");
+            }
+            Err(error)
+        }
+    }
+}
+
 struct WineSession {
     lifecycle: WineServerLifecycle,
     environment: Vec<(String, String)>,
     working_directory: String,
-    stop_started: AtomicBool,
-    stop_completed: AtomicBool,
-    lease_released: AtomicBool,
+    expected_wineserver_digest: String,
+    stop_outcome: OnceLock<StopOutcome>,
+    prior_cleanup_failure: OnceLock<CleanupStage>,
+    lease_state: Mutex<LeaseState>,
+    stopping: AtomicBool,
+    idle_cleanup_lock: Mutex<()>,
 }
 
 trait NaturalIdleCommand {
@@ -1373,13 +1765,38 @@ impl NaturalIdleCommand for Child {
     }
 }
 
+impl NaturalIdleCommand for AuxiliaryProcess {
+    fn try_wait_success(&mut self) -> io::Result<Option<bool>> {
+        self.poll()
+    }
+    fn interrupt_and_reap(&mut self) -> io::Result<()> {
+        reap_bounded(self, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT).map_err(|stage| {
+            self.cleanup_failure = Some(stage);
+            io::Error::other(format!("Wine cleanup failed: {stage:?}"))
+        })
+    }
+}
+
+#[cfg(test)]
 fn wait_for_natural_idle_command<C: NaturalIdleCommand>(
     command: &mut C,
     termination_started: &AtomicBool,
+    wait_for_next_poll: impl FnMut(),
+) -> io::Result<()> {
+    wait_for_natural_idle_command_with_stop(
+        command,
+        || termination_started.load(Ordering::Acquire),
+        wait_for_next_poll,
+    )
+}
+
+fn wait_for_natural_idle_command_with_stop<C: NaturalIdleCommand>(
+    command: &mut C,
+    termination_requested: impl Fn() -> bool,
     mut wait_for_next_poll: impl FnMut(),
 ) -> io::Result<()> {
     loop {
-        if termination_started.load(Ordering::Acquire) {
+        if termination_requested() {
             return command.interrupt_and_reap();
         }
         match command.try_wait_success() {
@@ -1398,9 +1815,20 @@ fn wait_for_natural_idle_command<C: NaturalIdleCommand>(
 
 impl WineSession {
     fn acquire(plan: &LaunchPlan) -> Result<Option<Arc<Self>>, ProcessError> {
-        let Some(lifecycle) = plan.lifecycle.wineserver.clone() else {
+        let Some(mut lifecycle) = plan.lifecycle.wineserver.clone() else {
             return Ok(None);
         };
+        lifecycle.prefix = std::fs::canonicalize(&lifecycle.prefix)
+            .map_err(|_| ProcessError::UnsafeDirectory("WINEPREFIX"))?
+            .to_str()
+            .ok_or(ProcessError::UnsafeDirectory("WINEPREFIX"))?
+            .into();
+        let expected_wineserver_digest = plan
+            .process
+            .environment
+            .get(WINESERVER_EXECUTABLE_DIGEST_ENV)
+            .ok_or(ProcessError::InvalidRuntimeEvidence("wineserver executable"))?
+            .clone();
         let mut leases = lock_recover(wine_prefix_leases());
         if !leases.insert(lifecycle.prefix.clone()) {
             return Err(ProcessError::WinePrefixBusy(lifecycle.prefix));
@@ -1416,63 +1844,72 @@ impl WineSession {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             working_directory: plan.process.working_directory.clone(),
-            stop_started: AtomicBool::new(false),
-            stop_completed: AtomicBool::new(false),
-            lease_released: AtomicBool::new(false),
+            expected_wineserver_digest,
+            stop_outcome: OnceLock::new(),
+            prior_cleanup_failure: OnceLock::new(),
+            lease_state: Mutex::new(LeaseState::Live),
+            stopping: AtomicBool::new(false),
+            idle_cleanup_lock: Mutex::new(()),
         })))
     }
 
     fn stop(&self, emitter: &EventEmitter) -> io::Result<()> {
-        if self
-            .stop_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            let deadline = Instant::now() + SUPERVISOR_FORCE_COMPLETION_TIMEOUT;
-            while !self.stop_completed.load(Ordering::Acquire) && Instant::now() < deadline {
-                thread::sleep(PROCESS_POLL_INTERVAL);
-            }
-            return if self.stop_completed.load(Ordering::Acquire) {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "concurrent wineserver cleanup did not complete",
-                ))
-            };
+        match self.stop_core(Some(emitter)) {
+            StopOutcome::Complete => Ok(()),
+            StopOutcome::Failed(stage) => Err(io::Error::other(format!("Wine cleanup failed: {stage:?}"))),
         }
-        emitter.emit(
-            RuntimeEventKind::WineServerStopRequested,
-            None,
-            None,
-            None,
-            Some(format!("stopping wineserver for prefix {}", self.lifecycle.prefix)),
-        );
+    }
 
-        // A root/descendant may have already caused wineserver to exit. In
-        // that case `-k` returns status 1, while the authoritative `-w`
-        // rendezvous succeeds; cleanup is still complete and idempotent.
-        let kill_result = self.run_command("-k");
-        // Wine's macOS driver may detach a GUI client from the launch process
-        // group. Some Runtime builds leave that host process blocked after
-        // wineserver exits instead of terminating it, which produces a frozen
-        // window whose Close and Exit actions no longer work. Bind the
-        // fallback to this prefix's system32 directory or ntdll mapping so
-        // another Bottle is never selected merely because it is also running
-        // Wine. Some macOS Wine builds retain the directory as their current
-        // working directory without keeping the marker file open.
-        let client_cleanup_result = platform::force_kill_wine_prefix_clients(Path::new(&self.lifecycle.prefix));
-        let wait_result = self.run_command("-w");
-        let stop_result = match (kill_result, wait_result, client_cleanup_result) {
-            (_, Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(error), Ok(()))
-            | (Err(error), Err(_), Ok(()))
-            | (_, Ok(()), Err(error))
-            | (_, Err(_), Err(error)) => Err(error),
-        };
-        self.release_lease();
-        self.stop_completed.store(true, Ordering::Release);
-        stop_result
+    fn stop_core(&self, emitter: Option<&EventEmitter>) -> StopOutcome {
+        *self.stop_outcome.get_or_init(|| {
+            self.stopping.store(true, Ordering::Release);
+            // A natural-idle command may still own a subprocess. Wake it and
+            // include its bounded reap result before memoizing cleanup/releasing.
+            let _idle_guard = lock_recover(&self.idle_cleanup_lock);
+            if let Some(emitter) = emitter {
+                emitter.emit(
+                    RuntimeEventKind::WineServerStopRequested,
+                    None,
+                    None,
+                    None,
+                    Some(format!("stopping wineserver for prefix {}", self.lifecycle.prefix)),
+                );
+            }
+
+            // A root/descendant may have already caused wineserver to exit. In
+            // that case `-k` returns status 1, while the authoritative `-w`
+            // rendezvous succeeds; cleanup is still complete and idempotent.
+            let kill_result = self.run_command("-k");
+            // Wine's macOS driver may detach a GUI client from the launch process
+            // group. Some Runtime builds leave that host process blocked after
+            // wineserver exits instead of terminating it, which produces a frozen
+            // window whose Close and Exit actions no longer work. Bind the
+            // fallback to this prefix's system32 directory or ntdll mapping so
+            // another Bottle is never selected merely because it is also running
+            // Wine. Some macOS Wine builds retain the directory as their current
+            // working directory without keeping the marker file open.
+            let client_cleanup_result = platform::force_kill_wine_prefix_clients(Path::new(&self.lifecycle.prefix));
+            let wait_result = self.run_command("-w");
+            let outcome = match (kill_result, wait_result, client_cleanup_result) {
+                (Err(CleanupStage::RuntimeVerification), _, _) | (_, Err(CleanupStage::RuntimeVerification), _) => {
+                    StopOutcome::Failed(CleanupStage::RuntimeVerification)
+                }
+                (_, _, Err(_)) => StopOutcome::Failed(CleanupStage::ClientCleanup),
+                (_, Err(stage), _) => StopOutcome::Failed(stage),
+                (Err(stage), _, _) if stage != CleanupStage::ServerExit => StopOutcome::Failed(stage),
+                _ => StopOutcome::Complete,
+            };
+            let outcome = self
+                .prior_cleanup_failure
+                .get()
+                .map_or(outcome, |stage| StopOutcome::Failed(*stage));
+            if outcome == StopOutcome::Complete {
+                self.release_lease();
+            } else {
+                self.poison_lease();
+            }
+            outcome
+        })
     }
 
     /// Wait until the managed Wine server reports that every process in the
@@ -1480,43 +1917,39 @@ impl WineSession {
     /// normally closing GUI application; an explicit termination request may
     /// still run `stop` concurrently and wake this rendezvous.
     fn wait_until_idle(&self, termination_started: &AtomicBool) -> io::Result<()> {
-        if termination_started.load(Ordering::Acquire) {
+        let _idle_guard = lock_recover(&self.idle_cleanup_lock);
+        if termination_started.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut child = self.spawn_command("-w")?;
-        wait_for_natural_idle_command(&mut child, termination_started, || {
-            thread::sleep(PROCESS_POLL_INTERVAL);
-        })
+        let mut child = self.spawn_command("-w").map_err(|stage| {
+            let _ = self.prior_cleanup_failure.set(stage);
+            io::Error::other(format!("Wine cleanup failed: {stage:?}"))
+        })?;
+        let result = wait_for_natural_idle_command_with_stop(
+            &mut child,
+            || termination_started.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire),
+            || {
+                thread::sleep(PROCESS_POLL_INTERVAL);
+            },
+        );
+        if result.is_err() {
+            let _ = self
+                .prior_cleanup_failure
+                .set(child.cleanup_failure.unwrap_or(CleanupStage::ServerWait));
+        }
+        result
     }
 
-    fn run_command(&self, argument: &str) -> io::Result<()> {
-        let child = self.spawn_command(argument)?;
-        Self::wait_for_cleanup_command(child, argument)
-    }
-
-    fn wait_for_cleanup_command(mut child: Child, argument: &str) -> io::Result<()> {
-        let deadline = Instant::now() + WINE_SERVER_COMMAND_TIMEOUT;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!("wineserver {argument} exited with {status}")))
-                };
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("wineserver {argument} did not exit within 5 seconds"),
-                ));
-            }
-            thread::sleep(PROCESS_POLL_INTERVAL);
+    fn run_command(&self, argument: &str) -> Result<(), CleanupStage> {
+        let mut child = self.spawn_command(argument)?;
+        match wait_bounded(&mut child, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CleanupStage::ServerExit),
+            Err(error) => Err(error.cleanup.unwrap_or(CleanupStage::ServerWait)),
         }
     }
 
-    fn spawn_command(&self, argument: &str) -> io::Result<Child> {
+    fn spawn_command(&self, argument: &str) -> Result<AuxiliaryProcess, CleanupStage> {
         let mut command = Command::new(&self.lifecycle.executable);
         command
             .arg(argument)
@@ -1527,22 +1960,57 @@ impl WineSession {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut attempts = 0;
-        loop {
-            match command.spawn() {
-                Ok(child) => return Ok(child),
-                Err(error) if is_executable_file_busy(&error) && attempts < EXECUTABLE_BUSY_RETRY_LIMIT => {
-                    attempts += 1;
-                    thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let prepared = platform::PreparedProcessTree::prepare(&mut command).map_err(|_| CleanupStage::ServerSpawn)?;
+        let child = spawn_with_verified_retries(
+            || self.verify_wineserver(),
+            || command.spawn(),
+            is_executable_file_busy,
+            || thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY),
+        )?;
+        attach_auxiliary(child, prepared).map_err(|error| error.cleanup.unwrap_or(CleanupStage::ServerSpawn))
     }
 
     fn release_lease(&self) {
-        if !self.lease_released.swap(true, Ordering::AcqRel) {
+        let mut state = lock_recover(&self.lease_state);
+        if *state == LeaseState::Live {
             let _ = lock_recover(wine_prefix_leases()).remove(&self.lifecycle.prefix);
+            *state = LeaseState::Released;
+        }
+    }
+
+    fn poison_lease(&self) {
+        let mut state = lock_recover(&self.lease_state);
+        if *state == LeaseState::Live {
+            *state = LeaseState::Poisoned;
+        }
+    }
+
+    fn verify_wineserver(&self) -> Result<(), CleanupStage> {
+        verify_pinned_executable(
+            Path::new(&self.lifecycle.executable),
+            &self.expected_wineserver_digest,
+            "wineserver executable",
+        )
+        .map_err(|_| CleanupStage::RuntimeVerification)
+    }
+}
+
+fn spawn_with_verified_retries<T>(
+    mut verify: impl FnMut() -> Result<(), CleanupStage>,
+    mut spawn: impl FnMut() -> io::Result<T>,
+    is_retryable: impl Fn(&io::Error) -> bool,
+    mut wait: impl FnMut(),
+) -> Result<T, CleanupStage> {
+    let mut attempts = 0;
+    loop {
+        verify()?;
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if is_retryable(&error) && attempts < EXECUTABLE_BUSY_RETRY_LIMIT => {
+                attempts += 1;
+                wait();
+            }
+            Err(_) => return Err(CleanupStage::ServerSpawn),
         }
     }
 }
@@ -1562,7 +2030,7 @@ fn is_executable_file_busy(_error: &io::Error) -> bool {
 
 impl Drop for WineSession {
     fn drop(&mut self) {
-        self.release_lease();
+        self.poison_lease();
     }
 }
 
@@ -1655,6 +2123,13 @@ mod platform {
         process_group_id: i32,
     }
 
+    pub fn force_kill_unattached(child: &mut Child) -> io::Result<()> {
+        let process_group_id = i32::try_from(child.id()).map_err(|_| io::Error::other("invalid process group"))?;
+        // The child was spawned through PreparedProcessTree::prepare, which
+        // creates this exact process group before exec, even if attach fails.
+        std::mem::ManuallyDrop::new(ProcessTree { process_group_id }).force_kill()
+    }
+
     #[cfg(target_os = "macos")]
     pub fn force_kill_wine_prefix_clients(prefix: &Path) -> io::Result<()> {
         let system32 = prefix.join("drive_c/windows/system32");
@@ -1668,31 +2143,26 @@ mod platform {
                 "Wine prefix ntdll marker is unavailable",
             ));
         }
-        let output = Command::new(LSOF_PATH)
+        let mut command = Command::new(LSOF_PATH);
+        command
             .args(["-t", "--"])
             .arg(&marker)
             .arg(&system32)
             .env_clear()
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()?;
+            .stderr(Stdio::null());
+        let (status, captured) = super::capture_auxiliary(&mut command, super::WINE_SERVER_COMMAND_TIMEOUT, 64 * 1024)?;
         // lsof uses status 1 when no process has the file open. That is the
         // normal result after a clean Wine shutdown.
-        if !output.status.success() && output.status.code() != Some(1) {
+        if !status.success() && status.code() != Some(1) {
             return Err(io::Error::other(format!(
                 "Wine prefix client discovery exited with {}",
-                output.status
+                status
             )));
-        }
-        if output.stdout.len() > 64 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Wine prefix client discovery exceeded 64 KiB",
-            ));
         }
         let current_process = i32::try_from(std::process::id())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "current pid does not fit in i32"))?;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+        for line in String::from_utf8_lossy(&captured).lines() {
             let process_id = line
                 .parse::<i32>()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lsof emitted an invalid pid"))?;
@@ -1899,6 +2369,13 @@ mod platform {
     pub struct ProcessTree {
         job: JobHandle,
         process_group_id: u32,
+    }
+
+    pub fn force_kill_unattached(child: &mut Child) -> io::Result<()> {
+        match child.try_wait()? {
+            Some(_) => Ok(()),
+            None => child.kill(),
+        }
     }
 
     pub fn force_kill_wine_prefix_clients(_prefix: &Path) -> io::Result<()> {
@@ -2165,6 +2642,602 @@ mod tests {
                 removed.unwrap();
             }
         }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StartupFault {
+        Wineboot,
+        Fonts,
+        Alias,
+        GuestMutation,
+        WineMutation,
+        ServerMutation,
+        Spawn,
+        Attach,
+        Reap,
+    }
+
+    struct FaultingStartup {
+        fault: StartupFault,
+        guest_spawns: std::cell::Cell<usize>,
+    }
+
+    impl StartupOperations for FaultingStartup {
+        fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+            initialize_wine_prefix(plan)?;
+            if self.fault == StartupFault::Wineboot {
+                return Err(ProcessError::Spawn(io::Error::other("injected wineboot exit")));
+            }
+            if self.fault == StartupFault::Reap {
+                let clock = VirtualClock {
+                    start: Instant::now(),
+                    ticks: std::cell::Cell::new(0),
+                };
+                let mut child = StuckAuxiliary {
+                    signalled: 0,
+                    reaps: false,
+                    signal_fails: false,
+                };
+                return Err(wait_bounded(&mut child, &clock, Duration::ZERO)
+                    .unwrap_err()
+                    .into_process_error(StartupStage::Wineboot));
+            }
+            let mutation = match self.fault {
+                StartupFault::GuestMutation => Some(plan.process.arguments[0].as_str()),
+                StartupFault::WineMutation => Some(plan.process.executable.as_str()),
+                StartupFault::ServerMutation => Some(plan.lifecycle.wineserver.as_ref().unwrap().executable.as_str()),
+                _ => None,
+            };
+            if let Some(path) = mutation {
+                let mut contents = std::fs::read(path).unwrap();
+                contents.extend_from_slice(b"\n");
+                std::fs::write(path, contents).unwrap();
+            }
+            Ok(())
+        }
+
+        fn fonts(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+            if self.fault == StartupFault::Fonts {
+                return Err(ProcessError::InvalidRuntimeEvidence("injected fonts"));
+            }
+            prepare_pinned_bottle_font(plan)
+        }
+
+        fn guest_alias(&self, plan: &LaunchPlan) -> Result<Option<PathBuf>, ProcessError> {
+            if self.fault == StartupFault::Alias {
+                return Err(ProcessError::InvalidRuntimeEvidence("injected alias"));
+            }
+            prepare_guest_execution_alias(plan)
+        }
+
+        fn spawn(&self, command: &mut Command) -> io::Result<Child> {
+            self.guest_spawns.set(self.guest_spawns.get() + 1);
+            // Mutation tests stop here on the old implementation: do not run
+            // altered fixture executables even while proving the missing check.
+            if self.fault != StartupFault::Attach {
+                return Err(io::Error::other("injected main spawn"));
+            }
+            command.spawn()
+        }
+
+        fn attach(
+            &self,
+            _prepared: platform::PreparedProcessTree,
+            _child: &Child,
+        ) -> io::Result<platform::ProcessTree> {
+            Err(io::Error::other("injected attach"))
+        }
+    }
+
+    fn startup_bound_fixture() -> RuntimeEvidenceFixture {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        let guest = Path::new(&fixture.plan.process.arguments[0]);
+        fixture.plan.guest_artifact = Some(GuestArtifactBinding {
+            digest: sha256_file(guest).unwrap(),
+            size_bytes: std::fs::metadata(guest).unwrap().len(),
+            stored_path: guest.to_str().unwrap().into(),
+            original_name: "guest.exe".into(),
+            architecture: CpuArchitecture::X86_64,
+            image_kind: "executable".into(),
+            subsystem: "windowsConsole".into(),
+            inspection_schema_version: SCHEMA_VERSION_V1.into(),
+        });
+        fixture.plan.validate().unwrap();
+        fixture
+    }
+
+    fn configure_server_exit(fixture: &mut RuntimeEvidenceFixture, fail_argument: &str) {
+        let server = &fixture.plan.lifecycle.wineserver.as_ref().unwrap().executable;
+        #[cfg(windows)]
+        let contents = format!("@echo off\r\necho %*>>\"%COMPATFORGE_TEST_WINESERVER_LOG%\"\r\nif \"%~1\"==\"{fail_argument}\" exit /b 1\r\nexit /b 0\r\n");
+        #[cfg(not(windows))]
+        let contents = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINESERVER_LOG\"\n[ \"$1\" != \"{fail_argument}\" ]\n");
+        std::fs::write(server, contents).unwrap();
+        fixture.plan.process.environment.insert(
+            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(server)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn startup_transaction_failure_matrix_stops_exact_server_and_releases_only_on_success() {
+        for fault in [
+            StartupFault::Wineboot,
+            StartupFault::Fonts,
+            StartupFault::Alias,
+            StartupFault::GuestMutation,
+            StartupFault::WineMutation,
+            StartupFault::ServerMutation,
+            StartupFault::Spawn,
+            StartupFault::Attach,
+            StartupFault::Reap,
+        ] {
+            for fail_argument in ["none", "-k", "-w"] {
+                let mut fixture = startup_bound_fixture();
+                configure_server_exit(&mut fixture, fail_argument);
+                let operations = FaultingStartup {
+                    fault,
+                    guest_spawns: std::cell::Cell::new(0),
+                };
+                let error = ProcessSupervisor::start_with_operations(&fixture.plan, &operations)
+                    .err()
+                    .expect("startup must fail");
+                let poisoned =
+                    matches!(fault, StartupFault::ServerMutation | StartupFault::Reap) || fail_argument == "-w";
+                if matches!(
+                    fault,
+                    StartupFault::GuestMutation | StartupFault::WineMutation | StartupFault::ServerMutation
+                ) {
+                    assert_eq!(
+                        operations.guest_spawns.get(),
+                        0,
+                        "{fault:?}: Guest spawn crossed a mutation boundary"
+                    );
+                    assert!(!fixture.guest_log.exists());
+                }
+                if fault == StartupFault::ServerMutation {
+                    assert!(!fixture.wineserver_log.exists(), "substituted server was executed");
+                } else {
+                    let commands = std::fs::read_to_string(&fixture.wineserver_log).unwrap_or_default();
+                    assert_eq!(
+                        commands.lines().collect::<Vec<_>>(),
+                        ["-k", "-w"],
+                        "{fault:?}: missing synchronous cleanup, {error}"
+                    );
+                }
+                let reacquired = WineSession::acquire(&fixture.plan);
+                assert_eq!(reacquired.is_err(), poisoned, "{fault:?}: wrong lease terminal state");
+                assert!(
+                    error.to_string().starts_with(if poisoned {
+                        "Wine startup cleanup failed:"
+                    } else {
+                        "Wine startup failed:"
+                    }),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_transaction_canonical_prefix_lease_and_abandoned_session_are_quarantined() {
+        let fixture = RuntimeEvidenceFixture::new();
+        let first = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+        let mut alias = fixture.valid_plan();
+        let prefix = Path::new(&alias.lifecycle.wineserver.as_ref().unwrap().prefix).join(".");
+        alias.lifecycle.wineserver.as_mut().unwrap().prefix = prefix.to_str().unwrap().into();
+        alias
+            .process
+            .environment
+            .insert("WINEPREFIX".into(), prefix.to_str().unwrap().into());
+        assert!(matches!(
+            WineSession::acquire(&alias),
+            Err(ProcessError::WinePrefixBusy(_))
+        ));
+        drop(first);
+        assert!(matches!(
+            WineSession::acquire(&fixture.plan),
+            Err(ProcessError::WinePrefixBusy(_))
+        ));
+        assert!(
+            !fixture.wineserver_log.exists(),
+            "Drop must not execute cleanup commands"
+        );
+    }
+
+    #[test]
+    fn startup_transaction_wine_session_cleanup_failure_is_memoized() {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        configure_server_exit(&mut fixture, "-w");
+        materialize_launch_directories(&fixture.plan).unwrap();
+        let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let emitter = EventEmitter::new("startup-cleanup".into(), sender);
+        assert!(session.stop(&emitter).is_err());
+        assert!(
+            session.stop(&emitter).is_err(),
+            "repeated stop must preserve the first failure"
+        );
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k", "-w"]
+        );
+    }
+
+    #[test]
+    fn startup_transaction_wine_session_concurrent_stop_preserves_failure_for_every_caller() {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        configure_server_exit(&mut fixture, "-w");
+        materialize_launch_directories(&fixture.plan).unwrap();
+        let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let workers = (0..4)
+            .map(|_| {
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    session.stop_core(None)
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), StopOutcome::Failed(CleanupStage::ServerExit));
+        }
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k", "-w"]
+        );
+    }
+
+    #[test]
+    fn startup_transaction_natural_idle_failure_cannot_be_erased_by_later_cleanup_success() {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        fixture.plan.process.environment.insert(
+            "COMPATFORGE_TEST_IDLE_SENTINEL".into(),
+            fixture.root.join("idle.failed").to_str().unwrap().into(),
+        );
+        #[cfg(windows)]
+        let source = "@echo off\r\necho %*>>\"%COMPATFORGE_TEST_WINESERVER_LOG%\"\r\nif \"%~1\"==\"-w\" if not exist \"%COMPATFORGE_TEST_IDLE_SENTINEL%\" (\r\necho failed>\"%COMPATFORGE_TEST_IDLE_SENTINEL%\"\r\nexit /b 1\r\n)\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let source = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINESERVER_LOG\"\nif [ \"$1\" = -w ] && [ ! -f \"$COMPATFORGE_TEST_IDLE_SENTINEL\" ]; then\nprintf failed > \"$COMPATFORGE_TEST_IDLE_SENTINEL\"\nexit 1\nfi\nexit 0\n";
+        let executable = &fixture.plan.lifecycle.wineserver.as_ref().unwrap().executable;
+        std::fs::write(executable, source).unwrap();
+        fixture.plan.process.environment.insert(
+            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(executable)).unwrap(),
+        );
+        materialize_launch_directories(&fixture.plan).unwrap();
+        let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+        assert!(session.wait_until_idle(&AtomicBool::new(false)).is_err());
+        assert!(matches!(session.stop_core(None), StopOutcome::Failed(_)));
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-w", "-k", "-w"]
+        );
+    }
+
+    #[test]
+    fn startup_transaction_real_wineboot_nonzero_stops_server_before_returning() {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        #[cfg(windows)]
+        let contents = "@echo off\r\necho %*>>\"%COMPATFORGE_TEST_WINE_LOG%\"\r\nexit /b 23\r\n";
+        #[cfg(not(windows))]
+        let contents = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINE_LOG\"\nexit 23\n";
+        std::fs::write(&fixture.plan.process.executable, contents).unwrap();
+        fixture.plan.process.environment.insert(
+            RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(&fixture.plan.process.executable)).unwrap(),
+        );
+        assert!(matches!(
+            ProcessSupervisor::start(&fixture.plan),
+            Err(ProcessError::Startup(StartupStage::Wineboot))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wine_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["wineboot -u"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k", "-w"]
+        );
+        assert!(!fixture.guest_log.exists());
+        assert!(WineSession::acquire(&fixture.plan).is_ok());
+    }
+
+    #[test]
+    fn startup_transaction_guest_mutation_after_wineboot_stops_before_font_commands() {
+        struct MutateGuestBeforeFonts(std::cell::Cell<bool>);
+        impl StartupOperations for MutateGuestBeforeFonts {
+            fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+                initialize_wine_prefix(plan)?;
+                std::fs::write(&plan.process.arguments[0], b"changed guest").unwrap();
+                Ok(())
+            }
+            fn fonts(&self, _plan: &LaunchPlan) -> Result<(), ProcessError> {
+                self.0.set(true);
+                Ok(())
+            }
+        }
+        let fixture = startup_bound_fixture();
+        let operations = MutateGuestBeforeFonts(std::cell::Cell::new(false));
+        assert!(ProcessSupervisor::start_with_operations(&fixture.plan, &operations).is_err());
+        assert!(
+            !operations.0.get(),
+            "Guest mutation was not checked before font preparation"
+        );
+        assert!(!fixture.guest_log.exists());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k", "-w"]
+        );
+    }
+
+    #[test]
+    fn startup_transaction_replaced_guest_alias_is_rechecked_at_main_spawn_boundary() {
+        struct ReplaceAlias(std::cell::Cell<bool>);
+        impl StartupOperations for ReplaceAlias {
+            fn guest_alias(&self, plan: &LaunchPlan) -> Result<Option<PathBuf>, ProcessError> {
+                let alias = prepare_guest_execution_alias(plan)?.unwrap();
+                std::fs::remove_file(&alias).unwrap();
+                std::fs::write(&alias, b"substituted alias").unwrap();
+                Ok(Some(alias))
+            }
+            fn spawn(&self, _command: &mut Command) -> io::Result<Child> {
+                self.0.set(true);
+                Err(io::Error::other("unexpected main spawn"))
+            }
+        }
+        let mut fixture = startup_bound_fixture();
+        let object = fixture.root.join("extensionless-object");
+        std::fs::copy(&fixture.plan.process.arguments[0], &object).unwrap();
+        fixture.plan.process.arguments[0] = object.to_str().unwrap().into();
+        fixture.plan.guest_artifact.as_mut().unwrap().stored_path = object.to_str().unwrap().into();
+        let operations = ReplaceAlias(std::cell::Cell::new(false));
+        assert!(ProcessSupervisor::start_with_operations(&fixture.plan, &operations).is_err());
+        verify_guest_inputs(&fixture.plan).unwrap();
+        assert!(!operations.0.get(), "replaced alias crossed the main spawn boundary");
+        assert!(!fixture.guest_log.exists());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k", "-w"]
+        );
+    }
+
+    #[test]
+    fn startup_transaction_armed_guard_drop_quarantines_without_external_commands() {
+        let fixture = RuntimeEvidenceFixture::new();
+        let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+        let guard = StartupWineSessionGuard::new(Arc::clone(&session));
+        drop(guard);
+        assert_eq!(*lock_recover(&session.lease_state), LeaseState::Poisoned);
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+        assert!(!fixture.wineserver_log.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_transaction_linux_wineboot_timeout_kills_descendant_holding_pipe() {
+        struct ShortWineboot;
+        impl StartupOperations for ShortWineboot {
+            fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+                initialize_wine_prefix_with_spawn(plan, Duration::from_millis(300), |command| {
+                    command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+                })
+            }
+        }
+        let mut fixture = RuntimeEvidenceFixture::new();
+        let pid_file = fixture.root.join("descendant.pid");
+        let source = "#!/bin/sh\n/bin/sleep 60 &\nprintf '%s' \"$!\" > \"$COMPATFORGE_TEST_DESCENDANT_PID\"\nwait\n";
+        std::fs::write(&fixture.plan.process.executable, source).unwrap();
+        fixture.plan.process.environment.insert(
+            "COMPATFORGE_TEST_DESCENDANT_PID".into(),
+            pid_file.to_str().unwrap().into(),
+        );
+        fixture.plan.process.environment.insert(
+            RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(&fixture.plan.process.executable)).unwrap(),
+        );
+        let started = Instant::now();
+        assert!(matches!(
+            ProcessSupervisor::start_with_operations(&fixture.plan, &ShortWineboot),
+            Err(ProcessError::Startup(StartupStage::Wineboot))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file).unwrap().parse::<u32>().unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        assert!(
+            stat.is_err() || stat.unwrap().contains(") Z "),
+            "descendant remained runnable after tree termination"
+        );
+        assert!(!fixture.guest_log.exists());
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k", "-w"]
+        );
+        assert!(WineSession::acquire(&fixture.plan).is_ok());
+    }
+
+    struct VirtualClock {
+        start: Instant,
+        ticks: std::cell::Cell<u64>,
+    }
+
+    impl PollClock for VirtualClock {
+        fn now(&self) -> Instant {
+            self.start + Duration::from_secs(self.ticks.get())
+        }
+        fn wait(&self) {
+            self.ticks.set(self.ticks.get() + 1);
+        }
+    }
+
+    struct StuckAuxiliary {
+        signalled: usize,
+        reaps: bool,
+        signal_fails: bool,
+    }
+
+    impl BoundedChild for StuckAuxiliary {
+        fn poll(&mut self) -> io::Result<Option<bool>> {
+            Ok((self.signalled > 0 && self.reaps).then_some(false))
+        }
+        fn force_kill_tree(&mut self) -> io::Result<()> {
+            self.signalled += 1;
+            if self.signal_fails {
+                Err(io::Error::other("injected signal"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn startup_transaction_wineboot_timeout_uses_bounded_tree_signal_and_reap() {
+        for (reaps, signal_fails, expected) in [
+            (true, false, None),
+            (true, true, Some(CleanupStage::TreeTermination)),
+            (false, false, Some(CleanupStage::RootReap)),
+        ] {
+            let clock = VirtualClock {
+                start: Instant::now(),
+                ticks: std::cell::Cell::new(0),
+            };
+            let mut child = StuckAuxiliary {
+                signalled: 0,
+                reaps,
+                signal_fails,
+            };
+            let error = wait_bounded(&mut child, &clock, Duration::from_secs(2)).unwrap_err();
+            assert_eq!(child.signalled, 1);
+            assert_eq!(error.cleanup, expected);
+            assert!(
+                clock.ticks.get() <= 7,
+                "timeout plus root-reap deadline must bound all paths"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_transaction_auxiliary_capture_rejects_overflow_before_allocating_past_limit() {
+        let mut input = io::Cursor::new(vec![b'x'; 65_537]);
+        let mut output = Vec::new();
+        let result = loop {
+            match read_auxiliary_chunk(&mut input, &mut output, 65_536) {
+                Ok(false) => continue,
+                value => break value,
+            }
+        };
+        assert!(result.is_err(), "overlong auxiliary output was accepted");
+        assert!(output.len() <= 65_536);
+    }
+
+    #[test]
+    fn startup_transaction_cleanup_busy_retry_reverifies_before_every_attempt() {
+        let verified = std::cell::Cell::new(0);
+        let spawned = std::cell::Cell::new(0);
+        let result: Result<(), CleanupStage> = spawn_with_verified_retries(
+            || {
+                verified.set(verified.get() + 1);
+                if verified.get() == 2 {
+                    Err(CleanupStage::RuntimeVerification)
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                spawned.set(spawned.get() + 1);
+                Err(io::Error::from_raw_os_error(26))
+            },
+            |error| error.raw_os_error() == Some(26),
+            || {},
+        );
+        assert_eq!(result, Err(CleanupStage::RuntimeVerification));
+        assert_eq!(verified.get(), 2);
+        assert_eq!(spawned.get(), 1, "changed executable reached the retry spawn");
+    }
+
+    #[test]
+    fn startup_transaction_cleanup_mutation_between_k_and_w_never_executes_replacement() {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        #[cfg(windows)]
+        let source = "@echo off\r\necho %*>>\"%COMPATFORGE_TEST_WINESERVER_LOG%\"\r\nif \"%~1\"==\"-k\" echo.>>\"%WINESERVER%\"\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let source = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINESERVER_LOG\"\nif [ \"$1\" = -k ]; then printf '\\n' >> \"$WINESERVER\"; fi\nexit 0\n";
+        let executable = &fixture.plan.lifecycle.wineserver.as_ref().unwrap().executable;
+        std::fs::write(executable, source).unwrap();
+        fixture.plan.process.environment.insert(
+            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(executable)).unwrap(),
+        );
+        let operations = FaultingStartup {
+            fault: StartupFault::Alias,
+            guest_spawns: std::cell::Cell::new(0),
+        };
+        assert!(matches!(
+            ProcessSupervisor::start_with_operations(&fixture.plan, &operations),
+            Err(ProcessError::StartupCleanup {
+                startup: StartupStage::GuestAlias,
+                cleanup: CleanupStage::RuntimeVerification
+            })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&fixture.wineserver_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["-k"]
+        );
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+        assert!(!fixture.guest_log.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_transaction_linux_auxiliary_capture_bounds_a_descendant_held_pipe_after_root_exit() {
+        let fixture = RuntimeEvidenceFixture::new();
+        let pid_file = fixture.root.join("capture-descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "/bin/sleep 60 & printf '%s' \"$!\" > \"$PID_FILE\"; exit 0"])
+            .env_clear()
+            .env("PID_FILE", &pid_file);
+        let started = Instant::now();
+        assert!(capture_auxiliary(&mut command, Duration::from_millis(300), 65_536).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file).unwrap().parse::<u32>().unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        assert!(
+            stat.is_err() || stat.unwrap().contains(") Z "),
+            "pipe-holding descendant remained runnable"
+        );
     }
 
     fn assert_runtime_evidence_rejected(fixture: &RuntimeEvidenceFixture, mutate: impl FnOnce(&mut LaunchPlan)) {
@@ -3474,19 +4547,15 @@ mod tests {
 
     #[test]
     fn rejects_concurrent_launches_for_the_same_managed_wine_prefix() {
-        let mut plan = fixture_plan();
-        let prefix = format!("test-prefix-{}", std::process::id());
-        plan.lifecycle.wineserver = Some(WineServerLifecycle {
-            executable: plan.process.executable.clone(),
-            prefix,
-        });
-        let first = WineSession::acquire(&plan).unwrap().unwrap();
+        let fixture = RuntimeEvidenceFixture::new();
+        materialize_launch_directories(&fixture.plan).unwrap();
+        let first = WineSession::acquire(&fixture.plan).unwrap().unwrap();
         assert!(matches!(
-            WineSession::acquire(&plan),
+            WineSession::acquire(&fixture.plan),
             Err(ProcessError::WinePrefixBusy(_))
         ));
-        drop(first);
-        assert!(WineSession::acquire(&plan).unwrap().is_some());
+        assert_eq!(first.stop_core(None), StopOutcome::Complete);
+        assert!(WineSession::acquire(&fixture.plan).unwrap().is_some());
     }
 
     #[cfg(unix)]
@@ -3524,13 +4593,18 @@ mod tests {
             output.to_string_lossy().into_owned(),
         );
         plan.process.working_directory = directory.to_string_lossy().into_owned();
+        std::fs::create_dir(&plan.lifecycle.wineserver.as_ref().unwrap().prefix).unwrap();
+        plan.process.environment.insert(
+            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(&executable).unwrap(),
+        );
         let session = WineSession::acquire(&plan).unwrap().unwrap();
         let (sender, _receiver) = mpsc::channel();
         let emitter = EventEmitter::new("wine-cleanup-test".into(), sender);
 
         session.stop(&emitter).unwrap();
 
-        let prefix = plan.lifecycle.wineserver.unwrap().prefix;
+        let prefix = &session.lifecycle.prefix;
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
             format!("-k:{prefix}\n-w:{prefix}\n")
@@ -3574,10 +4648,16 @@ mod tests {
             output.to_string_lossy().into_owned(),
         );
         plan.process.working_directory = directory.to_string_lossy().into_owned();
+        std::fs::create_dir(&prefix).unwrap();
+        plan.process.environment.insert(
+            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(&executable).unwrap(),
+        );
         let session = WineSession::acquire(&plan).unwrap().unwrap();
 
         session.wait_until_idle(&AtomicBool::new(false)).unwrap();
 
+        let prefix = &session.lifecycle.prefix;
         assert_eq!(std::fs::read_to_string(output).unwrap(), format!("-w:{prefix}\n"));
         assert!(matches!(
             WineSession::acquire(&plan),
