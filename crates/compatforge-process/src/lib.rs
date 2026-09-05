@@ -281,18 +281,26 @@ impl AuxiliaryFailure {
 fn reap_bounded<C: BoundedChild>(child: &mut C, clock: &impl PollClock, timeout: Duration) -> Result<(), CleanupStage> {
     let signal_error = child.force_kill_tree().err();
     let deadline = clock.now() + timeout;
+    let mut reap_failed = false;
     loop {
         match child.poll() {
             Ok(Some(_)) => {
                 let group_error = child.finish_tree(deadline).err();
                 return if signal_error.is_some() || group_error.is_some() {
                     Err(CleanupStage::TreeTermination)
+                } else if reap_failed {
+                    Err(CleanupStage::RootReap)
                 } else {
                     Ok(())
                 };
             }
-            _ if clock.now() >= deadline => return Err(CleanupStage::RootReap),
-            _ => clock.wait(),
+            result => {
+                reap_failed |= result.is_err();
+                if clock.now() >= deadline {
+                    return Err(CleanupStage::RootReap);
+                }
+                clock.wait();
+            }
         }
     }
 }
@@ -2920,6 +2928,71 @@ mod tests {
     fn failed_reap_or_join_refuses_acknowledgement() {
         let worker = WorkerJoinState::spawn(|| thread::sleep(Duration::from_millis(200)));
         assert!(worker.join_until(Instant::now() + Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn cleanup_auxiliary_poll_error_then_reap_preserves_failure_and_finishes_tree() {
+        struct RecoveringReap {
+            polls: usize,
+            signals: usize,
+            finishes: usize,
+            signal_fails: bool,
+            group_fails: bool,
+        }
+        impl BoundedChild for RecoveringReap {
+            fn poll(&mut self) -> io::Result<Option<bool>> {
+                self.polls += 1;
+                if self.polls == 1 {
+                    Err(io::Error::other("injected transient reap failure"))
+                } else {
+                    Ok(Some(false))
+                }
+            }
+            fn force_kill_tree(&mut self) -> io::Result<()> {
+                self.signals += 1;
+                if self.signal_fails {
+                    Err(io::Error::other("injected signal failure"))
+                } else {
+                    Ok(())
+                }
+            }
+            fn finish_tree(&mut self, _deadline: Instant) -> io::Result<()> {
+                self.finishes += 1;
+                if self.group_fails {
+                    Err(io::Error::other("injected group failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for (signal_fails, group_fails) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut child = RecoveringReap {
+                polls: 0,
+                signals: 0,
+                finishes: 0,
+                signal_fails,
+                group_fails,
+            };
+            let clock = VirtualClock {
+                start: Instant::now(),
+                ticks: std::cell::Cell::new(0),
+            };
+            let result = reap_bounded(&mut child, &clock, Duration::from_secs(3));
+            assert_eq!(child.signals, 1);
+            assert_eq!(child.polls, 2);
+            assert_eq!(
+                child.finishes, 1,
+                "a prior reap failure must not skip best-effort group quiescence"
+            );
+            assert_eq!(
+                result,
+                Err(if signal_fails || group_fails {
+                    CleanupStage::TreeTermination
+                } else {
+                    CleanupStage::RootReap
+                })
+            );
+        }
     }
 
     #[test]
