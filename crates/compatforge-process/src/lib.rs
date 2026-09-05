@@ -16,18 +16,20 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read};
 #[cfg(target_os = "macos")]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_COMBINED_OUTPUT_BYTES: usize = 1_048_576;
+const MAX_OUTPUT_EVENT_BYTES: usize = 16 * 1024;
 #[cfg(not(test))]
 const WINE_SERVER_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 // Exercise the same scheduling budget as production on loaded macOS hosts.
@@ -257,6 +259,9 @@ impl PollClock for SystemPollClock {
 trait BoundedChild {
     fn poll(&mut self) -> io::Result<Option<bool>>;
     fn force_kill_tree(&mut self) -> io::Result<()>;
+    fn finish_tree(&mut self, _deadline: Instant) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -279,11 +284,12 @@ fn reap_bounded<C: BoundedChild>(child: &mut C, clock: &impl PollClock, timeout:
     loop {
         match child.poll() {
             Ok(Some(_)) => {
-                return if signal_error.is_some() {
+                let group_error = child.finish_tree(deadline).err();
+                return if signal_error.is_some() || group_error.is_some() {
                     Err(CleanupStage::TreeTermination)
                 } else {
                     Ok(())
-                }
+                };
             }
             _ if clock.now() >= deadline => return Err(CleanupStage::RootReap),
             _ => clock.wait(),
@@ -299,7 +305,14 @@ fn wait_bounded<C: BoundedChild>(
     let deadline = clock.now() + timeout;
     loop {
         match child.poll() {
-            Ok(Some(success)) => return Ok(success),
+            Ok(Some(success)) => {
+                child
+                    .finish_tree(clock.now() + WINE_SERVER_COMMAND_TIMEOUT)
+                    .map_err(|_| AuxiliaryFailure {
+                        cleanup: Some(CleanupStage::TreeTermination),
+                    })?;
+                return Ok(success);
+            }
             Ok(None) if clock.now() < deadline => clock.wait(),
             _ => {
                 return Err(AuxiliaryFailure {
@@ -317,6 +330,9 @@ impl BoundedChild for Child {
     fn force_kill_tree(&mut self) -> io::Result<()> {
         platform::force_kill_unattached(self)
     }
+    fn finish_tree(&mut self, deadline: Instant) -> io::Result<()> {
+        platform::finish_unattached(self, deadline)
+    }
 }
 
 struct AuxiliaryProcess {
@@ -331,6 +347,14 @@ impl BoundedChild for AuxiliaryProcess {
     }
     fn force_kill_tree(&mut self) -> io::Result<()> {
         self.tree.force_kill()
+    }
+    fn finish_tree(&mut self, deadline: Instant) -> io::Result<()> {
+        let signal_error = self.tree.force_kill().err();
+        let group_result = self.tree.wait_until_gone(deadline);
+        match signal_error {
+            Some(error) => Err(error),
+            None => group_result,
+        }
     }
 }
 
@@ -671,17 +695,18 @@ fn supervise_command_with_operations<G>(
     let (sender, receiver) = mpsc::channel();
     let emitter = Arc::new(EventEmitter::new(plan.request_id.clone(), sender));
     let wine_session = startup_guard.as_ref().map(|guard| Arc::clone(&guard.session));
+    if let Some(session) = &wine_session {
+        session.hold_for_owned_tree();
+    }
     let controller = Arc::new(TerminationController {
         child: Arc::clone(&child),
         process_tree: Arc::clone(&process_tree),
         emitter: Arc::clone(&emitter),
-        root_exited: Arc::clone(&root_exited),
         completed: Arc::clone(&completed),
         termination_started: Arc::clone(&termination_started),
         process_id,
         grace_period: Duration::from_millis(plan.lifecycle.termination_grace_milliseconds),
         wine_session: wine_session.clone(),
-        keep_alive_after_root_exit,
         cleanup_failed: Arc::clone(&cleanup_failed),
         force_cleanup_started: AtomicBool::new(false),
         completion_lock: Mutex::new(()),
@@ -690,11 +715,24 @@ fn supervise_command_with_operations<G>(
 
     emitter.emit(RuntimeEventKind::Started, Some(process_id), None, None, None);
     let mut output_readers = Vec::new();
+    let output_budget = Arc::new(OutputBudget::new());
     if let Some(pipe) = stdout {
-        output_readers.push(spawn_output_reader(pipe, OutputStream::Stdout, Arc::clone(&emitter)));
+        output_readers.push(spawn_output_reader(
+            pipe,
+            OutputStream::Stdout,
+            Arc::clone(&output_budget),
+            Arc::clone(&emitter),
+            Arc::downgrade(&controller),
+        ));
     }
     if let Some(pipe) = stderr {
-        output_readers.push(spawn_output_reader(pipe, OutputStream::Stderr, Arc::clone(&emitter)));
+        output_readers.push(spawn_output_reader(
+            pipe,
+            OutputStream::Stderr,
+            output_budget,
+            Arc::clone(&emitter),
+            Arc::downgrade(&controller),
+        ));
     }
     let exit_watcher = spawn_exit_watcher(
         child,
@@ -1160,21 +1198,40 @@ impl LaunchHandle {
     /// Terminate if still live, complete bounded forced cleanup when needed,
     /// and join every supervisor worker before returning.
     pub fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), ProcessError> {
-        let _completion_guard = lock_recover(&self.controller.completion_lock);
+        let deadline = Instant::now()
+            .checked_add(graceful_wait)
+            .and_then(|time| time.checked_add(SUPERVISOR_FORCE_COMPLETION_TIMEOUT))
+            .ok_or_else(|| ProcessError::Terminate(io::Error::other("invalid completion deadline")))?;
+        self.terminate_and_wait_until(graceful_wait, deadline)
+    }
+
+    fn terminate_and_wait_until(&self, graceful_wait: Duration, deadline: Instant) -> Result<(), ProcessError> {
+        let _completion_guard = lock_until(&self.controller.completion_lock, deadline).map_err(|error| {
+            self.controller.mark_cleanup_failed();
+            ProcessError::Terminate(error)
+        })?;
         let termination_error = self.terminate().err();
-        let force_error = if self.controller.wait_until_completed(graceful_wait) {
+        let force_error = if self
+            .controller
+            .wait_until_completed(graceful_wait.min(deadline.saturating_duration_since(Instant::now())))
+        {
             None
         } else {
             self.controller.force_cleanup().err()
         };
         if !self
             .controller
-            .wait_until_completed(SUPERVISOR_FORCE_COMPLETION_TIMEOUT)
+            .wait_until_completed(deadline.saturating_duration_since(Instant::now()))
         {
-            let _ = self.controller.force_kill_and_reap();
+            self.controller.mark_cleanup_failed();
         }
-        let join_error = self.controller.join_workers().err();
-        if let Some(error) = join_error.or(force_error).or(termination_error) {
+        let reap_error = if self.controller.completed.load(Ordering::Acquire) {
+            None
+        } else {
+            self.controller.force_kill_and_reap(deadline).err()
+        };
+        let join_error = self.controller.join_workers(deadline).err();
+        if let Some(error) = join_error.or(reap_error).or(force_error).or(termination_error) {
             return Err(error);
         }
         if !self.is_finished() || self.controller.cleanup_failed.load(Ordering::Acquire) {
@@ -1191,6 +1248,19 @@ impl LaunchHandle {
     }
 }
 
+fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> io::Result<MutexGuard<'_, T>> {
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(io::Error::other("process completion lock deadline exceeded"))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(PROCESS_POLL_INTERVAL),
+        }
+    }
+}
+
 impl Drop for LaunchHandle {
     fn drop(&mut self) {
         let _ = self.controller.request_termination(TerminationReason::HandleDropped);
@@ -1202,30 +1272,40 @@ enum TerminationReason {
     User,
     Timeout,
     HandleDropped,
+    OutputLimit,
 }
 
 struct TerminationController {
     child: Arc<Mutex<Child>>,
     process_tree: Arc<platform::ProcessTree>,
     emitter: Arc<EventEmitter>,
-    root_exited: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
     termination_started: Arc<AtomicBool>,
     process_id: u32,
     grace_period: Duration,
     wine_session: Option<Arc<WineSession>>,
-    keep_alive_after_root_exit: bool,
     cleanup_failed: Arc<AtomicBool>,
     force_cleanup_started: AtomicBool,
     completion_lock: Mutex<()>,
-    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    workers: Mutex<Vec<WorkerJoinState>>,
 }
 
 impl TerminationController {
     fn request_termination(self: &Arc<Self>, reason: TerminationReason) -> Result<(), ProcessError> {
-        if self.completed.load(Ordering::Acquire)
-            || (self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit)
-        {
+        self.request_termination_with_signals(
+            reason,
+            || self.process_tree.request_graceful(),
+            || self.process_tree.force_kill(),
+        )
+    }
+
+    fn request_termination_with_signals(
+        self: &Arc<Self>,
+        reason: TerminationReason,
+        graceful: impl FnOnce() -> io::Result<()>,
+        forced: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), ProcessError> {
+        if self.completed.load(Ordering::Acquire) {
             return Ok(());
         }
         if self
@@ -1246,10 +1326,15 @@ impl TerminationController {
                 RuntimeEventKind::TerminateRequested,
                 Some("launch handle released while process was running".into()),
             ),
+            TerminationReason::OutputLimit => (
+                RuntimeEventKind::TerminateRequested,
+                Some("process output limit exceeded".into()),
+            ),
         };
         self.emitter.emit(kind, Some(self.process_id), None, None, message);
 
-        if let Err(error) = self.process_tree.request_graceful() {
+        if let Err(error) = graceful() {
+            self.mark_cleanup_failed();
             self.emitter.emit(
                 RuntimeEventKind::Failed,
                 Some(self.process_id),
@@ -1257,35 +1342,43 @@ impl TerminationController {
                 None,
                 Some(format!("graceful process-tree termination failed: {error}")),
             );
-            let _ = self.process_tree.force_kill();
+            if forced().is_err() {
+                self.emitter.emit(
+                    RuntimeEventKind::Failed,
+                    Some(self.process_id),
+                    None,
+                    None,
+                    Some("forced process-tree termination failed".into()),
+                );
+            }
             return Err(ProcessError::Terminate(error));
         }
 
-        let controller = Arc::clone(self);
-        let worker = thread::spawn(move || controller.escalate_after_grace());
-        self.register_worker(worker);
+        // Serialize the final completed check with publication to the worker
+        // registry. No escalation can be added after successful draining.
+        let mut workers = lock_recover(&self.workers);
+        if !self.completed.load(Ordering::Acquire) {
+            let controller = Arc::clone(self);
+            workers.push(WorkerJoinState::spawn(move || controller.escalate_after_grace()));
+        }
         Ok(())
     }
 
     fn escalate_after_grace(&self) {
         let deadline = Instant::now() + self.grace_period;
         while Instant::now() < deadline {
-            if self.completed.load(Ordering::Acquire)
-                || (self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit)
-            {
+            if self.completed.load(Ordering::Acquire) {
                 return;
             }
             thread::sleep(PROCESS_POLL_INTERVAL);
         }
-        if self.completed.load(Ordering::Acquire)
-            || (self.root_exited.load(Ordering::Acquire) && !self.keep_alive_after_root_exit)
-        {
+        if self.completed.load(Ordering::Acquire) {
             return;
         }
         let _ = self.force_cleanup();
     }
 
-    fn register_worker(&self, worker: thread::JoinHandle<()>) {
+    fn register_worker(&self, worker: WorkerJoinState) {
         lock_recover(&self.workers).push(worker);
     }
 
@@ -1314,19 +1407,9 @@ impl TerminationController {
             None,
             Some("graceful termination period expired; forcing process tree shutdown".into()),
         );
-        let mut first_error = None;
-        if let Some(wine_session) = &self.wine_session {
-            if let Err(error) = wine_session.stop(&self.emitter) {
-                self.emitter.emit(
-                    RuntimeEventKind::Failed,
-                    Some(self.process_id),
-                    None,
-                    None,
-                    Some(format!("wineserver cleanup failed: {error}")),
-                );
-                first_error = Some(error);
-            }
-        }
+        // The exit watcher performs the memoized Wine rendezvous. Doing it on
+        // this caller would let a concurrent stop hold the caller past its
+        // completion deadline before the owned root can even be killed.
         if let Err(error) = self.process_tree.force_kill() {
             self.emitter.emit(
                 RuntimeEventKind::Failed,
@@ -1335,52 +1418,99 @@ impl TerminationController {
                 None,
                 Some(format!("forced process-tree termination failed: {error}")),
             );
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
-            let mut child = lock_recover(&self.child);
-            let _ = child.kill();
-        }
-        if let Some(error) = first_error {
-            self.cleanup_failed.store(true, Ordering::Release);
+            self.mark_cleanup_failed();
             Err(ProcessError::Terminate(error))
         } else {
             Ok(())
         }
     }
 
-    fn force_kill_and_reap(&self) -> Result<(), ProcessError> {
-        let tree_error = self.process_tree.force_kill().err();
-        let mut child = lock_recover(&self.child);
-        let kill_error = child.kill().err();
-        let wait_error = child.wait().err();
-        if let Some(error) = tree_error.or(kill_error).or(wait_error) {
-            self.cleanup_failed.store(true, Ordering::Release);
-            Err(ProcessError::Terminate(error))
-        } else {
-            Ok(())
-        }
+    fn force_kill_and_reap(&self, deadline: Instant) -> Result<(), ProcessError> {
+        self.record_cleanup_result(finish_owned_process(&self.child, &self.process_tree, deadline))
     }
 
-    fn join_workers(&self) -> Result<(), ProcessError> {
-        let mut panicked = false;
+    fn record_cleanup_result(&self, result: io::Result<()>) -> Result<(), ProcessError> {
+        result.map_err(|error| {
+            self.mark_cleanup_failed();
+            ProcessError::Terminate(error)
+        })
+    }
+
+    fn join_workers(&self, deadline: Instant) -> Result<(), ProcessError> {
+        let mut failed = false;
         loop {
             let workers = std::mem::take(&mut *lock_recover(&self.workers));
             if workers.is_empty() {
                 break;
             }
             for worker in workers {
-                panicked |= worker.join().is_err();
+                failed |= worker.join_until(deadline).is_err();
+            }
+            if Instant::now() >= deadline {
+                failed |= !lock_recover(&self.workers).is_empty();
+                // Detach only on failure, never acknowledge outstanding work.
+                lock_recover(&self.workers).clear();
+                break;
             }
         }
-        if panicked {
-            self.cleanup_failed.store(true, Ordering::Release);
+        if failed {
+            self.mark_cleanup_failed();
             Err(ProcessError::Terminate(io::Error::other(
-                "process supervisor worker panicked",
+                "process supervisor workers did not complete",
             )))
         } else {
             Ok(())
         }
+    }
+
+    fn mark_cleanup_failed(&self) {
+        self.cleanup_failed.store(true, Ordering::Release);
+        if let Some(session) = &self.wine_session {
+            session.complete_owned_tree(false);
+        }
+    }
+}
+
+fn finish_owned_process(child: &Mutex<Child>, tree: &platform::ProcessTree, deadline: Instant) -> io::Result<()> {
+    finish_owned_cleanup(&SystemOwnedCleanup { child, tree }, &SystemPollClock, deadline)
+}
+
+trait OwnedCleanup {
+    fn force_kill(&self) -> io::Result<()>;
+    fn root_reaped(&self) -> io::Result<bool>;
+    fn wait_until_gone(&self, deadline: Instant) -> io::Result<()>;
+}
+
+struct SystemOwnedCleanup<'a> {
+    child: &'a Mutex<Child>,
+    tree: &'a platform::ProcessTree,
+}
+
+impl OwnedCleanup for SystemOwnedCleanup<'_> {
+    fn force_kill(&self) -> io::Result<()> {
+        self.tree.force_kill()
+    }
+    fn root_reaped(&self) -> io::Result<bool> {
+        lock_recover(self.child).try_wait().map(|status| status.is_some())
+    }
+    fn wait_until_gone(&self, deadline: Instant) -> io::Result<()> {
+        self.tree.wait_until_gone(deadline)
+    }
+}
+
+fn finish_owned_cleanup(operations: &impl OwnedCleanup, clock: &impl PollClock, deadline: Instant) -> io::Result<()> {
+    let signal_error = operations.force_kill().err();
+    let reap_result = loop {
+        match operations.root_reaped() {
+            Ok(true) => break operations.wait_until_gone(deadline),
+            Err(error) => break Err(error),
+            Ok(false) if clock.now() >= deadline => break Err(io::Error::other("process root reap deadline exceeded")),
+            Ok(false) => clock.wait(),
+        }
+    };
+    match signal_error {
+        Some(error) => Err(error),
+        None => reap_result,
     }
 }
 
@@ -1441,38 +1571,175 @@ impl EventEmitter {
     }
 }
 
+struct OutputBudget {
+    remaining: AtomicUsize,
+    overflow_emitted: AtomicBool,
+}
+
+impl OutputBudget {
+    fn new() -> Self {
+        Self {
+            remaining: AtomicUsize::new(MAX_COMBINED_OUTPUT_BYTES),
+            overflow_emitted: AtomicBool::new(false),
+        }
+    }
+}
+
+fn pump_output<R: Read>(
+    mut reader: R,
+    stream: OutputStream,
+    budget: Arc<OutputBudget>,
+    emitter: Arc<EventEmitter>,
+    controller: Weak<TerminationController>,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; MAX_OUTPUT_EVENT_BYTES];
+    let mut filled = 0;
+    loop {
+        if budget.overflow_emitted.load(Ordering::Acquire) {
+            emit_output(&emitter, stream, &buffer[..filled]);
+            return Ok(());
+        }
+        let count = match reader.read(&mut buffer[filled..]) {
+            Ok(0) => {
+                emit_output(&emitter, stream, &buffer[..filled]);
+                return Ok(());
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                emit_output(&emitter, stream, &buffer[..filled]);
+                return Err(error);
+            }
+        };
+        let available = budget
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                Some(remaining.saturating_sub(count))
+            })
+            .expect("reservation always succeeds");
+        let reserved = available.min(count);
+        filled += reserved;
+        if filled == buffer.len() || reserved != count {
+            let carry = if reserved == count {
+                incomplete_utf8_tail(&buffer[..filled])
+            } else {
+                0
+            };
+            emit_output(&emitter, stream, &buffer[..filled - carry]);
+            buffer.copy_within(filled - carry..filled, 0);
+            filled = carry;
+        }
+        if reserved != count {
+            if !budget.overflow_emitted.swap(true, Ordering::AcqRel) {
+                emitter.emit(
+                    RuntimeEventKind::Failed,
+                    None,
+                    None,
+                    None,
+                    Some("combined process output limit exceeded".into()),
+                );
+                if let Some(controller) = controller.upgrade() {
+                    let _ = controller.request_termination(TerminationReason::OutputLimit);
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    // A UTF-8 scalar needs at most three trailing bytes of carry. Invalid
+    // sequences still use the existing lossy conversion; only an incomplete
+    // otherwise-valid scalar is held for the next fixed-size chunk.
+    for length in 1..=3.min(bytes.len()) {
+        if let Err(error) = std::str::from_utf8(&bytes[bytes.len() - length..]) {
+            if error.valid_up_to() == 0 && error.error_len().is_none() {
+                return length;
+            }
+        }
+    }
+    0
+}
+
+fn emit_output(emitter: &EventEmitter, stream: OutputStream, bytes: &[u8]) {
+    if !bytes.is_empty() {
+        emitter.emit(
+            RuntimeEventKind::Output,
+            None,
+            Some(ProcessOutput {
+                stream,
+                text: String::from_utf8_lossy(bytes).into_owned(),
+            }),
+            None,
+            None,
+        );
+    }
+}
+
+struct WorkerJoinState {
+    completion: Receiver<()>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl WorkerJoinState {
+    fn spawn(work: impl FnOnce() + Send + 'static) -> Self {
+        let (sender, completion) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            struct CompletionSignal(Sender<()>);
+            impl Drop for CompletionSignal {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
+                }
+            }
+            let _signal = CompletionSignal(sender);
+            work();
+        });
+        Self { completion, handle }
+    }
+
+    fn join_until(self, deadline: Instant) -> io::Result<()> {
+        self.join_with_clock(deadline, &SystemPollClock)
+    }
+
+    fn join_with_clock(self, deadline: Instant, clock: &impl PollClock) -> io::Result<()> {
+        let mut acknowledged = false;
+        loop {
+            acknowledged |= self.completion.try_recv().is_ok();
+            if acknowledged && self.handle.is_finished() {
+                return self
+                    .handle
+                    .join()
+                    .map_err(|_| io::Error::other("supervisor worker panicked"));
+            }
+            if clock.now() >= deadline {
+                // Dropping JoinHandle detaches only this failed worker. The
+                // caller must retain cleanup_failed and refuse acknowledgement.
+                return Err(io::Error::other("process supervisor worker deadline exceeded"));
+            }
+            clock.wait();
+        }
+    }
+}
+
 fn spawn_output_reader(
     pipe: impl Read + Send + 'static,
     stream: OutputStream,
+    budget: Arc<OutputBudget>,
     emitter: Arc<EventEmitter>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut buffer = Vec::new();
-        loop {
-            buffer.clear();
-            match reader.read_until(b'\n', &mut buffer) {
-                Ok(0) => break,
-                Ok(_) => emitter.emit(
-                    RuntimeEventKind::Output,
-                    None,
-                    Some(ProcessOutput {
-                        stream,
-                        text: String::from_utf8_lossy(&buffer).into_owned(),
-                    }),
-                    None,
-                    None,
-                ),
-                Err(error) => {
-                    emitter.emit(
-                        RuntimeEventKind::Failed,
-                        None,
-                        None,
-                        None,
-                        Some(format!("failed to read {stream:?}: {error}")),
-                    );
-                    break;
-                }
+    controller: Weak<TerminationController>,
+) -> WorkerJoinState {
+    WorkerJoinState::spawn(move || {
+        if let Err(error) = pump_output(pipe, stream, budget, Arc::clone(&emitter), controller.clone()) {
+            emitter.emit(
+                RuntimeEventKind::Failed,
+                None,
+                None,
+                None,
+                Some(format!("failed to read {stream:?}: {error}")),
+            );
+            if let Some(controller) = controller.upgrade() {
+                controller.mark_cleanup_failed();
+                let _ = controller.request_termination(TerminationReason::User);
             }
         }
     })
@@ -1483,17 +1750,22 @@ struct ExitWatcherConfig {
     completed: Arc<AtomicBool>,
     emitter: Arc<EventEmitter>,
     wine_session: Option<Arc<WineSession>>,
-    output_readers: Vec<thread::JoinHandle<()>>,
+    output_readers: Vec<WorkerJoinState>,
     termination_started: Arc<AtomicBool>,
     keep_alive_after_root_exit: bool,
     cleanup_failed: Arc<AtomicBool>,
+}
+
+fn cleanup_deadline_after_idle(clock: &impl PollClock, idle: impl FnOnce()) -> Instant {
+    idle();
+    clock.now() + SUPERVISOR_FORCE_COMPLETION_TIMEOUT
 }
 
 fn spawn_exit_watcher(
     child: Arc<Mutex<Child>>,
     process_tree: Arc<platform::ProcessTree>,
     config: ExitWatcherConfig,
-) -> thread::JoinHandle<()> {
+) -> WorkerJoinState {
     let ExitWatcherConfig {
         root_exited,
         completed,
@@ -1504,7 +1776,7 @@ fn spawn_exit_watcher(
         keep_alive_after_root_exit,
         cleanup_failed,
     } = config;
-    thread::spawn(move || {
+    WorkerJoinState::spawn(move || {
         let result = loop {
             let result = lock_recover(&child).try_wait();
             match result {
@@ -1515,26 +1787,27 @@ fn spawn_exit_watcher(
         };
         root_exited.store(true, Ordering::Release);
 
-        if keep_alive_after_root_exit {
-            if let Some(wine_session) = wine_session.as_ref() {
-                if let Err(error) = wine_session.wait_until_idle(&termination_started) {
-                    cleanup_failed.store(true, Ordering::Release);
-                    emitter.emit(
-                        RuntimeEventKind::Failed,
-                        None,
-                        None,
-                        None,
-                        Some(format!("waiting for wineserver idle failed: {error}")),
-                    );
-                }
-            } else {
-                while !termination_started.load(Ordering::Acquire) {
-                    thread::sleep(PROCESS_POLL_INTERVAL);
+        let deadline = cleanup_deadline_after_idle(&SystemPollClock, || {
+            if keep_alive_after_root_exit {
+                if let Some(wine_session) = wine_session.as_ref() {
+                    if let Err(error) = wine_session.wait_until_idle(&termination_started) {
+                        cleanup_failed.store(true, Ordering::Release);
+                        emitter.emit(
+                            RuntimeEventKind::Failed,
+                            None,
+                            None,
+                            None,
+                            Some(format!("waiting for wineserver idle failed: {error}")),
+                        );
+                    }
+                } else {
+                    while !termination_started.load(Ordering::Acquire) {
+                        thread::sleep(PROCESS_POLL_INTERVAL);
+                    }
                 }
             }
-        }
-
-        if let Some(wine_session) = wine_session {
+        });
+        if let Some(wine_session) = &wine_session {
             if let Err(error) = wine_session.stop(&emitter) {
                 cleanup_failed.store(true, Ordering::Release);
                 emitter.emit(
@@ -1546,7 +1819,7 @@ fn spawn_exit_watcher(
                 );
             }
         }
-        if let Err(error) = process_tree.force_kill() {
+        if let Err(error) = finish_owned_process(&child, &process_tree, deadline) {
             cleanup_failed.store(true, Ordering::Release);
             emitter.emit(
                 RuntimeEventKind::Failed,
@@ -1559,7 +1832,7 @@ fn spawn_exit_watcher(
         // Descendants may inherit the output pipes, so terminate the tree before
         // draining readers and publishing the terminal event.
         for output_reader in output_readers {
-            if output_reader.join().is_err() {
+            if output_reader.join_until(deadline).is_err() {
                 cleanup_failed.store(true, Ordering::Release);
                 emitter.emit(
                     RuntimeEventKind::Failed,
@@ -1569,6 +1842,10 @@ fn spawn_exit_watcher(
                     Some("output reader panicked".into()),
                 );
             }
+        }
+
+        if let Some(session) = &wine_session {
+            session.complete_owned_tree(!cleanup_failed.load(Ordering::Acquire) && result.is_ok());
         }
 
         let wait_failed = result.is_err();
@@ -1595,8 +1872,8 @@ fn spawn_timeout_watcher(
     completed: Arc<AtomicBool>,
     keep_alive_after_root_exit: bool,
     maximum_runtime: Duration,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+) -> WorkerJoinState {
+    WorkerJoinState::spawn(move || {
         let deadline = Instant::now() + maximum_runtime;
         while Instant::now() < deadline {
             if completed.load(Ordering::Acquire)
@@ -1699,6 +1976,7 @@ struct WineSession {
     stop_outcome: OnceLock<StopOutcome>,
     prior_cleanup_failure: OnceLock<CleanupStage>,
     lease_state: Mutex<LeaseState>,
+    owned_tree_pending: AtomicBool,
     stopping: AtomicBool,
     idle_cleanup_lock: Mutex<()>,
 }
@@ -1767,7 +2045,14 @@ impl NaturalIdleCommand for Child {
 
 impl NaturalIdleCommand for AuxiliaryProcess {
     fn try_wait_success(&mut self) -> io::Result<Option<bool>> {
-        self.poll()
+        let result = self.poll()?;
+        if result.is_some() {
+            self.finish_tree(Instant::now() + WINE_SERVER_COMMAND_TIMEOUT)
+                .inspect_err(|_| {
+                    self.cleanup_failure = Some(CleanupStage::TreeTermination);
+                })?;
+        }
+        Ok(result)
     }
     fn interrupt_and_reap(&mut self) -> io::Result<()> {
         reap_bounded(self, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT).map_err(|stage| {
@@ -1848,6 +2133,7 @@ impl WineSession {
             stop_outcome: OnceLock::new(),
             prior_cleanup_failure: OnceLock::new(),
             lease_state: Mutex::new(LeaseState::Live),
+            owned_tree_pending: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             idle_cleanup_lock: Mutex::new(()),
         })))
@@ -1972,9 +2258,24 @@ impl WineSession {
 
     fn release_lease(&self) {
         let mut state = lock_recover(&self.lease_state);
-        if *state == LeaseState::Live {
+        if *state == LeaseState::Live && !self.owned_tree_pending.load(Ordering::Acquire) {
             let _ = lock_recover(wine_prefix_leases()).remove(&self.lifecycle.prefix);
             *state = LeaseState::Released;
+        }
+    }
+
+    fn hold_for_owned_tree(&self) {
+        self.owned_tree_pending.store(true, Ordering::Release);
+    }
+    fn complete_owned_tree(&self, success: bool) {
+        if success {
+            self.owned_tree_pending.store(false, Ordering::Release);
+            if self.stop_outcome.get() == Some(&StopOutcome::Complete) {
+                self.release_lease();
+            }
+        } else {
+            let _ = self.prior_cleanup_failure.set(CleanupStage::TreeTermination);
+            self.poison_lease();
         }
     }
 
@@ -2042,6 +2343,74 @@ fn wine_prefix_leases() -> &'static Mutex<HashSet<String>> {
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeSignal {
+    Graceful,
+    Force,
+    Probe,
+}
+
+#[cfg(any(unix, test))]
+trait GroupSignals {
+    /// `false` means ESRCH; permission denied is not proof of disappearance.
+    fn signal(&self, group: i32, signal: TreeSignal) -> io::Result<bool>;
+}
+
+#[cfg(any(unix, test))]
+struct OwnedProcessGroup<B: GroupSignals> {
+    id: i32,
+    armed: Mutex<bool>,
+    backend: B,
+}
+
+#[cfg(any(unix, test))]
+impl<B: GroupSignals> OwnedProcessGroup<B> {
+    fn new(id: i32, backend: B) -> Self {
+        Self {
+            id,
+            armed: Mutex::new(true),
+            backend,
+        }
+    }
+    fn send(&self, signal: TreeSignal) -> io::Result<()> {
+        let armed = lock_recover(&self.armed);
+        if *armed {
+            self.backend.signal(self.id, signal)?;
+        }
+        Ok(())
+    }
+    fn wait_until_gone(&self, root_reaped: bool, clock: &impl PollClock, deadline: Instant) -> io::Result<()> {
+        if !root_reaped {
+            return Err(io::Error::other("process root has not been reaped"));
+        }
+        loop {
+            {
+                let mut armed = lock_recover(&self.armed);
+                if !*armed {
+                    return Ok(());
+                }
+                match self.backend.signal(self.id, TreeSignal::Probe) {
+                    Ok(false) => {
+                        *armed = false;
+                        return Ok(());
+                    }
+                    Ok(true) => (),
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => (),
+                    Err(error) => return Err(error),
+                }
+            }
+            if clock.now() >= deadline {
+                return Err(io::Error::other("owned process group remains live"));
+            }
+            clock.wait();
+        }
+    }
+}
+
+// Deliberately no Drop signal: an integer group id may have been reused by
+// then. Only an explicit live-tree transaction may signal this owned group.
 
 #[cfg(unix)]
 mod platform {
@@ -2115,19 +2484,52 @@ mod platform {
         pub fn attach(self, child: &Child) -> io::Result<ProcessTree> {
             let process_group_id = i32::try_from(child.id())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child pid does not fit in i32"))?;
-            Ok(ProcessTree { process_group_id })
+            Ok(ProcessTree {
+                group: super::OwnedProcessGroup::new(process_group_id, SystemGroupSignals),
+            })
         }
     }
 
     pub struct ProcessTree {
-        process_group_id: i32,
+        group: super::OwnedProcessGroup<SystemGroupSignals>,
+    }
+
+    struct SystemGroupSignals;
+
+    impl super::GroupSignals for SystemGroupSignals {
+        fn signal(&self, group: i32, signal: super::TreeSignal) -> io::Result<bool> {
+            let number = match signal {
+                super::TreeSignal::Graceful => SIGTERM,
+                super::TreeSignal::Force => SIGKILL,
+                super::TreeSignal::Probe => 0,
+            };
+            // SAFETY: group is the positive id created before this child's exec.
+            if unsafe { kill(-group, number) } != -1 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ESRCH) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
     }
 
     pub fn force_kill_unattached(child: &mut Child) -> io::Result<()> {
         let process_group_id = i32::try_from(child.id()).map_err(|_| io::Error::other("invalid process group"))?;
         // The child was spawned through PreparedProcessTree::prepare, which
         // creates this exact process group before exec, even if attach fails.
-        std::mem::ManuallyDrop::new(ProcessTree { process_group_id }).force_kill()
+        ProcessTree {
+            group: super::OwnedProcessGroup::new(process_group_id, SystemGroupSignals),
+        }
+        .force_kill()
+    }
+
+    pub fn finish_unattached(child: &Child, deadline: std::time::Instant) -> io::Result<()> {
+        let id = i32::try_from(child.id()).map_err(|_| io::Error::other("invalid process group"))?;
+        let group = super::OwnedProcessGroup::new(id, SystemGroupSignals);
+        group.wait_until_gone(true, &super::SystemPollClock, deadline)
     }
 
     #[cfg(target_os = "macos")]
@@ -2190,40 +2592,24 @@ mod platform {
 
     impl ProcessTree {
         pub fn request_graceful(&self) -> io::Result<()> {
-            self.send_signal(SIGTERM)
+            self.send_signal(super::TreeSignal::Graceful)
         }
 
         pub fn force_kill(&self) -> io::Result<()> {
-            self.send_signal(SIGKILL)
+            self.send_signal(super::TreeSignal::Force)
         }
 
-        fn send_signal(&self, signal: i32) -> io::Result<()> {
+        fn send_signal(&self, signal: super::TreeSignal) -> io::Result<()> {
             #[cfg(target_os = "macos")]
             {
-                retry_permission_denied_signal(|| self.send_signal_once(signal), || thread::sleep(SIGNAL_RETRY_DELAY))
+                retry_permission_denied_signal(|| self.group.send(signal), || thread::sleep(SIGNAL_RETRY_DELAY))
             }
             #[cfg(not(target_os = "macos"))]
-            self.send_signal_once(signal)
+            self.group.send(signal)
         }
 
-        fn send_signal_once(&self, signal: i32) -> io::Result<()> {
-            // SAFETY: the negative id targets the process group created for this
-            // launch. No Rust memory is shared with the operating system call.
-            if unsafe { kill(-self.process_group_id, signal) } != -1 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(ESRCH) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
-
-    impl Drop for ProcessTree {
-        fn drop(&mut self) {
-            let _ = self.force_kill();
+        pub fn wait_until_gone(&self, deadline: std::time::Instant) -> io::Result<()> {
+            self.group.wait_until_gone(true, &super::SystemPollClock, deadline)
         }
     }
 
@@ -2338,6 +2724,13 @@ mod platform {
         fn GenerateConsoleCtrlEvent(control_event: Dword, process_group_id: Dword) -> Bool;
         fn SetInformationJobObject(job: Handle, class: i32, information: *const c_void, length: Dword) -> Bool;
         fn TerminateJobObject(job: Handle, exit_code: u32) -> Bool;
+        fn QueryInformationJobObject(
+            job: Handle,
+            class: i32,
+            information: *mut c_void,
+            length: Dword,
+            returned_length: *mut Dword,
+        ) -> Bool;
     }
 
     pub struct PreparedProcessTree {
@@ -2378,6 +2771,10 @@ mod platform {
         }
     }
 
+    pub fn finish_unattached(_child: &Child, _deadline: std::time::Instant) -> io::Result<()> {
+        Ok(())
+    }
+
     pub fn force_kill_wine_prefix_clients(_prefix: &Path) -> io::Result<()> {
         Ok(())
     }
@@ -2399,6 +2796,42 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
+        }
+
+        pub fn wait_until_gone(&self, deadline: std::time::Instant) -> io::Result<()> {
+            #[repr(C)]
+            #[derive(Default)]
+            struct Accounting {
+                times: [i64; 4],
+                faults: Dword,
+                total_processes: Dword,
+                active_processes: Dword,
+                terminated_processes: Dword,
+            }
+            loop {
+                let mut accounting = Accounting::default();
+                // SAFETY: information class 1 uses the fixed C-layout basic
+                // accounting structure; the unnamed Job handle remains live.
+                if unsafe {
+                    QueryInformationJobObject(
+                        self.job.raw(),
+                        1,
+                        std::ptr::addr_of_mut!(accounting).cast(),
+                        std::mem::size_of::<Accounting>() as Dword,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if accounting.active_processes == 0 {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::other("owned Job remains live"));
+                }
+                std::thread::sleep(super::PROCESS_POLL_INTERVAL);
+            }
         }
     }
 
@@ -2455,6 +2888,634 @@ mod tests {
         TranslatorKind, TranslatorSelection,
     };
     use std::collections::BTreeMap;
+
+    struct SmallReads {
+        remaining: usize,
+        byte: u8,
+        largest_request: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn descendant_holding_pipe_refuses_unbounded_reader_join() {
+        struct HeldPipe(Receiver<()>);
+        impl Read for HeldPipe {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                let _ = self.0.recv_timeout(Duration::from_millis(250));
+                Ok(0)
+            }
+        }
+        let (_release, held) = mpsc::channel();
+        let (sender, _events) = mpsc::channel();
+        let worker = spawn_output_reader(
+            HeldPipe(held),
+            OutputStream::Stdout,
+            Arc::new(OutputBudget::new()),
+            Arc::new(EventEmitter::new("held-pipe".into(), sender)),
+            Weak::new(),
+        );
+        assert!(worker.join_until(Instant::now() + Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn failed_reap_or_join_refuses_acknowledgement() {
+        let worker = WorkerJoinState::spawn(|| thread::sleep(Duration::from_millis(200)));
+        assert!(worker.join_until(Instant::now() + Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn failed_reap_or_signal_or_live_group_marks_controller_failure_and_refuses_acknowledgement() {
+        struct FailedCleanup {
+            stage: u8,
+            calls: Mutex<Vec<&'static str>>,
+        }
+        impl OwnedCleanup for FailedCleanup {
+            fn force_kill(&self) -> io::Result<()> {
+                lock_recover(&self.calls).push("kill");
+                if self.stage == 0 {
+                    Err(io::Error::other("injected signal"))
+                } else {
+                    Ok(())
+                }
+            }
+            fn root_reaped(&self) -> io::Result<bool> {
+                lock_recover(&self.calls).push("reap");
+                match self.stage {
+                    1 => Err(io::Error::other("injected reap")),
+                    2 => Ok(false),
+                    _ => Ok(true),
+                }
+            }
+            fn wait_until_gone(&self, _deadline: Instant) -> io::Result<()> {
+                lock_recover(&self.calls).push("group");
+                if self.stage == 3 {
+                    Err(io::Error::other("owned group still live"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for stage in 0..4 {
+            let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
+            collect_until_exit(&handle, Instant::now() + Duration::from_secs(5));
+            let operations = FailedCleanup {
+                stage,
+                calls: Mutex::new(Vec::new()),
+            };
+            let clock = VirtualClock {
+                start: Instant::now(),
+                ticks: std::cell::Cell::new(0),
+            };
+            let result = finish_owned_cleanup(&operations, &clock, clock.now() + Duration::from_secs(3));
+            assert!(handle.controller.record_cleanup_result(result).is_err());
+            assert!(handle.controller.cleanup_failed.load(Ordering::Acquire));
+            assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+            assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+            let calls = lock_recover(&operations.calls);
+            assert_eq!(calls.first(), Some(&"kill"));
+            assert!(calls.contains(&"reap"), "a failed signal must still attempt root reap");
+            assert_eq!(calls.contains(&"group"), stage == 0 || stage == 3);
+            assert!(clock.ticks.get() <= 3);
+        }
+    }
+
+    #[test]
+    fn cleanup_failed_graceful_and_fallback_signals_remain_sticky_on_real_controller() {
+        let handle = ProcessSupervisor::start(&helper_plan()).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = handle.controller.request_termination_with_signals(
+            TerminationReason::User,
+            || {
+                calls.set(calls.get() + 1);
+                Err(io::Error::other("injected graceful failure"))
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Err(io::Error::other("injected force failure"))
+            },
+        );
+        let cleanup = handle.terminate_and_wait(Duration::ZERO);
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 2);
+        assert!(
+            handle.is_finished(),
+            "real fixture must still be reaped before checking failure"
+        );
+        assert!(handle.controller.cleanup_failed.load(Ordering::Acquire));
+        assert!(cleanup.is_err());
+        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn cleanup_output_read_failure_stops_owned_tree_and_refuses_acknowledgement() {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected pipe read failure"))
+            }
+        }
+        let handle = ProcessSupervisor::start(&helper_plan()).unwrap();
+        handle.controller.register_worker(spawn_output_reader(
+            FailedRead,
+            OutputStream::Stdout,
+            Arc::new(OutputBudget::new()),
+            Arc::clone(&handle.controller.emitter),
+            Arc::downgrade(&handle.controller),
+        ));
+        let cleanup = handle.terminate_and_wait(Duration::ZERO);
+        assert!(handle.is_finished());
+        assert!(cleanup.is_err());
+        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+    }
+
+    struct RecordingGroup {
+        signals: Arc<Mutex<Vec<(i32, TreeSignal)>>>,
+        alive_probes: AtomicUsize,
+        denied: bool,
+    }
+    impl GroupSignals for RecordingGroup {
+        fn signal(&self, group: i32, signal: TreeSignal) -> io::Result<bool> {
+            lock_recover(&self.signals).push((group, signal));
+            if signal == TreeSignal::Probe {
+                if self.denied {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                return Ok(self
+                    .alive_probes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
+                    .unwrap()
+                    > 0);
+            }
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn cleanup_waits_until_group_disappears() {
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let group = OwnedProcessGroup::new(
+            123,
+            RecordingGroup {
+                signals: Arc::clone(&signals),
+                alive_probes: AtomicUsize::new(2),
+                denied: false,
+            },
+        );
+        let clock = VirtualClock {
+            start: Instant::now(),
+            ticks: std::cell::Cell::new(0),
+        };
+        group.send(TreeSignal::Graceful).unwrap();
+        group.send(TreeSignal::Force).unwrap();
+        group
+            .wait_until_gone(true, &clock, clock.now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(clock.ticks.get(), 2);
+        assert!(lock_recover(&signals).iter().all(|(id, _)| *id == 123));
+        assert_eq!(
+            lock_recover(&signals)
+                .iter()
+                .filter(|(_, s)| *s == TreeSignal::Probe)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn process_tree_drop_never_signals_reused_group() {
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let group = OwnedProcessGroup::new(
+            123,
+            RecordingGroup {
+                signals: Arc::clone(&signals),
+                alive_probes: AtomicUsize::new(0),
+                denied: false,
+            },
+        );
+        drop(group);
+        assert!(lock_recover(&signals).is_empty());
+    }
+
+    #[test]
+    fn cleanup_successful_server_wait_does_not_release_live_or_failed_owned_tree() {
+        for success in [true, false] {
+            let fixture = RuntimeEvidenceFixture::new();
+            materialize_launch_directories(&fixture.plan).unwrap();
+            let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+            session.hold_for_owned_tree();
+            assert_eq!(session.stop_core(None), StopOutcome::Complete);
+            assert!(
+                WineSession::acquire(&fixture.plan).is_err(),
+                "server rendezvous alone released live tree lease"
+            );
+            session.complete_owned_tree(success);
+            assert_eq!(WineSession::acquire(&fixture.plan).is_ok(), success);
+        }
+    }
+
+    #[test]
+    fn cleanup_live_or_permission_denied_group_refuses_disarm() {
+        for denied in [false, true] {
+            let signals = Arc::new(Mutex::new(Vec::new()));
+            let group = OwnedProcessGroup::new(
+                456,
+                RecordingGroup {
+                    signals: Arc::clone(&signals),
+                    alive_probes: AtomicUsize::new(100),
+                    denied,
+                },
+            );
+            let clock = VirtualClock {
+                start: Instant::now(),
+                ticks: std::cell::Cell::new(0),
+            };
+            assert!(group.wait_until_gone(false, &clock, clock.now()).is_err());
+            assert!(group
+                .wait_until_gone(true, &clock, clock.now() + Duration::from_secs(3))
+                .is_err());
+            assert!(*lock_recover(&group.armed));
+            assert_eq!(clock.ticks.get(), 3);
+            let previous = lock_recover(&signals).len();
+            drop(group);
+            assert_eq!(lock_recover(&signals).len(), previous);
+        }
+    }
+
+    #[test]
+    fn process_tree_signal_holds_authority_until_backend_returns_and_disarm_blocks_later_signals() {
+        struct PausedSignal {
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+            signals: AtomicUsize,
+        }
+        impl GroupSignals for PausedSignal {
+            fn signal(&self, _id: i32, signal: TreeSignal) -> io::Result<bool> {
+                self.signals.fetch_add(1, Ordering::Relaxed);
+                if signal != TreeSignal::Probe {
+                    self.entered.send(()).unwrap();
+                    lock_recover(&self.release)
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+        let (entered, inside) = mpsc::channel();
+        let (release, paused) = mpsc::channel();
+        let group = Arc::new(OwnedProcessGroup::new(
+            123,
+            PausedSignal {
+                entered,
+                release: Mutex::new(paused),
+                signals: AtomicUsize::new(0),
+            },
+        ));
+        let sending = Arc::clone(&group);
+        let signal = thread::spawn(move || sending.send(TreeSignal::Force));
+        inside.recv_timeout(Duration::from_secs(2)).unwrap();
+        let held = group.armed.try_lock().is_err();
+        release.send(()).unwrap();
+        signal.join().unwrap().unwrap();
+        assert!(held, "signal lost authority before its backend returned");
+        group
+            .wait_until_gone(true, &SystemPollClock, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let count = group.backend.signals.load(Ordering::Acquire);
+        group.send(TreeSignal::Force).unwrap();
+        group.send(TreeSignal::Graceful).unwrap();
+        assert_eq!(group.backend.signals.load(Ordering::Acquire), count);
+    }
+
+    #[test]
+    fn cleanup_worker_requires_signal_and_join_under_one_virtual_deadline() {
+        let clock = VirtualClock {
+            start: Instant::now(),
+            ticks: std::cell::Cell::new(0),
+        };
+        let deadline = clock.now() + Duration::from_secs(3);
+        let finished = || {
+            let handle = thread::spawn(|| {});
+            let limit = Instant::now() + Duration::from_secs(2);
+            while !handle.is_finished() && Instant::now() < limit {
+                thread::yield_now();
+            }
+            assert!(handle.is_finished());
+            handle
+        };
+        let (sender, completion) = mpsc::channel();
+        sender.send(()).unwrap();
+        WorkerJoinState {
+            completion,
+            handle: finished(),
+        }
+        .join_with_clock(deadline, &clock)
+        .unwrap();
+        assert_eq!(clock.ticks.get(), 0);
+        let (_sender, completion) = mpsc::channel();
+        assert!(WorkerJoinState {
+            completion,
+            handle: finished()
+        }
+        .join_with_clock(deadline, &clock)
+        .is_err());
+        assert_eq!(
+            clock.ticks.get(),
+            3,
+            "a finished thread without completion must not acknowledge"
+        );
+        let (_sender, completion) = mpsc::channel();
+        assert!(WorkerJoinState {
+            completion,
+            handle: finished()
+        }
+        .join_with_clock(deadline, &clock)
+        .is_err());
+        assert_eq!(
+            clock.ticks.get(),
+            3,
+            "the next worker must share the exhausted deadline"
+        );
+    }
+
+    #[test]
+    fn cleanup_worker_timeout_marks_controller_failure_and_repeated_ack_is_refused() {
+        let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
+        collect_until_exit(&handle, Instant::now() + Duration::from_secs(5));
+        let (release, wait) = mpsc::channel();
+        handle.controller.register_worker(WorkerJoinState::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        }));
+        let result = handle.terminate_and_wait_until(Duration::ZERO, Instant::now() + Duration::from_millis(10));
+        release.send(()).unwrap();
+        assert!(result.is_err());
+        assert!(handle.controller.cleanup_failed.load(Ordering::Acquire));
+        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn cleanup_completion_mutex_contention_obeys_deadline() {
+        let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
+        collect_until_exit(&handle, Instant::now() + Duration::from_secs(5));
+        let lock = lock_recover(&handle.controller.completion_lock);
+        let started = Instant::now();
+        assert!(handle
+            .terminate_and_wait_until(Duration::ZERO, started + Duration::from_millis(10))
+            .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(lock);
+        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn cleanup_deadline_starts_after_long_natural_gui_idle() {
+        let clock = VirtualClock {
+            start: Instant::now(),
+            ticks: std::cell::Cell::new(0),
+        };
+        let deadline = cleanup_deadline_after_idle(&clock, || {
+            for _ in 0..60 {
+                clock.wait();
+            }
+        });
+        assert_eq!(
+            deadline.duration_since(clock.now()),
+            SUPERVISOR_FORCE_COMPLETION_TIMEOUT
+        );
+    }
+
+    impl Read for SmallReads {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.largest_request.fetch_max(buffer.len(), Ordering::Relaxed);
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            self.remaining -= 1;
+            buffer[0] = self.byte;
+            Ok(1)
+        }
+    }
+
+    fn output_budget_events(first: impl Read, second: impl Read) -> (Vec<RuntimeEvent>, Arc<OutputBudget>) {
+        let (sender, receiver) = mpsc::channel();
+        let emitter = Arc::new(EventEmitter::new("output-budget".into(), sender));
+        let budget = Arc::new(OutputBudget::new());
+        emitter.emit(RuntimeEventKind::Started, Some(1), None, None, None);
+        pump_output(
+            first,
+            OutputStream::Stdout,
+            Arc::clone(&budget),
+            Arc::clone(&emitter),
+            Weak::new(),
+        )
+        .unwrap();
+        pump_output(
+            second,
+            OutputStream::Stderr,
+            Arc::clone(&budget),
+            Arc::clone(&emitter),
+            Weak::new(),
+        )
+        .unwrap();
+        emitter.emit(RuntimeEventKind::Exited, None, None, None, None);
+        (receiver.try_iter().collect(), budget)
+    }
+
+    fn assert_output_budget_events(events: &[RuntimeEvent], bytes: usize, overflows: usize) {
+        let outputs: Vec<_> = events.iter().filter_map(|event| event.output.as_ref()).collect();
+        assert_eq!(outputs.iter().map(|output| output.text.len()).sum::<usize>(), bytes);
+        assert!(outputs.len() <= MAX_COMBINED_OUTPUT_BYTES / MAX_OUTPUT_EVENT_BYTES + 2);
+        assert!(outputs.iter().all(|output| output.text.len() <= MAX_OUTPUT_EVENT_BYTES));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RuntimeEventKind::Failed)
+                .count(),
+            overflows
+        );
+        for (sequence, event) in events.iter().enumerate() {
+            assert_eq!(event.sequence, sequence as u64);
+        }
+        assert_eq!(events.last().unwrap().kind, RuntimeEventKind::Exited);
+    }
+
+    #[test]
+    fn output_budget_exact_cap_and_no_newline_cap_plus_one() {
+        for extra in [0, 1] {
+            let (events, budget) = output_budget_events(
+                io::repeat(b'x').take((MAX_COMBINED_OUTPUT_BYTES + extra) as u64),
+                io::empty(),
+            );
+            assert_output_budget_events(&events, MAX_COMBINED_OUTPUT_BYTES, extra);
+            assert_eq!(budget.remaining.load(Ordering::Acquire), 0);
+            assert_eq!(budget.overflow_emitted.load(Ordering::Acquire), extra != 0);
+        }
+    }
+
+    #[test]
+    fn output_budget_streams_share_cap_and_single_overflow() {
+        let half = MAX_COMBINED_OUTPUT_BYTES / 2;
+        let (events, _) = output_budget_events(
+            io::repeat(b'a').take(half as u64),
+            io::repeat(b'b').take((half + 1) as u64),
+        );
+        assert_output_budget_events(&events, MAX_COMBINED_OUTPUT_BYTES, 1);
+    }
+
+    #[test]
+    fn output_budget_one_byte_newlines_have_bounded_events_and_reads() {
+        let largest = Arc::new(AtomicUsize::new(0));
+        let (events, _) = output_budget_events(
+            SmallReads {
+                remaining: MAX_COMBINED_OUTPUT_BYTES + 1,
+                byte: b'\n',
+                largest_request: Arc::clone(&largest),
+            },
+            io::empty(),
+        );
+        assert_output_budget_events(&events, MAX_COMBINED_OUTPUT_BYTES, 1);
+        assert!(largest.load(Ordering::Relaxed) <= MAX_OUTPUT_EVENT_BYTES);
+    }
+
+    #[test]
+    fn output_budget_preserves_valid_utf8_across_chunk_boundary() {
+        for scalar in ["é", "€", "😀"] {
+            let text = format!("{}{scalar}tail", "x".repeat(MAX_OUTPUT_EVENT_BYTES - 1));
+            let (events, _) = output_budget_events(io::Cursor::new(text.as_bytes()), io::empty());
+            let captured: String = events
+                .iter()
+                .filter_map(|event| event.output.as_ref())
+                .map(|output| output.text.as_str())
+                .collect();
+            assert_eq!(captured, text);
+        }
+    }
+
+    #[test]
+    fn output_budget_invalid_utf8_remains_bounded_lossy_text() {
+        let (events, _) = output_budget_events(
+            io::repeat(0xff).take((MAX_COMBINED_OUTPUT_BYTES + 1) as u64),
+            io::empty(),
+        );
+        let outputs: Vec<_> = events.iter().filter_map(|event| event.output.as_ref()).collect();
+        assert_eq!(
+            outputs.iter().map(|o| o.text.chars().count()).sum::<usize>(),
+            MAX_COMBINED_OUTPUT_BYTES
+        );
+        assert!(outputs.iter().all(|o| o.text.len() <= 3 * MAX_OUTPUT_EVENT_BYTES));
+        assert!(outputs.len() <= MAX_COMBINED_OUTPUT_BYTES / MAX_OUTPUT_EVENT_BYTES + 2);
+    }
+
+    #[test]
+    fn output_budget_concurrent_streams_reserve_once_and_emit_one_failure() {
+        let (sender, receiver) = mpsc::channel();
+        let emitter = Arc::new(EventEmitter::new("interleaved-output".into(), sender));
+        emitter.emit(RuntimeEventKind::Started, Some(1), None, None, None);
+        let budget = Arc::new(OutputBudget::new());
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            let emitter = Arc::clone(&emitter);
+            let budget = Arc::clone(&budget);
+            let gate = Arc::clone(&gate);
+            workers.push(WorkerJoinState::spawn(move || {
+                gate.wait();
+                pump_output(
+                    io::repeat(b'x').take((MAX_COMBINED_OUTPUT_BYTES + 1) as u64),
+                    stream,
+                    budget,
+                    emitter,
+                    Weak::new(),
+                )
+                .unwrap();
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for worker in workers {
+            worker.join_until(deadline).unwrap();
+        }
+        emitter.emit(RuntimeEventKind::Exited, None, None, None, None);
+        assert_output_budget_events(&receiver.try_iter().collect::<Vec<_>>(), MAX_COMBINED_OUTPUT_BYTES, 1);
+    }
+
+    #[test]
+    fn output_budget_real_overflow_requests_owned_tree_termination_and_one_exit() {
+        let mut plan = helper_plan();
+        plan.process
+            .environment
+            .insert("COMPATFORGE_PROCESS_TEST_HELPER".into(), "output-limit".into());
+        plan.lifecycle.maximum_runtime_milliseconds = Some(5_000);
+        plan.lifecycle.termination_grace_milliseconds = 20;
+        let handle = ProcessSupervisor::start(&plan).unwrap();
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        handle.terminate_and_wait(Duration::from_millis(20)).unwrap();
+        assert_output_budget_events(&events, MAX_COMBINED_OUTPUT_BYTES, 1);
+        assert!(events
+            .iter()
+            .any(|event| event.kind == RuntimeEventKind::TerminateRequested));
+        assert!(!events.iter().any(|event| event.kind == RuntimeEventKind::TimedOut));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RuntimeEventKind::Exited)
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_holding_pipe_native_linux_tree_is_reaped_without_touching_other_group() {
+        let mut unrelated_command = Command::new(std::env::current_exe().unwrap());
+        unrelated_command
+            .args(["--exact", "tests::supervisor_helper", "--nocapture"])
+            .env_clear()
+            .env("COMPATFORGE_PROCESS_TEST_HELPER", "sleep")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut unrelated = spawn_auxiliary(&mut unrelated_command).unwrap();
+        let mut plan = helper_plan();
+        plan.process.environment.insert(
+            "COMPATFORGE_PROCESS_TEST_HELPER".into(),
+            "exit-holding-descendant".into(),
+        );
+        plan.lifecycle.termination_grace_milliseconds = 20;
+        let handle = match ProcessSupervisor::start(&plan) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let cleanup = reap_bounded(&mut unrelated, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT);
+                panic!("held-pipe launch failed: {error}; unrelated cleanup: {cleanup:?}");
+            }
+        };
+        // The root publishes readiness only after its child inherited both
+        // pipes, then exits normally. Let the exit watcher encounter that
+        // state; do not race termination against descendant creation.
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(20));
+        let ready = events
+            .iter()
+            .filter_map(|event| event.output.as_ref())
+            .any(|output| output.text.contains("held-pipe-descendant-spawned"));
+        let normal_root_exit = events
+            .iter()
+            .find_map(|event| event.exit.as_ref())
+            .is_some_and(|exit| exit.success);
+        let result = handle.terminate_and_wait(Duration::from_millis(500));
+        let other_still_live = unrelated.child.try_wait().map(|status| status.is_none());
+        let unrelated_cleanup = reap_bounded(&mut unrelated, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT);
+        assert!(ready, "descendant/pipe inheritance scenario was never reached");
+        assert!(normal_root_exit, "root was killed before its deliberate exit");
+        result.unwrap();
+        assert!(other_still_live.unwrap());
+        unrelated_cleanup.unwrap();
+        assert!(handle.is_finished());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RuntimeEventKind::Exited)
+                .count(),
+            1
+        );
+    }
 
     fn fixture_plan() -> LaunchPlan {
         LaunchPlan {
@@ -4448,7 +5509,7 @@ mod tests {
         let handle = ProcessSupervisor::start(&fixture_plan()).unwrap();
         let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
         assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
-        handle.controller.register_worker(thread::spawn(|| {
+        handle.controller.register_worker(WorkerJoinState::spawn(|| {
             panic!("supervisor worker failure fixture");
         }));
 
@@ -4464,9 +5525,9 @@ mod tests {
         let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
         assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
         let controller = Arc::clone(&handle.controller);
-        handle.controller.register_worker(thread::spawn(move || {
+        handle.controller.register_worker(WorkerJoinState::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            controller.register_worker(thread::spawn(|| {}));
+            controller.register_worker(WorkerJoinState::spawn(|| {}));
         }));
 
         handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
@@ -4481,7 +5542,7 @@ mod tests {
         let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
         assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
         let (release, released) = mpsc::channel();
-        handle.controller.register_worker(thread::spawn(move || {
+        handle.controller.register_worker(WorkerJoinState::spawn(move || {
             released.recv().unwrap();
             thread::sleep(Duration::from_millis(200));
         }));
@@ -4805,6 +5866,28 @@ mod tests {
     #[test]
     fn supervisor_helper() {
         match std::env::var("COMPATFORGE_PROCESS_TEST_HELPER").as_deref() {
+            Ok("output-limit") => {
+                let chunk = [b'x'; MAX_OUTPUT_EVENT_BYTES];
+                for _ in 0..(MAX_COMBINED_OUTPUT_BYTES / MAX_OUTPUT_EVENT_BYTES + 2) {
+                    if std::io::Write::write_all(&mut std::io::stdout(), &chunk).is_err() {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_secs(30));
+            }
+            #[cfg(target_os = "linux")]
+            Ok("exit-holding-descendant") => {
+                let _descendant = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tests::supervisor_helper", "--nocapture"])
+                    .env_clear()
+                    .env("COMPATFORGE_PROCESS_TEST_HELPER", "sleep")
+                    .spawn()
+                    .unwrap();
+                println!("held-pipe-descendant-spawned");
+                print!("{}", " ".repeat(MAX_OUTPUT_EVENT_BYTES));
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                std::process::exit(0);
+            }
             Ok("sleep") => {
                 println!("helper-ready");
                 thread::sleep(Duration::from_secs(30));
@@ -4819,6 +5902,10 @@ mod tests {
                     .spawn()
                     .unwrap();
                 println!("descendant-ready");
+                // Task10 deliberately batches live output into fixed chunks;
+                // make this readiness handshake a whole chunk, not one line.
+                print!("{}", " ".repeat(MAX_OUTPUT_EVENT_BYTES));
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
                 thread::sleep(Duration::from_secs(30));
                 let _ = descendant.kill();
                 let _ = descendant.wait();
