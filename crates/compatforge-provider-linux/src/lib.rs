@@ -17,7 +17,7 @@ use compatforge_domain::{
     ContractError, CoreConfig, CpuArchitecture, HostOs, ProviderDescriptor, RuntimeBinding, RuntimeChannel,
     RuntimeComponent, RuntimeHost, RuntimePackManifest, SCHEMA_VERSION_V1,
 };
-use compatforge_runtime::{sha256_digest_bytes, RejectAllSignatures, RuntimePackStore};
+use compatforge_runtime::{sha256_digest_bytes, RejectAllSignatures, RuntimePackError, RuntimePackStore};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -466,6 +466,7 @@ pub enum LinuxBootstrapError {
     InvalidRequest(&'static str),
     UnsupportedHost,
     Evidence(EvidenceFailure),
+    CommitUncertain { cleanup_failed: bool },
     ConflictingActiveRef,
     RegistrationFailed(&'static str),
     Provider(LinuxProviderError),
@@ -478,6 +479,13 @@ impl fmt::Display for LinuxBootstrapError {
             Self::InvalidRequest(field) => write!(formatter, "invalid Linux bootstrap request: {field}"),
             Self::UnsupportedHost => formatter.write_str("Linux bootstrap requires a Linux x86_64 host"),
             Self::Evidence(failure) => write!(formatter, "Linux bootstrap evidence failed: {failure}"),
+            Self::CommitUncertain { cleanup_failed } => {
+                formatter.write_str("Linux Runtime Pack active-ref commit durability is uncertain")?;
+                if *cleanup_failed {
+                    formatter.write_str(" and staging cleanup failed")?;
+                }
+                Ok(())
+            }
             Self::ConflictingActiveRef => formatter.write_str("Linux Preview Runtime has a conflicting active ref"),
             Self::RegistrationFailed(operation) => {
                 write!(formatter, "Linux Preview Runtime registration failed: {operation}")
@@ -495,6 +503,7 @@ impl std::error::Error for LinuxBootstrapError {
             Self::Provider(error) => Some(error),
             Self::InvalidRequest(_)
             | Self::UnsupportedHost
+            | Self::CommitUncertain { .. }
             | Self::ConflictingActiveRef
             | Self::RegistrationFailed(_) => None,
         }
@@ -955,7 +964,7 @@ impl BootstrapOperations for SystemBootstrapOperations {
     ) -> Result<(), LinuxBootstrapError> {
         let receipt = RuntimePackStore::new(store_root)
             .install_bundle(staging, "manifest.json", &RejectAllSignatures)
-            .map_err(|_| LinuxBootstrapError::RegistrationFailed("Runtime Pack install"))?;
+            .map_err(map_runtime_install_error)?;
         if receipt.pack_id != manifest.id || receipt.digest != manifest.digest {
             return Err(LinuxBootstrapError::RegistrationFailed("Runtime Pack receipt"));
         }
@@ -1046,10 +1055,7 @@ fn validate_then_bootstrap(
         .populate_staging(&staging, &prepared)
         .and_then(|()| operations.install_pack(&prepared.roots.runtime_store, &staging, &prepared.manifest));
     let cleanup_result = operations.cleanup_staging(&staging, prepared.owner);
-    if let Err(error) = install_result {
-        return cleanup_result.and(Err(error));
-    }
-    cleanup_result?;
+    combine_install_and_cleanup(install_result, cleanup_result)?;
 
     let installed_ref = observe_exact_active_ref(&prepared.roots.runtime_store, prepared.owner)?;
     if installed_ref
@@ -1120,6 +1126,27 @@ fn validate_then_bootstrap(
             capabilities: vec![RUNTIME_CAPABILITY.into()],
         },
     })
+}
+
+fn map_runtime_install_error(error: RuntimePackError) -> LinuxBootstrapError {
+    if error.is_commit_uncertain() {
+        LinuxBootstrapError::CommitUncertain { cleanup_failed: false }
+    } else {
+        LinuxBootstrapError::RegistrationFailed("Runtime Pack install")
+    }
+}
+
+fn combine_install_and_cleanup(
+    install: Result<(), LinuxBootstrapError>,
+    cleanup: Result<(), LinuxBootstrapError>,
+) -> Result<(), LinuxBootstrapError> {
+    match install {
+        Err(LinuxBootstrapError::CommitUncertain { cleanup_failed }) => Err(LinuxBootstrapError::CommitUncertain {
+            cleanup_failed: cleanup_failed || cleanup.is_err(),
+        }),
+        Err(error) => cleanup.and(Err(error)),
+        Ok(()) => cleanup,
+    }
 }
 
 fn require_unchanged_active_ref(
@@ -1804,84 +1831,113 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
             return None;
         }
     }
-    if entries.iter().any(|candidate| {
-        entries
-            .iter()
-            .filter(|entry| {
-                entry.mount_id != candidate.mount_id
-                    && entry.parent_id == candidate.mount_id
-                    && entry.mount_point == candidate.mount_point
-            })
-            .count()
-            > 1
-    }) {
-        return None;
-    }
+    let mut same_point_children = BTreeMap::new();
     for entry in entries {
-        let mut seen = BTreeSet::new();
-        let mut cursor = entry;
-        loop {
-            if cursor.mount_id == cursor.parent_id && cursor.mount_point == b"/" {
-                break;
+        if let Some(parent) = by_id.get(&entry.parent_id) {
+            if entry.mount_id != parent.mount_id && entry.mount_point == parent.mount_point {
+                let count = same_point_children.entry(parent.mount_id).or_insert(0_usize);
+                *count += 1;
+                if *count > 1 {
+                    return None;
+                }
             }
-            let Some(parent) = by_id.get(&cursor.parent_id) else {
-                break;
-            };
-            if !seen.insert(cursor.mount_id) {
-                return None;
-            }
-            cursor = parent;
         }
     }
-    let hidden_at_same_point = entries
-        .iter()
-        .filter(|candidate| {
-            entries.iter().any(|entry| {
-                entry.mount_id != candidate.mount_id
-                    && entry.parent_id == candidate.mount_id
-                    && entry.mount_point == candidate.mount_point
-            })
-        })
-        .map(|entry| entry.mount_id)
-        .collect::<BTreeSet<_>>();
-    let covered_by_ancestor = entries
-        .iter()
-        .filter(|candidate| {
-            entries.iter().any(|cover| {
-                cover.parent_id == candidate.parent_id
-                    && cover.mount_id != candidate.parent_id
-                    && cover.mount_point != candidate.mount_point
-                    && linux_path_contains(&cover.mount_point, &candidate.mount_point)
-            })
-        })
-        .map(|entry| entry.mount_id)
-        .collect::<BTreeSet<_>>();
-    let mut visible = Vec::new();
+    let hidden_at_same_point = same_point_children.into_keys().collect::<BTreeSet<_>>();
+
+    let mut siblings = BTreeMap::<u64, Vec<&MountEntry>>::new();
     for entry in entries {
-        if hidden_at_same_point.contains(&entry.mount_id) || covered_by_ancestor.contains(&entry.mount_id) {
+        siblings.entry(entry.parent_id).or_default().push(entry);
+    }
+    let mut covered_by_ancestor = BTreeSet::new();
+    for group in siblings.values_mut() {
+        group.sort_by(|left, right| {
+            // Component ordering keeps a path's descendants contiguous even when
+            // punctuation sorts before '/' (for example /a, /a-, and /a/b).
+            left.mount_point
+                .split(|byte| *byte == b'/')
+                .cmp(right.mount_point.split(|byte| *byte == b'/'))
+                .then_with(|| left.mount_id.cmp(&right.mount_id))
+        });
+        let mut ancestors: Vec<&MountEntry> = Vec::new();
+        for candidate in group.iter().copied() {
+            while ancestors
+                .last()
+                .is_some_and(|ancestor| !linux_path_contains(&ancestor.mount_point, &candidate.mount_point))
+            {
+                ancestors.pop();
+            }
+            if ancestors.last().is_some_and(|ancestor| {
+                ancestor.mount_point != candidate.mount_point
+                    && linux_path_contains(&ancestor.mount_point, &candidate.mount_point)
+            }) {
+                covered_by_ancestor.insert(candidate.mount_id);
+            }
+            if candidate.mount_id != candidate.parent_id
+                && ancestors
+                    .last()
+                    .map_or(true, |ancestor| ancestor.mount_point != candidate.mount_point)
+            {
+                ancestors.push(candidate);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Visibility {
+        Visible,
+        SamePointHidden,
+        AncestorHidden,
+    }
+    let mut states = BTreeMap::<u64, Visibility>::new();
+    for entry in entries {
+        if states.contains_key(&entry.mount_id) {
             continue;
         }
+        let mut chain = Vec::new();
+        let mut positions = BTreeSet::new();
         let mut cursor = entry;
-        let mut hidden = false;
-        loop {
+        let inherited = loop {
+            if let Some(state) = states.get(&cursor.mount_id) {
+                break *state;
+            }
+            if !positions.insert(cursor.mount_id) {
+                return None;
+            }
+            chain.push(cursor);
             if cursor.mount_id == cursor.parent_id && cursor.mount_point == b"/" {
-                break;
+                break Visibility::Visible;
             }
             let Some(parent) = by_id.get(&cursor.parent_id) else {
-                break;
+                break Visibility::Visible;
             };
-            if parent.mount_point != cursor.mount_point
-                && (hidden_at_same_point.contains(&parent.mount_id) || covered_by_ancestor.contains(&parent.mount_id))
-            {
-                hidden = true;
-                break;
-            }
             cursor = parent;
-        }
-        if !hidden {
-            visible.push(entry.clone());
+        };
+        let mut parent_state = inherited;
+        while let Some(current) = chain.pop() {
+            let parent_point = by_id
+                .get(&current.parent_id)
+                .map(|parent| parent.mount_point.as_slice());
+            let state = if covered_by_ancestor.contains(&current.mount_id)
+                || parent_state == Visibility::AncestorHidden
+                || (parent_state == Visibility::SamePointHidden
+                    && parent_point.is_some_and(|point| point != current.mount_point))
+            {
+                Visibility::AncestorHidden
+            } else if hidden_at_same_point.contains(&current.mount_id) {
+                Visibility::SamePointHidden
+            } else {
+                Visibility::Visible
+            };
+            states.insert(current.mount_id, state);
+            parent_state = state;
         }
     }
+    let mut visible = entries
+        .iter()
+        .filter(|entry| states.get(&entry.mount_id) == Some(&Visibility::Visible))
+        .cloned()
+        .collect::<Vec<_>>();
     visible.sort_by_key(|entry| entry.mount_id);
     Some(visible)
 }
@@ -3674,7 +3730,7 @@ int main(void) {
 
         let reused_ids = MountSnapshot {
             entries: parse_mountinfo(
-                b"21 20 8:2 /old-child /storage/sub/child rw - ext4 /dev/a rw\n\
+                b"21 20 8:2 /stack-top /storage/sub rw - ext4 /dev/a rw\n\
                   20 1 8:2 /old /storage/sub rw - ext4 /dev/a rw\n\
                   3 1 8:3 /source/sub /store rw - ext4 /dev/b rw\n\
                   2 1 8:3 /source /storage rw - ext4 /dev/b rw\n\
@@ -3696,6 +3752,128 @@ int main(void) {
             .unwrap(),
         };
         assert!(derive_mount_evidence(roots, entrypoints, &smaller_id_ro).is_err());
+    }
+
+    fn visible_mounts_valid_oracle(entries: &[MountEntry]) -> Vec<u64> {
+        let hidden_same = entries
+            .iter()
+            .filter(|candidate| {
+                entries.iter().any(|child| {
+                    child.mount_id != candidate.mount_id
+                        && child.parent_id == candidate.mount_id
+                        && child.mount_point == candidate.mount_point
+                })
+            })
+            .map(|entry| entry.mount_id)
+            .collect::<BTreeSet<_>>();
+        let covered = entries
+            .iter()
+            .filter(|candidate| {
+                entries.iter().any(|cover| {
+                    cover.parent_id == candidate.parent_id
+                        && cover.mount_id != cover.parent_id
+                        && cover.mount_point != candidate.mount_point
+                        && linux_path_contains(&cover.mount_point, &candidate.mount_point)
+                })
+            })
+            .map(|entry| entry.mount_id)
+            .collect::<BTreeSet<_>>();
+        let by_id = entries
+            .iter()
+            .map(|entry| (entry.mount_id, entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut result = Vec::new();
+        for entry in entries {
+            if hidden_same.contains(&entry.mount_id) || covered.contains(&entry.mount_id) {
+                continue;
+            }
+            let mut cursor = entry;
+            let mut invisible = false;
+            while let Some(parent) = by_id.get(&cursor.parent_id) {
+                if covered.contains(&parent.mount_id)
+                    || (hidden_same.contains(&parent.mount_id) && parent.mount_point != cursor.mount_point)
+                {
+                    invisible = true;
+                    break;
+                }
+                if parent.mount_id == cursor.mount_id {
+                    break;
+                }
+                cursor = parent;
+            }
+            if !invisible {
+                result.push(entry.mount_id);
+            }
+        }
+        result.sort_unstable();
+        result
+    }
+
+    #[test]
+    fn mount_visibility_matches_naive_oracle_for_known_valid_topologies() {
+        let cases = [
+            b"1 1 8:1 / / rw - ext4 root rw\n2 1 8:2 /a /a rw - ext4 a rw\n3 1 8:3 /b /b rw - ext4 b rw\n"
+                .as_slice(),
+            b"1 1 8:1 / / rw - ext4 root rw\n20 1 8:2 /old /storage/sub rw - ext4 a rw\n21 20 8:2 /top /storage/sub rw - ext4 a rw\n2 1 8:3 /source /storage rw - ext4 b rw\n"
+                .as_slice(),
+            b"1 1 8:1 / / rw - ext4 root rw\n2 1 8:2 /old /runtime rw - ext4 a rw\n3 2 8:3 /top /runtime rw - ext4 b rw\n4 3 8:3 /child /runtime/child rw - ext4 b rw\n"
+                .as_slice(),
+            b"1 1 8:1 / / rw - ext4 root rw\n2 1 8:2 / /storage rw - ext4 a rw\n3 1 8:3 / /storage-extra rw - ext4 b rw\n4 1 8:4 / /storage/sub rw - ext4 c rw\n"
+                .as_slice(),
+            b"1 1 8:1 / / rw - ext4 root rw\n2 1 8:2 / /a rw - ext4 a rw\n3 1 8:3 / /a. rw - ext4 b rw\n4 1 8:4 / /a- rw - ext4 c rw\n5 1 8:5 / /a0 rw - ext4 d rw\n6 1 8:6 / /a/b rw - ext4 e rw\n7 1 8:7 / /a/b- rw - ext4 f rw\n8 1 8:8 / /a/b/c rw - ext4 g rw\n"
+                .as_slice(),
+        ];
+        for bytes in cases {
+            let entries = parse_mountinfo(bytes).unwrap();
+            let expected = visible_mounts_valid_oracle(&entries);
+            for candidate in [entries.clone(), entries.iter().cloned().rev().collect()] {
+                let actual = visible_mounts(&candidate)
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.mount_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mount_visibility_handles_large_wide_and_deep_topologies() {
+        let mut wide = vec![MountEntry {
+            mount_id: 1,
+            parent_id: 1,
+            device: b"8:1".to_vec(),
+            root: b"/".to_vec(),
+            mount_point: b"/".to_vec(),
+            read_only: false,
+        }];
+        for index in 0..10_000_u64 {
+            wide.push(MountEntry {
+                mount_id: index + 2,
+                parent_id: 1,
+                device: b"8:2".to_vec(),
+                root: format!("/source/{index}").into_bytes(),
+                mount_point: format!("/wide/{index}").into_bytes(),
+                read_only: false,
+            });
+        }
+        assert_eq!(visible_mounts(&wide).unwrap().len(), wide.len());
+
+        let mut deep = wide[..1].to_vec();
+        let mut point = String::new();
+        for index in 0..4_096_u64 {
+            point.push_str("/d");
+            deep.push(MountEntry {
+                mount_id: index + 2,
+                parent_id: index + 1,
+                device: b"8:3".to_vec(),
+                root: b"/".to_vec(),
+                mount_point: point.as_bytes().to_vec(),
+                read_only: false,
+            });
+        }
+        deep.reverse();
+        assert_eq!(visible_mounts(&deep).unwrap().len(), deep.len());
     }
 
     #[test]
@@ -4429,6 +4607,26 @@ int main(void) {
     }
 
     #[test]
+    fn bootstrap_preserves_commit_uncertainty_across_cleanup_failure() {
+        assert_eq!(
+            map_runtime_install_error(RuntimePackError::Io(std::io::Error::other(
+                "immutable manifest directory sync: /private/path"
+            ))),
+            LinuxBootstrapError::RegistrationFailed("Runtime Pack install")
+        );
+        let install = LinuxBootstrapError::CommitUncertain { cleanup_failed: false };
+        let cleanup = Err(LinuxBootstrapError::RegistrationFailed("staging cleanup"));
+        assert_eq!(
+            combine_install_and_cleanup(Err(install), cleanup),
+            Err(LinuxBootstrapError::CommitUncertain { cleanup_failed: true })
+        );
+        assert_eq!(
+            LinuxBootstrapError::CommitUncertain { cleanup_failed: true }.to_string(),
+            "Linux Runtime Pack active-ref commit durability is uncertain and staging cleanup failed"
+        );
+    }
+
+    #[test]
     fn receipt_contract_is_exact_and_path_free_portably() {
         let receipt = LinuxLocalContextReceipt {
             schema_version: SCHEMA_VERSION_V1.into(),
@@ -4658,6 +4856,7 @@ int main(void) {
     enum BootstrapFault {
         Install,
         RefWrite,
+        CommitUncertain { cleanup_failed: bool },
         StagingCleanup,
         Storage,
     }
@@ -4666,6 +4865,9 @@ int main(void) {
     struct FaultingBootstrapOperations {
         fault: BootstrapFault,
         system: SystemBootstrapOperations,
+        installed_ref: RefCell<Option<Vec<u8>>>,
+        cleanup_calls: RefCell<usize>,
+        storage_calls: RefCell<usize>,
     }
 
     #[cfg(target_os = "linux")]
@@ -4674,6 +4876,9 @@ int main(void) {
             Self {
                 fault,
                 system: SystemBootstrapOperations,
+                installed_ref: RefCell::new(None),
+                cleanup_calls: RefCell::new(0),
+                storage_calls: RefCell::new(0),
             }
         }
     }
@@ -4710,13 +4915,27 @@ int main(void) {
                     fs::create_dir_all(store_root.join("refs/wine-linux-x86-64-local-preview/current.json"))
                         .expect("inject active-ref write failure");
                 }
-                BootstrapFault::StagingCleanup | BootstrapFault::Storage => {}
+                BootstrapFault::CommitUncertain { .. } | BootstrapFault::StagingCleanup | BootstrapFault::Storage => {}
             }
-            self.system.install_pack(store_root, staging, manifest)
+            self.system.install_pack(store_root, staging, manifest)?;
+            if matches!(self.fault, BootstrapFault::CommitUncertain { .. }) {
+                *self.installed_ref.borrow_mut() = Some(
+                    fs::read(store_root.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json"))
+                        .expect("capture the actual published ref before injecting uncertainty"),
+                );
+                // This tests bootstrap control flow after a real install. The actual
+                // post-rename directory-sync fault is tested privately in JsonStore.
+                return Err(LinuxBootstrapError::CommitUncertain { cleanup_failed: false });
+            }
+            Ok(())
         }
 
         fn cleanup_staging(&self, staging: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
-            if matches!(self.fault, BootstrapFault::StagingCleanup) {
+            *self.cleanup_calls.borrow_mut() += 1;
+            if matches!(
+                self.fault,
+                BootstrapFault::StagingCleanup | BootstrapFault::CommitUncertain { cleanup_failed: true }
+            ) {
                 Err(LinuxBootstrapError::RegistrationFailed("staging cleanup"))
             } else {
                 self.system.cleanup_staging(staging, owner)
@@ -4724,6 +4943,7 @@ int main(void) {
         }
 
         fn prepare_storage(&self, storage_root: &Path, owner: OwnerIdentity) -> Result<(), LinuxBootstrapError> {
+            *self.storage_calls.borrow_mut() += 1;
             if matches!(self.fault, BootstrapFault::Storage) {
                 Err(LinuxBootstrapError::RegistrationFailed("storage create"))
             } else {
@@ -4842,7 +5062,9 @@ int main(void) {
             let store = fixture.directory.root.join(match fault {
                 BootstrapFault::Install => "failed-install-store",
                 BootstrapFault::RefWrite => "failed-ref-store",
-                BootstrapFault::StagingCleanup | BootstrapFault::Storage => unreachable!(),
+                BootstrapFault::CommitUncertain { .. } | BootstrapFault::StagingCleanup | BootstrapFault::Storage => {
+                    unreachable!()
+                }
             });
             let storage = fixture.directory.root.join("failed-install-storage");
             let request = bootstrap_request(&fixture, &store, &storage);
@@ -4912,7 +5134,9 @@ int main(void) {
                         "fault injection must be the only non-immutable ref artifact"
                     );
                 }
-                BootstrapFault::StagingCleanup | BootstrapFault::Storage => unreachable!(),
+                BootstrapFault::CommitUncertain { .. } | BootstrapFault::StagingCleanup | BootstrapFault::Storage => {
+                    unreachable!()
+                }
             }
         }
 
@@ -4966,6 +5190,49 @@ int main(void) {
                 ("manifest.json".into(), 'f'),
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_commit_uncertainty_keeps_exact_ref_and_stops_before_storage() {
+        for cleanup_failed in [false, true] {
+            let fixture = LinuxPublicProviderFixture::new();
+            let store = fixture.directory.root.join("uncertain-store");
+            let storage = fixture.directory.root.join("uncertain-storage");
+            let request = bootstrap_request(&fixture, &store, &storage);
+            let prepared = prepare_bootstrap(&fixture.host, &request, current_owner_identity().unwrap())
+                .expect("derive expected registration before install");
+            let operations = FaultingBootstrapOperations::new(BootstrapFault::CommitUncertain { cleanup_failed });
+
+            let result = validate_then_bootstrap(&fixture.host, &request, &SystemProbeCommand, &operations);
+
+            assert!(
+                matches!(result, Err(LinuxBootstrapError::CommitUncertain { cleanup_failed: actual }) if actual == cleanup_failed),
+                "uncertainty must remain a failure without Context or receipt"
+            );
+            assert_eq!(*operations.cleanup_calls.borrow(), 1);
+            assert_eq!(*operations.storage_calls.borrow(), 0);
+            assert!(!storage.exists());
+            let runtime_store = RuntimePackStore::new(&store);
+            assert_eq!(
+                runtime_store.active_digest(LOCAL_PREVIEW_PACK_ID).unwrap(),
+                Some(prepared.manifest.digest.clone())
+            );
+            assert_eq!(
+                runtime_store.verified_manifest(&prepared.manifest.digest).unwrap(),
+                prepared.manifest
+            );
+            let active_ref = fs::read(store.join("refs").join(LOCAL_PREVIEW_PACK_ID).join("current.json")).unwrap();
+            assert_eq!(
+                Some(active_ref),
+                *operations.installed_ref.borrow(),
+                "no ref rewriting or rollback after uncertain outcome"
+            );
+            let has_staging = snapshot_tree(&store).iter().any(|(path, _, _)| {
+                path.starts_with(&format!("{BOOTSTRAP_STAGING_PARENT}/{BOOTSTRAP_STAGING_PREFIX}"))
+            });
+            assert_eq!(has_staging, cleanup_failed);
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -148,6 +148,25 @@ impl JsonStore {
     }
 
     pub fn write<T: Serialize>(&self, relative_path: impl AsRef<Path>, value: &T) -> Result<(), StoreError> {
+        self.write_with_directory_sync(relative_path, value, sync_directory)
+    }
+
+    fn write_with_directory_sync<T: Serialize>(
+        &self,
+        relative_path: impl AsRef<Path>,
+        value: &T,
+        directory_sync: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(), StoreError> {
+        self.write_with_publish(relative_path, value, replace_file, directory_sync)
+    }
+
+    fn write_with_publish<T: Serialize>(
+        &self,
+        relative_path: impl AsRef<Path>,
+        value: &T,
+        publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        directory_sync: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(), StoreError> {
         let path = self.resolve(relative_path.as_ref())?;
         let parent = path.parent().ok_or(StoreError::InvalidRelativePath)?;
         fs::create_dir_all(parent).map_err(StoreError::Io)?;
@@ -160,8 +179,8 @@ impl JsonStore {
             let mut file = create_private_temporary(&temporary)?;
             file.write_all(&bytes).map_err(StoreError::Io)?;
             file.sync_all().map_err(StoreError::Io)?;
-            replace_file(&temporary, &path)?;
-            sync_directory(parent)?;
+            publish(&temporary, &path).map_err(StoreError::Io)?;
+            directory_sync(parent).map_err(StoreError::DurabilityUncertain)?;
             Ok(())
         })();
 
@@ -221,22 +240,20 @@ fn temporary_path(target: &Path) -> Result<PathBuf, StoreError> {
     Ok(target.with_file_name(format!(".{file_name}.tmp-{}-{counter}", std::process::id())))
 }
 
-fn replace_file(temporary: &Path, target: &Path) -> Result<(), StoreError> {
+fn replace_file(temporary: &Path, target: &Path) -> io::Result<()> {
     // Rust 1.78 implements this with rename(2) on Unix and
     // MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows. Both replace the
     // destination without first removing the visible target path.
-    fs::rename(temporary, target).map_err(StoreError::Io)
+    fs::rename(temporary, target)
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), StoreError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(StoreError::Io)
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), StoreError> {
+fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -244,6 +261,9 @@ fn sync_directory(_path: &Path) -> Result<(), StoreError> {
 pub enum StoreError {
     InvalidRelativePath,
     Io(io::Error),
+    /// The replacement is visible, but syncing its parent directory failed.
+    /// Callers must not retry as though the old value were still active.
+    DurabilityUncertain(io::Error),
     Json(serde_json::Error),
 }
 
@@ -252,6 +272,9 @@ impl fmt::Display for StoreError {
         match self {
             Self::InvalidRelativePath => formatter.write_str("store path must be a non-empty relative path"),
             Self::Io(error) => write!(formatter, "store I/O failed: {error}"),
+            Self::DurabilityUncertain(error) => {
+                write!(formatter, "store commit durability is uncertain: {error}")
+            }
             Self::Json(error) => write!(formatter, "store JSON failed: {error}"),
         }
     }
@@ -261,7 +284,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidRelativePath => None,
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::DurabilityUncertain(error) => Some(error),
             Self::Json(error) => Some(error),
         }
     }
@@ -344,13 +367,91 @@ mod tests {
         assert!(matches!(error, StoreError::InvalidRelativePath));
     }
 
+    #[test]
+    fn post_rename_directory_sync_failure_is_typed_and_keeps_published_value() {
+        for existing in [false, true] {
+            let directory = temporary_directory("post-rename-sync");
+            let store = JsonStore::new(&directory);
+            let relative = Path::new("state.json");
+            if existing {
+                store
+                    .write(
+                        relative,
+                        &Fixture {
+                            schema_version: "1".into(),
+                            value: 1,
+                        },
+                    )
+                    .unwrap();
+            }
+            let error = store
+                .write_with_directory_sync(
+                    relative,
+                    &Fixture {
+                        schema_version: "1".into(),
+                        value: 9,
+                    },
+                    |_| Err(io::Error::other("injected directory sync failure")),
+                )
+                .unwrap_err();
+
+            assert!(matches!(error, StoreError::DurabilityUncertain(_)));
+            assert_eq!(store.read::<Fixture>(relative).unwrap().value, 9);
+            assert!(fs::read_dir(&directory).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pre_rename_failure_is_not_uncertain_and_preserves_existing_value() {
+        let directory = temporary_directory("pre-rename-failure");
+        let store = JsonStore::new(&directory);
+        let relative = Path::new("state.json");
+        store
+            .write(
+                relative,
+                &Fixture {
+                    schema_version: "1".into(),
+                    value: 3,
+                },
+            )
+            .unwrap();
+        let error = store
+            .write_with_publish(
+                relative,
+                &Fixture {
+                    schema_version: "1".into(),
+                    value: 4,
+                },
+                |_, _| Err(io::Error::other("injected rename failure")),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Io(_)));
+        assert_eq!(store.read::<Fixture>(relative).unwrap().value, 3);
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn json_store_private_mode_is_independent_of_umask() {
         use std::process::Command;
 
-        for mask in ["0000", "0002"] {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mask in ["0000", "0002", "0777"] {
             let root = temporary_directory(&format!("umask-{mask}"));
+            fs::create_dir_all(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let status = Command::new("/bin/sh")
                 .arg("-c")
                 .arg("umask \"$1\"; export COMPATFORGE_STORAGE_UMASK_ROOT=\"$2\"; exec \"$3\" --ignored --exact tests::json_store_private_mode_child --nocapture")

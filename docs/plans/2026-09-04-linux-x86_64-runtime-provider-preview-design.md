@@ -164,9 +164,9 @@ Receipt 不包含 Runtime、Storage、Wine、Wineserver、临时目录或输出�
 
 Preview Pack 只绑定两个入口文件，不绑定 Wine 随后加载的 ntdll、Unix/Windows DLL 或其他共享库。因此公开 canary summary 必须记录 runtimeEvidenceScope: entrypoints-only 与 runtimeTreeValidated: false。完整 Runtime 树清单、FD-pinned Runtime 执行和跨进程 Store 锁均留给正式 materializer 检查点；本检查点不得把入口证据描述成整个 Runtime 不可变。
 
-Provider 使用显式 packDigest 读取并复验 manifest/object，不依赖该 Pack ID 当前的 active ref。即使 active ref 后来指向另一 digest，本次 Context 也只能继续使用显式 pin；对应行为必须有负向测试。
+Provider 使用显式 packDigest 读取并复验 manifest/object，不依赖该 Pack ID 当前的 active ref。所有 bundle、已发布与加载中的 manifest 读取均以 1 MiB 为硬上限并读取上限加一字节判定溢出，新 manifest 的发布字节也受同一上限约束并在 active ref 前拒绝超限。即使 active ref 后来指向另一 digest，本次 Context 也只能继续使用显式 pin；对应行为必须有负向测试。
 
-当前 RuntimePackStore 只有进程内写锁，Preview bootstrap 因此要求调用期间由调用者保证 Store 单写者。它会在 install 前检查冲突 active ref，但不声称跨进程 compare-and-install 原子性；install/ref 失败可以留下内容寻址的不可变 object/manifest，却不得覆盖预先存在的冲突 ref、产出 Context 或公开成功 receipt。真实 Runner 总是使用一个新的独占 Store root。跨进程 Store 锁留给正式 materializer 检查点。
+当前 RuntimePackStore 只有进程内写锁，Preview bootstrap 因此要求调用期间由调用者保证 Store 单写者。它会在 install 前检查冲突 active ref，但不声称跨进程 compare-and-install 原子性；install/ref 失败可以留下内容寻址的不可变 object/manifest，却不得覆盖预先存在的冲突 ref、产出 Context 或公开成功 receipt。active ref rename 已可见而随后父目录同步失败时，返回专用 commit-uncertain 失败；调用者必须检查可见 ref 状态且不得自动 rollback。staging cleanup 仍须执行，并在同一闭合错误中保留 cleanup 是否失败，不得把 commit uncertainty 降格或覆盖。不可变 object/manifest 的同类同步失败仍是普通安装失败，因为它不表示 active ref 已切换。真实 Runner 总是使用一个新的独占 Store root。跨进程 Store 锁留给正式 materializer 检查点。
 
 ## 入口与版本复验
 
