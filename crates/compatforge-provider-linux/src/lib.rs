@@ -1872,6 +1872,9 @@ fn visible_mounts(entries: &[MountEntry]) -> Option<Vec<MountEntry>> {
                     && linux_path_contains(&ancestor.mount_point, &candidate.mount_point)
             }) {
                 covered_by_ancestor.insert(candidate.mount_id);
+                // Keep the covering ancestor on top for later same-point siblings.
+                // A hidden descendant must not replace its own cover in the stack.
+                continue;
             }
             if candidate.mount_id != candidate.parent_id
                 && ancestors
@@ -3807,6 +3810,65 @@ int main(void) {
         }
         result.sort_unstable();
         result
+    }
+
+    #[test]
+    fn mount_visibility_hides_covered_duplicate_siblings_in_every_record_order() {
+        let base = parse_mountinfo(
+            b"1 1 8:1 / / rw - ext4 root rw\n\
+              2 1 8:2 / /a rw - ext4 a rw\n\
+              3 1 8:3 / /a/b rw - ext4 b rw\n\
+              4 1 8:4 / /a/b rw - ext4 c rw\n",
+        )
+        .unwrap();
+        let mut descendants = base.clone();
+        descendants.extend(
+            parse_mountinfo(
+                b"5 3 8:5 / /a/b/child rw - ext4 d rw\n\
+                  6 4 8:6 / /a/b rw - ext4 e rw\n",
+            )
+            .unwrap(),
+        );
+        for entries in [base, descendants] {
+            let expected = visible_mounts_valid_oracle(&entries);
+            assert_eq!(expected, [1, 2]);
+            let mut shuffled = entries.clone();
+            shuffled.rotate_left(2);
+            for candidate in [entries.clone(), entries.into_iter().rev().collect(), shuffled] {
+                let actual = visible_mounts(&candidate)
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.mount_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mount_writability_rejects_rw_duplicate_siblings_beneath_read_only_cover() {
+        let entries = parse_mountinfo(
+            b"1 1 8:1 / / rw - ext4 root rw\n\
+              2 1 8:2 / /a ro - ext4 a ro\n\
+              3 1 8:3 / /a/b rw - ext4 b rw\n\
+              4 1 8:4 / /a/b rw - ext4 c rw\n",
+        )
+        .unwrap();
+        let mut shuffled = entries.clone();
+        shuffled.rotate_left(2);
+        for candidate in [entries.clone(), entries.into_iter().rev().collect(), shuffled] {
+            let snapshot = MountSnapshot { entries: candidate };
+            for roots in [["/a/b", "/storage", "/runtime"], ["/store", "/a/b", "/runtime"]] {
+                assert!(matches!(
+                    derive_mount_evidence(roots, ["/runtime/bin/wine", "/runtime/bin/wineserver"], &snapshot),
+                    Err(LinuxBootstrapError::InvalidRequest("read-only destination"))
+                ));
+            }
+            let visible = visible_mounts(&snapshot.entries).unwrap();
+            let selected = selected_mount(b"/a/b/file", &visible).unwrap();
+            assert_eq!(selected.mount_id, 2);
+            assert!(selected.read_only);
+        }
     }
 
     #[test]
