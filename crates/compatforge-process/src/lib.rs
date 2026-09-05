@@ -718,6 +718,7 @@ fn supervise_command_with_operations<G>(
         cleanup_failed: Arc::clone(&cleanup_failed),
         force_cleanup_started: AtomicBool::new(false),
         completion_lock: Mutex::new(()),
+        active_operations: Mutex::new(0),
         workers: Mutex::new(Vec::new()),
     });
 
@@ -1295,6 +1296,7 @@ struct TerminationController {
     cleanup_failed: Arc<AtomicBool>,
     force_cleanup_started: AtomicBool,
     completion_lock: Mutex<()>,
+    active_operations: Mutex<usize>,
     workers: Mutex<Vec<WorkerJoinState>>,
 }
 
@@ -1313,14 +1315,15 @@ impl TerminationController {
         graceful: impl FnOnce() -> io::Result<()>,
         forced: impl FnOnce() -> io::Result<()>,
     ) -> Result<(), ProcessError> {
-        if self.completed.load(Ordering::Acquire) {
+        let Some(operation) = self.begin_operation() else {
             return Ok(());
-        }
+        };
         if self
             .termination_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            operation.complete(true);
             return Ok(());
         }
 
@@ -1342,7 +1345,6 @@ impl TerminationController {
         self.emitter.emit(kind, Some(self.process_id), None, None, message);
 
         if let Err(error) = graceful() {
-            self.mark_cleanup_failed();
             self.emitter.emit(
                 RuntimeEventKind::Failed,
                 Some(self.process_id),
@@ -1359,6 +1361,7 @@ impl TerminationController {
                     Some("forced process-tree termination failed".into()),
                 );
             }
+            operation.complete(false);
             return Err(ProcessError::Terminate(error));
         }
 
@@ -1369,6 +1372,8 @@ impl TerminationController {
             let controller = Arc::clone(self);
             workers.push(WorkerJoinState::spawn(move || controller.escalate_after_grace()));
         }
+        drop(workers);
+        operation.complete(true);
         Ok(())
     }
 
@@ -1397,15 +1402,45 @@ impl TerminationController {
 
     fn wait_until_completed(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while !self.completed.load(Ordering::Acquire) && Instant::now() < deadline {
+        while !self.completion_ready() && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
         }
-        self.completed.load(Ordering::Acquire)
+        self.completion_ready()
+    }
+
+    fn completion_ready(&self) -> bool {
+        let active = lock_recover(&self.active_operations);
+        self.completed.load(Ordering::Acquire) && *active == 0
+    }
+
+    fn begin_operation(&self) -> Option<TerminationOperationGuard<'_>> {
+        let mut active = lock_recover(&self.active_operations);
+        if self.completed.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(session) = &self.wine_session {
+            if !session.begin_termination_operation() {
+                return None;
+            }
+        }
+        *active += 1;
+        Some(TerminationOperationGuard {
+            controller: self,
+            armed: true,
+        })
     }
 
     fn force_cleanup(&self) -> Result<(), ProcessError> {
+        self.force_cleanup_with_signal(|| self.process_tree.force_kill())
+    }
+
+    fn force_cleanup_with_signal(&self, forced: impl FnOnce() -> io::Result<()>) -> Result<(), ProcessError> {
+        let Some(operation) = self.begin_operation() else {
+            return Ok(());
+        };
         if self.force_cleanup_started.swap(true, Ordering::AcqRel) {
+            operation.complete(true);
             return Ok(());
         }
         self.emitter.emit(
@@ -1418,7 +1453,7 @@ impl TerminationController {
         // The exit watcher performs the memoized Wine rendezvous. Doing it on
         // this caller would let a concurrent stop hold the caller past its
         // completion deadline before the owned root can even be killed.
-        if let Err(error) = self.process_tree.force_kill() {
+        if let Err(error) = forced() {
             self.emitter.emit(
                 RuntimeEventKind::Failed,
                 Some(self.process_id),
@@ -1426,15 +1461,21 @@ impl TerminationController {
                 None,
                 Some(format!("forced process-tree termination failed: {error}")),
             );
-            self.mark_cleanup_failed();
+            operation.complete(false);
             Err(ProcessError::Terminate(error))
         } else {
+            operation.complete(true);
             Ok(())
         }
     }
 
     fn force_kill_and_reap(&self, deadline: Instant) -> Result<(), ProcessError> {
-        self.record_cleanup_result(finish_owned_process(&self.child, &self.process_tree, deadline))
+        let Some(operation) = self.begin_operation() else {
+            return Ok(());
+        };
+        let result = self.record_cleanup_result(finish_owned_process(&self.child, &self.process_tree, deadline));
+        operation.complete(result.is_ok());
+        result
     }
 
     fn record_cleanup_result(&self, result: io::Result<()>) -> Result<(), ProcessError> {
@@ -1475,6 +1516,38 @@ impl TerminationController {
         self.cleanup_failed.store(true, Ordering::Release);
         if let Some(session) = &self.wine_session {
             session.complete_owned_tree(false);
+        }
+    }
+}
+
+struct TerminationOperationGuard<'a> {
+    controller: &'a TerminationController,
+    armed: bool,
+}
+
+impl TerminationOperationGuard<'_> {
+    fn complete(mut self, success: bool) {
+        self.finish(success);
+    }
+
+    fn finish(&mut self, success: bool) {
+        if !success {
+            self.controller.mark_cleanup_failed();
+        }
+        if let Some(session) = &self.controller.wine_session {
+            session.end_termination_operation();
+        }
+        *lock_recover(&self.controller.active_operations) -= 1;
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminationOperationGuard<'_> {
+    fn drop(&mut self) {
+        // An abandoned outcome poisons before either gate can acknowledge it.
+        // Drop changes only in-memory state and never launches a command.
+        if self.armed {
+            self.finish(false);
         }
     }
 }
@@ -1840,14 +1913,14 @@ fn spawn_exit_watcher(
         // Descendants may inherit the output pipes, so terminate the tree before
         // draining readers and publishing the terminal event.
         for output_reader in output_readers {
-            if output_reader.join_until(deadline).is_err() {
+            if let Err(error) = output_reader.join_until(deadline) {
                 cleanup_failed.store(true, Ordering::Release);
                 emitter.emit(
                     RuntimeEventKind::Failed,
                     None,
                     None,
                     None,
-                    Some("output reader panicked".into()),
+                    Some(output_join_failure_message(&error)),
                 );
             }
         }
@@ -1872,6 +1945,11 @@ fn spawn_exit_watcher(
         }
         completed.store(true, Ordering::Release);
     })
+}
+
+fn output_join_failure_message(error: &io::Error) -> String {
+    // join_until constructs only fixed, path-free deadline/panic diagnostics.
+    format!("output reader did not complete: {error}")
 }
 
 fn spawn_timeout_watcher(
@@ -1985,6 +2063,7 @@ struct WineSession {
     prior_cleanup_failure: OnceLock<CleanupStage>,
     lease_state: Mutex<LeaseState>,
     owned_tree_pending: AtomicBool,
+    termination_operations: AtomicUsize,
     stopping: AtomicBool,
     idle_cleanup_lock: Mutex<()>,
 }
@@ -2142,6 +2221,7 @@ impl WineSession {
             prior_cleanup_failure: OnceLock::new(),
             lease_state: Mutex::new(LeaseState::Live),
             owned_tree_pending: AtomicBool::new(false),
+            termination_operations: AtomicUsize::new(0),
             stopping: AtomicBool::new(false),
             idle_cleanup_lock: Mutex::new(()),
         })))
@@ -2266,7 +2346,10 @@ impl WineSession {
 
     fn release_lease(&self) {
         let mut state = lock_recover(&self.lease_state);
-        if *state == LeaseState::Live && !self.owned_tree_pending.load(Ordering::Acquire) {
+        if *state == LeaseState::Live
+            && !self.owned_tree_pending.load(Ordering::Acquire)
+            && self.termination_operations.load(Ordering::Acquire) == 0
+        {
             let _ = lock_recover(wine_prefix_leases()).remove(&self.lifecycle.prefix);
             *state = LeaseState::Released;
         }
@@ -2274,6 +2357,27 @@ impl WineSession {
 
     fn hold_for_owned_tree(&self) {
         self.owned_tree_pending.store(true, Ordering::Release);
+    }
+
+    fn begin_termination_operation(&self) -> bool {
+        // The same gate guards release and the last release-before-completed
+        // window. Never resurrect a lease already available to another launch.
+        let state = lock_recover(&self.lease_state);
+        if *state == LeaseState::Released {
+            return false;
+        }
+        self.termination_operations.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    fn end_termination_operation(&self) {
+        {
+            let _state = lock_recover(&self.lease_state);
+            self.termination_operations.fetch_sub(1, Ordering::AcqRel);
+        }
+        if self.stop_outcome.get() == Some(&StopOutcome::Complete) {
+            self.release_lease();
+        }
     }
     fn complete_owned_tree(&self, success: bool) {
         if success {
@@ -3076,6 +3180,271 @@ mod tests {
         assert!(handle.controller.cleanup_failed.load(Ordering::Acquire));
         assert!(cleanup.is_err());
         assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+    }
+
+    fn held_wine_controller_fixture() -> (RuntimeEvidenceFixture, LaunchHandle) {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        let runtime = std::env::current_exe().unwrap();
+        fixture.plan.process.executable = runtime.to_str().unwrap().into();
+        fixture.plan.process.arguments = vec![
+            "--exact".into(),
+            "tests::supervisor_helper".into(),
+            "--nocapture".into(),
+        ];
+        fixture
+            .plan
+            .process
+            .environment
+            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), sha256_file(&runtime).unwrap());
+        fixture
+            .plan
+            .process
+            .environment
+            .insert("COMPATFORGE_PROCESS_TEST_HELPER".into(), "sleep".into());
+        fixture.plan.lifecycle.maximum_runtime_milliseconds = None;
+        let marker = Path::new(&fixture.plan.lifecycle.wineserver.as_ref().unwrap().prefix)
+            .join("drive_c/windows/system32/ntdll.dll");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(marker, b"fixture prefix already initialized").unwrap();
+        let handle = ProcessSupervisor::start(&fixture.plan).unwrap();
+        (fixture, handle)
+    }
+
+    fn assert_inflight_failure_keeps_wine_lease(forced_path: bool) {
+        let (fixture, handle) = held_wine_controller_fixture();
+        let controller = Arc::clone(&handle.controller);
+        let session = Arc::clone(controller.wine_session.as_ref().unwrap());
+        let (entered, blocked) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let operation = thread::spawn(move || {
+            let failed_signal = || {
+                entered.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(io::Error::other("late signal failure"))
+            };
+            if forced_path {
+                controller.force_cleanup_with_signal(failed_signal)
+            } else {
+                controller.request_termination_with_signals(TerminationReason::User, failed_signal, || Ok(()))
+            }
+        });
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stop_outcome = session.stop_core(None);
+        session.complete_owned_tree(true);
+        let prematurely_reusable = WineSession::acquire(&fixture.plan).unwrap_or(None).is_some();
+        release.send(()).unwrap();
+        let signal_result = operation.join().unwrap();
+        let root_cleanup = finish_owned_process(
+            &handle.controller.child,
+            &handle.controller.process_tree,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let acknowledgement = handle.terminate_and_wait(Duration::from_secs(1));
+        root_cleanup.unwrap();
+        assert_eq!(stop_outcome, StopOutcome::Complete);
+        assert!(
+            !prematurely_reusable,
+            "normal cleanup released the lease before an active signal outcome"
+        );
+        assert!(signal_result.is_err());
+        assert!(acknowledgement.is_err());
+        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+    }
+
+    #[test]
+    fn cleanup_inflight_termination_failure_keeps_wine_lease_until_outcome_is_known() {
+        assert_inflight_failure_keeps_wine_lease(false);
+    }
+
+    #[test]
+    fn cleanup_inflight_forced_failure_keeps_wine_lease_until_outcome_is_known() {
+        assert_inflight_failure_keeps_wine_lease(true);
+    }
+
+    #[test]
+    fn cleanup_inflight_success_automatically_releases_once_without_acknowledgement() {
+        for forced_path in [false, true] {
+            let (fixture, handle) = held_wine_controller_fixture();
+            let controller = Arc::clone(&handle.controller);
+            let (entered, blocked) = mpsc::channel();
+            let (release, resumed) = mpsc::channel();
+            let operation = thread::spawn(move || {
+                let signal = || {
+                    entered.send(()).unwrap();
+                    resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                };
+                if forced_path {
+                    controller.force_cleanup_with_signal(signal)
+                } else {
+                    controller.request_termination_with_signals(TerminationReason::User, signal, || Ok(()))
+                }
+            });
+            blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+            let root_cleanup = finish_owned_process(
+                &handle.controller.child,
+                &handle.controller.process_tree,
+                Instant::now() + Duration::from_secs(2),
+            );
+            let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(2));
+            let held_before_outcome = WineSession::acquire(&fixture.plan).is_err();
+            release.send(()).unwrap();
+            let signal_result = operation.join().unwrap();
+            // No terminate_and_wait has occurred: the last successful operation
+            // must itself make the normally completed Wine lease reusable.
+            let next = WineSession::acquire(&fixture.plan);
+            let reusable = next.as_ref().is_ok_and(|session| session.is_some());
+            let still_exclusive = if let Ok(Some(next)) = next {
+                handle
+                    .controller
+                    .wine_session
+                    .as_ref()
+                    .unwrap()
+                    .complete_owned_tree(true);
+                let exclusive = WineSession::acquire(&fixture.plan).is_err();
+                let _ = next.stop_core(None);
+                exclusive
+            } else {
+                false
+            };
+            let acknowledgement = handle.terminate_and_wait(Duration::from_secs(1));
+            root_cleanup.unwrap();
+            signal_result.unwrap();
+            acknowledgement.unwrap();
+            assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+            assert!(held_before_outcome);
+            assert!(reusable);
+            assert!(still_exclusive, "an old session must never release a replacement lease");
+        }
+    }
+
+    #[test]
+    fn cleanup_released_lease_refuses_new_backend_calls_before_completed_flag() {
+        let (_fixture, handle) = held_wine_controller_fixture();
+        let session = handle.controller.wine_session.as_ref().unwrap();
+        let stop = session.stop_core(None);
+        session.complete_owned_tree(true);
+        let before_completed = !handle.controller.completed.load(Ordering::Acquire);
+        let calls = std::cell::Cell::new(0);
+        let request = handle.controller.request_termination_with_signals(
+            TerminationReason::User,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        let force = handle.controller.force_cleanup_with_signal(|| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        let skipped_reap = handle
+            .controller
+            .force_kill_and_reap(Instant::now() + Duration::from_secs(1));
+        let root_still_live = lock_recover(&handle.controller.child)
+            .try_wait()
+            .map(|status| status.is_none());
+        let cleanup = finish_owned_process(
+            &handle.controller.child,
+            &handle.controller.process_tree,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let acknowledgement = handle.terminate_and_wait(Duration::from_secs(1));
+        cleanup.unwrap();
+        acknowledgement.unwrap();
+        assert_eq!(stop, StopOutcome::Complete);
+        assert!(before_completed);
+        request.unwrap();
+        force.unwrap();
+        skipped_reap.unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(
+            root_still_live.unwrap(),
+            "released-prefix skip must include force/reap path"
+        );
+    }
+
+    #[test]
+    fn cleanup_abandoned_operation_guard_poisons_before_letting_lease_or_ack_proceed() {
+        let (fixture, handle) = held_wine_controller_fixture();
+        let operation = handle.controller.begin_operation().unwrap();
+        let session = handle.controller.wine_session.as_ref().unwrap();
+        let stop = session.stop_core(None);
+        session.complete_owned_tree(true);
+        let before = std::fs::read(&fixture.wineserver_log);
+        drop(operation);
+        let after = std::fs::read(&fixture.wineserver_log);
+        let held = WineSession::acquire(&fixture.plan).is_err();
+        let cleanup = finish_owned_process(
+            &handle.controller.child,
+            &handle.controller.process_tree,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let acknowledgement = handle.terminate_and_wait(Duration::from_secs(1));
+        cleanup.unwrap();
+        assert_eq!(stop, StopOutcome::Complete);
+        assert_eq!(
+            before.unwrap(),
+            after.unwrap(),
+            "Drop must not execute an external cleanup command"
+        );
+        assert!(held);
+        assert!(acknowledgement.is_err());
+        assert_eq!(*lock_recover(&handle.controller.active_operations), 0);
+    }
+
+    #[test]
+    fn cleanup_inflight_outcome_wait_uses_existing_ack_deadline() {
+        let (fixture, handle) = held_wine_controller_fixture();
+        let controller = Arc::clone(&handle.controller);
+        let (entered, blocked) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let operation = thread::spawn(move || {
+            controller.force_cleanup_with_signal(|| {
+                entered.send(()).unwrap();
+                resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+        });
+        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+        let cleanup = finish_owned_process(
+            &handle.controller.child,
+            &handle.controller.process_tree,
+            Instant::now() + Duration::from_secs(2),
+        );
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(2));
+        let started = Instant::now();
+        let acknowledgement = handle.terminate_and_wait_until(Duration::ZERO, started + Duration::from_millis(10));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        let signal_result = operation.join().unwrap();
+        cleanup.unwrap();
+        signal_result.unwrap();
+        assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+        assert!(acknowledgement.is_err());
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+    }
+
+    #[test]
+    fn cleanup_reader_deadline_message_does_not_claim_a_panic() {
+        let (release, wait) = mpsc::channel();
+        let worker = WorkerJoinState::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        let error = worker
+            .join_until(Instant::now() + Duration::from_millis(10))
+            .unwrap_err();
+        let _ = release.send(());
+        let message = output_join_failure_message(&error);
+        assert!(message.starts_with("output reader did not complete:"));
+        assert!(message.contains("deadline"));
+        assert!(!message.contains("panic"));
     }
 
     #[test]
