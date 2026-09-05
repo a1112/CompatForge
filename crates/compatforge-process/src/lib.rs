@@ -556,32 +556,57 @@ fn ensure_directory(path: &Path, field: &'static str) -> Result<(), ProcessError
 }
 
 fn verify_pinned_runtime(plan: &LaunchPlan) -> Result<(), ProcessError> {
-    let runtime_digest = plan.process.environment.get(RUNTIME_EXECUTABLE_DIGEST_ENV);
-    let wineserver_digest = plan.process.environment.get(WINESERVER_EXECUTABLE_DIGEST_ENV);
-    match (runtime_digest, wineserver_digest) {
-        (None, None) => return Ok(()),
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(ProcessError::InvalidRuntimeEvidence("incomplete Runtime evidence"));
-        }
-        (Some(runtime_digest), Some(wineserver_digest)) => {
-            verify_pinned_executable(
-                Path::new(&plan.process.executable),
-                runtime_digest,
-                "runtime executable",
-            )?;
-            let lifecycle = plan
-                .lifecycle
-                .wineserver
-                .as_ref()
-                .ok_or(ProcessError::InvalidRuntimeEvidence("wineserver lifecycle"))?;
-            verify_pinned_executable(
-                Path::new(&lifecycle.executable),
-                wineserver_digest,
-                "wineserver executable",
-            )?;
+    let environment = &plan.process.environment;
+    let managed = plan.lifecycle.wineserver.is_some()
+        || [
+            "COMPATFORGE_RUNTIME_PACK_DIGEST",
+            RUNTIME_EXECUTABLE_DIGEST_ENV,
+            WINESERVER_EXECUTABLE_DIGEST_ENV,
+            "WINESERVER",
+        ]
+        .iter()
+        .any(|key| environment.contains_key(*key));
+    // Legacy native/FFI probes may label a command with Pack + WINEPREFIX
+    // without claiming a managed Wine lifecycle or pinned Runtime evidence.
+    if !managed {
+        return Ok(());
+    }
+    if plan.runtime.provider != RuntimeKind::Wine {
+        return Err(ProcessError::InvalidRuntimeEvidence("Runtime provider"));
+    }
+    let (Some(runtime_digest), Some(wineserver_digest)) = (
+        environment.get(RUNTIME_EXECUTABLE_DIGEST_ENV),
+        environment.get(WINESERVER_EXECUTABLE_DIGEST_ENV),
+    ) else {
+        return Err(ProcessError::InvalidRuntimeEvidence("incomplete Runtime evidence"));
+    };
+    let lifecycle = plan
+        .lifecycle
+        .wineserver
+        .as_ref()
+        .ok_or(ProcessError::InvalidRuntimeEvidence("wineserver lifecycle"))?;
+    // Validate the plan's exact identity before materialization or commands.
+    // Store manifest association remains the Provider/PreparedLaunch's job.
+    for (key, expected) in [
+        ("WINESERVER", &lifecycle.executable),
+        ("WINEPREFIX", &lifecycle.prefix),
+        ("COMPATFORGE_RUNTIME_PACK", &plan.runtime.pack_id),
+        ("COMPATFORGE_RUNTIME_PACK_DIGEST", &plan.runtime.pack_digest),
+    ] {
+        if environment.get(key) != Some(expected) {
+            return Err(ProcessError::InvalidRuntimeEvidence(key));
         }
     }
-    Ok(())
+    verify_pinned_executable(
+        Path::new(&plan.process.executable),
+        runtime_digest,
+        "runtime executable",
+    )?;
+    verify_pinned_executable(
+        Path::new(&lifecycle.executable),
+        wineserver_digest,
+        "wineserver executable",
+    )
 }
 
 fn verify_pinned_font_config(plan: &LaunchPlan) -> Result<(), ProcessError> {
@@ -1991,6 +2016,389 @@ mod tests {
         }
     }
 
+    struct RuntimeEvidenceFixture {
+        root: PathBuf,
+        plan: LaunchPlan,
+        wine_log: PathBuf,
+        guest_log: PathBuf,
+        wineserver_log: PathBuf,
+    }
+
+    impl RuntimeEvidenceFixture {
+        fn new() -> Self {
+            use std::sync::atomic::AtomicU64;
+
+            static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+            let temporary = std::env::temp_dir();
+            #[cfg(unix)]
+            let temporary = temporary.canonicalize().unwrap();
+            let root = temporary.join(format!(
+                "compatforge-runtime-evidence-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let prefix = root.join("prefix");
+            std::fs::create_dir(&prefix).unwrap();
+            std::fs::create_dir(root.join("alternate-prefix")).unwrap();
+            #[cfg(windows)]
+            let (wine_name, guest_name, server_name) = ("wine.cmd", "guest.cmd", "wineserver.cmd");
+            #[cfg(not(windows))]
+            let (wine_name, guest_name, server_name) = ("wine", "guest", "wineserver");
+            let wine = root.join(wine_name);
+            let guest = root.join(guest_name);
+            let wineserver = root.join(server_name);
+            #[cfg(windows)]
+            let sources = [
+                "@echo off\r\necho %*>>\"%COMPATFORGE_TEST_WINE_LOG%\"\r\nif \"%~1\"==\"wineboot\" (\r\nmkdir \"%WINEPREFIX%\\drive_c\\windows\\system32\"\r\necho marker>\"%WINEPREFIX%\\drive_c\\windows\\system32\\ntdll.dll\"\r\nexit /b 0\r\n)\r\ncall \"%~1\"\r\nexit /b %errorlevel%\r\n",
+                "@echo off\r\necho guest>\"%COMPATFORGE_TEST_GUEST_LOG%\"\r\nexit /b 0\r\n",
+                "@echo off\r\necho %*>>\"%COMPATFORGE_TEST_WINESERVER_LOG%\"\r\nexit /b 0\r\n",
+            ];
+            #[cfg(not(windows))]
+            let sources = [
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINE_LOG\"\nif [ \"$1\" = wineboot ]; then\n/bin/mkdir -p \"$WINEPREFIX/drive_c/windows/system32\" || exit 1\nprintf marker > \"$WINEPREFIX/drive_c/windows/system32/ntdll.dll\"\nelse\nexec \"$1\"\nfi\n",
+                "#!/bin/sh\nprintf guest > \"$COMPATFORGE_TEST_GUEST_LOG\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINESERVER_LOG\"\n",
+            ];
+            for (path, source) in [&wine, &guest, &wineserver].into_iter().zip(sources) {
+                std::fs::write(path, source).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
+            std::fs::copy(
+                &wineserver,
+                root.join(server_name)
+                    .with_file_name(format!("alternate-{server_name}")),
+            )
+            .unwrap();
+            let wine_digest = sha256_file(&wine).unwrap();
+            let wineserver_digest = sha256_file(&wineserver).unwrap();
+            assert_ne!(wine_digest, wineserver_digest);
+            let wine_log = root.join("wine.log");
+            let guest_log = root.join("guest.log");
+            let wineserver_log = root.join("wineserver.log");
+            let mut plan = fixture_plan();
+            plan.runtime.pack_digest = format!("sha256:{}", "a".repeat(64));
+            plan.process.executable = wine.to_str().unwrap().into();
+            plan.process.arguments = vec![guest.to_str().unwrap().into()];
+            // Invalid evidence must not even materialize this working directory.
+            plan.process.working_directory = root.join("launch-working").to_str().unwrap().into();
+            plan.process.environment = BTreeMap::from([
+                ("COMPATFORGE_RUNTIME_PACK".into(), plan.runtime.pack_id.clone()),
+                (
+                    "COMPATFORGE_RUNTIME_PACK_DIGEST".into(),
+                    plan.runtime.pack_digest.clone(),
+                ),
+                (RUNTIME_EXECUTABLE_DIGEST_ENV.into(), wine_digest),
+                (WINESERVER_EXECUTABLE_DIGEST_ENV.into(), wineserver_digest),
+                ("WINESERVER".into(), wineserver.to_str().unwrap().into()),
+                ("WINEPREFIX".into(), prefix.to_str().unwrap().into()),
+                ("COMPATFORGE_TEST_WINE_LOG".into(), wine_log.to_str().unwrap().into()),
+                ("COMPATFORGE_TEST_GUEST_LOG".into(), guest_log.to_str().unwrap().into()),
+                (
+                    "COMPATFORGE_TEST_WINESERVER_LOG".into(),
+                    wineserver_log.to_str().unwrap().into(),
+                ),
+            ]);
+            plan.lifecycle.wineserver = Some(WineServerLifecycle {
+                executable: wineserver.to_str().unwrap().into(),
+                prefix: prefix.to_str().unwrap().into(),
+            });
+            plan.lifecycle.termination_grace_milliseconds = 100;
+            plan.lifecycle.maximum_runtime_milliseconds = Some(5_000);
+            plan.validate().unwrap();
+            assert!(!prefix.join("drive_c/windows/system32/ntdll.dll").exists());
+            Self {
+                root,
+                plan,
+                wine_log,
+                guest_log,
+                wineserver_log,
+            }
+        }
+
+        fn valid_plan(&self) -> LaunchPlan {
+            self.plan.clone()
+        }
+
+        fn alternate_wineserver(&self) -> PathBuf {
+            let server = Path::new(&self.plan.lifecycle.wineserver.as_ref().unwrap().executable);
+            self.root
+                .join(format!("alternate-{}", server.file_name().unwrap().to_str().unwrap()))
+        }
+
+        fn alternate_prefix(&self) -> PathBuf {
+            self.root.join("alternate-prefix")
+        }
+
+        fn alternate_pack_digest(&self) -> String {
+            format!("sha256:{}", "b".repeat(64))
+        }
+
+        fn assert_no_command_logs(&self) {
+            for path in [&self.wine_log, &self.guest_log, &self.wineserver_log] {
+                assert!(!path.exists(), "unexpected command log: {}", path.display());
+            }
+        }
+
+        fn assert_valid_launch_runs_commands(&self, plan: &LaunchPlan) {
+            self.assert_no_command_logs();
+            let handle = ProcessSupervisor::start(plan).unwrap();
+            let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+            let cleanup = handle.terminate_and_wait(Duration::from_secs(1));
+            cleanup.unwrap();
+            assert_eq!(events.last().map(|event| event.kind), Some(RuntimeEventKind::Exited));
+            assert!(events.last().unwrap().exit.as_ref().unwrap().success);
+            assert!(std::fs::read_to_string(&self.wine_log).unwrap().contains("wineboot -u"));
+            assert!(std::fs::read_to_string(&self.guest_log).unwrap().contains("guest"));
+            assert!(std::fs::read_to_string(&self.wineserver_log).unwrap().contains("-w"));
+        }
+    }
+
+    impl Drop for RuntimeEvidenceFixture {
+        fn drop(&mut self) {
+            let removed = std::fs::remove_dir_all(&self.root);
+            if !std::thread::panicking() {
+                removed.unwrap();
+            }
+        }
+    }
+
+    fn assert_runtime_evidence_rejected(fixture: &RuntimeEvidenceFixture, mutate: impl FnOnce(&mut LaunchPlan)) {
+        let mut plan = fixture.valid_plan();
+        mutate(&mut plan);
+        match ProcessSupervisor::start(&plan) {
+            Err(ProcessError::InvalidRuntimeEvidence(_)) => {}
+            Err(error) => panic!("expected InvalidRuntimeEvidence, got {error:?}"),
+            Ok(handle) => {
+                // During RED the old validator can actually start the guest.
+                // Reap every worker before failing or removing fixture files.
+                let cleanup = handle.terminate_and_wait(Duration::from_secs(1));
+                panic!("expected InvalidRuntimeEvidence, got a launch handle; cleanup: {cleanup:?}");
+            }
+        }
+        fixture.assert_no_command_logs();
+        assert!(!Path::new(&plan.process.working_directory).exists());
+    }
+
+    #[test]
+    fn runtime_evidence_valid_fixture_runs_wineboot_guest_and_wineserver() {
+        let fixture = RuntimeEvidenceFixture::new();
+        fixture.assert_valid_launch_runs_commands(&fixture.valid_plan());
+    }
+
+    #[test]
+    fn runtime_evidence_mismatched_wineserver_environment_is_rejected_before_spawn() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process.environment.insert(
+                "WINESERVER".into(),
+                fixture.alternate_wineserver().to_str().unwrap().into(),
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_mismatched_pack_environment_is_rejected_before_spawn() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process
+                .environment
+                .insert("COMPATFORGE_RUNTIME_PACK".into(), "different-pack".into());
+        });
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process.environment.insert(
+                "COMPATFORGE_RUNTIME_PACK_DIGEST".into(),
+                fixture.alternate_pack_digest(),
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_mismatched_pack_digest_is_rejected_before_spawn() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process.environment.insert(
+                "COMPATFORGE_RUNTIME_PACK_DIGEST".into(),
+                fixture.alternate_pack_digest(),
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_missing_or_unpaired_digests_are_rejected_before_spawn() {
+        for missing in [
+            RUNTIME_EXECUTABLE_DIGEST_ENV,
+            WINESERVER_EXECUTABLE_DIGEST_ENV,
+            "COMPATFORGE_RUNTIME_PACK_DIGEST",
+        ] {
+            let fixture = RuntimeEvidenceFixture::new();
+            assert_runtime_evidence_rejected(&fixture, |plan| {
+                plan.process.environment.remove(missing);
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_swapped_digests_are_rejected_before_spawn() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            let runtime = plan.process.environment.remove(RUNTIME_EXECUTABLE_DIGEST_ENV).unwrap();
+            let wineserver = plan
+                .process
+                .environment
+                .remove(WINESERVER_EXECUTABLE_DIGEST_ENV)
+                .unwrap();
+            plan.process
+                .environment
+                .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), wineserver);
+            plan.process
+                .environment
+                .insert(WINESERVER_EXECUTABLE_DIGEST_ENV.into(), runtime);
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_wine_lifecycle_without_complete_evidence_is_rejected_before_spawn() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process.environment.remove(RUNTIME_EXECUTABLE_DIGEST_ENV);
+            plan.process.environment.remove(WINESERVER_EXECUTABLE_DIGEST_ENV);
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_wineprefix_must_equal_lifecycle_prefix() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process
+                .environment
+                .insert("WINEPREFIX".into(), fixture.alternate_prefix().to_str().unwrap().into());
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_each_marker_even_empty_activates_managed_validation() {
+        for marker in [
+            "COMPATFORGE_RUNTIME_PACK_DIGEST",
+            RUNTIME_EXECUTABLE_DIGEST_ENV,
+            WINESERVER_EXECUTABLE_DIGEST_ENV,
+            "WINESERVER",
+        ] {
+            let fixture = RuntimeEvidenceFixture::new();
+            assert_runtime_evidence_rejected(&fixture, |plan| {
+                plan.lifecycle.wineserver = None;
+                for key in [
+                    "COMPATFORGE_RUNTIME_PACK_DIGEST",
+                    RUNTIME_EXECUTABLE_DIGEST_ENV,
+                    WINESERVER_EXECUTABLE_DIGEST_ENV,
+                    "WINESERVER",
+                ] {
+                    plan.process.environment.remove(key);
+                }
+                plan.process.environment.insert(marker.into(), String::new());
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_lifecycle_alone_activates_managed_validation() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            for key in [
+                "COMPATFORGE_RUNTIME_PACK_DIGEST",
+                RUNTIME_EXECUTABLE_DIGEST_ENV,
+                WINESERVER_EXECUTABLE_DIGEST_ENV,
+                "WINESERVER",
+            ] {
+                plan.process.environment.remove(key);
+            }
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_missing_identity_fields_are_rejected_before_spawn() {
+        for missing in ["WINESERVER", "WINEPREFIX", "COMPATFORGE_RUNTIME_PACK"] {
+            let fixture = RuntimeEvidenceFixture::new();
+            assert_runtime_evidence_rejected(&fixture, |plan| {
+                plan.process.environment.remove(missing);
+            });
+        }
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.lifecycle.wineserver = None;
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_requires_wine_provider() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.runtime.provider = RuntimeKind::Remote;
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_rejects_malformed_executable_digests() {
+        for field in [RUNTIME_EXECUTABLE_DIGEST_ENV, WINESERVER_EXECUTABLE_DIGEST_ENV] {
+            for malformed in [
+                String::new(),
+                "sha256:abc".into(),
+                format!("sha256:{}", "g".repeat(64)),
+                format!("SHA256:{}", "a".repeat(64)),
+            ] {
+                let fixture = RuntimeEvidenceFixture::new();
+                assert_runtime_evidence_rejected(&fixture, |plan| {
+                    plan.process.environment.insert(field.into(), malformed);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_evidence_preserves_uppercase_executable_digest_hex() {
+        let fixture = RuntimeEvidenceFixture::new();
+        let mut plan = fixture.valid_plan();
+        for field in [RUNTIME_EXECUTABLE_DIGEST_ENV, WINESERVER_EXECUTABLE_DIGEST_ENV] {
+            let digest = plan.process.environment.get_mut(field).unwrap();
+            *digest = format!("sha256:{}", digest[7..].to_ascii_uppercase());
+        }
+        fixture.assert_valid_launch_runs_commands(&plan);
+    }
+
+    #[test]
+    fn runtime_evidence_pack_digest_identity_is_exact_even_for_valid_uppercase_hex() {
+        let fixture = RuntimeEvidenceFixture::new();
+        assert_runtime_evidence_rejected(&fixture, |plan| {
+            plan.process.environment.insert(
+                "COMPATFORGE_RUNTIME_PACK_DIGEST".into(),
+                format!("sha256:{}", "A".repeat(64)),
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_evidence_legacy_pack_and_wineprefix_alone_remain_unmanaged() {
+        let fixture = RuntimeEvidenceFixture::new();
+        let mut plan = fixture_plan();
+        plan.process.working_directory = fixture.root.to_str().unwrap().into();
+        plan.process
+            .environment
+            .insert("COMPATFORGE_RUNTIME_PACK".into(), plan.runtime.pack_id.clone());
+        plan.process
+            .environment
+            .insert("WINEPREFIX".into(), fixture.alternate_prefix().to_str().unwrap().into());
+        let handle = ProcessSupervisor::start(&plan).unwrap();
+        let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
+        handle.terminate_and_wait(Duration::from_secs(1)).unwrap();
+        assert!(events.last().unwrap().exit.as_ref().unwrap().success);
+        fixture.assert_no_command_logs();
+    }
+
     fn pinned_fixture_plan() -> (LaunchPlan, BottleExecutableBinding) {
         let mut plan = fixture_plan();
         let binding = BottleExecutableBinding {
@@ -2330,53 +2738,43 @@ mod tests {
 
     #[test]
     fn refuses_a_tampered_pinned_runtime_before_spawning() {
-        let mut plan = fixture_plan();
+        let fixture = RuntimeEvidenceFixture::new();
+        let mut plan = fixture.valid_plan();
         plan.process.environment.insert(
             RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
             format!("sha256:{}", "0".repeat(64)),
         );
-        plan.process.environment.insert(
-            WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
-            format!("sha256:{}", "0".repeat(64)),
-        );
-        plan.lifecycle.wineserver = Some(WineServerLifecycle {
-            executable: plan.process.executable.clone(),
-            prefix: format!("runtime-evidence-prefix-{}", std::process::id()),
-        });
         assert!(matches!(
             ProcessSupervisor::start(&plan),
             Err(ProcessError::InvalidRuntimeEvidence("runtime executable"))
         ));
+        fixture.assert_no_command_logs();
     }
 
     #[test]
     fn refuses_a_tampered_pinned_wineserver_before_spawning() {
-        let mut plan = fixture_plan();
-        let runtime_digest = sha256_file(Path::new(&plan.process.executable)).unwrap();
-        plan.process
-            .environment
-            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), runtime_digest);
+        let fixture = RuntimeEvidenceFixture::new();
+        let mut plan = fixture.valid_plan();
         plan.process.environment.insert(
             WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
             format!("sha256:{}", "0".repeat(64)),
         );
-        plan.lifecycle.wineserver = Some(WineServerLifecycle {
-            executable: plan.process.executable.clone(),
-            prefix: format!("runtime-evidence-prefix-{}", std::process::id()),
-        });
         assert!(matches!(
             ProcessSupervisor::start(&plan),
             Err(ProcessError::InvalidRuntimeEvidence("wineserver executable"))
         ));
+        fixture.assert_no_command_logs();
     }
 
     #[test]
     fn accepts_complete_fresh_runtime_evidence_and_rejects_incomplete_evidence() {
-        let mut plan = fixture_plan();
-        let digest = sha256_file(Path::new(&plan.process.executable)).unwrap();
-        plan.process
+        let fixture = RuntimeEvidenceFixture::new();
+        let mut plan = fixture.valid_plan();
+        let digest = plan
+            .process
             .environment
-            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), digest.clone());
+            .remove(WINESERVER_EXECUTABLE_DIGEST_ENV)
+            .unwrap();
         assert!(matches!(
             verify_pinned_runtime(&plan),
             Err(ProcessError::InvalidRuntimeEvidence("incomplete Runtime evidence"))
@@ -2384,10 +2782,6 @@ mod tests {
         plan.process
             .environment
             .insert(WINESERVER_EXECUTABLE_DIGEST_ENV.into(), digest);
-        plan.lifecycle.wineserver = Some(WineServerLifecycle {
-            executable: plan.process.executable.clone(),
-            prefix: format!("runtime-evidence-prefix-{}", std::process::id()),
-        });
         verify_pinned_runtime(&plan).unwrap();
     }
 
@@ -2696,6 +3090,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn complete_managed_runtime_environment(plan: &mut LaunchPlan) {
+        let lifecycle = plan.lifecycle.wineserver.as_ref().unwrap();
+        for (key, value) in [
+            ("COMPATFORGE_RUNTIME_PACK", &plan.runtime.pack_id),
+            ("COMPATFORGE_RUNTIME_PACK_DIGEST", &plan.runtime.pack_digest),
+            ("WINESERVER", &lifecycle.executable),
+            ("WINEPREFIX", &lifecycle.prefix),
+        ] {
+            plan.process.environment.insert(key.into(), value.clone());
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn gui_launch_reaches_exit_after_wineserver_becomes_idle_without_termination() {
         use std::io::Write;
@@ -2757,6 +3164,7 @@ mod tests {
             executable: wineserver.to_string_lossy().into_owned(),
             prefix: prefix.to_string_lossy().into_owned(),
         });
+        complete_managed_runtime_environment(&mut plan);
 
         let handle = ProcessSupervisor::start(&plan).unwrap();
         let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(10));
@@ -2853,6 +3261,7 @@ mod tests {
             executable: wineserver.to_string_lossy().into_owned(),
             prefix: prefix.to_string_lossy().into_owned(),
         });
+        complete_managed_runtime_environment(&mut plan);
 
         let handle = ProcessSupervisor::start(&plan).unwrap();
         let start_deadline = Instant::now() + Duration::from_secs(5);
