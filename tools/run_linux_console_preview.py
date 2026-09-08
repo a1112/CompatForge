@@ -325,9 +325,11 @@ class EvidenceStore:
                 # A later close error cannot undo the durable start boundary.
                 self.started = True
         except BaseException:
-            os.close(descriptor)
-            if identity is not None:
-                self._remove_owned(path, identity)
+            try:
+                os.close(descriptor)
+            finally:
+                if identity is not None:
+                    self._remove_owned(path, identity)
             raise
         else:
             self.owned_files[path] = identity
@@ -570,10 +572,12 @@ def run_bounded(spec, adapter, observer, clock):
                 if stage == "reap":
                     code = value
                 break
-            # Readiness waits also avoid spinning while root exit/group removal
-            # propagates. The remaining absolute budget bounds each wait.
+            # Cleanup must not depend on a selector/readiness channel that may
+            # have caused the command failure. Use an independent bounded pause
+            # (injectable with the clock), retaining the same absolute deadline.
             try:
-                adapter.readiness(running, min(0.01, max(0, spec.deadline - clock())))
+                pause = getattr(clock, "pause", time.sleep)
+                pause(min(0.01, max(0, spec.deadline - clock())))
             except BaseException:
                 status = status or OuterCleanupStatus("Failed", stage)
                 break

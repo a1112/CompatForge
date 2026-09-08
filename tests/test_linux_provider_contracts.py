@@ -549,6 +549,22 @@ class LinuxConsoleRunnerPreflightTests(unittest.TestCase):
 
 
 class EvidencePrimitiveTests(unittest.TestCase):
+    def test_compound_write_or_sync_and_close_failure_removes_identified_partial(self):
+        for operation in ("write", "fsync"):
+            with self.subTest(operation=operation):
+                name = "request.json" if operation == "write" else "inspection.json"
+                store = self.runner.EvidenceStore(self.root)
+                real_close = os.close
+                def close_then_fail(descriptor):
+                    real_close(descriptor)
+                    raise OSError("secondary close failure")
+                with mock.patch.object(self.runner.os, operation, side_effect=OSError("primary failure")), \
+                        mock.patch.object(self.runner.os, "close", side_effect=close_then_fail):
+                    with self.assertRaises(OSError):
+                        store.write_json(name, {})
+                store.rollback_setup()
+                self.assertFalse((self.root / name).exists())
+
     def test_fsynced_marker_close_failure_runs_finalizer_and_preserves_evidence(self):
         store = self.runner.EvidenceStore(self.root)
         store.write_json("private-context.json", {})
@@ -728,6 +744,9 @@ class FakeClock:
         self.now += 0.001
         return self.now
 
+    def pause(self, duration):
+        self.now += duration
+
 
 class FakeCommandAdapter:
     def __init__(self, chunks=(), failure=None):
@@ -767,6 +786,32 @@ class FakeCommandAdapter:
 
 
 class BoundedCommandStateMachineTests(unittest.TestCase):
+    def test_broken_readiness_does_not_abort_delayed_outer_cleanup(self):
+        runner = runner_module()
+        for delayed_stage in ("reap", "group"):
+            with self.subTest(stage=delayed_stage):
+                adapter = FakeCommandAdapter()
+                adapter.readiness = mock.Mock(side_effect=OSError("persistent readiness failure"))
+                original_apply = adapter.apply
+                attempts = []
+                def delayed_cleanup(action, running):
+                    if action.kind == delayed_stage:
+                        attempts.append(action.kind)
+                        if len(attempts) == 1:
+                            return None if delayed_stage == "reap" else True
+                    return original_apply(action, running)
+                adapter.apply = delayed_cleanup
+                clock = FakeClock()
+                spec = SimpleNamespace(argv=(str(Path(sys.executable).resolve()),), environment={},
+                                       cwd=ROOT, output_limit_bytes=8, deadline=1.0)
+                with self.assertRaises(runner.CommandFailure) as caught:
+                    runner.run_bounded(spec, adapter, None, clock)
+                self.assertEqual(caught.exception.reason, "read")
+                self.assertEqual(caught.exception.outer_cleanup_status.state, "Complete")
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(adapter.readiness.call_count, 1)
+                self.assertLess(clock.now, spec.deadline)
+
     def test_simultaneously_ready_streams_read_at_most_combined_cap_plus_one(self):
         runner = runner_module()
         adapter = FakeCommandAdapter([("stdout", b"12345678"), ("stderr", b"x" * 100)])
