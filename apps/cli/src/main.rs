@@ -1607,6 +1607,8 @@ struct SupervisionState {
     grace_expired: bool,
     invalid: bool,
     sink_failed: bool,
+    awaiting_explicit_ack: bool,
+    explicit_termination_acknowledged: bool,
 }
 
 impl SupervisionState {
@@ -1633,6 +1635,9 @@ impl SupervisionState {
             self.invalid = true;
         }
         match event.kind {
+            RuntimeEventKind::TerminateRequested if self.awaiting_explicit_ack => {
+                self.explicit_termination_acknowledged = true;
+            }
             RuntimeEventKind::Failed => self.failed = true,
             RuntimeEventKind::TimedOut => self.timed_out = true,
             RuntimeEventKind::GracePeriodExpired => self.grace_expired = true,
@@ -1661,20 +1666,62 @@ fn supervise_launch(
     sink: &mut dyn EventSink,
     mode: CompletionMode,
 ) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    supervise_launch_with_elapsed(handle, sink, mode, || started.elapsed())
+}
+
+fn supervise_launch_with_elapsed(
+    handle: &dyn SupervisedLaunch,
+    sink: &mut dyn EventSink,
+    mode: CompletionMode,
+    mut elapsed: impl FnMut() -> Duration,
+) -> Result<(), Box<dyn Error>> {
     let terminate_after = match mode {
         CompletionMode::Normal => None,
         CompletionMode::TerminateAfter(delay) => Some(delay),
     };
-    let started = Instant::now();
     let mut termination_requested = false;
     let mut termination_failed = false;
     let mut premature_closed = false;
     let mut state = SupervisionState::default();
+    const MAX_COMPLETION_DRAIN_EVENTS: usize = 1024;
 
     loop {
-        if !termination_requested && terminate_after.is_some_and(|delay| started.elapsed() >= delay) {
-            termination_requested = true;
-            termination_failed = handle.terminate().is_err();
+        if !termination_requested && terminate_after.is_some_and(|delay| elapsed() >= delay) {
+            // Publishing a previous event may cross the timer boundary after the guest already exited.
+            // Consume that queued evidence before deciding this is an explicit termination.
+            let mut queue_empty = false;
+            for index in 0..=MAX_COMPLETION_DRAIN_EVENTS {
+                match handle.next_event(Duration::ZERO) {
+                    EventPoll::Event(event) => {
+                        if index == MAX_COMPLETION_DRAIN_EVENTS {
+                            state.invalid = true;
+                            break;
+                        }
+                        state.consume(&event, sink);
+                        if state.exited || state.needs_shutdown(false) {
+                            break;
+                        }
+                    }
+                    EventPoll::Timeout => {
+                        queue_empty = true;
+                        break;
+                    }
+                    EventPoll::Closed => {
+                        premature_closed = !state.exited;
+                        break;
+                    }
+                }
+            }
+            if state.needs_shutdown(false) {
+                termination_failed = handle.terminate().is_err();
+            } else if queue_empty {
+                termination_requested = true;
+                // terminate() can return Ok after completion without accepting a new request.
+                // Only a valid subsequent TerminateRequested before Exited proves acceptance.
+                state.awaiting_explicit_ack = true;
+                termination_failed = handle.terminate().is_err();
+            }
             break;
         }
         match handle.next_event(Duration::from_millis(250)) {
@@ -1706,7 +1753,6 @@ fn supervise_launch(
     // This is the authoritative completion acknowledgement, even after Exited or a failed terminate.
     let cleanup = handle.terminate_and_wait(handle.grace_period());
     // A joined supervisor cannot enqueue more events. Bound even a faulty adapter's drain.
-    const MAX_COMPLETION_DRAIN_EVENTS: usize = 1024;
     for index in 0..=MAX_COMPLETION_DRAIN_EVENTS {
         match handle.next_event(Duration::ZERO) {
             EventPoll::Event(event) => {
@@ -1721,11 +1767,12 @@ fn supervise_launch(
     }
     // Cleanup failure has precedence over guest, transcript, publication, or termination errors.
     cleanup?;
+    let explicit_termination = termination_requested && state.explicit_termination_acknowledged;
     if premature_closed
         || termination_failed
-        || state.needs_shutdown(termination_requested)
+        || state.needs_shutdown(explicit_termination)
         || !state.exited
-        || !(state.success || termination_requested)
+        || !(state.success || explicit_termination)
     {
         return Err(io::Error::other("supervised launch did not complete successfully").into());
     }
@@ -1771,6 +1818,7 @@ mod tests {
 
     struct SupervisionFake {
         events: std::cell::RefCell<std::collections::VecDeque<EventPoll>>,
+        after_terminate: std::cell::RefCell<std::collections::VecDeque<EventPoll>>,
         calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
         cleanup_error: bool,
         terminate_error: bool,
@@ -1781,6 +1829,7 @@ mod tests {
         fn new(events: Vec<EventPoll>) -> Self {
             Self {
                 events: std::cell::RefCell::new(events.into()),
+                after_terminate: Default::default(),
                 calls: Default::default(),
                 cleanup_error: false,
                 terminate_error: false,
@@ -1799,6 +1848,9 @@ mod tests {
         }
         fn terminate(&self) -> Result<(), ProcessError> {
             self.calls.borrow_mut().push("terminate".into());
+            self.events
+                .borrow_mut()
+                .extend(self.after_terminate.borrow_mut().drain(..));
             if self.terminate_error {
                 Err(ProcessError::Terminate(io::Error::other("terminate failed")))
             } else {
@@ -1889,6 +1941,239 @@ mod tests {
             true,
             &["poll", "write:0", "poll", "write:1", "cleanup:3000", "drain"],
         );
+    }
+
+    #[test]
+    fn supervise_plan_timer_boundary_preserves_queued_natural_exit_after_slow_sink() {
+        struct SlowSink<'a> {
+            inner: SupervisionSink,
+            elapsed: &'a std::cell::Cell<Duration>,
+        }
+        impl EventSink for SlowSink<'_> {
+            fn write_event(&mut self, event: &compatforge_domain::RuntimeEvent) -> io::Result<()> {
+                self.inner.write_event(event)?;
+                self.elapsed.set(Duration::from_millis(51));
+                Ok(())
+            }
+        }
+        for guest_success in [false, true] {
+            let fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                supervised_event(1, RuntimeEventKind::Exited, guest_success),
+            ]);
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let mut sink = SlowSink {
+                inner: SupervisionSink {
+                    calls: fake.calls.clone(),
+                    fail: false,
+                },
+                elapsed: &elapsed,
+            };
+            let result = supervise_launch_with_elapsed(
+                &fake,
+                &mut sink,
+                CompletionMode::TerminateAfter(Duration::from_millis(50)),
+                || elapsed.get(),
+            );
+            assert_eq!(result.is_ok(), guest_success);
+            assert_eq!(
+                *fake.calls.borrow(),
+                ["poll", "write:0", "drain", "write:1", "cleanup:3000", "drain"]
+            );
+        }
+    }
+
+    #[test]
+    fn supervise_plan_timer_boundary_noop_termination_does_not_waive_guest_failure() {
+        for success in [false, true] {
+            let fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Started, false)]);
+            fake.after_terminate
+                .borrow_mut()
+                .push_back(supervised_event(1, RuntimeEventKind::Exited, success));
+            check_supervision(
+                &fake,
+                CompletionMode::TerminateAfter(Duration::ZERO),
+                false,
+                success,
+                &[
+                    "drain",
+                    "write:0",
+                    "drain",
+                    "terminate",
+                    "cleanup:3000",
+                    "drain",
+                    "write:1",
+                    "drain",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn supervise_plan_timer_boundary_does_not_accept_preexisting_or_invalid_termination_ack() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::TerminateRequested, false),
+        ]);
+        fake.after_terminate
+            .borrow_mut()
+            .push_back(supervised_event(2, RuntimeEventKind::Exited, false));
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            false,
+            false,
+            &[
+                "drain",
+                "write:0",
+                "drain",
+                "write:1",
+                "drain",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "write:2",
+                "drain",
+            ],
+        );
+
+        let fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Started, false)]);
+        fake.after_terminate.borrow_mut().extend([
+            supervised_event(2, RuntimeEventKind::TerminateRequested, false),
+            supervised_event(3, RuntimeEventKind::Exited, false),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            false,
+            false,
+            &[
+                "drain",
+                "write:0",
+                "drain",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "drain",
+                "drain",
+            ],
+        );
+
+        let fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Started, false)]);
+        fake.after_terminate.borrow_mut().extend([
+            supervised_event(1, RuntimeEventKind::Exited, false),
+            supervised_event(2, RuntimeEventKind::TerminateRequested, false),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            false,
+            false,
+            &[
+                "drain",
+                "write:0",
+                "drain",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "write:1",
+                "drain",
+                "drain",
+            ],
+        );
+    }
+
+    #[test]
+    fn supervise_plan_timer_boundary_adverse_or_unpublishable_event_enters_cleanup_immediately() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Failed, false),
+            supervised_event(2, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            false,
+            false,
+            &[
+                "drain",
+                "write:0",
+                "drain",
+                "write:1",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "write:2",
+                "drain",
+            ],
+        );
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            true,
+            false,
+            &["drain", "write:0", "terminate", "cleanup:3000", "drain", "drain"],
+        );
+    }
+
+    #[test]
+    fn supervise_plan_timer_boundary_predrain_is_bounded_even_for_infinite_adapter() {
+        #[derive(Default)]
+        struct InfiniteOutput {
+            sequence: std::cell::Cell<u64>,
+            completed: std::cell::Cell<bool>,
+            calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        }
+        impl SupervisedLaunch for InfiniteOutput {
+            fn next_event(&self, timeout: Duration) -> EventPoll {
+                assert!(timeout.is_zero());
+                self.calls.borrow_mut().push("drain".into());
+                if self.completed.get() {
+                    return EventPoll::Timeout;
+                }
+                let sequence = self.sequence.get();
+                self.sequence.set(sequence + 1);
+                assert!(sequence < 2048, "timer boundary drain must not run forever");
+                supervised_event(
+                    sequence,
+                    if sequence == 0 {
+                        RuntimeEventKind::Started
+                    } else {
+                        RuntimeEventKind::Output
+                    },
+                    false,
+                )
+            }
+            fn terminate(&self) -> Result<(), ProcessError> {
+                self.calls.borrow_mut().push("terminate".into());
+                Ok(())
+            }
+            fn terminate_and_wait(&self, _: Duration) -> Result<(), ProcessError> {
+                self.calls.borrow_mut().push("cleanup".into());
+                self.completed.set(true);
+                Ok(())
+            }
+            fn is_finished(&self) -> bool {
+                self.completed.get()
+            }
+        }
+        let fake = InfiniteOutput::default();
+        let mut sink = SupervisionSink {
+            calls: fake.calls.clone(),
+            fail: false,
+        };
+        assert!(supervise_launch(&fake, &mut sink, CompletionMode::TerminateAfter(Duration::ZERO)).is_err());
+        let mut expected = Vec::new();
+        for sequence in 0..1024 {
+            expected.push("drain".to_owned());
+            expected.push(format!("write:{sequence}"));
+        }
+        expected.extend(["drain", "terminate", "cleanup", "drain"].map(str::to_owned));
+        assert_eq!(*fake.calls.borrow(), expected);
     }
     #[test]
     fn supervise_plan_failed_event_terminates_then_publishes_queued_terminal_in_sequence() {
@@ -1983,10 +2268,11 @@ mod tests {
     }
     #[test]
     fn supervise_plan_explicit_termination_preserves_nonzero_and_grace_expiry_semantics() {
-        let fake = SupervisionFake::new(vec![
-            supervised_event(0, RuntimeEventKind::Started, false),
-            supervised_event(1, RuntimeEventKind::GracePeriodExpired, false),
-            supervised_event(2, RuntimeEventKind::Exited, false),
+        let fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Started, false)]);
+        fake.after_terminate.borrow_mut().extend([
+            supervised_event(1, RuntimeEventKind::TerminateRequested, false),
+            supervised_event(2, RuntimeEventKind::GracePeriodExpired, false),
+            supervised_event(3, RuntimeEventKind::Exited, false),
         ]);
         check_supervision(
             &fake,
@@ -1994,14 +2280,17 @@ mod tests {
             false,
             true,
             &[
-                "terminate",
-                "cleanup:3000",
                 "drain",
                 "write:0",
+                "drain",
+                "terminate",
+                "cleanup:3000",
                 "drain",
                 "write:1",
                 "drain",
                 "write:2",
+                "drain",
+                "write:3",
                 "drain",
             ],
         );
@@ -2054,7 +2343,7 @@ mod tests {
             CompletionMode::TerminateAfter(Duration::ZERO),
             false,
             false,
-            &["terminate", "cleanup:3000", "drain"],
+            &["drain", "terminate", "cleanup:3000", "drain"],
         );
     }
     #[test]
@@ -2100,10 +2389,10 @@ mod tests {
     #[test]
     fn supervise_plan_termination_failure_still_joins_and_cleanup_error_takes_precedence() {
         for cleanup_error in [false, true] {
-            let mut fake = SupervisionFake::new(vec![
-                supervised_event(0, RuntimeEventKind::Started, false),
-                supervised_event(1, RuntimeEventKind::Exited, true),
-            ]);
+            let mut fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Started, false)]);
+            fake.after_terminate
+                .borrow_mut()
+                .push_back(supervised_event(1, RuntimeEventKind::Exited, true));
             fake.terminate_error = true;
             fake.cleanup_error = cleanup_error;
             let error = check_supervision(
@@ -2112,10 +2401,11 @@ mod tests {
                 false,
                 false,
                 &[
-                    "terminate",
-                    "cleanup:3000",
                     "drain",
                     "write:0",
+                    "drain",
+                    "terminate",
+                    "cleanup:3000",
                     "drain",
                     "write:1",
                     "drain",
@@ -2129,10 +2419,11 @@ mod tests {
     #[test]
     fn supervise_plan_adverse_events_are_not_waived_by_explicit_termination() {
         for kind in [RuntimeEventKind::Failed, RuntimeEventKind::TimedOut] {
-            let fake = SupervisionFake::new(vec![
-                supervised_event(0, RuntimeEventKind::Started, false),
-                supervised_event(1, kind, false),
-                supervised_event(2, RuntimeEventKind::Exited, false),
+            let fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Started, false)]);
+            fake.after_terminate.borrow_mut().extend([
+                supervised_event(1, RuntimeEventKind::TerminateRequested, false),
+                supervised_event(2, kind, false),
+                supervised_event(3, RuntimeEventKind::Exited, false),
             ]);
             check_supervision(
                 &fake,
@@ -2140,14 +2431,17 @@ mod tests {
                 false,
                 false,
                 &[
-                    "terminate",
-                    "cleanup:3000",
                     "drain",
                     "write:0",
+                    "drain",
+                    "terminate",
+                    "cleanup:3000",
                     "drain",
                     "write:1",
                     "drain",
                     "write:2",
+                    "drain",
+                    "write:3",
                     "drain",
                 ],
             );
