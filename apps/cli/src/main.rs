@@ -14,8 +14,11 @@ use compatforge_orchestrator::{PolicyEngine, PreparedLaunch};
 #[cfg(target_os = "macos")]
 use compatforge_process::LaunchHandle;
 use compatforge_process::{EventPoll, ProcessSupervisor};
+use compatforge_provider_linux::{
+    create_local_context as create_linux_local_context, LinuxLocalContextRequest, LinuxProviderConfig, LinuxProviderSet,
+};
 use compatforge_provider_macos::{
-    create_local_context, MacOsLocalContextRequest, MacOsProviderConfig, MacOsProviderSet,
+    create_local_context as create_macos_local_context, MacOsLocalContextRequest, MacOsProviderConfig, MacOsProviderSet,
 };
 use compatforge_runtime::{sha256_digest_bytes, RejectAllSignatures, RuntimePackStore};
 use compatforge_service::{AutomationService, ServiceConfig, ServiceRequest};
@@ -29,6 +32,176 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const PINNED_SUMATRAPDF_FAILURE: &str = "pinned SumatraPDF launch failed";
+
+#[derive(Debug, PartialEq, Eq)]
+enum LinuxCommand<'a> {
+    Probe(&'a str),
+    Context(&'a str, &'a str),
+    Local(&'a str, Option<&'a str>),
+}
+
+fn parse_linux_command(arguments: &[String]) -> io::Result<Option<LinuxCommand<'_>>> {
+    if !matches!(arguments, [group, platform, ..] if matches!(group.as_str(), "provider" | "local") && platform == "linux")
+    {
+        return Ok(None);
+    }
+    let command = match arguments {
+        [group, _, command, config] if group == "provider" && command == "probe" => LinuxCommand::Probe(config),
+        [group, _, command, config, storage] if group == "provider" && command == "context" => {
+            LinuxCommand::Context(config, storage)
+        }
+        [group, _, command, request] if group == "local" && command == "context" => LinuxCommand::Local(request, None),
+        [group, _, command, request, output] if group == "local" && command == "context" => {
+            LinuxCommand::Local(request, Some(output))
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Linux command arguments",
+            ))
+        }
+    };
+    Ok(Some(command))
+}
+
+trait PrivateOutput: Write {
+    fn sync_private(&mut self) -> io::Result<()>;
+}
+
+trait PrivateOutputFs {
+    type Output: PrivateOutput;
+    fn validate_parent(&self, path: &Path) -> io::Result<()>;
+    fn create_new(&self, path: &Path, mode: u32) -> io::Result<Self::Output>;
+    fn remove_partial(&self, path: &Path) -> io::Result<()>;
+}
+
+fn write_private_output_with<T: Serialize, F: PrivateOutputFs>(
+    path: &Path,
+    value: &T,
+    filesystem: &F,
+) -> io::Result<()> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private output requires an absolute path",
+        ));
+    }
+    filesystem.validate_parent(path)?;
+    let mut file = filesystem.create_new(path, 0o600)?;
+    let result = (|| {
+        serde_json::to_writer_pretty(&mut file, value).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_private()
+    })();
+    drop(file);
+    if let Err(error) = result {
+        filesystem.remove_partial(path)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct SystemPrivateOutputFs;
+
+fn validate_private_parent_facts(
+    is_directory: bool,
+    is_symlink: bool,
+    canonical: bool,
+    caller_owned: bool,
+) -> io::Result<()> {
+    if !is_directory || is_symlink || !canonical || !caller_owned {
+        Err(io::Error::other(
+            "private output requires a canonical caller-owned directory",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+impl PrivateOutput for fs::File {
+    fn sync_private(&mut self) -> io::Result<()> {
+        self.sync_all()
+    }
+}
+
+impl PrivateOutputFs for SystemPrivateOutputFs {
+    type Output = fs::File;
+    fn validate_parent(&self, path: &Path) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("private output has no parent"))?;
+        for ancestor in parent.ancestors() {
+            let metadata = fs::symlink_metadata(ancestor)?;
+            validate_private_parent_facts(metadata.is_dir(), metadata.file_type().is_symlink(), true, true)?;
+        }
+        let canonical = parent.canonicalize()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            // SAFETY: geteuid has no arguments or memory preconditions.
+            let caller_uid = unsafe { geteuid() };
+            validate_private_parent_facts(
+                true,
+                false,
+                canonical == parent,
+                fs::metadata(&canonical)?.uid() == caller_uid,
+            )?;
+        }
+        #[cfg(not(unix))]
+        let _ = canonical;
+        Ok(())
+    }
+    fn create_new(&self, path: &Path, mode: u32) -> io::Result<Self::Output> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        options.open(path)
+    }
+    fn remove_partial(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+}
+
+fn run_linux_command(command: LinuxCommand<'_>) -> Result<(), Box<dyn Error>> {
+    let mut stdout = io::stdout().lock();
+    match command {
+        LinuxCommand::Probe(config) => {
+            let config = read_json::<LinuxProviderConfig>(Path::new(config))?;
+            let snapshot = LinuxProviderSet::probe(&HostProbe::probe()?, &config)?;
+            serde_json::to_writer_pretty(&mut stdout, &snapshot.capabilities)?;
+        }
+        LinuxCommand::Context(config, storage) => {
+            let config = read_json::<LinuxProviderConfig>(Path::new(config))?;
+            let snapshot = LinuxProviderSet::probe(&HostProbe::probe()?, &config)?;
+            serde_json::to_writer_pretty(&mut stdout, &snapshot.core_config(storage.to_owned())?)?;
+        }
+        LinuxCommand::Local(request, output) => {
+            let request = read_json::<LinuxLocalContextRequest>(Path::new(request))?;
+            let local = create_linux_local_context(&HostProbe::probe()?, &request)?;
+            if let Some(output) = output {
+                write_private_output_with(Path::new(output), &local.config, &SystemPrivateOutputFs)?;
+            }
+            serde_json::to_writer_pretty(&mut stdout, &local.receipt)?;
+        }
+    }
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
 const PINNED_SUMATRAPDF_DIAGNOSTIC: &[u8] = b"compatforge-cli: pinned SumatraPDF launch failed\n";
 #[cfg(any(target_os = "macos", test))]
 const PINNED_RUNTIME_REQUEST_ID: &str = "pinned-sumatrapdf";
@@ -56,6 +229,9 @@ fn main() {
 }
 
 fn run_arguments(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if let Some(command) = parse_linux_command(arguments)? {
+        return run_linux_command(command);
+    }
     if arguments.first().is_some_and(|argument| argument == "bottle") {
         return run_bottle(arguments).map_err(|error| Box::new(error) as Box<dyn Error>);
     }
@@ -108,14 +284,14 @@ fn run_arguments(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         [group, platform, command, request_path] if group == "local" && platform == "macos" && command == "context" => {
             let request = read_json::<MacOsLocalContextRequest>(Path::new(request_path))?;
-            let local = create_local_context(&HostProbe::probe()?, &request)?;
+            let local = create_macos_local_context(&HostProbe::probe()?, &request)?;
             println!("{}", serde_json::to_string_pretty(&local.receipt)?);
         }
         [group, platform, command, request_path, context_output]
             if group == "local" && platform == "macos" && command == "context" =>
         {
             let request = read_json::<MacOsLocalContextRequest>(Path::new(request_path))?;
-            let local = create_local_context(&HostProbe::probe()?, &request)?;
+            let local = create_macos_local_context(&HostProbe::probe()?, &request)?;
             fs::write(
                 context_output,
                 format!("{}\n", serde_json::to_string_pretty(&local.config)?),
@@ -1350,6 +1526,9 @@ fn print_help() {
     println!("usage:");
     println!("  compatforge-cli version");
     println!("  compatforge-cli probe");
+    println!("  compatforge-cli provider linux probe <provider-config.json>");
+    println!("  compatforge-cli provider linux context <provider-config.json> <storage-root>");
+    println!("  compatforge-cli local linux context <bootstrap-request.json> [<private-context-output.json>]");
     println!("  compatforge-cli inspect <windows-executable>");
     println!("  compatforge-cli provider macos probe <provider-config.json>");
     println!("  compatforge-cli provider macos context <provider-config.json> <storage-root>");
@@ -1378,6 +1557,239 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_provider_argv_accepts_only_exact_forms() {
+        for (argv, expected) in [
+            (
+                words(&["provider", "linux", "probe", "config"]),
+                LinuxCommand::Probe("config"),
+            ),
+            (
+                words(&["provider", "linux", "context", "config", "storage"]),
+                LinuxCommand::Context("config", "storage"),
+            ),
+            (
+                words(&["local", "linux", "context", "request"]),
+                LinuxCommand::Local("request", None),
+            ),
+            (
+                words(&["local", "linux", "context", "request", "output"]),
+                LinuxCommand::Local("request", Some("output")),
+            ),
+        ] {
+            assert_eq!(parse_linux_command(&argv).unwrap(), Some(expected));
+            let mut extra = argv.clone();
+            extra.push("extra".into());
+            if argv.len() != 4 || argv[0] != "local" {
+                assert!(parse_linux_command(&extra).is_err());
+            }
+        }
+        for argv in [
+            words(&["provider", "linux"]),
+            words(&["local", "linux"]),
+            words(&["provider", "linux", "porbe", "config"]),
+            words(&["provider", "linux", "context", "config"]),
+            words(&["local", "linux", "context"]),
+            words(&["local", "linux", "probe", "request"]),
+        ] {
+            assert_eq!(
+                parse_linux_command(&argv).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            parse_linux_command(&words(&["provider", "macos", "probe", "config"])).unwrap(),
+            None
+        );
+    }
+
+    #[derive(Default)]
+    struct PrivateFs {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail: &'static str,
+    }
+    struct PrivateFile {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail: &'static str,
+    }
+    impl Write for PrivateFile {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls.borrow_mut().push("write".into());
+            if self.fail == "write" {
+                Err(io::Error::other("write"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl PrivateOutput for PrivateFile {
+        fn sync_private(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("sync".into());
+            if self.fail == "sync" {
+                Err(io::Error::other("sync"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl PrivateOutputFs for PrivateFs {
+        type Output = PrivateFile;
+        fn validate_parent(&self, _: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push("parent".into());
+            if matches!(self.fail, "missing" | "symlink" | "directory" | "owner") {
+                Err(io::Error::other(self.fail))
+            } else {
+                Ok(())
+            }
+        }
+        fn create_new(&self, _: &Path, mode: u32) -> io::Result<Self::Output> {
+            self.calls.borrow_mut().push(format!("create_new:{mode:o}"));
+            if self.fail == "exists" {
+                Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"))
+            } else {
+                Ok(PrivateFile {
+                    calls: self.calls.clone(),
+                    fail: self.fail,
+                })
+            }
+        }
+        fn remove_partial(&self, _: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push("remove".into());
+            Ok(())
+        }
+    }
+    fn private_test_path() -> PathBuf {
+        std::env::temp_dir().join("private-context.json")
+    }
+
+    #[test]
+    fn private_output_uses_create_new_and_mode_at_open() {
+        let fs = PrivateFs::default();
+        write_private_output_with(&private_test_path(), &serde_json::json!({"secret": 1}), &fs).unwrap();
+        let calls = fs.calls.borrow();
+        assert_eq!(&calls[..2], ["parent", "create_new:600"]);
+        assert_eq!(calls.last().unwrap(), "sync");
+        assert!(!calls.iter().any(|call| call == "remove"));
+    }
+
+    #[test]
+    fn private_output_rejects_unsafe_targets_before_writing() {
+        let fs = PrivateFs::default();
+        assert!(write_private_output_with(Path::new("relative.json"), &1, &fs).is_err());
+        assert!(fs.calls.borrow().is_empty());
+        for fail in ["missing", "symlink", "directory", "owner", "exists"] {
+            let fs = PrivateFs {
+                fail,
+                ..Default::default()
+            };
+            assert!(write_private_output_with(&private_test_path(), &1, &fs).is_err());
+            assert!(!fs.calls.borrow().iter().any(|call| call == "write" || call == "remove"));
+            assert!(!fs.calls.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn private_output_removes_partial_write_sync_and_serialization_failures() {
+        struct BadSerialization;
+        impl Serialize for BadSerialization {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("serialization"))
+            }
+        }
+        for fail in ["write", "sync", "serialization"] {
+            let fs = PrivateFs {
+                fail,
+                ..Default::default()
+            };
+            let result = if fail == "serialization" {
+                write_private_output_with(&private_test_path(), &BadSerialization, &fs)
+            } else {
+                write_private_output_with(&private_test_path(), &1, &fs)
+            };
+            assert!(result.is_err());
+            assert_eq!(fs.calls.borrow().last().map(String::as_str), Some("remove"));
+        }
+    }
+
+    #[test]
+    fn private_output_parent_facts_refuse_alias_type_and_foreign_owner() {
+        assert!(validate_private_parent_facts(true, false, true, true).is_ok());
+        for (directory, symlink, canonical, owner) in [
+            (false, false, true, true),
+            (true, true, true, true),
+            (true, false, false, true),
+            (true, false, true, false),
+        ] {
+            assert!(validate_private_parent_facts(directory, symlink, canonical, owner).is_err());
+        }
+    }
+
+    struct CliTempDir(PathBuf);
+    impl CliTempDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "compatforge-cli-test-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+    impl Drop for CliTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn private_output_real_filesystem_never_overwrites_and_refuses_missing_parent_or_directory() {
+        let root = CliTempDir::new();
+        let path = root.0.join("private.json");
+        write_private_output_with(&path, &serde_json::json!({"secret": 1}), &SystemPrivateOutputFs).unwrap();
+        let first = fs::read(&path).unwrap();
+        assert!(write_private_output_with(&path, &2, &SystemPrivateOutputFs).is_err());
+        assert_eq!(fs::read(&path).unwrap(), first);
+        assert!(write_private_output_with(&root.0, &2, &SystemPrivateOutputFs).is_err());
+        assert!(write_private_output_with(&root.0.join("missing/private.json"), &2, &SystemPrivateOutputFs).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            let alias = root.0.join("alias");
+            symlink(&path, &alias).unwrap();
+            assert!(write_private_output_with(&alias, &2, &SystemPrivateOutputFs).is_err());
+            let parent_alias = root.0.join("parent-alias");
+            symlink(&root.0, &parent_alias).unwrap();
+            assert!(write_private_output_with(&parent_alias.join("other.json"), &2, &SystemPrivateOutputFs).is_err());
+        }
+    }
+
+    #[test]
+    fn private_output_absent_when_linux_bootstrap_validation_fails() {
+        let root = CliTempDir::new();
+        let request = root.0.join("request.json");
+        let output = root.0.join("private.json");
+        fs::write(&request, b"{}").unwrap();
+        assert!(run_arguments(&words(&[
+            "local",
+            "linux",
+            "context",
+            request.to_str().unwrap(),
+            output.to_str().unwrap()
+        ]))
+        .is_err());
+        assert!(!output.exists());
+    }
 
     fn words(value: &[&str]) -> Vec<String> {
         value.iter().map(|word| (*word).to_owned()).collect()

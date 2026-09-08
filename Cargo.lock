@@ -49,6 +49,7 @@ dependencies = [
  "compatforge-inspect",
  "compatforge-orchestrator",
  "compatforge-process",
+ "compatforge-provider-linux",
  "compatforge-provider-macos",
  "compatforge-runtime",
  "compatforge-service",
