@@ -11,9 +11,8 @@ use compatforge_guest_artifact::{
 };
 use compatforge_inspect::inspect_path;
 use compatforge_orchestrator::{PolicyEngine, PreparedLaunch};
-#[cfg(target_os = "macos")]
 use compatforge_process::LaunchHandle;
-use compatforge_process::{EventPoll, ProcessSupervisor};
+use compatforge_process::{EventPoll, ProcessError, ProcessSupervisor};
 use compatforge_provider_linux::{
     create_local_context as create_linux_local_context, LinuxLocalContextRequest, LinuxProviderConfig, LinuxProviderSet,
 };
@@ -177,30 +176,56 @@ impl PrivateOutputFs for SystemPrivateOutputFs {
 }
 
 fn run_linux_command(command: LinuxCommand<'_>) -> Result<(), Box<dyn Error>> {
-    let mut stdout = io::stdout().lock();
-    match command {
+    let output = match command {
         LinuxCommand::Probe(config) => {
             let config = read_json::<LinuxProviderConfig>(Path::new(config))?;
             let snapshot = LinuxProviderSet::probe(&HostProbe::probe()?, &config)?;
-            serde_json::to_writer_pretty(&mut stdout, &snapshot.capabilities)?;
+            LinuxOutput::Probe(snapshot.capabilities)
         }
         LinuxCommand::Context(config, storage) => {
             let config = read_json::<LinuxProviderConfig>(Path::new(config))?;
             let snapshot = LinuxProviderSet::probe(&HostProbe::probe()?, &config)?;
-            serde_json::to_writer_pretty(&mut stdout, &snapshot.core_config(storage.to_owned())?)?;
+            LinuxOutput::Context(snapshot.core_config(storage.to_owned())?)
         }
         LinuxCommand::Local(request, output) => {
             let request = read_json::<LinuxLocalContextRequest>(Path::new(request))?;
             let local = create_linux_local_context(&HostProbe::probe()?, &request)?;
-            if let Some(output) = output {
-                write_private_output_with(Path::new(output), &local.config, &SystemPrivateOutputFs)?;
+            LinuxOutput::Local(local, output.map(Path::new))
+        }
+    };
+    publish_linux_output(output, &mut io::stdout().lock(), &SystemPrivateOutputFs)?;
+    Ok(())
+}
+
+enum LinuxOutput<'a> {
+    Probe(compatforge_domain::CapabilityReport),
+    Context(CoreConfig),
+    Local(compatforge_provider_linux::LinuxLocalContext, Option<&'a Path>),
+}
+
+fn publish_linux_output(
+    output: LinuxOutput<'_>,
+    stdout: &mut dyn Write,
+    filesystem: &impl PrivateOutputFs,
+) -> io::Result<()> {
+    match output {
+        LinuxOutput::Probe(report) => serde_json::to_writer_pretty(&mut *stdout, &report).map_err(io::Error::other)?,
+        LinuxOutput::Context(config) => {
+            serde_json::to_writer_pretty(&mut *stdout, &config).map_err(io::Error::other)?
+        }
+        LinuxOutput::Local(local, output) => {
+            if let Some(path) = output {
+                write_new_private_json(path, &local.config, filesystem)?;
             }
-            serde_json::to_writer_pretty(&mut stdout, &local.receipt)?;
+            serde_json::to_writer_pretty(&mut *stdout, &local.receipt).map_err(io::Error::other)?;
         }
     }
     stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    Ok(())
+    stdout.flush()
+}
+
+fn write_new_private_json(path: &Path, config: &CoreConfig, filesystem: &impl PrivateOutputFs) -> io::Result<()> {
+    write_private_output_with(path, config, filesystem)
 }
 const PINNED_SUMATRAPDF_DIAGNOSTIC: &[u8] = b"compatforge-cli: pinned SumatraPDF launch failed\n";
 #[cfg(any(target_os = "macos", test))]
@@ -1493,32 +1518,218 @@ fn launch(
 
 fn supervise_plan(plan: &LaunchPlan, terminate_after: Option<Duration>) -> Result<(), Box<dyn Error>> {
     let handle = ProcessSupervisor::start(plan)?;
+    let configured = ConfiguredLaunch {
+        handle,
+        grace: Duration::from_millis(plan.lifecycle.termination_grace_milliseconds),
+    };
+    let mut sink = JsonLineEventSink(io::stdout().lock());
+    supervise_launch(
+        &configured,
+        &mut sink,
+        terminate_after.map_or(CompletionMode::Normal, CompletionMode::TerminateAfter),
+    )
+}
+
+trait SupervisedLaunch {
+    fn next_event(&self, timeout: Duration) -> EventPoll;
+    fn terminate(&self) -> Result<(), ProcessError>;
+    fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), ProcessError>;
+    fn is_finished(&self) -> bool;
+    fn grace_period(&self) -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
+impl SupervisedLaunch for LaunchHandle {
+    fn next_event(&self, timeout: Duration) -> EventPoll {
+        self.next_event(timeout)
+    }
+    fn terminate(&self) -> Result<(), ProcessError> {
+        self.terminate()
+    }
+    fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), ProcessError> {
+        self.terminate_and_wait(graceful_wait)
+    }
+    fn is_finished(&self) -> bool {
+        self.is_finished()
+    }
+}
+
+struct ConfiguredLaunch {
+    handle: LaunchHandle,
+    grace: Duration,
+}
+impl SupervisedLaunch for ConfiguredLaunch {
+    fn next_event(&self, timeout: Duration) -> EventPoll {
+        self.handle.next_event(timeout)
+    }
+    fn terminate(&self) -> Result<(), ProcessError> {
+        self.handle.terminate()
+    }
+    fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), ProcessError> {
+        self.handle.terminate_and_wait(graceful_wait)
+    }
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+    fn grace_period(&self) -> Duration {
+        self.grace
+    }
+}
+
+trait EventSink {
+    fn write_event(&mut self, event: &compatforge_domain::RuntimeEvent) -> io::Result<()>;
+}
+
+struct JsonLineEventSink<W: Write>(W);
+impl<W: Write> EventSink for JsonLineEventSink<W> {
+    fn write_event(&mut self, event: &compatforge_domain::RuntimeEvent) -> io::Result<()> {
+        serde_json::to_writer(&mut self.0, event).map_err(io::Error::other)?;
+        self.0.write_all(b"\n")?;
+        self.0.flush()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionMode {
+    Normal,
+    TerminateAfter(Duration),
+}
+
+#[derive(Default)]
+struct SupervisionState {
+    next_sequence: u64,
+    request_id: Option<String>,
+    exited: bool,
+    success: bool,
+    failed: bool,
+    timed_out: bool,
+    grace_expired: bool,
+    invalid: bool,
+    sink_failed: bool,
+}
+
+impl SupervisionState {
+    fn consume(&mut self, event: &compatforge_domain::RuntimeEvent, sink: &mut dyn EventSink) {
+        let valid = !self.exited
+            && !self.invalid
+            && event.sequence == self.next_sequence
+            && (event.kind == RuntimeEventKind::Started) == (self.next_sequence == 0)
+            && event.schema_version == compatforge_domain::SCHEMA_VERSION_V1
+            && !event.request_id.is_empty()
+            && self.request_id.as_ref().map_or(true, |id| id == &event.request_id)
+            && event.process_id != Some(0)
+            && (event.kind != RuntimeEventKind::Output || event.output.is_some())
+            && (event.kind != RuntimeEventKind::Exited || event.exit.is_some())
+            && (event.kind != RuntimeEventKind::Failed || event.message.is_some());
+        if !valid {
+            self.invalid = true;
+            return;
+        }
+        self.request_id.get_or_insert_with(|| event.request_id.clone());
+        if let Some(next) = self.next_sequence.checked_add(1) {
+            self.next_sequence = next;
+        } else {
+            self.invalid = true;
+        }
+        match event.kind {
+            RuntimeEventKind::Failed => self.failed = true,
+            RuntimeEventKind::TimedOut => self.timed_out = true,
+            RuntimeEventKind::GracePeriodExpired => self.grace_expired = true,
+            RuntimeEventKind::Exited => {
+                self.exited = true;
+                self.success = event.exit.as_ref().is_some_and(|exit| exit.success);
+            }
+            _ => {}
+        }
+        if !self.sink_failed && sink.write_event(event).is_err() {
+            self.sink_failed = true;
+        }
+    }
+
+    fn needs_shutdown(&self, explicit_termination: bool) -> bool {
+        self.failed
+            || self.timed_out
+            || self.invalid
+            || self.sink_failed
+            || (self.grace_expired && !explicit_termination)
+    }
+}
+
+fn supervise_launch(
+    handle: &dyn SupervisedLaunch,
+    sink: &mut dyn EventSink,
+    mode: CompletionMode,
+) -> Result<(), Box<dyn Error>> {
+    let terminate_after = match mode {
+        CompletionMode::Normal => None,
+        CompletionMode::TerminateAfter(delay) => Some(delay),
+    };
     let started = Instant::now();
     let mut termination_requested = false;
+    let mut termination_failed = false;
+    let mut premature_closed = false;
+    let mut state = SupervisionState::default();
 
     loop {
         if !termination_requested && terminate_after.is_some_and(|delay| started.elapsed() >= delay) {
-            handle.terminate()?;
             termination_requested = true;
+            termination_failed = handle.terminate().is_err();
+            break;
         }
         match handle.next_event(Duration::from_millis(250)) {
             EventPoll::Event(event) => {
-                println!("{}", serde_json::to_string(&event)?);
-                if event.kind == RuntimeEventKind::Exited {
-                    let success = event.exit.as_ref().is_some_and(|exit| exit.success);
-                    if success || termination_requested {
-                        return Ok(());
+                state.consume(&event, sink);
+                if state.needs_shutdown(termination_requested) {
+                    // Do not wait for a terminal event from an already failing producer or sink.
+                    if !termination_requested {
+                        termination_failed = handle.terminate().is_err();
                     }
-                    return Err(io::Error::other("supervised process exited unsuccessfully").into());
+                    break;
                 }
-                if event.kind == RuntimeEventKind::Failed {
-                    return Err(io::Error::other("process supervision failed").into());
+                if state.exited {
+                    break;
                 }
             }
-            EventPoll::Timeout => {}
-            EventPoll::Closed => return Err(io::Error::other("runtime event stream closed").into()),
+            EventPoll::Timeout => {
+                if handle.is_finished() {
+                    break;
+                }
+            }
+            EventPoll::Closed => {
+                premature_closed = !state.exited;
+                break;
+            }
         }
     }
+
+    // This is the authoritative completion acknowledgement, even after Exited or a failed terminate.
+    let cleanup = handle.terminate_and_wait(handle.grace_period());
+    // A joined supervisor cannot enqueue more events. Bound even a faulty adapter's drain.
+    const MAX_COMPLETION_DRAIN_EVENTS: usize = 1024;
+    for index in 0..=MAX_COMPLETION_DRAIN_EVENTS {
+        match handle.next_event(Duration::ZERO) {
+            EventPoll::Event(event) => {
+                if index == MAX_COMPLETION_DRAIN_EVENTS {
+                    state.invalid = true;
+                    break;
+                }
+                state.consume(&event, sink);
+            }
+            EventPoll::Timeout | EventPoll::Closed => break,
+        }
+    }
+    // Cleanup failure has precedence over guest, transcript, publication, or termination errors.
+    cleanup?;
+    if premature_closed
+        || termination_failed
+        || state.needs_shutdown(termination_requested)
+        || !state.exited
+        || !(state.success || termination_requested)
+    {
+        return Err(io::Error::other("supervised launch did not complete successfully").into());
+    }
+    Ok(())
 }
 
 fn print_help() {
@@ -1557,6 +1768,587 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SupervisionFake {
+        events: std::cell::RefCell<std::collections::VecDeque<EventPoll>>,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        cleanup_error: bool,
+        terminate_error: bool,
+        finished: bool,
+        grace: Duration,
+    }
+    impl SupervisionFake {
+        fn new(events: Vec<EventPoll>) -> Self {
+            Self {
+                events: std::cell::RefCell::new(events.into()),
+                calls: Default::default(),
+                cleanup_error: false,
+                terminate_error: false,
+                finished: true,
+                grace: Duration::from_secs(3),
+            }
+        }
+    }
+    impl SupervisedLaunch for SupervisionFake {
+        fn next_event(&self, timeout: Duration) -> EventPoll {
+            self.calls
+                .borrow_mut()
+                .push(if timeout.is_zero() { "drain" } else { "poll" }.into());
+            assert!(self.calls.borrow().len() < 100, "supervision must not poll forever");
+            self.events.borrow_mut().pop_front().unwrap_or(EventPoll::Timeout)
+        }
+        fn terminate(&self) -> Result<(), ProcessError> {
+            self.calls.borrow_mut().push("terminate".into());
+            if self.terminate_error {
+                Err(ProcessError::Terminate(io::Error::other("terminate failed")))
+            } else {
+                Ok(())
+            }
+        }
+        fn terminate_and_wait(&self, graceful_wait: Duration) -> Result<(), ProcessError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("cleanup:{}", graceful_wait.as_millis()));
+            if self.cleanup_error {
+                Err(ProcessError::Terminate(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cleanup deadline",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        fn is_finished(&self) -> bool {
+            self.calls.borrow_mut().push("finished".into());
+            self.finished
+        }
+        fn grace_period(&self) -> Duration {
+            self.grace
+        }
+    }
+    struct SupervisionSink {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail: bool,
+    }
+    impl EventSink for SupervisionSink {
+        fn write_event(&mut self, event: &compatforge_domain::RuntimeEvent) -> io::Result<()> {
+            self.calls.borrow_mut().push(format!("write:{}", event.sequence));
+            if self.fail {
+                Err(io::Error::other("sink failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn supervised_event(sequence: u64, kind: RuntimeEventKind, success: bool) -> EventPoll {
+        EventPoll::Event(compatforge_domain::RuntimeEvent {
+            schema_version: "1".into(),
+            request_id: "supervised-test".into(),
+            sequence,
+            elapsed_milliseconds: sequence,
+            kind,
+            process_id: Some(1),
+            output: (kind == RuntimeEventKind::Output).then(|| compatforge_domain::ProcessOutput {
+                stream: compatforge_domain::OutputStream::Stdout,
+                text: "output".into(),
+            }),
+            exit: (kind == RuntimeEventKind::Exited).then_some(compatforge_domain::ProcessExit {
+                code: Some(if success { 0 } else { 1 }),
+                success,
+            }),
+            message: (kind == RuntimeEventKind::Failed).then(|| "failed".into()),
+        })
+    }
+    fn check_supervision(
+        fake: &SupervisionFake,
+        mode: CompletionMode,
+        fail_sink: bool,
+        success: bool,
+        expected: &[&str],
+    ) -> Option<String> {
+        let mut sink = SupervisionSink {
+            calls: fake.calls.clone(),
+            fail: fail_sink,
+        };
+        let result = supervise_launch(fake, &mut sink, mode);
+        assert_eq!(result.is_ok(), success);
+        assert_eq!(*fake.calls.borrow(), expected);
+        result.err().map(|error| error.to_string())
+    }
+
+    #[test]
+    fn supervise_plan_success_still_acknowledges_cleanup_and_drains() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            true,
+            &["poll", "write:0", "poll", "write:1", "cleanup:3000", "drain"],
+        );
+    }
+    #[test]
+    fn supervise_plan_failed_event_terminates_then_publishes_queued_terminal_in_sequence() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Failed, false),
+            supervised_event(2, RuntimeEventKind::Output, false),
+            supervised_event(3, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &[
+                "poll",
+                "write:0",
+                "poll",
+                "write:1",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "write:2",
+                "drain",
+                "write:3",
+                "drain",
+            ],
+        );
+    }
+    #[test]
+    fn supervise_plan_failed_without_exited_never_waits_for_forever_timeouts() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Failed, false),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &[
+                "poll",
+                "write:0",
+                "poll",
+                "write:1",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+            ],
+        );
+    }
+    #[test]
+    fn supervise_plan_closed_or_finished_timeout_without_exit_refuses_success() {
+        for (event, expected) in [
+            (EventPoll::Closed, vec!["poll", "cleanup:3000", "drain"]),
+            (EventPoll::Timeout, vec!["poll", "finished", "cleanup:3000", "drain"]),
+        ] {
+            let fake = SupervisionFake::new(vec![event]);
+            check_supervision(&fake, CompletionMode::Normal, false, false, &expected);
+        }
+    }
+    #[test]
+    fn supervise_plan_cleanup_error_overrides_guest_success_and_sink_failure() {
+        for sink_error in [false, true] {
+            let mut fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                supervised_event(1, RuntimeEventKind::Exited, true),
+            ]);
+            fake.cleanup_error = true;
+            let expected = if sink_error {
+                vec!["poll", "write:0", "terminate", "cleanup:3000", "drain", "drain"]
+            } else {
+                vec!["poll", "write:0", "poll", "write:1", "cleanup:3000", "drain"]
+            };
+            let error = check_supervision(&fake, CompletionMode::Normal, sink_error, false, &expected).unwrap();
+            assert!(error.contains("cleanup deadline"));
+        }
+    }
+    #[test]
+    fn supervise_plan_sink_error_requests_cleanup_without_missing_exit_hang() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            true,
+            false,
+            &["poll", "write:0", "terminate", "cleanup:3000", "drain", "drain"],
+        );
+    }
+    #[test]
+    fn supervise_plan_explicit_termination_preserves_nonzero_and_grace_expiry_semantics() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::GracePeriodExpired, false),
+            supervised_event(2, RuntimeEventKind::Exited, false),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            false,
+            true,
+            &[
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "write:0",
+                "drain",
+                "write:1",
+                "drain",
+                "write:2",
+                "drain",
+            ],
+        );
+    }
+    #[test]
+    fn supervise_plan_exit_before_explicit_delay_uses_normal_success_rules() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Exited, false),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::from_secs(60)),
+            false,
+            false,
+            &["poll", "write:0", "poll", "write:1", "cleanup:3000", "drain"],
+        );
+    }
+    #[test]
+    fn supervise_plan_configured_grace_is_passed_exactly() {
+        for grace in [Duration::from_millis(1), Duration::from_secs(60)] {
+            let mut fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                supervised_event(1, RuntimeEventKind::Exited, true),
+            ]);
+            fake.grace = grace;
+            check_supervision(
+                &fake,
+                CompletionMode::Normal,
+                false,
+                true,
+                &[
+                    "poll",
+                    "write:0",
+                    "poll",
+                    "write:1",
+                    &format!("cleanup:{}", grace.as_millis()),
+                    "drain",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn supervise_plan_explicit_termination_never_waits_for_missing_terminal() {
+        let mut fake = SupervisionFake::new(vec![]);
+        fake.finished = false;
+        check_supervision(
+            &fake,
+            CompletionMode::TerminateAfter(Duration::ZERO),
+            false,
+            false,
+            &["terminate", "cleanup:3000", "drain"],
+        );
+    }
+    #[test]
+    fn supervise_plan_requires_started_first_and_refuses_duplicate_started() {
+        let fake = SupervisionFake::new(vec![supervised_event(0, RuntimeEventKind::Exited, true)]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &["poll", "terminate", "cleanup:3000", "drain"],
+        );
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Started, false),
+            supervised_event(2, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &["poll", "write:0", "poll", "terminate", "cleanup:3000", "drain", "drain"],
+        );
+    }
+
+    #[test]
+    fn supervise_plan_premature_closed_stream_cannot_be_repaired_by_queued_exit() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            EventPoll::Closed,
+            supervised_event(1, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &["poll", "write:0", "poll", "cleanup:3000", "drain", "write:1", "drain"],
+        );
+    }
+
+    #[test]
+    fn supervise_plan_termination_failure_still_joins_and_cleanup_error_takes_precedence() {
+        for cleanup_error in [false, true] {
+            let mut fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                supervised_event(1, RuntimeEventKind::Exited, true),
+            ]);
+            fake.terminate_error = true;
+            fake.cleanup_error = cleanup_error;
+            let error = check_supervision(
+                &fake,
+                CompletionMode::TerminateAfter(Duration::ZERO),
+                false,
+                false,
+                &[
+                    "terminate",
+                    "cleanup:3000",
+                    "drain",
+                    "write:0",
+                    "drain",
+                    "write:1",
+                    "drain",
+                ],
+            )
+            .unwrap();
+            assert_eq!(error.contains("cleanup deadline"), cleanup_error);
+        }
+    }
+
+    #[test]
+    fn supervise_plan_adverse_events_are_not_waived_by_explicit_termination() {
+        for kind in [RuntimeEventKind::Failed, RuntimeEventKind::TimedOut] {
+            let fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                supervised_event(1, kind, false),
+                supervised_event(2, RuntimeEventKind::Exited, false),
+            ]);
+            check_supervision(
+                &fake,
+                CompletionMode::TerminateAfter(Duration::ZERO),
+                false,
+                false,
+                &[
+                    "terminate",
+                    "cleanup:3000",
+                    "drain",
+                    "write:0",
+                    "drain",
+                    "write:1",
+                    "drain",
+                    "write:2",
+                    "drain",
+                ],
+            );
+        }
+        for kind in [RuntimeEventKind::TimedOut, RuntimeEventKind::GracePeriodExpired] {
+            let fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                supervised_event(1, kind, false),
+                supervised_event(2, RuntimeEventKind::Exited, true),
+            ]);
+            check_supervision(
+                &fake,
+                CompletionMode::Normal,
+                false,
+                false,
+                &[
+                    "poll",
+                    "write:0",
+                    "poll",
+                    "write:1",
+                    "terminate",
+                    "cleanup:3000",
+                    "drain",
+                    "write:2",
+                    "drain",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn supervise_plan_validates_every_field_and_sequence_before_publication() {
+        for field in [
+            "schema",
+            "request-empty",
+            "request-different",
+            "pid",
+            "sequence",
+            "output",
+            "exit",
+            "message",
+        ] {
+            let EventPoll::Event(mut event) = supervised_event(1, RuntimeEventKind::Output, false) else {
+                unreachable!()
+            };
+            match field {
+                "schema" => event.schema_version = "2".into(),
+                "request-empty" => event.request_id.clear(),
+                "request-different" => event.request_id = "different".into(),
+                "pid" => event.process_id = Some(0),
+                "sequence" => event.sequence = 2,
+                "output" => event.output = None,
+                "exit" => event.kind = RuntimeEventKind::Exited,
+                "message" => event.kind = RuntimeEventKind::Failed,
+                _ => unreachable!(),
+            }
+            let fake = SupervisionFake::new(vec![
+                supervised_event(0, RuntimeEventKind::Started, false),
+                EventPoll::Event(event),
+                supervised_event(2, RuntimeEventKind::Exited, true),
+            ]);
+            check_supervision(
+                &fake,
+                CompletionMode::Normal,
+                false,
+                false,
+                &["poll", "write:0", "poll", "terminate", "cleanup:3000", "drain", "drain"],
+            );
+        }
+    }
+
+    #[test]
+    fn supervise_plan_checks_sequences_during_cleanup_and_rejects_post_terminal_events() {
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Failed, false),
+            supervised_event(3, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &[
+                "poll",
+                "write:0",
+                "poll",
+                "write:1",
+                "terminate",
+                "cleanup:3000",
+                "drain",
+                "drain",
+            ],
+        );
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            supervised_event(1, RuntimeEventKind::Exited, true),
+            supervised_event(2, RuntimeEventKind::Output, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            false,
+            &["poll", "write:0", "poll", "write:1", "cleanup:3000", "drain", "drain"],
+        );
+    }
+
+    #[test]
+    fn supervise_plan_active_timeout_is_not_completion_but_finished_timeout_drains_exit() {
+        let mut fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            EventPoll::Timeout,
+            supervised_event(1, RuntimeEventKind::Exited, true),
+        ]);
+        fake.finished = false;
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            true,
+            &[
+                "poll",
+                "write:0",
+                "poll",
+                "finished",
+                "poll",
+                "write:1",
+                "cleanup:3000",
+                "drain",
+            ],
+        );
+        let fake = SupervisionFake::new(vec![
+            supervised_event(0, RuntimeEventKind::Started, false),
+            EventPoll::Timeout,
+            supervised_event(1, RuntimeEventKind::Exited, true),
+        ]);
+        check_supervision(
+            &fake,
+            CompletionMode::Normal,
+            false,
+            true,
+            &[
+                "poll",
+                "write:0",
+                "poll",
+                "finished",
+                "cleanup:3000",
+                "drain",
+                "write:1",
+                "drain",
+            ],
+        );
+    }
+
+    #[test]
+    fn supervise_plan_real_jsonl_serialization_write_newline_and_flush_errors_cleanup() {
+        struct FaultWriter {
+            boundary: usize,
+            written: usize,
+            fail_flush: bool,
+        }
+        impl Write for FaultWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.written >= self.boundary {
+                    return Err(io::Error::other("injected write failure"));
+                }
+                let count = bytes.len().min(self.boundary - self.written);
+                self.written += count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fail_flush {
+                    Err(io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let EventPoll::Event(started) = supervised_event(0, RuntimeEventKind::Started, false) else {
+            unreachable!()
+        };
+        let serialized_len = serde_json::to_vec(&started).unwrap().len();
+        // The first failure is an actual serde_json::to_writer error caused by its underlying writer.
+        for (boundary, fail_flush) in [(0, false), (serialized_len, false), (usize::MAX, true)] {
+            let fake = SupervisionFake::new(vec![
+                EventPoll::Event(started.clone()),
+                supervised_event(1, RuntimeEventKind::Exited, true),
+            ]);
+            let mut sink = JsonLineEventSink(FaultWriter {
+                boundary,
+                written: 0,
+                fail_flush,
+            });
+            assert!(supervise_launch(&fake, &mut sink, CompletionMode::Normal).is_err());
+            assert_eq!(
+                *fake.calls.borrow(),
+                ["poll", "terminate", "cleanup:3000", "drain", "drain"]
+            );
+        }
+    }
 
     #[test]
     fn linux_provider_argv_accepts_only_exact_forms() {
@@ -1789,6 +2581,62 @@ mod tests {
         ]))
         .is_err());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn linux_provider_output_projects_exact_public_or_private_document_for_all_four_forms() {
+        // Serialization fixture only: the real provider's HostGate is never replaced.
+        let config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        let receipt = compatforge_provider_linux::LinuxLocalContextReceipt {
+            schema_version: "1".into(),
+            source: "local-preview".into(),
+            version: "test".into(),
+            architecture: compatforge_domain::CpuArchitecture::X86_64,
+            pack_id: "preview".into(),
+            pack_digest: format!("sha256:{}", "a".repeat(64)),
+            capabilities: vec!["guest-x86_64".into()],
+        };
+        let root = CliTempDir::new();
+        let output = root.0.join("private.json");
+        for (value, expected) in [
+            (
+                LinuxOutput::Probe(config.capabilities.clone()),
+                serde_json::to_value(&config.capabilities).unwrap(),
+            ),
+            (
+                LinuxOutput::Context(config.clone()),
+                serde_json::to_value(&config).unwrap(),
+            ),
+            (
+                LinuxOutput::Local(
+                    compatforge_provider_linux::LinuxLocalContext {
+                        config: config.clone(),
+                        receipt: receipt.clone(),
+                    },
+                    None,
+                ),
+                serde_json::to_value(&receipt).unwrap(),
+            ),
+            (
+                LinuxOutput::Local(
+                    compatforge_provider_linux::LinuxLocalContext {
+                        config: config.clone(),
+                        receipt: receipt.clone(),
+                    },
+                    Some(&output),
+                ),
+                serde_json::to_value(&receipt).unwrap(),
+            ),
+        ] {
+            let mut stdout = Vec::new();
+            publish_linux_output(value, &mut stdout, &SystemPrivateOutputFs).unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&stdout).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(output).unwrap()).unwrap(),
+            serde_json::to_value(config).unwrap()
+        );
     }
 
     fn words(value: &[&str]) -> Vec<String> {
