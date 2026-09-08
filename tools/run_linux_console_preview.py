@@ -297,6 +297,11 @@ class EvidenceStore:
             pass
 
     def write_json(self, name, value):
+        if name == "run-start.json":
+            raise ValueError("run-start-requires-fixed-cleanup-inputs")
+        return self._write_json(name, value)
+
+    def _write_json(self, name, value, *, mark_started=False):
         payload = json.dumps(value, sort_keys=True, separators=(",", ":"),
                              ensure_ascii=True, allow_nan=False).encode("utf-8") + b"\n"
         if len(payload) > JSON_LIMIT:
@@ -316,6 +321,9 @@ class EvidenceStore:
                 remaining = remaining[written:]
             # os.write is unbuffered; fsync is the completion boundary.
             os.fsync(descriptor)
+            if mark_started:
+                # A later close error cannot undo the durable start boundary.
+                self.started = True
         except BaseException:
             os.close(descriptor)
             if identity is not None:
@@ -326,7 +334,8 @@ class EvidenceStore:
             try:
                 os.close(descriptor)
             except BaseException:
-                self._remove_owned(path, identity)
+                if not mark_started:
+                    self._remove_owned(path, identity)
                 raise
         return path
 
@@ -359,6 +368,7 @@ class EvidenceStore:
     def run_product(self, context, prefix, wineserver_digest, product, finalizer):
         if self.started:
             raise ValueError("run-already-started")
+        failure = None
         try:
             if context != self.root / "private-context.json":
                 raise ValueError("fixed-context-required")
@@ -366,18 +376,19 @@ class EvidenceStore:
             if (not prefix.is_absolute() or prefix.resolve() != prefix
                     or re.fullmatch(r"sha256:[0-9a-f]{64}", wineserver_digest) is None):
                 raise ValueError("fixed-cleanup-inputs-required")
-            self.write_json("run-start.json", {"schemaVersion": "1",
+            self._write_json("run-start.json", {"schemaVersion": "1",
                             "context": str(context), "prefix": str(prefix),
-                            "wineserverDigest": wineserver_digest})
-        except BaseException:
-            self.rollback_setup()
-            raise
-        self.started = True
-        failure = None
+                            "wineserverDigest": wineserver_digest}, mark_started=True)
+        except BaseException as error:
+            if not self.started:
+                self.rollback_setup()
+                raise
+            failure = error
         result = None
         reason = "execution"
         try:
-            result = product()
+            if failure is None:
+                result = product()
             if isinstance(result, CommandResult) and result.return_code != 0:
                 raise CommandFailure("nonzero-exit", result.stdout, result.stderr,
                                      result.outer_pid, result.outer_process_group_id,
@@ -525,6 +536,10 @@ def run_bounded(spec, adapter, observer, clock):
             break
         for action in machine.step(readiness, clock()):
             try:
+                # Earlier ready streams may have consumed the shared budget
+                # since step() built this batch. Bound each actual read afresh.
+                action = CommandAction(action.kind, action.stream,
+                                       min(action.size, machine.remaining + 1))
                 accepted = machine.consume(action.stream, adapter.apply(action, running))
             except BaseException:
                 machine.reason = "read"

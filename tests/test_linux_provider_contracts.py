@@ -549,6 +549,35 @@ class LinuxConsoleRunnerPreflightTests(unittest.TestCase):
 
 
 class EvidencePrimitiveTests(unittest.TestCase):
+    def test_fsynced_marker_close_failure_runs_finalizer_and_preserves_evidence(self):
+        store = self.runner.EvidenceStore(self.root)
+        store.write_json("private-context.json", {})
+        calls = []
+        real_close = os.close
+        real_fsync = os.fsync
+        synced = set()
+        failed = []
+        def record_sync(descriptor):
+            real_fsync(descriptor)
+            synced.add(descriptor)
+        def close_after_sync(descriptor):
+            real_close(descriptor)
+            if descriptor in synced and not failed:
+                failed.append(True)
+                raise OSError("close after durable marker")
+        with mock.patch.object(self.runner.os, "fsync", side_effect=record_sync), \
+                mock.patch.object(self.runner.os, "close", side_effect=close_after_sync):
+            with self.assertRaises(OSError):
+                store.run_product(self.root / "private-context.json", self.root.parent / "prefix",
+                                  "sha256:" + "a" * 64, lambda: calls.append("product"),
+                                  lambda failure: calls.append(("finalizer", failure)))
+        self.assertEqual(calls, [("finalizer", True)])
+        self.assertTrue(store.started)
+        self.assertTrue((self.root / "run-start.json").is_file())
+        self.assertTrue((self.root / "private-context.json").is_file())
+        self.assertEqual(store.read_json("failure.json"), {"schemaVersion": "1", "reason": "execution"})
+        self.assertFalse((self.root / "public-summary.json").exists())
+
     def test_symlink_json_read_is_rejected_before_open(self):
         store = self.runner.EvidenceStore(self.root)
         with mock.patch.object(Path, "is_symlink", return_value=True), \
@@ -738,6 +767,30 @@ class FakeCommandAdapter:
 
 
 class BoundedCommandStateMachineTests(unittest.TestCase):
+    def test_simultaneously_ready_streams_read_at_most_combined_cap_plus_one(self):
+        runner = runner_module()
+        adapter = FakeCommandAdapter([("stdout", b"12345678"), ("stderr", b"x" * 100)])
+        adapter.readiness = lambda running, timeout: ["stdout", "stderr"]
+        read_sizes = []
+        read_bytes = []
+        apply = adapter.apply
+        def record_read(action, running):
+            result = apply(action, running)
+            if action.kind == "read":
+                read_sizes.append(action.size)
+                read_bytes.append(result)
+            return result
+        adapter.apply = record_read
+        spec = SimpleNamespace(argv=(str(Path(sys.executable).resolve()),), environment={},
+                               cwd=ROOT, output_limit_bytes=8, deadline=1.0)
+        with self.assertRaises(runner.CommandFailure) as caught:
+            runner.run_bounded(spec, adapter, None, FakeClock())
+        self.assertEqual(caught.exception.reason, "output-limit")
+        self.assertEqual(read_sizes, [9, 1])
+        self.assertEqual(sum(map(len, read_bytes)), 9)
+        self.assertEqual(caught.exception.partial_stdout, b"12345678")
+        self.assertEqual(caught.exception.partial_stderr, b"")
+
     def test_spurious_readiness_is_not_eof_or_read_failure(self):
         runner = runner_module()
         adapter = FakeCommandAdapter([("stdout", b"ok")])
