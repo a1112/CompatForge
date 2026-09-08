@@ -1,13 +1,114 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
+import sys
+import os
+import tempfile
+import time
+from unittest import mock
+from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROVIDER_SCHEMA = ROOT / "schemas" / "linux-provider.schema.json"
 BOOTSTRAP_SCHEMA = ROOT / "schemas" / "linux-bootstrap-request.schema.json"
+
+
+def runner_module():
+    name = "compatforge_linux_console_runner"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, ROOT / "tools" / "run_linux_console_preview.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def runner_args():
+    base = ROOT.parent / "runner-fixtures"
+    return [
+        "--cli", str(base / "cli"),
+        "--compiler", str(base / "compiler"),
+        "--runtime-store-root", str(base / "runtime"),
+        "--storage-root", str(base / "storage"),
+        "--materialized-root", str(base / "wine"),
+        "--evidence-root", str(base / "evidence"),
+        "--wine", "bin/wine64", "--wineserver", "bin/wineserver",
+        "--version", "10.0-preview",
+    ]
+
+
+class FakePlatform:
+    def __init__(self, os_name="Linux", machine="x86_64", uid=1000):
+        self.os = os_name
+        self.arch = machine
+        self.uid = uid
+
+    def os_name(self):
+        return self.os
+
+    def machine(self):
+        return self.arch
+
+    def current_uid(self):
+        return self.uid
+
+
+class FakeFileSystem:
+    def __init__(self, inputs):
+        self.repository_root = ROOT
+        self.nodes = {}
+        self.aliases = {}
+        self.created = []
+        self.commands = []
+        for path in (ROOT, inputs.materialized_root, inputs.cli.parent):
+            self.put(path, "directory")
+        for path in (inputs.cli, inputs.compiler,
+                     inputs.materialized_root / inputs.wine_relative,
+                     inputs.materialized_root / inputs.wineserver_relative):
+            self.put(path, "file", mode=0o700)
+
+    def put(self, path, kind, mode=0o700, uid=1000, symlink=False):
+        self.nodes[path] = SimpleNamespace(exists=True, kind=kind, mode=mode,
+                                          uid=uid, symlink=symlink,
+                                          identity=(1, len(self.nodes) + 1))
+
+    def inspect(self, path):
+        return self.nodes.get(path, SimpleNamespace(exists=False))
+
+    def nearest_existing_ancestor(self, path):
+        runner = runner_module()
+        for source, destination in self.aliases.items():
+            if path == source or source in path.parents:
+                return runner.PhysicalAncestor(source, destination, (1, 1),
+                                                tuple(path.relative_to(source).parts))
+        parent = path
+        missing = []
+        while not self.inspect(parent).exists:
+            missing.insert(0, parent.name)
+            parent = parent.parent
+        return runner.PhysicalAncestor(parent, parent, self.inspect(parent).identity,
+                                       tuple(missing))
+
+    def mkdir_exclusive(self, path):
+        if self.inspect(path).exists:
+            raise FileExistsError(path)
+        self.put(path, "directory")
+        self.created.append((path, 0o700))
+        return self.inspect(path).identity
+
+    def remove_owned_empty_directory(self, path, identity):
+        if self.inspect(path).identity == identity:
+            self.nodes.pop(path)
+
+    def record(self, argv, environment):
+        self.commands.append((argv, environment))
 
 
 def document(path: Path) -> dict[str, object]:
@@ -286,6 +387,569 @@ class LinuxProviderSchemaTests(unittest.TestCase):
         self.assertFalse(accepts_const(graphics, []))
         self.assertFalse(accepts_const(graphics, ["opengl", "metal"]))
         self.assertFalse(accepts_const(graphics, ["metal"]))
+
+
+class LinuxConsoleRunnerPreflightTests(unittest.TestCase):
+    def test_root_owned_readonly_tools_are_allowed_and_direct_version_is_validated(self):
+        runner = runner_module()
+        inputs = runner.parse_closed_args(runner_args())
+        fs = FakeFileSystem(inputs)
+        for path in (inputs.cli, inputs.compiler, inputs.materialized_root,
+                     inputs.materialized_root / inputs.wine_relative,
+                     inputs.materialized_root / inputs.wineserver_relative):
+            fs.put(path, fs.inspect(path).kind, 0o755, uid=0)
+        try:
+            checked = runner.preflight(inputs, FakePlatform(), fs)
+        except ValueError as error:
+            self.fail(f"trusted root-owned tool rejected: {error}")
+        self.assertIsNotNone(checked)
+        self.assert_preflight_rejects(replace(inputs, declared_version="vbad"), fs)
+
+    def test_exclusive_roots_created_only_after_full_preflight(self):
+        runner = runner_module()
+        inputs = runner.parse_closed_args(runner_args())
+        fs = FakeFileSystem(inputs)
+        checked = runner.preflight(inputs, FakePlatform(), fs)
+        self.assertEqual(fs.created, [])
+        created = runner.create_exclusive_roots(checked, fs)
+        self.assertIsNotNone(created)
+        self.assertEqual(fs.created, [(p, 0o700) for p in checked.roots])
+        self.assertEqual(fs.commands, [])
+
+    def test_creation_refuses_changed_ancestor_and_rolls_back_owned_roots(self):
+        runner = runner_module()
+        inputs = runner.parse_closed_args(runner_args())
+        fs = FakeFileSystem(inputs)
+        checked = runner.preflight(inputs, FakePlatform(), fs)
+        fs.aliases[inputs.storage_root] = ROOT / "changed"
+        with self.assertRaises(ValueError):
+            runner.create_exclusive_roots(checked, fs)
+        self.assertEqual(fs.created, [])
+
+    def test_physical_aliases_between_all_root_pairs_are_rejected(self):
+        runner = runner_module()
+        inputs = runner.parse_closed_args(runner_args())
+        paths = (ROOT, inputs.runtime_store_root, inputs.storage_root,
+                 inputs.materialized_root, inputs.evidence_root)
+        for index, left in enumerate(paths):
+            for right in paths[index + 1:]:
+                for suffix in ((), ("child",)):
+                    fs = FakeFileSystem(inputs)
+                    fs.aliases[right] = left.joinpath(*suffix)
+                    with self.subTest(left=left, right=right, suffix=suffix):
+                        self.assert_preflight_rejects(inputs, fs)
+
+    def test_parser_does_not_silently_normalize_path_components(self):
+        runner = runner_module()
+        base = runner_args()[1].replace("\\", "/")
+        for value in (base + "/", base + "/./child", base + "//child", base + "/../child"):
+            args = runner_args()
+            args[1] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                runner.parse_closed_args(args)
+
+    def test_every_root_pair_lexical_equal_ancestor_descendant_is_rejected(self):
+        runner = runner_module()
+        original = runner.parse_closed_args(runner_args())
+        fields = ("repository_root", "runtime_store_root", "storage_root",
+                  "materialized_root", "evidence_root")
+        for index, left in enumerate(fields):
+            for right in fields[index + 1:]:
+                for relation in ("equal", "ancestor", "descendant"):
+                    inputs = original
+                    fs = FakeFileSystem(inputs)
+                    base = getattr(fs if left == "repository_root" else inputs, left)
+                    other = base if relation == "equal" else (
+                        base.parent if relation == "ancestor" else base / "child")
+                    inputs = replace(inputs, **{right: other})
+                    if right == "materialized_root":
+                        fs.put(other, "directory")
+                        fs.put(other / inputs.wine_relative, "file")
+                        fs.put(other / inputs.wineserver_relative, "file")
+                    with self.subTest(left=left, right=right, relation=relation):
+                        self.assert_preflight_rejects(inputs, fs)
+
+    def assert_preflight_rejects(self, inputs, filesystem, platform=None):
+        with self.assertRaises(ValueError):
+            runner_module().preflight(inputs, platform or FakePlatform(), filesystem)
+        self.assertEqual(filesystem.created, [])
+        self.assertEqual(filesystem.commands, [])
+
+    def test_host_and_executable_preflight_before_any_side_effect(self):
+        runner = runner_module()
+        inputs = runner.parse_closed_args(runner_args())
+        for platform in (FakePlatform("Windows"), FakePlatform("Darwin"),
+                         FakePlatform(machine="aarch64")):
+            self.assert_preflight_rejects(inputs, FakeFileSystem(inputs), platform)
+        for field in ("cli", "compiler"):
+            for kind, mode, uid, symlink in (("missing", 0o700, 1000, False),
+                    ("directory", 0o700, 1000, False), ("file", 0o600, 1000, False),
+                    ("file", 0o777, 1000, False), ("file", 0o700, 2000, False),
+                    ("file", 0o700, 1000, True)):
+                fs = FakeFileSystem(inputs)
+                path = getattr(inputs, field)
+                if kind == "missing":
+                    fs.nodes.pop(path)
+                else:
+                    fs.put(path, kind, mode, uid, symlink)
+                with self.subTest(field=field, kind=kind, mode=mode, uid=uid, symlink=symlink):
+                    self.assert_preflight_rejects(inputs, fs)
+
+    def test_materialized_entrypoints_and_all_new_roots_are_checked(self):
+        runner = runner_module()
+        inputs = runner.parse_closed_args(runner_args())
+        for path in (inputs.materialized_root,
+                     inputs.materialized_root / inputs.wine_relative,
+                     inputs.materialized_root / inputs.wineserver_relative):
+            fs = FakeFileSystem(inputs)
+            fs.nodes.pop(path)
+            self.assert_preflight_rejects(inputs, fs)
+        fs = FakeFileSystem(inputs)
+        fs.put(inputs.materialized_root, "file")
+        self.assert_preflight_rejects(inputs, fs)
+        for field in ("runtime_store_root", "storage_root", "evidence_root"):
+            fs = FakeFileSystem(inputs)
+            fs.put(getattr(inputs, field), "directory")
+            self.assert_preflight_rejects(inputs, fs)
+        fs = FakeFileSystem(inputs)
+        fs.put(inputs.storage_root / "bottles" / "linux-console-preview" / "prefix", "directory")
+        self.assert_preflight_rejects(inputs, fs)
+
+    def test_closed_parser_requires_every_flag_exactly_once(self):
+        runner = runner_module()
+        args = runner_args()
+        for invalid in ([], args[:-2], args + args[:2], args + ["extra"],
+                        args + ["--unknown", "x"], ["--cli=x"] + args[2:]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                runner.parse_closed_args(invalid)
+        parsed = runner.parse_closed_args(args)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.cli, Path(args[1]))
+        self.assertEqual(str(parsed.wine_relative), "bin/wine64")
+
+    def test_parser_rejects_unsafe_path_spelling_and_version(self):
+        runner = runner_module()
+        for flag, values in (
+            ("--cli", ["relative", "", "a\0b"]),
+            ("--wine", ["/wine", "../wine", "a/../wine", "a//wine", "./wine", "a\\wine", "C:wine", "wine/", ""]),
+            ("--wineserver", ["/server", "../server"]),
+            ("--version", ["", "v10", "1 bad", "1\n2", "1" * 129]),
+        ):
+            for value in values:
+                args = runner_args()
+                args[args.index(flag) + 1] = value
+                with self.subTest(flag=flag, value=value), self.assertRaises(ValueError):
+                    runner.parse_closed_args(args)
+
+    def test_runner_module_exists(self) -> None:
+        self.assertTrue(
+            (ROOT / "tools" / "run_linux_console_preview.py").is_file(),
+            "Linux Console preview runner is missing",
+        )
+
+
+class EvidencePrimitiveTests(unittest.TestCase):
+    def test_symlink_json_read_is_rejected_before_open(self):
+        store = self.runner.EvidenceStore(self.root)
+        with mock.patch.object(Path, "is_symlink", return_value=True), \
+                mock.patch.object(self.runner.os, "open") as opened:
+            with self.assertRaises(ValueError):
+                store.read_json("private-context.json")
+        opened.assert_not_called()
+
+    def test_fstat_failure_closes_descriptor_without_claiming_unknown_file_ownership(self):
+        store = self.runner.EvidenceStore(self.root)
+        opened_descriptors = []
+        real_open = os.open
+        def capture(*args):
+            descriptor = real_open(*args)
+            opened_descriptors.append(descriptor)
+            def close_if_open():
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self.addCleanup(close_if_open)
+            return descriptor
+        with mock.patch.object(self.runner.os, "open", side_effect=capture), \
+                mock.patch.object(self.runner.os, "fstat", side_effect=OSError("metadata")):
+            with self.assertRaises(OSError):
+                store.write_json("private-context.json", {})
+        with self.assertRaises(OSError):
+            os.fstat(opened_descriptors[0])
+
+    def test_pre_marker_rollback_removes_owned_empty_roots_but_preserves_caller_data(self):
+        runner = self.runner
+        fs = runner.NativeFileSystem()
+        fresh = self.root.parent / "fresh"
+        identity = fs.mkdir_exclusive(fresh)
+        roots = runner.CreatedRoots((fresh,), ((fresh, identity),))
+        store = runner.EvidenceStore(fresh, created_roots=roots, filesystem=fs)
+        store.write_json("private-context.json", {})
+        store.rollback_setup()
+        self.assertFalse(fresh.exists())
+        self.assertTrue(self.root.exists())
+
+    def test_nonzero_product_status_is_failure_even_if_callback_returns_normally(self):
+        store = self.runner.EvidenceStore(self.root)
+        store.write_json("private-context.json", {})
+        finalized = []
+        def product():
+            return self.runner.CommandResult(7, b"", b"", 101, 101)
+        with self.assertRaises(self.runner.CommandFailure):
+            store.run_product(self.root / "private-context.json", self.root.parent / "prefix",
+                              "sha256:" + "a" * 64, product, finalized.append)
+        self.assertEqual(finalized, [True])
+
+    def setUp(self):
+        self.runner = runner_module()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve() / "evidence"
+        self.root.mkdir(mode=0o700)
+
+    def test_exclusive_private_artifact_is_fsynced_and_not_overwritten(self):
+        store = self.runner.EvidenceStore(self.root)
+        with mock.patch.object(self.runner.os, "open", wraps=os.open) as opened, \
+                mock.patch.object(self.runner.os, "fsync", wraps=os.fsync) as synced:
+            store.write_json("private-context.json", {"fixed": True})
+            self.assertTrue((self.root / "private-context.json").is_file())
+            self.assertTrue(synced.called)
+            flags = opened.call_args.args[1]
+            self.assertTrue(flags & os.O_EXCL)
+            self.assertEqual(opened.call_args.args[2], 0o600)
+        with self.assertRaises(FileExistsError):
+            store.write_json("private-context.json", {})
+        self.assertEqual(store.read_json("private-context.json"), {"fixed": True})
+
+    def test_closed_names_and_bounded_json_reads(self):
+        store = self.runner.EvidenceStore(self.root)
+        for name in ("../private-context.json", "other.json", "public-summary.json"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                store.write_json(name, {})
+        store.write_json("private-context.json", {"a": "x" * 20})
+        with self.assertRaises(ValueError):
+            store.read_json("private-context.json", limit=10)
+
+    def test_write_and_sync_failure_remove_only_own_partial_file(self):
+        for operation in ("write", "fsync"):
+            with self.subTest(operation=operation):
+                store = self.runner.EvidenceStore(self.root)
+                with mock.patch.object(self.runner.os, operation, side_effect=OSError("injected")):
+                    with self.assertRaises(OSError):
+                        store.write_json("private-context.json", {})
+                self.assertFalse((self.root / "private-context.json").exists())
+
+    def test_fsynced_marker_precedes_product_and_finalizer_runs_on_success(self):
+        store = self.runner.EvidenceStore(self.root)
+        store.write_json("private-context.json", {})
+        calls = []
+        def product():
+            self.assertTrue((self.root / "run-start.json").is_file())
+            calls.append("product")
+            return 42
+        result = store.run_product(self.root / "private-context.json", self.root.parent / "prefix",
+                                   "sha256:" + "a" * 64, product,
+                                   lambda failed: calls.append(("finalizer", failed)))
+        self.assertEqual(result, 42)
+        self.assertEqual(calls, ["product", ("finalizer", False)])
+
+    def test_post_marker_failure_preserves_one_private_failure_and_no_summary(self):
+        store = self.runner.EvidenceStore(self.root)
+        store.write_json("private-context.json", {})
+        finalized = []
+        def fail():
+            raise RuntimeError("secret /absolute/path")
+        with self.assertRaises(RuntimeError):
+            store.run_product(self.root / "private-context.json", self.root.parent / "prefix",
+                              "sha256:" + "a" * 64, fail, finalized.append)
+        self.assertEqual(finalized, [True])
+        record = store.read_json("failure.json")
+        self.assertEqual(record, {"schemaVersion": "1", "reason": "execution"})
+        self.assertEqual(len(list(self.root.glob("failure*"))), 1)
+        self.assertFalse((self.root / "public-summary.json").exists())
+
+    def test_marker_sync_failure_rolls_back_before_product(self):
+        store = self.runner.EvidenceStore(self.root)
+        store.write_json("private-context.json", {})
+        calls = []
+        with mock.patch.object(self.runner.os, "fsync", side_effect=OSError("injected")):
+            with self.assertRaises(OSError):
+                store.run_product(self.root / "private-context.json", self.root.parent / "prefix",
+                                  "sha256:" + "a" * 64, lambda: calls.append("product"), calls.append)
+        self.assertEqual(calls, [])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_finalizer_failure_is_sticky_and_records_private_failure(self):
+        store = self.runner.EvidenceStore(self.root)
+        store.write_json("private-context.json", {})
+        def fail_finalizer(failed):
+            raise RuntimeError("cleanup")
+        with self.assertRaises(RuntimeError):
+            store.run_product(self.root / "private-context.json", self.root.parent / "prefix",
+                              "sha256:" + "a" * 64, lambda: 0, fail_finalizer)
+        self.assertEqual(store.read_json("failure.json")["reason"], "cleanup")
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        self.now += 0.001
+        return self.now
+
+
+class FakeCommandAdapter:
+    def __init__(self, chunks=(), failure=None):
+        self.chunks = list(chunks) + [("stdout", b""), ("stderr", b"")]
+        self.failure = failure
+        self.actions = []
+        self.started = []
+
+    def start(self, spec):
+        self.started.append(spec)
+        return SimpleNamespace(pid=101, process_group_id=101)
+
+    def readiness(self, running, timeout):
+        if self.failure == "timeout":
+            return []
+        return [self.chunks[0][0]] if self.chunks else []
+
+    def apply(self, action, running):
+        self.actions.append(action.kind)
+        if self.failure == action.kind:
+            raise OSError("injected " + action.kind)
+        if action.kind == "read":
+            stream, chunk = self.chunks.pop(0)
+            if len(chunk) > action.size:
+                self.chunks.insert(0, (stream, chunk[action.size:]))
+            return chunk[:action.size]
+        if action.kind == "reap":
+            return 0
+        if action.kind == "group":
+            return self.failure == "group-live"
+
+    def exited(self, running):
+        return not self.chunks
+
+    def close(self, running):
+        self.actions.append("close")
+
+
+class BoundedCommandStateMachineTests(unittest.TestCase):
+    def test_spurious_readiness_is_not_eof_or_read_failure(self):
+        runner = runner_module()
+        adapter = FakeCommandAdapter([("stdout", b"ok")])
+        apply = adapter.apply
+        seen = []
+        def would_block_once(action, running):
+            if action.kind == "read" and not seen:
+                seen.append(True)
+                return None
+            return apply(action, running)
+        adapter.apply = would_block_once
+        spec = SimpleNamespace(argv=(str(Path(sys.executable).resolve()),), environment={},
+                               cwd=ROOT, output_limit_bytes=8, deadline=1.0)
+        try:
+            result = runner.run_bounded(spec, adapter, None, FakeClock())
+        except runner.CommandFailure as error:
+            self.fail(f"would-block readiness was treated as {error.reason}")
+        self.assertEqual(result.stdout, b"ok")
+
+    def test_cleanup_does_not_signal_after_reap_and_respects_absolute_deadline(self):
+        runner = runner_module()
+        adapter = FakeCommandAdapter(failure="group-live")
+        clock = FakeClock()
+        spec = SimpleNamespace(argv=(str(Path(sys.executable).resolve()),), environment={},
+                               cwd=ROOT, output_limit_bytes=8, deadline=1.0)
+        with self.assertRaises(runner.CommandFailure) as caught:
+            runner.run_bounded(spec, adapter, None, clock)
+        self.assertEqual(caught.exception.outer_cleanup_status.state, "TimedOut")
+        self.assertLess(clock.now, 1.01)
+        self.assertLess(adapter.actions.index("kill"), adapter.actions.index("reap"))
+        self.assertEqual(adapter.actions.count("kill"), 1)
+
+    def test_readiness_failure_still_kills_and_reaps_outer_group(self):
+        runner = runner_module()
+        adapter = FakeCommandAdapter()
+        adapter.readiness = mock.Mock(side_effect=OSError("readiness"))
+        spec = SimpleNamespace(argv=(str(Path(sys.executable).resolve()),), environment={},
+                               cwd=ROOT, output_limit_bytes=8, deadline=1.0)
+        with self.assertRaises(Exception) as caught:
+            runner.run_bounded(spec, adapter, None, FakeClock())
+        self.assertEqual(getattr(caught.exception, "reason", None), "read")
+        self.assertIn("kill", adapter.actions)
+        self.assertIn("reap", adapter.actions)
+
+    def test_invalid_command_spec_does_not_spawn(self):
+        runner = runner_module()
+        valid = dict(argv=(str(Path(sys.executable).resolve()),), environment={},
+                     cwd=ROOT, output_limit_bytes=8, deadline=1.0)
+        for field, value in (("argv", ("python",)), ("argv", ()),
+                             ("environment", None), ("cwd", Path("relative")),
+                             ("output_limit_bytes", 1024 * 1024 + 1),
+                             ("deadline", float("inf")), ("deadline", -1.0)):
+            adapter = FakeCommandAdapter()
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                runner.run_bounded(SimpleNamespace(**(valid | {field: value})), adapter, None, FakeClock())
+            self.assertEqual(adapter.started, [])
+
+    def command(self, chunks=(), failure=None, observer=None, cap=8):
+        runner = runner_module()
+        spec = SimpleNamespace(argv=(str(Path(sys.executable).resolve()), "-c", "pass"),
+                               environment={}, cwd=ROOT, output_limit_bytes=cap, deadline=1.0)
+        adapter = FakeCommandAdapter(chunks, failure)
+        result = runner.run_bounded(spec, adapter, observer, FakeClock())
+        return result, adapter
+
+    def test_normal_eof_exit_and_exact_cap(self):
+        for chunks in ([], [("stdout", b"12345678")], [("stdout", b"1234"), ("stderr", b"5678")]):
+            with self.subTest(chunks=chunks):
+                result, adapter = self.command(chunks)
+                self.assertIsNotNone(result)
+                self.assertEqual(result.return_code, 0)
+                self.assertEqual(result.stdout, b"".join(c for s, c in chunks if s == "stdout"))
+                self.assertEqual(result.stderr, b"".join(c for s, c in chunks if s == "stderr"))
+                self.assertIn("reap", adapter.actions)
+                self.assertIn("group", adapter.actions)
+
+    def test_overflow_no_newline_and_combined_budget_preserve_bounded_partial_bytes(self):
+        for chunks in ([("stdout", b"x" * 9)], [("stdout", b"x" * 10000)],
+                       [("stdout", b"1234"), ("stderr", b"56789")]):
+            with self.subTest(chunks=chunks), self.assertRaises(Exception) as caught:
+                self.command(chunks)
+            error = getattr(caught, "exception", None)
+            self.assertIsNotNone(error)
+            self.assertEqual(getattr(error, "reason", None), "output-limit")
+            self.assertEqual(len(error.partial_stdout) + len(error.partial_stderr), 8)
+            self.assertEqual(error.outer_cleanup_status.state, "Complete")
+            self.assertEqual(error.outer_pid, 101)
+            self.assertEqual(error.outer_process_group_id, 101)
+            self.assertFalse(hasattr(error, "inner_cleanup_status"))
+
+    def test_timeout_observer_and_read_failure_are_distinct_and_cleanup_outer_only(self):
+        class FailingObserver:
+            def on_chunk(self, stream, chunk):
+                raise ValueError("private-observer-details")
+        for fault, observer, reason in (("timeout", None, "timeout"),
+                                        ("read", None, "read"),
+                                        (None, FailingObserver(), "observer")):
+            with self.subTest(fault=fault, reason=reason), self.assertRaises(Exception) as caught:
+                self.command([("stdout", b"partial")], fault, observer)
+            error = getattr(caught, "exception", None)
+            self.assertIsNotNone(error)
+            self.assertEqual(getattr(error, "reason", None), reason)
+            self.assertEqual(error.outer_cleanup_status.state, "Complete")
+            if observer:
+                self.assertEqual(error.partial_stdout, b"partial")
+
+    def test_outer_kill_reap_and_group_failures_are_permanently_unsuccessful(self):
+        for fault, state, stage in (("kill", "Failed", "kill"),
+                                    ("reap", "Failed", "reap"),
+                                    ("group", "Failed", "group"),
+                                    ("group-live", "TimedOut", "group")):
+            with self.subTest(fault=fault), self.assertRaises(Exception) as caught:
+                self.command([("stdout", b"123456789")], fault)
+            error = getattr(caught, "exception", None)
+            self.assertIsNotNone(error)
+            self.assertEqual(getattr(error, "reason", None), "output-limit")
+            self.assertEqual(error.outer_cleanup_status.state, state)
+            self.assertEqual(error.outer_cleanup_status.stage, stage)
+
+
+@unittest.skipUnless(sys.platform == "linux", "requires native Linux selectors and process groups")
+class LinuxBoundedCommandIntegrationTests(unittest.TestCase):
+    def command(self, source, cap=1024, duration=3.0):
+        runner = runner_module()
+        return runner.run_bounded(
+            runner.CommandSpec((str(Path(sys.executable).resolve()), "-S", "-c", source),
+                               {}, ROOT, cap, time.monotonic() + duration),
+            runner.LinuxCommandAdapter(), None, time.monotonic)
+
+    def test_native_success_nonzero_and_empty_environment(self):
+        result = self.command("import os; print(os.environ.get('HOME','absent')); raise SystemExit(7)")
+        self.assertEqual(result.stdout, b"absent\n")
+        self.assertEqual(result.return_code, 7)
+
+    def test_native_exact_cap_and_nonnewline_overflow(self):
+        self.assertEqual(self.command("import os; os.write(1,b'x'*8)", 8).stdout, b"x" * 8)
+        with self.assertRaises(runner_module().CommandFailure) as caught:
+            self.command("import os; os.write(1,b'x'*100000)", 8)
+        self.assertEqual(caught.exception.reason, "output-limit")
+        self.assertEqual(caught.exception.outer_cleanup_status.state, "Complete")
+
+    def test_native_timeout_and_descendant_held_pipe_are_bounded(self):
+        for source in ("import time; time.sleep(30)",
+                       "import os,time; child=os.fork(); time.sleep(30) if child==0 else None"):
+            start = time.monotonic()
+            with self.assertRaises(runner_module().CommandFailure) as caught:
+                self.command(source, duration=1.5)
+            self.assertEqual(caught.exception.reason, "timeout")
+            self.assertLess(time.monotonic() - start, 2.0)
+
+
+@unittest.skipUnless(sys.platform == "linux", "requires Linux permissions and symlinks")
+class LinuxPhysicalPreflightIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = runner_module()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.materialized = self.base / "wine"
+        self.materialized.mkdir(mode=0o700)
+        for name in ("wine64", "wineserver", "cli", "compiler"):
+            path = self.materialized / name
+            path.write_bytes(b"controlled non-executing preflight fixture")
+            path.chmod(0o700)
+        self.inputs = self.runner.RunnerInputs(
+            self.materialized / "cli", self.materialized / "compiler",
+            self.base / "runtime", self.base / "storage", self.materialized,
+            self.base / "evidence", self.runner.PurePosixPath("wine64"),
+            self.runner.PurePosixPath("wineserver"), "10.0")
+
+    def test_physical_alias_and_nearest_existing_ancestor(self):
+        fs = self.runner.NativeFileSystem()
+        alias = self.base / "alias"
+        alias.symlink_to(self.materialized, target_is_directory=True)
+        result = fs.nearest_existing_ancestor(alias / "missing" / "child")
+        self.assertEqual(result.destination, self.materialized / "missing" / "child")
+        inputs = replace(self.inputs, evidence_root=alias / "missing" / "child")
+        with self.assertRaises(ValueError):
+            self.runner.preflight(inputs, self.runner.NativePlatform(), fs)
+        self.assertFalse(self.inputs.runtime_store_root.exists())
+
+    def test_executable_mode_and_exclusive_root_modes(self):
+        fs = self.runner.NativeFileSystem()
+        self.inputs.cli.chmod(0o600)
+        with self.assertRaises(ValueError):
+            self.runner.preflight(self.inputs, self.runner.NativePlatform(), fs)
+        self.inputs.cli.chmod(0o700)
+        checked = self.runner.preflight(self.inputs, self.runner.NativePlatform(), fs)
+        created = self.runner.create_exclusive_roots(checked, fs)
+        for root in created.roots:
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(root.stat().st_uid, os.getuid())
+
+    def test_private_evidence_mode_symlink_and_fifo_refusal(self):
+        self.inputs.evidence_root.mkdir(mode=0o700)
+        store = self.runner.EvidenceStore(self.inputs.evidence_root)
+        store.write_json("private-context.json", {})
+        target = self.inputs.evidence_root / "private-context.json"
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        link = self.inputs.evidence_root / "request.json"
+        link.symlink_to(target)
+        with self.assertRaises(OSError):
+            store.write_json("request.json", {})
+        with self.assertRaises(ValueError):
+            store.read_json("request.json")
+        fifo = self.inputs.evidence_root / "inspection.json"
+        os.mkfifo(fifo)
+        with self.assertRaises(ValueError):
+            store.read_json("inspection.json")
+        self.inputs.evidence_root.chmod(0o755)
+        with self.assertRaises(ValueError):
+            self.runner.EvidenceStore(self.inputs.evidence_root)
 
 
 if __name__ == "__main__":
