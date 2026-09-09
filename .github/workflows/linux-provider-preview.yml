@@ -1,0 +1,141 @@
+name: Linux Provider synthetic preview
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/linux-provider-target
+      CF_FIXTURE_ROOT: ${{ runner.temp }}/linux-provider-fixture
+      CF_BUILD_ROOT: ${{ runner.temp }}/linux-provider-build
+      CF_EVIDENCE_ROOT: ${{ runner.temp }}/linux-provider-evidence
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Run Linux schema and native contracts
+        run: python3 -S -B -m unittest tests.test_linux_provider_contracts -v
+      - name: Validate repository contracts
+        run: python3 -B scripts/validate_repository.py
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build release CLI
+        run: cargo build -p compatforge-cli --release --locked
+      - name: Compile real ET_EXEC and ET_DYN version-only helpers
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir "$CF_BUILD_ROOT" "$CF_EVIDENCE_ROOT"
+          cc -std=c11 -Wall -Wextra -Werror -fno-pie -no-pie -DCF_STUB_WINE \
+            tests/fixtures/linux_provider_stub.c -o "$CF_BUILD_ROOT/wine"
+          cc -std=c11 -Wall -Wextra -Werror -fPIE -pie -DCF_STUB_WINESERVER \
+            tests/fixtures/linux_provider_stub.c -o "$CF_BUILD_ROOT/wineserver"
+          python3 -S -B scripts/create_linux_provider_fixture.py \
+            "$CF_FIXTURE_ROOT" "$CF_BUILD_ROOT/wine" "$CF_BUILD_ROOT/wineserver"
+      - name: Install synthetic Pack and probe explicit Provider
+        run: |
+          set -euo pipefail
+          umask 077
+          CF_CLI="$CARGO_TARGET_DIR/release/compatforge-cli"
+          "$CF_CLI" runtime install "$CF_FIXTURE_ROOT/store" "$CF_FIXTURE_ROOT/bundle" manifest.json \
+            > "$CF_EVIDENCE_ROOT/install.json"
+          "$CF_CLI" provider linux probe "$CF_FIXTURE_ROOT/provider.json" \
+            > "$CF_EVIDENCE_ROOT/probe.json"
+          mkdir "$CF_FIXTURE_ROOT/provider-storage"
+          "$CF_CLI" provider linux context "$CF_FIXTURE_ROOT/provider.json" "$CF_FIXTURE_ROOT/provider-storage" \
+            > "$CF_EVIDENCE_ROOT/provider-context.json"
+      - name: Bootstrap a separate new local Store and Storage
+        run: |
+          set -euo pipefail
+          umask 077
+          test ! -e "$CF_FIXTURE_ROOT/bootstrap-store"
+          test ! -e "$CF_FIXTURE_ROOT/bootstrap-storage"
+          "$CARGO_TARGET_DIR/release/compatforge-cli" local linux context "$CF_FIXTURE_ROOT/bootstrap.json" \
+            "$CF_EVIDENCE_ROOT/private-context.json" > "$CF_EVIDENCE_ROOT/bootstrap-receipt.json"
+      - name: Assert synthetic receipts and private context wiring
+        run: |
+          set -euo pipefail
+          python3 -S -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+
+          root = Path(os.environ["CF_FIXTURE_ROOT"])
+          evidence = Path(os.environ["CF_EVIDENCE_ROOT"])
+          expected = json.loads((root / "expected-digests.json").read_text())
+          read = lambda name: json.loads((evidence / name).read_text())
+          install = read("install.json")
+          assert install == {"schemaVersion": "1", "packId": expected["packId"],
+                             "digest": expected["packDigest"], "activated": True, "reusedObjects": 0}
+          receipt = read("bootstrap-receipt.json")
+          assert receipt == {"schemaVersion": "1", "source": "explicit-override", "version": "11.0",
+                             "architecture": "x86_64", "packId": expected["bootstrapPackId"],
+                             "packDigest": expected["bootstrapPackDigest"], "capabilities": ["guest-x86_64"]}
+
+          def check_report(report, provider_id):
+              assert report["schemaVersion"] == "1"
+              assert report["host"]["os"] == "linux" and report["host"]["architecture"] == "x86_64"
+              for collection, identity, version, capabilities in (
+                  ("runtimeProviders", provider_id, "11.0", ["guest-x86_64"]),
+                  ("translators", "native-host", "host", ["x86_64-on-x86_64"]),
+                  ("graphicsBackends", "linux-wined3d", "11.0", ["opengl"]),
+              ):
+                  matches = [item for item in report[collection] if item["id"] == identity]
+                  assert len(matches) == 1
+                  item = matches[0]
+                  assert item["available"] is True and item["version"] == version
+                  assert item["capabilities"] == capabilities and not item.get("reason")
+
+          check_report(read("probe.json"), expected["packId"])
+          for filename, provider_id, pack_id, pack_digest, storage in (
+              ("provider-context.json", expected["packId"], expected["packId"], expected["packDigest"], "provider-storage"),
+              ("private-context.json", "wine-linux-x86-64-preview", expected["bootstrapPackId"],
+               expected["bootstrapPackDigest"], "bootstrap-storage"),
+          ):
+              config = read(filename)
+              assert set(config) == {"schemaVersion", "capabilities", "runtimeBindings", "storageRoot", "sandboxProfile", "supervisor"}
+              assert config["schemaVersion"] == "1" and config["sandboxProfile"] == "desktop"
+              assert config["storageRoot"] == str(root / storage)
+              check_report(config["capabilities"], provider_id)
+              wine, server = (str(root / "materialized/bin" / role) for role in ("wine", "wineserver"))
+              assert config["runtimeBindings"] == [{
+                  "providerId": provider_id, "packId": pack_id, "packDigest": pack_digest,
+                  "executable": wine, "wineserverExecutable": server,
+                  "environment": {
+                      "COMPATFORGE_RUNTIME_PACK": pack_id,
+                      "COMPATFORGE_RUNTIME_PACK_DIGEST": pack_digest,
+                      "COMPATFORGE_RUNTIME_EXECUTABLE_SHA256": expected["wineDigest"],
+                      "COMPATFORGE_WINESERVER_EXECUTABLE_SHA256": expected["wineserverDigest"],
+                      "WINEDEBUG": "-all", "WINESERVER": server, "WINEARCH": "win64",
+                      "WINEDLLOVERRIDES": "mscoree,mshtml=",
+                  },
+              }]
+          for role, key in (("wine", "wineDigest"), ("wineserver", "wineserverDigest")):
+              assert "sha256:" + hashlib.sha256((root / "materialized/bin" / role).read_bytes()).hexdigest() == expected[key]
+          assert stat.S_IMODE((evidence / "private-context.json").stat().st_mode) == 0o600
+          print("Synthetic ELF probe, Pack association, and CLI wiring passed; Guest execution is not validated.")
+          PY

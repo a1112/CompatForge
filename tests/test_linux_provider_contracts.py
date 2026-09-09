@@ -9,6 +9,11 @@ import tempfile
 import time
 import hashlib
 import copy
+import struct
+import subprocess
+import shutil
+import ast
+import textwrap
 from unittest import mock
 from dataclasses import replace
 from types import SimpleNamespace
@@ -1669,6 +1674,265 @@ class LinuxPreviewProcIntegrationTests(unittest.TestCase):
                 mock.patch.object(processes, "_read", side_effect=PermissionError("hidepid")):
             with self.assertRaises(PermissionError):
                 processes.observe(123, Path("/fixed-prefix"))
+
+
+class LinuxProviderCiContractTests(unittest.TestCase):
+    def workflow(self):
+        path = ROOT / ".github/workflows/linux-provider-preview.yml"
+        self.assertTrue(path.is_file(), "dedicated Ubuntu workflow is missing")
+        return path.read_text(encoding="utf-8")
+
+    def test_dedicated_workflow_and_fixture_sources_exist(self):
+        for name in (".github/workflows/linux-provider-preview.yml",
+                     "tests/fixtures/linux_provider_stub.c",
+                     "scripts/create_linux_provider_fixture.py"):
+            with self.subTest(name=name):
+                self.assertTrue((ROOT / name).is_file(), f"missing Task14 source: {name}")
+
+    def test_workflow_reuses_pins_and_offline_toolchain_gates(self):
+        workflow = self.workflow()
+        baseline = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        for action in ("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+                       "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+                       "dtolnay/rust-toolchain@stable"):
+            self.assertIn(action, baseline)
+            self.assertIn(action, workflow)
+        for value in ('python-version: "3.12"', "components: clippy,rustfmt",
+                      "runs-on: ubuntu-latest", "contents: read",
+                      "python3 -S -B -m unittest tests.test_linux_provider_contracts -v",
+                      "python3 -B scripts/validate_repository.py",
+                      "cargo fmt --all --check", "cargo check --workspace --all-targets --locked",
+                      "cargo test --workspace --locked",
+                      "cargo clippy --workspace --all-targets --locked -- -D warnings",
+                      "cargo build -p compatforge-cli --release --locked"):
+            self.assertIn(value, workflow)
+
+    def test_workflow_only_runs_synthetic_probe_wiring_outside_checkout(self):
+        workflow = self.workflow()
+        for value in ('CARGO_TARGET_DIR: ${{ runner.temp }}/linux-provider-target',
+                      'CF_FIXTURE_ROOT: ${{ runner.temp }}/linux-provider-fixture',
+                      'CF_BUILD_ROOT: ${{ runner.temp }}/linux-provider-build',
+                      'CF_EVIDENCE_ROOT: ${{ runner.temp }}/linux-provider-evidence',
+                      'cc -std=c11 -Wall -Wextra -Werror', '-fno-pie -no-pie', '-fPIE -pie',
+                      'scripts/create_linux_provider_fixture.py', 'runtime install',
+                      'provider linux probe', 'provider linux context', 'local linux context',
+                      'bootstrap-store', 'bootstrap-storage', 'private-context.json'):
+            self.assertIn(value, workflow)
+        self.assertNotRegex(workflow, r"(?im)\b(?:apt|apt-get|brew|curl|wget|prepared-launch)\b")
+        self.assertNotRegex(workflow, r"(?i)(?:install\s+wine|download.*runtime|runtime.*download)")
+        self.assertNotRegex(workflow, r"(?m)^\s*(?:CARGO_TARGET_DIR|CF_\w+ROOT):.*(?:github.workspace|\./|\$PWD)")
+        self.assertNotIn("-o target/", workflow)
+
+    def test_workflow_receipt_assertion_accepts_real_native_descriptor_shape(self):
+        script = self.workflow().split("python3 -S -B - <<'PY'\n", 1)[1].rsplit("\n          PY", 1)[0]
+        parsed = ast.parse(textwrap.dedent(script))
+        function = next(node for node in parsed.body if isinstance(node, ast.FunctionDef) and node.name == "check_report")
+        namespace = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "workflow-check-report", "exec"), namespace)
+        report = {"schemaVersion": "1", "host": {"os": "linux", "architecture": "x86_64", "osVersion": "6.8.0"},
+                  "runtimeProviders": [{"id": "wine-linux-ci", "version": "11.0", "available": True,
+                                        "capabilities": ["guest-x86_64"]}],
+                  "translators": [{"id": "native-host", "version": "host", "available": True,
+                                   "capabilities": ["x86_64-on-x86_64"]}],
+                  "graphicsBackends": [{"id": "linux-wined3d", "version": "11.0", "available": True,
+                                        "capabilities": ["opengl"]}]}
+        namespace["check_report"](report, "wine-linux-ci")
+        report["runtimeProviders"][0]["available"] = False
+        with self.assertRaises(AssertionError):
+            namespace["check_report"](report, "wine-linux-ci")
+
+
+class LinuxProviderFixtureTests(unittest.TestCase):
+    def generator(self):
+        path = ROOT / "scripts/create_linux_provider_fixture.py"
+        self.assertTrue(path.is_file(), "external fixture generator is missing")
+        spec = importlib.util.spec_from_file_location("linux_provider_fixture", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def inputs(self, parent):
+        # Serialization-only ELF headers; native tests below compile real helpers.
+        paths = []
+        for name, kind in (("wine-input", 2), ("server-input", 3)):
+            header = bytearray(64)
+            header[:7] = b"\x7fELF\x02\x01\x01"
+            struct.pack_into("<HHI", header, 16, kind, 62, 1)
+            struct.pack_into("<H", header, 52, 64)
+            path = parent / name
+            path.write_bytes(header)
+            paths.append(path)
+        return paths
+
+    def test_generator_writes_closed_two_component_bundle_and_separate_bootstrap(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            wine, server = self.inputs(parent)
+            root = parent / "fixture"
+            generator.create_fixture(root, wine, server)
+            read = lambda name: json.loads((root / name).read_text(encoding="utf-8"))
+            manifest, provider, bootstrap, expected = map(read, (
+                "bundle/manifest.json", "provider.json", "bootstrap.json", "expected-digests.json"))
+            self.assertEqual(set(manifest), {"schemaVersion", "id", "version", "channel", "host",
+                                             "components", "capabilities", "digest"})
+            self.assertEqual(manifest["host"], {"os": "linux", "architecture": "x86_64"})
+            self.assertEqual(manifest["capabilities"], ["guest-x86_64"])
+            self.assertEqual([c["name"] for c in manifest["components"]],
+                             ["wine-entrypoint", "wineserver-entrypoint"])
+            for component, role, source in zip(manifest["components"], ("wine", "wineserver"), (wine, server)):
+                self.assertEqual(set(component), {"name", "version", "license", "artifact", "digest", "entrypoints"})
+                self.assertEqual(component["entrypoints"], {role: f"bin/{role}"})
+                self.assertEqual((root / "bundle" / component["artifact"]).read_bytes(), source.read_bytes())
+                self.assertEqual((root / "materialized/bin" / role).read_bytes(), source.read_bytes())
+                self.assertEqual(component["digest"], "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest())
+            unsigned = {k: v for k, v in manifest.items() if k != "digest"}
+            digest = "sha256:" + hashlib.sha256(json.dumps(unsigned, separators=(",", ":")).encode()).hexdigest()
+            self.assertEqual(manifest["digest"], digest)
+            self.assertEqual(set(provider), {"schemaVersion", "runtimeStoreRoot", "wineRuntime"})
+            self.assertEqual(set(provider["wineRuntime"]), {
+                "providerId", "packId", "packDigest", "version", "architecture", "materializedRoot",
+                "wine", "wineserver", "capabilities", "wined3dCapabilities"})
+            self.assertEqual(provider["wineRuntime"]["packDigest"], digest)
+            self.assertEqual(provider["wineRuntime"]["wined3dCapabilities"], ["opengl"])
+            self.assertEqual(set(bootstrap), {"schemaVersion", "runtimeStoreRoot", "storageRoot",
+                                             "materializedRoot", "wine", "wineserver", "version"})
+            self.assertEqual(bootstrap["runtimeStoreRoot"], str(root / "bootstrap-store"))
+            self.assertEqual(bootstrap["storageRoot"], str(root / "bootstrap-storage"))
+            self.assertNotEqual(bootstrap["runtimeStoreRoot"], provider["runtimeStoreRoot"])
+            self.assertFalse((root / "bootstrap-store").exists())
+            self.assertFalse((root / "bootstrap-storage").exists())
+            self.assertEqual(set(expected), {"schemaVersion", "packId", "packDigest", "wineDigest",
+                                           "wineserverDigest", "bootstrapPackId", "bootstrapPackDigest"})
+            self.assertEqual(expected["packDigest"], digest)
+            for key in ("packDigest", "wineDigest", "wineserverDigest", "bootstrapPackDigest"):
+                self.assertRegex(expected[key], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual((root / "materialized/compatforge-linux-provider-fixture.marker").read_bytes(),
+                             b"COMPATFORGE_LINUX_PROVIDER_FIXTURE_V1\n")
+
+    def test_bundle_and_expected_digests_are_deterministic_across_external_roots(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            inputs = self.inputs(parent)
+            for name in ("one", "two"):
+                generator.create_fixture(parent / name, *inputs)
+            for name in ("bundle/manifest.json", "expected-digests.json"):
+                self.assertEqual((parent / "one" / name).read_bytes(), (parent / "two" / name).read_bytes())
+
+    def test_existing_nonempty_root_is_preserved_and_empty_root_is_allowed(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            inputs = self.inputs(parent)
+            root = parent / "fixture"
+            root.mkdir()
+            generator.create_fixture(root, *inputs)
+            original = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            with self.assertRaises((ValueError, FileExistsError)):
+                generator.create_fixture(root, *inputs)
+            self.assertEqual(original, {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+
+    def test_refuses_repository_relative_and_invalid_inputs_before_creation(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            wine, server = self.inputs(parent)
+            for root in (ROOT / "task14-must-not-exist", Path("relative-fixture")):
+                with self.subTest(root=root), self.assertRaises(ValueError):
+                    generator.create_fixture(root, wine, server)
+                self.assertFalse(root.exists())
+            for invalid in (parent / "missing", parent):
+                root = parent / "invalid-output"
+                with self.subTest(invalid=invalid), self.assertRaises((ValueError, OSError)):
+                    generator.create_fixture(root, invalid, server)
+                self.assertFalse(root.exists())
+            wine.write_bytes(b"not an ELF")
+            with self.assertRaises(ValueError):
+                generator.create_fixture(parent / "invalid-output", wine, server)
+            self.assertFalse((parent / "invalid-output").exists())
+
+    def test_refuses_wrong_elf_class_architecture_and_role(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            wine, server = self.inputs(parent)
+            original = wine.read_bytes()
+            for offset, value in ((4, 1), (5, 2), (16, 3), (18, 3), (52, 0)):
+                with self.subTest(offset=offset):
+                    data = bytearray(original)
+                    data[offset] = value
+                    wine.write_bytes(data)
+                    with self.assertRaises(ValueError):
+                        generator.create_fixture(parent / "invalid-output", wine, server)
+                    self.assertFalse((parent / "invalid-output").exists())
+
+    def test_nonregular_input_is_rejected_before_opening(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            _, server = self.inputs(parent)
+            with mock.patch.object(generator.os, "open", side_effect=AssertionError("must not open special input")):
+                with self.assertRaises(ValueError):
+                    generator.create_fixture(parent / "output", parent, server)
+
+
+@unittest.skipUnless(sys.platform == "linux", "real ELF execution requires Linux")
+class LinuxProviderFixtureNativeTests(unittest.TestCase):
+    generator = LinuxProviderFixtureTests.generator
+    inputs = LinuxProviderFixtureTests.inputs
+    def test_real_elf_stub_enforces_role_arguments_cwd_and_clean_environment(self):
+        generator = self.generator()
+        compiler = shutil.which("cc")
+        self.assertIsNotNone(compiler, "Ubuntu fixture gate requires the existing cc compiler")
+        source = ROOT / "tests/fixtures/linux_provider_stub.c"
+        self.assertTrue(source.is_file(), "Linux fixture C source is missing")
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            wine, server = parent / "wine-input", parent / "server-input"
+            for output, flags, role in ((wine, ["-fno-pie", "-no-pie"], "CF_STUB_WINE"),
+                                        (server, ["-fPIE", "-pie"], "CF_STUB_WINESERVER")):
+                subprocess.run([compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", *flags,
+                                "-D" + role, str(source), "-o", str(output)], check=True,
+                               capture_output=True, timeout=30)
+            self.assertEqual(struct.unpack_from("<H", wine.read_bytes(), 16)[0], 2)
+            self.assertEqual(struct.unpack_from("<H", server.read_bytes(), 16)[0], 3)
+            root = parent / "fixture"
+            generator.create_fixture(root, wine, server)
+            cwd = root / "materialized"
+            environment = {"LANG": "C", "LC_ALL": "C", "WINEDEBUG": "-all"}
+            for role, stdout, stderr in (("wine", b"wine-11.0\n", b""),
+                                         ("wineserver", b"", b"Wine 11.0\n")):
+                executable = cwd / "bin" / role
+                run = lambda args, env, directory: subprocess.run([str(executable), *args],
+                    cwd=directory, env=env, capture_output=True, timeout=5)
+                result = run(["--version"], environment, cwd)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, stdout, stderr))
+                for args in ([], ["guest.exe"], ["--version", "extra"]):
+                    self.assertNotEqual(run(args, environment, cwd).returncode, 0)
+                self.assertNotEqual(run(["--version"], environment, parent).returncode, 0)
+                for key in ("LANG", "LC_ALL", "WINEDEBUG", "PATH", "HOME"):
+                    invalid = dict(environment, **{key: "wrong"})
+                    self.assertNotEqual(run(["--version"], invalid, cwd).returncode, 0)
+                for key in environment:
+                    invalid = {k: v for k, v in environment.items() if k != key}
+                    self.assertNotEqual(run(["--version"], invalid, cwd).returncode, 0)
+            (cwd / "compatforge-linux-provider-fixture.marker").write_bytes(b"wrong\n")
+            self.assertNotEqual(run(["--version"], environment, cwd).returncode, 0)
+
+    def test_symlink_inputs_and_output_ancestors_are_refused(self):
+        generator = self.generator()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            wine, server = self.inputs(parent)
+            alias = parent / "wine-alias"
+            alias.symlink_to(wine)
+            with self.assertRaises(ValueError):
+                generator.create_fixture(parent / "output", alias, server)
+            (parent / "alias").symlink_to(parent, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                generator.create_fixture(parent / "alias/output", wine, server)
+            self.assertFalse((parent / "output").exists())
 
 
 if __name__ == "__main__":
