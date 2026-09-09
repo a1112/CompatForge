@@ -7,6 +7,8 @@ import sys
 import os
 import tempfile
 import time
+import hashlib
+import copy
 from unittest import mock
 from dataclasses import replace
 from types import SimpleNamespace
@@ -1048,6 +1050,527 @@ class LinuxPhysicalPreflightIntegrationTests(unittest.TestCase):
         self.inputs.evidence_root.chmod(0o755)
         with self.assertRaises(ValueError):
             self.runner.EvidenceStore(self.inputs.evidence_root)
+
+
+class PreviewHarness:
+    """Only the process boundary is synthetic; parsing, files and policy are real."""
+    def __init__(self, case, fault=None):
+        self.r = runner_module()
+        self.fault = fault
+        temporary = tempfile.TemporaryDirectory()
+        case.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        materialized = self.base / "wine"
+        materialized.mkdir()
+        for name in ("cli", "compiler", "wine64", "wineserver"):
+            (materialized / name).write_bytes(name.encode())
+        self.inputs = self.r.RunnerInputs(materialized / "cli", materialized / "compiler",
+            self.base / "runtime", self.base / "storage", materialized,
+            self.base / "evidence", self.r.PurePosixPath("wine64"),
+            self.r.PurePosixPath("wineserver"), "10.0")
+        self.paths = self.r.EvidencePaths(self.inputs.evidence_root)
+        self.clock = FakeClock()
+        self.calls = []
+        self.io = []
+        self.signals = []
+        self.platform = FakePlatform()
+        self.host_display_detected = True
+        self.observed = False
+        self.pid = 321
+        self.identity = self.r.Verified(self.pid, 1000, 1234, self.prefix)
+        harness = self
+        class Files(self.r.NativeFileSystem):
+            def inspect(self, path):
+                result = super().inspect(path)
+                return replace(result, mode=0o700, uid=1000) if result.exists else result
+            def record_io(self, operation, path):
+                harness.io.append((operation, path))
+        self.fs = Files()
+        self.expected = ["PROC_OBSERVER_SELF_TEST", "COMPILE_GUEST", "INSPECT_GUEST",
+            "BOOTSTRAP_CONTEXT", "PREPARED_PLAN_PRE", "PREPARED_LAUNCH",
+            "PREPARED_PLAN_POST", "WINESERVER_VERSION", "WINESERVER_WAIT"]
+
+    @property
+    def prefix(self):
+        return self.inputs.storage_root / "bottles" / "linux-console-preview" / "prefix"
+
+    def digest(self, path):
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def receipt(self):
+        return {"schemaVersion": "1", "source": "explicit-override", "version": "10.0",
+                "architecture": "x86_64", "packId": "wine-linux-x86-64-local-preview",
+                "packDigest": "sha256:" + "a" * 64, "capabilities": ["guest-x86_64"]}
+
+    def context(self):
+        receipt = self.receipt()
+        return {"schemaVersion": "1", "storageRoot": str(self.inputs.storage_root),
+            "capabilities": {"schemaVersion": "1", "host": {"os": "linux", "osVersion": "controlled", "architecture": "x86_64"},
+                "runtimeProviders": [{"id": "wine-linux-x86-64-preview", "kind": "wine", "version": "10.0", "available": True, "capabilities": ["guest-x86_64"]}],
+                "translators": [{"id": "native-host", "kind": "native", "version": "host", "available": True, "capabilities": ["x86_64-on-x86_64"]}],
+                "graphicsBackends": [{"id": "linux-wined3d", "kind": "wined3d", "version": "10.0", "available": True, "capabilities": ["opengl"]}]},
+            "runtimeBindings": [{"providerId": "wine-linux-x86-64-preview",
+                "packId": receipt["packId"], "packDigest": receipt["packDigest"],
+                "executable": str(self.inputs.materialized_root / "wine64"),
+                "wineserverExecutable": str(self.inputs.materialized_root / "wineserver"),
+                "environment": {"COMPATFORGE_RUNTIME_PACK": receipt["packId"],
+                    "COMPATFORGE_RUNTIME_PACK_DIGEST": receipt["packDigest"],
+                    "COMPATFORGE_RUNTIME_EXECUTABLE_SHA256": self.digest(self.inputs.materialized_root / "wine64"),
+                    "COMPATFORGE_WINESERVER_EXECUTABLE_SHA256": self.digest(self.inputs.materialized_root / "wineserver"),
+                    "WINEDEBUG": "-all", "WINESERVER": str(self.inputs.materialized_root / "wineserver"),
+                    "WINEARCH": "win64", "WINEDLLOVERRIDES": "mscoree,mshtml="}}],
+            "sandboxProfile": "desktop", "supervisor": {"terminationGraceMilliseconds": 1000}}
+
+    def plan(self):
+        receipt = self.receipt()
+        digest = self.digest(self.paths.guest)
+        stored = self.inputs.storage_root / "guest-artifacts" / "objects" / "sha256" / digest[7:]
+        return {"schemaVersion": "1", "requestId": self.r.REQUEST_ID,
+            "runtime": {"provider": "wine", "packId": receipt["packId"], "packDigest": receipt["packDigest"]},
+            "translator": {"provider": "native"}, "graphics": {"backend": "wined3d"},
+            "process": {"executable": str(self.inputs.materialized_root / "wine64"),
+                "arguments": [str(stored)], "environment": self.context()["runtimeBindings"][0]["environment"] | {"WINEPREFIX": str(self.prefix)},
+                "workingDirectory": str(self.prefix)},
+            "guestArtifact": {"digest": digest, "sizeBytes": self.paths.guest.stat().st_size,
+                "storedPath": str(stored), "originalName": self.paths.guest.name,
+                "architecture": "x86_64", "imageKind": "executable", "subsystem": "windowsConsole", "inspectionSchemaVersion": "1"},
+            "sandbox": {"profile": "desktop", "network": "deny", "allowDevices": []},
+            "lifecycle": {"maximumRuntimeMilliseconds": 60000, "terminationGraceMilliseconds": 1000,
+                "wineserver": {"executable": str(self.inputs.materialized_root / "wineserver"), "prefix": str(self.prefix)}}}
+
+    def events(self):
+        values = [{"kind": "started", "processId": self.pid},
+            {"kind": "output", "output": {"stream": "stdout", "text": "COMPATFORGE_WINDOWS_CONSOLE_OK\n"}},
+            {"kind": "wine-server-stop-requested"},
+            {"kind": "exited", "exit": {"code": 0, "success": True}}]
+        if self.fault == "missing-marker": values[1]["output"]["text"] = ""
+        if self.fault == "duplicate-marker": values[1]["output"]["text"] *= 2
+        if self.fault == "stderr-marker": values[1]["output"]["stream"] = "stderr"
+        if self.fault == "nonzero-exit": values[-1]["exit"] = {"code": 7, "success": False}
+        if self.fault == "failure-event": values[2] = {"kind": "failed", "message": "private /secret"}
+        if self.fault == "missing-ack": values.pop(2)
+        if self.fault == "second-started": values.insert(1, {"kind": "started", "processId": self.pid})
+        if self.fault == "event-after-exit": values.append({"kind": "output", "output": {"stream": "stdout", "text": "late"}})
+        for index, value in enumerate(values):
+            value.update(schemaVersion="1", requestId=self.r.REQUEST_ID, sequence=index, elapsedMilliseconds=index)
+        if self.fault == "gapped-events": values[-1]["sequence"] += 1
+        return b"".join(json.dumps(value).encode() + b"\n" for value in values)
+
+    def run(self, kind, spec, observer=None):
+        name = kind.name
+        self.calls.append((name, spec))
+        # A success fixture rejects any unexpected command immediately.
+        if self.fault is None:
+            assert name == self.expected[len(self.calls) - 1], (name, self.calls)
+        assert Path(spec.argv[0]).is_absolute()
+        assert spec.cwd.is_absolute()
+        assert not any(key in spec.environment for key in ("PATH", "HOME", "DISPLAY", "XDG_DATA_HOME"))
+        assert spec.deadline <= 300.01
+        output = b""
+        code = 0
+        if name == "PROC_OBSERVER_SELF_TEST":
+            observer.on_chunk("stdout", b"322\n")
+            if self.fault == "self-test": raise ValueError("helper not visible")
+        elif name == "COMPILE_GUEST":
+            self.paths.guest.write_bytes(b"controlled synthetic PE bytes")
+            if self.fault == "compiler": code = 1
+            if self.fault == "compiler-warning": return self.r.CommandResult(0, b"", b"warning", 900, 900)
+            if self.fault == "missing-pe": self.paths.guest.unlink()
+        elif name == "INSPECT_GUEST":
+            value = {"schemaVersion": "1", "fileDigest": self.digest(self.paths.guest),
+                "fileSizeBytes": self.paths.guest.stat().st_size, "format": "pe32Plus", "architecture": "x86_64",
+                "machineCode": 0x8664, "imageKind": "executable", "subsystem": "windowsConsole",
+                "subsystemCode": 3, "entryPointRva": 4096, "sections": [], "importLibraries": []}
+            if self.fault == "inspection": value["architecture"] = "x86"
+            output = json.dumps(value).encode()
+        elif name == "BOOTSTRAP_CONTEXT":
+            value = self.context()
+            if self.fault == "bootstrap": value["runtimeBindings"][0]["packDigest"] = "sha256:" + "b" * 64
+            self.paths.bootstrap_context.write_text(json.dumps(value), encoding="utf-8")
+            output = json.dumps(self.receipt()).encode()
+        elif name in ("PREPARED_PLAN_PRE", "PREPARED_PLAN_POST"):
+            value = self.plan()
+            if self.fault == "pre-plan" and name.endswith("PRE"): value["translator"]["provider"] = "qemu"
+            if self.fault == "plan-mismatch" and name.endswith("POST"): value["decisionTrace"] = ["changed"]
+            if self.fault == "reserve" and name.endswith("PRE"): self.clock.now = 256
+            if self.fault == "pre-input" and name.endswith("PRE"): self.paths.execution_context.write_text("{}")
+            output = json.dumps(value).encode()
+        elif name == "PREPARED_LAUNCH":
+            assert (self.paths.root / "run-start.json").is_file()
+            assert spec.deadline <= 255.01
+            if self.fault == "abort-before-started":
+                raise self.r.CommandFailure("read", b"", b"", 900, 900, self.r.OuterCleanupStatus("Complete", "none"))
+            output = b"bad-json\n" if self.fault == "malformed-events" else self.events()
+            for start in range(0, len(output), 13): observer.on_chunk("stdout", output[start:start + 13])
+            if self.fault in ("abort-after-started", "outer-cleanup", "overflow", "deadline"):
+                if self.fault == "deadline": self.clock.now = 256
+                raise self.r.CommandFailure("output-limit" if self.fault == "overflow" else "timeout", output, b"", 900, 900,
+                    self.r.OuterCleanupStatus("Failed", "group") if self.fault == "outer-cleanup" else self.r.OuterCleanupStatus("Complete", "none"))
+            if self.fault == "post-input": self.paths.launch_request.write_text("{}")
+            if self.fault == "server-drift": (self.inputs.materialized_root / "wineserver").write_bytes(b"replaced")
+            if self.fault == "cli-ack": code = 1
+        elif name == "WINESERVER_VERSION": return self.r.CommandResult(0, b"", b"Wine 10.0\n", 900, 900)
+        elif name == "WINESERVER_WAIT":
+            if self.fault == "wait-failure": code = 1
+            if self.fault == "wait-timeout": raise self.r.CommandFailure("timeout", b"", b"", 900, 900, self.r.OuterCleanupStatus("Complete", "none"))
+        elif name != "WINESERVER_KILL": raise AssertionError(name)
+        return self.r.CommandResult(code, output, b"", 900, 900)
+
+    def observe(self, pid, prefix):
+        if prefix != self.prefix: return self.r.Verified(pid, 1000, 1234, prefix)
+        if self.fault in ("quick-exit", "zombie"): return self.r.ExitedBeforeSnapshot(pid)
+        if self.fault == "hidden-proc": raise PermissionError("hidden /proc")
+        if self.observed and self.fault == "disappeared-leader": return self.r.ExitedBeforeSnapshot(pid)
+        if self.observed and self.fault == "changed-start": return replace(self.identity, start_time_ticks=9999)
+        if self.fault == "prefix-mismatch": return replace(self.identity, canonical_prefix=prefix.parent)
+        self.observed = True
+        return self.identity
+
+    def exact_prefix_processes(self, prefix):
+        if prefix != self.prefix: return []
+        if self.fault == "hidden-scan": raise PermissionError("hidden /proc")
+        return [self.pid] if self.fault == "live-prefix" else []
+
+    def group_exists(self, pid):
+        if pid != self.pid: return False
+        return self.fault in ("live-group", "quick-live-group")
+
+    def signal_verified_group(self, identity, signum):
+        if identity.canonical_prefix == self.prefix:
+            self.signals.append((identity, signum))
+
+    def execute(self):
+        return self.r.execute_preview(self.inputs, self.paths, self, self, self.fs, self.clock)
+
+
+class LinuxConsoleRunnerExecutionTests(unittest.TestCase):
+    def test_post_plan_outer_cleanup_failure_remains_distinct(self):
+        h = self.harness("post-plan-outer")
+        run = h.run
+        def fail_post_plan(kind, spec, observer=None):
+            if kind.name == "PREPARED_PLAN_POST":
+                h.calls.append((kind.name, spec))
+                raise h.r.CommandFailure("read", b"", b"", 901, 901, h.r.OuterCleanupStatus("Failed", "reap"))
+            return run(kind, spec, observer)
+        h.run = fail_post_plan
+        result = h.execute()
+        self.assertFalse(result.success)
+        self.assertFalse(result.finalizer.outer_cleanup)
+        self.assertTrue(result.finalizer.wineserver_cleanup)
+
+    def test_server_command_outer_failure_is_not_inner_cleanup(self):
+        h = self.harness("server-outer")
+        run = h.run
+        def fail_wait(kind, spec, observer=None):
+            if kind.name == "WINESERVER_WAIT":
+                h.calls.append((kind.name, spec))
+                raise h.r.CommandFailure("read", b"", b"", 902, 902, h.r.OuterCleanupStatus("Failed", "reap"))
+            return run(kind, spec, observer)
+        h.run = fail_wait
+        result = h.execute()
+        self.assertFalse(result.success)
+        self.assertFalse(result.finalizer.outer_cleanup)
+        self.assertTrue(result.finalizer.inner_group_cleanup)
+
+    def test_private_json_duplicate_nonfinite_and_oversize_fail_closed(self):
+        for payload in ('{"schemaVersion":"1","schemaVersion":"1"}', '{"value":NaN}', '[]', 'x' * (1024 * 1024 + 1)):
+            with self.subTest(payload=payload[:40]):
+                h = self.harness("bad-context")
+                run = h.run
+                def invalid_context(kind, spec, observer=None):
+                    result = run(kind, spec, observer)
+                    if kind.name == "BOOTSTRAP_CONTEXT": h.paths.bootstrap_context.write_text(payload)
+                    return result
+                h.run = invalid_context
+                self.assertFalse(h.execute().success)
+                self.assertFalse((h.paths.root / "run-start.json").exists())
+
+    def test_version_stream_shape_is_exact_and_failure_never_publishes(self):
+        for stdout, stderr in ((b"Wine 10.0\n", b""), (b"", b"Wine 10.0 \n"), (b"", b"Wine 11.0\n")):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                h = self.harness("version-shape")
+                run = h.run
+                def invalid_version(kind, spec, observer=None):
+                    result = run(kind, spec, observer)
+                    return replace(result, stdout=stdout, stderr=stderr) if kind.name == "WINESERVER_VERSION" else result
+                h.run = invalid_version
+                self.assertFalse(h.execute().success)
+                self.assertFalse(h.paths.public_summary.exists())
+
+    def test_public_summary_validator_rejects_private_and_unknown_values(self):
+        r = runner_module()
+        self.assertTrue(callable(getattr(r, "validate_public_summary", None)), "closed public summary validator missing")
+        h = self.harness()
+        self.assertTrue(h.execute().success)
+        summary = json.loads(h.paths.public_summary.read_text())
+        r.validate_public_summary(summary)
+        for field, value in (("extra", "/secret"), ("runtimeVersion", str(h.paths.guest)),
+                ("runtimeEventKinds", [{"path": "/secret"}]), ("guestDigest", "failure.json"),
+                ("runtimePackId", r.REQUEST_ID), ("planCorrelation", "saved-plan-executed")):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                r.validate_public_summary(summary | {field: value})
+
+    def test_verified_abnormal_group_gets_bounded_term_then_kill(self):
+        h = self.harness("abort-after-started")
+        live = [True]
+        h.group_exists = lambda pid: pid == h.pid and live[0]
+        def signal_group(identity, signum):
+            if identity.canonical_prefix == h.prefix:
+                h.signals.append((identity, signum))
+                if signum == 9: live[0] = False
+        h.signal_verified_group = signal_group
+        self.assertFalse(h.execute().success)
+        self.assertEqual([signum for _, signum in h.signals], [15, 9])
+        self.assertGreaterEqual(h.clock.now, 0.5)
+
+    def test_proc_running_state_change_does_not_change_identity(self):
+        r = runner_module()
+        processes = r.NativeProcView()
+        processes.platform = FakePlatform()
+        prefix = ROOT.parent / "fixed-prefix"
+        with mock.patch.object(processes, "_stat", side_effect=[(1000, b"S", 321, 1234), (1000, b"R", 321, 1234)]), \
+                mock.patch.object(processes, "_read", return_value=os.fsencode("WINEPREFIX=" + str(prefix)) + b"\0"):
+            try:
+                observed = processes.observe(321, prefix)
+            except OSError:
+                self.fail("normal scheduling-state change was rejected as identity drift")
+        self.assertEqual(observed, r.Verified(321, 1000, 1234, prefix))
+
+    def test_unavailable_or_drifted_capabilities_fail_before_marker(self):
+        for provider, field, value in (("runtimeProviders", "available", False),
+                ("runtimeProviders", "capabilities", ["arbitrary"]), ("translators", "kind", "qemu"),
+                ("graphicsBackends", "version", "11.0")):
+            with self.subTest(provider=provider, field=field):
+                h = self.harness("capabilities")
+                context = h.context
+                def drift():
+                    value_context = context()
+                    value_context["capabilities"][provider][0][field] = value
+                    return value_context
+                h.context = drift
+                self.assertFalse(h.execute().success)
+                self.assertFalse((h.paths.root / "run-start.json").exists())
+
+    def test_premarker_failed_command_output_is_removed(self):
+        for fault in ("compiler", "compiler-warning", "bootstrap"):
+            with self.subTest(fault=fault):
+                h = self.failure(fault, False)
+                self.assertFalse(h.paths.guest.exists())
+                self.assertFalse(h.paths.bootstrap_context.exists())
+
+    def test_abnormal_server_drift_prevents_all_signalling(self):
+        h = self.harness("server-drift")
+        run = h.run
+        def fail_after_mutation(kind, spec, observer=None):
+            result = run(kind, spec, observer)
+            if kind.name == "PREPARED_LAUNCH":
+                raise h.r.CommandFailure("read", result.stdout, b"", 900, 900, h.r.OuterCleanupStatus("Complete", "none"))
+            return result
+        h.run = fail_after_mutation
+        h.group_exists = lambda pid: pid == h.pid
+        self.assertFalse(h.execute().success)
+        self.assertEqual(h.signals, [])
+        self.assertFalse(any(name.startswith("WINESERVER_") for name, _ in h.calls))
+
+    def test_server_is_rehashed_before_every_invocation(self):
+        for after in ("WINESERVER_VERSION", "WINESERVER_KILL"):
+            with self.subTest(after=after):
+                h = self.harness("abort-before-started")
+                run = h.run
+                def replace_server(kind, spec, observer=None):
+                    result = run(kind, spec, observer)
+                    if kind.name == after:
+                        (h.inputs.materialized_root / "wineserver").write_bytes(b"replacement")
+                    return result
+                h.run = replace_server
+                self.assertFalse(h.execute().success)
+                self.assertNotIn("WINESERVER_WAIT", [name for name, _ in h.calls])
+
+    def test_marker_durable_close_failure_still_finalizes(self):
+        h = self.harness("marker-close")
+        close = h.r.os.close
+        failed = False
+        def fail_marker_close(descriptor):
+            nonlocal failed
+            close(descriptor)
+            if (h.paths.root / "run-start.json").exists() and not failed:
+                failed = True
+                raise OSError("injected close")
+        with mock.patch.object(h.r.os, "close", side_effect=fail_marker_close):
+            result = h.execute()
+        self.assertFalse(result.success)
+        self.assertEqual([name for name, _ in h.calls][-3:], ["WINESERVER_VERSION", "WINESERVER_KILL", "WINESERVER_WAIT"])
+        self.assertTrue(h.paths.private_failure.exists())
+
+    def test_final_input_rehash_and_summary_write_failures_cannot_publish(self):
+        for fault in ("final-cli-drift", "summary-sync"):
+            with self.subTest(fault=fault):
+                h = self.harness(fault)
+                run = h.run
+                def mutate_after_wait(kind, spec, observer=None):
+                    result = run(kind, spec, observer)
+                    if kind.name == "WINESERVER_WAIT" and fault == "final-cli-drift":
+                        h.inputs.cli.write_bytes(b"changed")
+                    return result
+                h.run = mutate_after_wait
+                original_write = h.r.EvidenceStore._write_payload
+                def fail_summary(store, name, payload, **kwargs):
+                    if name == "public-summary.json":
+                        with mock.patch.object(h.r.os, "fsync", side_effect=OSError("disk failure")):
+                            return original_write(store, name, payload, **kwargs)
+                    return original_write(store, name, payload, **kwargs)
+                with mock.patch.object(h.r.EvidenceStore, "_write_payload", new=fail_summary) if fault == "summary-sync" else mock.patch.object(h.r.EvidenceStore, "_write_payload", new=original_write):
+                    self.assertFalse(h.execute().success)
+                self.assertFalse(h.paths.public_summary.exists())
+                self.assertTrue(h.paths.private_failure.exists())
+
+    def harness(self, fault=None):
+        self.assertTrue(callable(getattr(runner_module(), "execute_preview", None)),
+                        "Task13 execute_preview orchestration is missing")
+        return PreviewHarness(self, fault)
+
+    def failure(self, fault, started):
+        h = self.harness(fault)
+        result = h.execute()
+        self.assertFalse(result.success, fault)
+        self.assertIn(result.category, {"contract", "integrity", "unsupported-host", "test-infrastructure", "execution", "cleanup"})
+        self.assertFalse(h.paths.public_summary.exists(), fault)
+        names = [name for name, _ in h.calls]
+        if started:
+            self.assertTrue((h.paths.root / "run-start.json").exists(), fault)
+            self.assertEqual(len(list(h.paths.root.glob("failure*"))), 1, fault)
+            failure = json.loads(h.paths.private_failure.read_text())
+            self.assertNotIn(str(h.base), json.dumps(failure))
+            if fault != "server-drift":
+                self.assertIn("WINESERVER_VERSION", names, fault)
+                self.assertIn("WINESERVER_WAIT", names, fault)
+        else:
+            self.assertNotIn("WINESERVER_VERSION", names, fault)
+            self.assertFalse((h.paths.root / "run-start.json").exists(), fault)
+        return h
+
+    def test_success_runs_exact_nine_commands_and_publishes_last(self):
+        h = self.harness()
+        result = h.execute()
+        self.assertTrue(result.success)
+        self.assertEqual([name for name, _ in h.calls], h.expected)
+        summary = json.loads(h.paths.public_summary.read_text())
+        self.assertEqual(len(summary), 20)
+        self.assertEqual(summary["planCorrelation"], "pre-post-canonical-match")
+        self.assertFalse(summary["displayForwarded"])
+        self.assertFalse(summary["networkIsolationValidated"])
+        self.assertEqual(h.io[-1], ("write", h.paths.public_summary))
+        bootstrap = json.loads(h.paths.bootstrap_context.read_text())
+        execution = json.loads(h.paths.execution_context.read_text())
+        bootstrap["supervisor"]["maximumRuntimeMilliseconds"] = 60000
+        self.assertEqual(bootstrap, execution)
+        request = json.loads(h.paths.launch_request.read_text())
+        self.assertEqual(request["arguments"], [])
+        self.assertEqual(request["environment"], {})
+        self.assertEqual(request["constraints"]["networkPolicy"], "deny")
+        self.assertEqual(h.calls[1][1].argv[1:-3], ("-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", "-Wl,--subsystem,console,--no-insert-timestamp"))
+
+    def test_compiler_or_inspection_failure_is_closed(self):
+        for fault in ("self-test", "compiler", "compiler-warning", "missing-pe", "inspection", "bootstrap", "pre-plan", "reserve"):
+            with self.subTest(fault=fault): self.failure(fault, False)
+
+    def test_immutable_input_or_plan_drift_is_closed(self):
+        self.failure("pre-input", False)
+        for fault in ("post-input", "plan-mismatch", "server-drift"):
+            with self.subTest(fault=fault): self.failure(fault, True)
+
+    def test_malformed_or_adverse_events_are_closed(self):
+        for fault in ("malformed-events", "gapped-events", "missing-marker", "duplicate-marker", "stderr-marker", "nonzero-exit", "failure-event", "missing-ack", "second-started", "event-after-exit", "cli-ack"):
+            with self.subTest(fault=fault): self.failure(fault, True)
+
+    def test_cleanup_failure_is_closed(self):
+        for fault in ("wait-failure", "wait-timeout", "hidden-proc", "hidden-scan", "live-prefix", "live-group", "prefix-mismatch", "outer-cleanup"):
+            with self.subTest(fault=fault): self.failure(fault, True)
+
+    def test_deadline_or_output_failure_runs_failure_finalizer(self):
+        for fault in ("overflow", "deadline", "abort-before-started", "abort-after-started"):
+            with self.subTest(fault=fault):
+                h = self.failure(fault, True)
+                names = [name for name, _ in h.calls]
+                self.assertEqual(names[-3:], ["WINESERVER_VERSION", "WINESERVER_KILL", "WINESERVER_WAIT"])
+                self.assertTrue(all(identity.pid != 900 for identity, _ in h.signals))
+
+    def test_quick_exit_requires_all_independent_cleanup_proofs(self):
+        for fault in ("quick-exit", "zombie", "disappeared-leader"):
+            with self.subTest(fault=fault):
+                h = self.harness(fault)
+                self.assertTrue(h.execute().success)
+                self.assertEqual(h.signals, [])
+        h = self.harness("quick-live-group")
+        h.observe = lambda pid, prefix: h.r.ExitedBeforeSnapshot(pid)
+        self.assertFalse(h.execute().success)
+        self.assertEqual(h.signals, [])
+
+    def test_changed_identity_is_never_signalled(self):
+        h = self.harness("changed-start")
+        run = h.run
+        def abort(kind, spec, observer=None):
+            result = run(kind, spec, observer)
+            if kind.name == "PREPARED_LAUNCH":
+                raise h.r.CommandFailure("read", result.stdout, b"", 900, 900, h.r.OuterCleanupStatus("Complete", "none"))
+            return result
+        h.run = abort
+        self.assertFalse(h.execute().success)
+        self.assertEqual(h.signals, [])
+
+
+@unittest.skipUnless(sys.platform == "linux", "requires native Linux /proc visibility and process groups")
+class LinuxPreviewProcIntegrationTests(unittest.TestCase):
+    def test_native_observer_self_test_stops_reaps_and_proves_disappearance(self):
+        r = runner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            prefix = root / "exact-prefix"
+            clock = time.monotonic
+            processes = r.NativeProcView(clock, clock() + 5)
+            observer = r.ProcSelfTestObserver(processes, prefix)
+            result = r.NativePreviewCommands(clock).run(r.ClosedCommandKind.PROC_OBSERVER_SELF_TEST,
+                r.CommandSpec((str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                    "import os,time; print(os.getpid(),flush=True); time.sleep(30)"),
+                    {"WINEPREFIX": str(prefix)}, root, 1024, clock() + 3), observer)
+            self.assertEqual(result.return_code, -15)
+            self.assertIsNotNone(observer.identity)
+            self.assertFalse(processes.group_exists(observer.identity.pid))
+            self.assertEqual(processes.exact_prefix_processes(prefix), [])
+            self.assertIsInstance(processes.observe(observer.identity.pid, prefix), r.ExitedBeforeSnapshot)
+
+    def test_native_exact_environment_entry_does_not_match_similar_prefix(self):
+        r = runner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            prefix = root / "prefix"
+            processes = r.NativeProcView(time.monotonic, time.monotonic() + 5)
+            observations = []
+            class Observer:
+                def on_chunk(self, stream, chunk):
+                    if stream == "stdout" and b"\n" in chunk:
+                        pid = int(chunk)
+                        observations.append(pid)
+                        selftest.assertIn(pid, processes.exact_prefix_processes(prefix))
+                        selftest.assertNotIn(pid, processes.exact_prefix_processes(root / "pref"))
+                        with selftest.assertRaises(OSError):
+                            processes.observe(pid, root / "pref")
+                        processes.signal_verified_group(processes.observe(pid, prefix), 15)
+            selftest = self
+            r.NativePreviewCommands().run(r.ClosedCommandKind.PROC_OBSERVER_SELF_TEST,
+                r.CommandSpec((str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                    "import os,time; print(os.getpid(),flush=True); time.sleep(30)"),
+                    {"WINEPREFIX": str(prefix)}, root, 1024, time.monotonic() + 3), Observer())
+            self.assertEqual(len(observations), 1)
+
+    def test_native_unreadable_live_environment_is_not_skipped(self):
+        r = runner_module()
+        processes = r.NativeProcView()
+        stat_record = (os.getuid(), b"S", 123, 1234)
+        with mock.patch.object(processes, "_stat", return_value=stat_record), \
+                mock.patch.object(processes, "_read", side_effect=PermissionError("hidepid")):
+            with self.assertRaises(PermissionError):
+                processes.observe(123, Path("/fixed-prefix"))
 
 
 if __name__ == "__main__":
