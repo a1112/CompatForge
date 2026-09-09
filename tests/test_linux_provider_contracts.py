@@ -1742,7 +1742,34 @@ class LinuxProviderCiContractTests(unittest.TestCase):
             namespace["check_report"](report, "wine-linux-ci")
 
 
+def linux_provider_fixture_directory():
+    parent = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
+    if not parent.is_absolute():
+        raise ValueError("Task14 temporary parent must be absolute")
+    parent = parent.resolve()
+    if parent == ROOT or ROOT in parent.parents:
+        raise ValueError("Task14 fixtures must stay outside the checkout")
+    return tempfile.TemporaryDirectory(prefix="compatforge-linux-fixture-", dir=parent)
+
+
 class LinuxProviderFixtureTests(unittest.TestCase):
+    def test_fixture_temp_directory_uses_runner_temp_and_refuses_checkout(self):
+        factory = globals().get("linux_provider_fixture_directory")
+        self.assertTrue(callable(factory), "Task14 external temporary-directory helper is missing")
+        with factory() as directory:
+            parent = Path(directory).resolve()
+            with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(parent)}):
+                with factory() as routed:
+                    self.assertEqual(Path(routed).resolve().parent, parent)
+            for unsafe in (ROOT, ROOT / "must-not-create-task14-temp", Path("relative-temp")):
+                with self.subTest(unsafe=unsafe), mock.patch.dict(os.environ, {"RUNNER_TEMP": str(unsafe)}):
+                    with self.assertRaises(ValueError):
+                        factory()
+            with mock.patch.dict(os.environ):
+                os.environ.pop("RUNNER_TEMP", None)
+                with factory() as fallback:
+                    self.assertEqual(Path(fallback).resolve().parent, Path(tempfile.gettempdir()).resolve())
+
     def generator(self):
         path = ROOT / "scripts/create_linux_provider_fixture.py"
         self.assertTrue(path.is_file(), "external fixture generator is missing")
@@ -1766,7 +1793,7 @@ class LinuxProviderFixtureTests(unittest.TestCase):
 
     def test_generator_writes_closed_two_component_bundle_and_separate_bootstrap(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             wine, server = self.inputs(parent)
             root = parent / "fixture"
@@ -1812,7 +1839,7 @@ class LinuxProviderFixtureTests(unittest.TestCase):
 
     def test_bundle_and_expected_digests_are_deterministic_across_external_roots(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             inputs = self.inputs(parent)
             for name in ("one", "two"):
@@ -1822,7 +1849,7 @@ class LinuxProviderFixtureTests(unittest.TestCase):
 
     def test_existing_nonempty_root_is_preserved_and_empty_root_is_allowed(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             inputs = self.inputs(parent)
             root = parent / "fixture"
@@ -1835,7 +1862,7 @@ class LinuxProviderFixtureTests(unittest.TestCase):
 
     def test_refuses_repository_relative_and_invalid_inputs_before_creation(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             wine, server = self.inputs(parent)
             for root in (ROOT / "task14-must-not-exist", Path("relative-fixture")):
@@ -1854,7 +1881,7 @@ class LinuxProviderFixtureTests(unittest.TestCase):
 
     def test_refuses_wrong_elf_class_architecture_and_role(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             wine, server = self.inputs(parent)
             original = wine.read_bytes()
@@ -1869,7 +1896,7 @@ class LinuxProviderFixtureTests(unittest.TestCase):
 
     def test_nonregular_input_is_rejected_before_opening(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             _, server = self.inputs(parent)
             with mock.patch.object(generator.os, "open", side_effect=AssertionError("must not open special input")):
@@ -1887,7 +1914,7 @@ class LinuxProviderFixtureNativeTests(unittest.TestCase):
         self.assertIsNotNone(compiler, "Ubuntu fixture gate requires the existing cc compiler")
         source = ROOT / "tests/fixtures/linux_provider_stub.c"
         self.assertTrue(source.is_file(), "Linux fixture C source is missing")
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             wine, server = parent / "wine-input", parent / "server-input"
             for output, flags, role in ((wine, ["-fno-pie", "-no-pie"], "CF_STUB_WINE"),
@@ -1922,7 +1949,7 @@ class LinuxProviderFixtureNativeTests(unittest.TestCase):
 
     def test_symlink_inputs_and_output_ancestors_are_refused(self):
         generator = self.generator()
-        with tempfile.TemporaryDirectory() as directory:
+        with linux_provider_fixture_directory() as directory:
             parent = Path(directory).resolve()
             wine, server = self.inputs(parent)
             alias = parent / "wine-alias"
