@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 import hashlib
+import base64
 from pathlib import Path, PurePosixPath
 import os
 import json
@@ -115,6 +116,20 @@ class NativeFileSystem:
             except OSError:
                 # Never recurse into product/caller data during setup rollback.
                 pass
+
+    def verify_private_file(self, path, identity):
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+                             getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != identity
+                    or self.inspect(path).identity != identity
+                    or (sys.platform == "linux" and (info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600))):
+                raise ValueError("nonprivate-compiler-output")
+        finally:
+            os.close(descriptor)
+        getattr(self, "record_io", lambda *args: None)("private-mode", path)
 
 
 @dataclass(frozen=True)
@@ -252,6 +267,7 @@ def create_exclusive_roots(preflight: PreflightResult,
 JSON_LIMIT = 1024 * 1024
 PRIVATE_NAMES = frozenset({"private-context.json", "bootstrap-request.json",
                           "bootstrap-context.json",
+                          "console-preview.exe",
                           "bootstrap-receipt.json", "request.json", "inspection.json",
                           "pre-plan.json", "post-plan.json", "events.jsonl",
                           "command-diagnostics.json", "run-start.json", "failure.json",
@@ -427,6 +443,7 @@ class CommandSpec:
     cwd: Path
     output_limit_bytes: int
     deadline: float
+    creation_umask: int | None = None
 
 
 @dataclass(frozen=True)
@@ -525,6 +542,7 @@ def run_bounded(spec, adapter, observer, clock):
                    or not key or "=" in key or "\0" in key + value
                    for key, value in spec.environment.items())
             or not spec.cwd.is_absolute() or not 0 < spec.output_limit_bytes <= JSON_LIMIT
+            or getattr(spec, "creation_umask", None) not in (None, 0o177)
             or not math.isfinite(spec.deadline) or spec.deadline <= start):
         raise ValueError("invalid-command-spec")
     try:
@@ -622,7 +640,8 @@ class LinuxCommandAdapter:
             process = subprocess.Popen(list(spec.argv), cwd=spec.cwd,
                                        env=dict(spec.environment), stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       start_new_session=True, close_fds=True, bufsize=0)
+                                       start_new_session=True, close_fds=True, bufsize=0,
+                                       umask=spec.creation_umask if spec.creation_umask is not None else -1)
         except BaseException:
             selector.close()
             raise
@@ -920,7 +939,10 @@ class PreviewLaunchObserver:
         self.events.append(event)
 
     def finish(self):
-        if (self.invalid or self.buffer or not self.terminal or self.stdout != CONSOLE_MARKER
+        marker_lines = sum(line in (CONSOLE_MARKER, CONSOLE_MARKER[:-1] + "\r\n")
+                           for line in self.stdout.splitlines(keepends=True))
+        if (self.invalid or self.buffer or not self.terminal or marker_lines != 1
+                or self.stdout.count(CONSOLE_MARKER.rstrip()) != 1
                 or CONSOLE_MARKER.rstrip() in self.stderr):
             raise PreviewFailure("execution")
         return [event["kind"] for event in self.events]
@@ -1043,6 +1065,60 @@ class NativePreviewCommands:
         if not isinstance(kind, ClosedCommandKind):
             raise PreviewFailure("contract")
         return run_bounded(spec, LinuxCommandAdapter(), observer, self.clock)
+
+
+class PreviewCommandJournal:
+    """Bounded private command evidence, independent of event parsing success."""
+
+    def __init__(self, commands):
+        self.commands = commands
+        self.entries = []
+        self.remaining = 256 * 1024
+        self.launch_stdout = b""
+
+    def run(self, kind, spec, observer=None):
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        class Capture:
+            def on_chunk(self, stream, chunk):
+                remaining = JSON_LIMIT - sum(map(len, buffers.values()))
+                buffers[stream].extend(chunk[:remaining])
+                if observer is not None:
+                    observer.on_chunk(stream, chunk)
+        result = None
+        error = None
+        try:
+            result = self.commands.run(kind, spec, Capture() if observer is not None else None)
+            return result
+        except BaseException as caught:
+            error = caught
+            raise
+        finally:
+            if result is not None:
+                stdout, stderr = result.stdout, result.stderr
+                status = OuterCleanupStatus("Complete", "none")
+                reason = "complete" if result.return_code == 0 else "nonzero-exit"
+            elif isinstance(error, CommandFailure):
+                stdout, stderr = error.partial_stdout, error.partial_stderr
+                status = error.outer_cleanup_status
+                reason = error.reason if error.reason in {"start", "read", "observer", "timeout", "output-limit", "outer-cleanup"} else "execution"
+            else:
+                stdout, stderr = bytes(buffers["stdout"]), bytes(buffers["stderr"])
+                status = OuterCleanupStatus("Failed", "start")
+                reason = "observer" if observer is not None else "execution"
+            if kind == ClosedCommandKind.PREPARED_LAUNCH:
+                self.launch_stdout = stdout[:JSON_LIMIT]
+            record = {"commandKind": kind.name, "returnCode": result.return_code if result is not None else None,
+                      "reason": reason, "outerCleanup": {"state": status.state, "stage": status.stage}}
+            for stream, payload in (("stdout", stdout), ("stderr", stderr)):
+                accepted = payload[:min(16384, self.remaining)]
+                self.remaining -= len(accepted)
+                record[stream + "Base64"] = base64.b64encode(accepted).decode("ascii")
+                record[stream + "Truncated"] = len(accepted) != len(payload)
+            if len(self.entries) < 32:
+                self.entries.append(record)
+
+    def document(self):
+        return {"schemaVersion": "1", "commands": self.entries}
 
 
 def _receipt(value, inputs):
@@ -1218,6 +1294,9 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
     outer_complete = True
     failure = None
     outcome = None
+    finalized_abnormally = False
+    journal = PreviewCommandJournal(commands)
+    commands = journal
     snapshots = {}
     guest_identity = None
     bootstrap_identity = None
@@ -1227,10 +1306,14 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
         _check_time(clock, work_deadline)
         try:
             result = commands.run(kind, CommandSpec(tuple(map(str, argv)), environment or {},
-                cwd or inputs.evidence_root, JSON_LIMIT, work_deadline), observer)
+                cwd or inputs.evidence_root, JSON_LIMIT, work_deadline,
+                0o177 if kind == ClosedCommandKind.COMPILE_GUEST else None), observer)
         except CommandFailure as error:
             outer_complete = outer_complete and error.outer_cleanup_status.state == "Complete"
             raise
+        finally:
+            if kind == ClosedCommandKind.PREPARED_LAUNCH:
+                store._write_payload("events.jsonl", journal.launch_stdout)
         if result.return_code != 0:
             raise PreviewFailure("execution")
         return result
@@ -1268,6 +1351,10 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
         except BaseException:
             raise PreviewFailure("test-infrastructure") from None
 
+        # Reserve the exact output privately before handing its pathname to the
+        # compiler. A linker may replace the inode; inspect its produced inode
+        # afterwards rather than incorrectly requiring reservation identity.
+        store._write_payload("console-preview.exe", b"")
         try:
             result = run(ClosedCommandKind.COMPILE_GUEST, (inputs.compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
                 "-Wl,--subsystem,console,--no-insert-timestamp", source, "-o", paths.guest))
@@ -1277,6 +1364,7 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
                 guest_identity = guest_facts.identity
         if result.stdout or result.stderr:
             raise PreviewFailure("execution")
+        filesystem.verify_private_file(paths.guest, guest_identity)
         guest_digest = _hash_file(paths.guest, filesystem, clock, work_deadline, 64 * 1024 * 1024)
         guest_identity = filesystem.inspect(paths.guest).identity
         unchanged(snapshots)
@@ -1319,15 +1407,9 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
         _check_time(clock, work_deadline)
         store._write_json("run-start.json", {"schemaVersion": "1", "context": str(paths.execution_context),
             "prefix": str(prefix), "wineserverDigest": server_digest}, mark_started=True)
-        try:
-            result = run(ClosedCommandKind.PREPARED_LAUNCH,
-                (inputs.cli, "prepared-launch", paths.execution_context, paths.guest, paths.launch_request), observer=observer)
-            store._write_payload("events.jsonl", result.stdout)
-            event_kinds = observer.finish()
-        except CommandFailure as error:
-            outer_complete = error.outer_cleanup_status.state == "Complete"
-            store._write_payload("events.jsonl", error.partial_stdout)
-            raise
+        run(ClosedCommandKind.PREPARED_LAUNCH,
+            (inputs.cli, "prepared-launch", paths.execution_context, paths.guest, paths.launch_request), observer=observer)
+        event_kinds = observer.finish()
         unchanged(input_hashes)
         post_plan = _json(run(ClosedCommandKind.PREPARED_PLAN_POST,
             (inputs.cli, "prepared-plan", paths.execution_context, paths.guest, paths.launch_request)).stdout)
@@ -1340,6 +1422,7 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
         if isinstance(error, ValueError) and str(error) == "unsupported-host": failure = "unsupported-host"
     finally:
         if store is not None and store.started:
+            finalized_abnormally = failure is not None
             outcome, cleanup_category = _finalize(failure is not None, observer, outer_complete,
                 inputs, server_digest, commands, processes, filesystem, clock, deadline)
             if cleanup_category:
@@ -1370,11 +1453,29 @@ def execute_preview(inputs, paths, commands, processes, filesystem, clock):
                 "cleanupStatus": "complete", "consoleValidated": True, "graphicsValidated": False,
                 "runtimeEvidenceScope": "entrypoints-only", "runtimeTreeValidated": False, "networkIsolationValidated": False}
             validate_public_summary(summary)
+            store.write_json("command-diagnostics.json", journal.document())
             store._write_json("public-summary.json", summary)
             return PreviewResult(True, None, outcome)
         except BaseException as error:
             failure = getattr(error, "category", "execution")
     if store is not None and store.started:
+        # A late integrity/publication failure escalates the same transaction
+        # to its abnormal path. Reuse the original absolute deadline and retain
+        # every incomplete earlier cleanup result; never mint another budget.
+        if not finalized_abnormally:
+            late_outcome, cleanup_category = _finalize(True, observer, outer_complete,
+                inputs, server_digest, commands, processes, filesystem, clock, deadline)
+            outcome = FinalizerOutcome(
+                outcome.outer_cleanup and late_outcome.outer_cleanup,
+                outcome.inner_group_cleanup and late_outcome.inner_group_cleanup,
+                outcome.wineserver_cleanup and late_outcome.wineserver_cleanup,
+                outcome.prefix_observation and late_outcome.prefix_observation)
+            failure = failure or cleanup_category
+        try:
+            if paths.root / "command-diagnostics.json" not in store.owned_files:
+                store.write_json("command-diagnostics.json", journal.document())
+        except OSError:
+            failure = "test-infrastructure"
         try:
             store.write_json("failure.json", {"schemaVersion": "1", "reason": failure})
         except OSError:

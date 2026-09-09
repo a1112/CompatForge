@@ -1244,6 +1244,83 @@ class PreviewHarness:
 
 
 class LinuxConsoleRunnerExecutionTests(unittest.TestCase):
+    def test_launch_failure_preserves_transcript_and_bounded_diagnostics(self):
+        for fault in ("cli-ack", "overflow", "abort-after-started", "malformed-events"):
+            with self.subTest(fault=fault):
+                h = self.harness(fault)
+                self.assertFalse(h.execute().success)
+                self.assertTrue(h.paths.events.exists())
+                self.assertGreater(h.paths.events.stat().st_size, 0)
+                diagnostics = h.paths.root / "command-diagnostics.json"
+                self.assertTrue(diagnostics.exists())
+                self.assertLessEqual(diagnostics.stat().st_size, h.r.JSON_LIMIT)
+                self.assertIn("PREPARED_LAUNCH", diagnostics.read_text())
+                self.assertEqual(len(list(h.paths.root.glob("failure*"))), 1)
+                self.assertFalse(h.paths.public_summary.exists())
+
+    def test_late_failure_always_escalates_to_abnormal_finalizer(self):
+        for fault in ("late-hash", "late-summary"):
+            with self.subTest(fault=fault):
+                h = self.harness(fault)
+                run = h.run
+                def late_mutation(kind, spec, observer=None):
+                    result = run(kind, spec, observer)
+                    if kind.name == "WINESERVER_WAIT" and fault == "late-hash": h.inputs.cli.write_bytes(b"changed")
+                    return result
+                h.run = late_mutation
+                original_write = h.r.EvidenceStore._write_payload
+                def fail_summary(store, name, payload, **kwargs):
+                    if name == "public-summary.json" and fault == "late-summary":
+                        with mock.patch.object(h.r.os, "fsync", side_effect=OSError("injected")):
+                            return original_write(store, name, payload, **kwargs)
+                    return original_write(store, name, payload, **kwargs)
+                with mock.patch.object(h.r.EvidenceStore, "_write_payload", new=fail_summary):
+                    self.assertFalse(h.execute().success)
+                self.assertEqual([name for name, _ in h.calls][-3:], ["WINESERVER_VERSION", "WINESERVER_KILL", "WINESERVER_WAIT"])
+                self.assertFalse(h.paths.public_summary.exists())
+
+    def test_console_marker_is_one_complete_lf_or_crlf_line(self):
+        for line in ("COMPATFORGE_WINDOWS_CONSOLE_OK\n", "COMPATFORGE_WINDOWS_CONSOLE_OK\r\n",
+                     "diagnostic\nCOMPATFORGE_WINDOWS_CONSOLE_OK\r\n"):
+            with self.subTest(line=line):
+                h = self.harness("line-ending")
+                original_events = h.events
+                h.events = lambda: original_events().replace(b"COMPATFORGE_WINDOWS_CONSOLE_OK\\n", json.dumps(line)[1:-1].encode())
+                self.assertTrue(h.execute().success)
+        for line in ("beforeCOMPATFORGE_WINDOWS_CONSOLE_OK\n", "COMPATFORGE_WINDOWS_CONSOLE_OKafter\n", "COMPATFORGE_WINDOWS_CONSOLE_OK", "COMPATFORGE_WINDOWS_CONSOLE_OK\r"):
+            with self.subTest(line=line):
+                h = self.harness("incomplete-marker")
+                original_events = h.events
+                h.events = lambda: original_events().replace(b"COMPATFORGE_WINDOWS_CONSOLE_OK\\n", json.dumps(line)[1:-1].encode())
+                self.assertFalse(h.execute().success)
+
+    def test_guest_is_private_before_compiler_and_identity_checked_after(self):
+        h = self.harness("guest-private")
+        run = h.run
+        seen = []
+        def check_placeholder(kind, spec, observer=None):
+            if kind.name == "COMPILE_GUEST":
+                self.assertTrue(h.paths.guest.is_file(), "compiler output must be precreated exclusively")
+                self.assertEqual(h.paths.guest.read_bytes(), b"")
+                self.assertEqual(spec.creation_umask, 0o177)
+                seen.append(h.paths.guest.stat().st_ino)
+            return run(kind, spec, observer)
+        h.run = check_placeholder
+        self.assertTrue(h.execute().success)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(("private-mode", h.paths.guest), h.io)
+
+    def test_diagnostic_write_failure_does_not_suppress_failure_record(self):
+        h = self.harness("cli-ack")
+        write = h.r.EvidenceStore.write_json
+        def fail_diagnostics(store, name, value):
+            if name == "command-diagnostics.json": raise OSError("diagnostic disk failure")
+            return write(store, name, value)
+        with mock.patch.object(h.r.EvidenceStore, "write_json", new=fail_diagnostics):
+            self.assertFalse(h.execute().success)
+        self.assertTrue(h.paths.private_failure.exists())
+        self.assertFalse(h.paths.public_summary.exists())
+
     def test_post_plan_outer_cleanup_failure_remains_distinct(self):
         h = self.harness("post-plan-outer")
         run = h.run
@@ -1521,6 +1598,27 @@ class LinuxConsoleRunnerExecutionTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "requires native Linux /proc visibility and process groups")
 class LinuxPreviewProcIntegrationTests(unittest.TestCase):
+    def test_native_child_umask_and_compiler_output_private_postcondition(self):
+        r = runner_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            root.chmod(0o700)
+            store = r.EvidenceStore(root)
+            guest = store._write_payload("console-preview.exe", b"")
+            self.assertEqual(guest.stat().st_mode & 0o777, 0o600)
+            # Exercise the child-only mask even when a tool replaces its output.
+            source = "import os,sys; p=sys.argv[1]; os.unlink(p); f=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o777); os.write(f,b'controlled'); os.close(f)"
+            r.NativePreviewCommands().run(r.ClosedCommandKind.COMPILE_GUEST,
+                r.CommandSpec((str(Path(sys.executable).resolve()), "-I", "-S", "-c", source, str(guest)),
+                    {}, root, 1024, time.monotonic() + 3, 0o177))
+            self.assertEqual(guest.stat().st_mode & 0o777, 0o600)
+            fs = r.NativeFileSystem()
+            fs.verify_private_file(guest, fs.inspect(guest).identity)
+            guest.chmod(0o700)
+            with self.assertRaises(ValueError):
+                fs.verify_private_file(guest, fs.inspect(guest).identity)
+            self.assertEqual(guest.stat().st_mode & 0o777, 0o700)
+
     def test_native_observer_self_test_stops_reaps_and_proves_disappearance(self):
         r = runner_module()
         with tempfile.TemporaryDirectory() as directory:
