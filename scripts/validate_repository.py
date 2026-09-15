@@ -4674,7 +4674,7 @@ def _validate_macos_acceptance_report(source: str) -> None:
             )
     for marker in (
         "cjkTextReadable: true",
-        "127.0.0.1:1421",
+        "127.0.0.1:16040",
         "HTTP 200",
         "127.0.0.1:1420",
         "nextStage:",
