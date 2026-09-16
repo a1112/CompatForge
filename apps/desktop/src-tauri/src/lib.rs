@@ -431,6 +431,7 @@ where
 {
     let options = DesktopLaunchOptions::parse(arguments)?;
     let application = tauri::Builder::default()
+        .plugin(project_resource_monitor::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let base = app.path().app_local_data_dir()?;
@@ -451,6 +452,7 @@ where
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            project_resource_monitor::project_resource_snapshot,
             state_snapshot,
             bootstrap_runtime,
             service_call,
@@ -672,3 +674,5 @@ mod tests {
         );
     }
 }
+
+mod project_resource_monitor;

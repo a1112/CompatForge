@@ -18,6 +18,7 @@ path = "src/main.rs"
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
+monitor-sysinfo = { package = "sysinfo", version = "0.33", default-features = false, features = ["system"] }
 compatforge-capability = { path = "../../../crates/compatforge-capability" }
 compatforge-domain = { path = "../../../crates/compatforge-domain" }
 compatforge-inspect = { path = "../../../crates/compatforge-inspect" }
