@@ -1401,7 +1401,9 @@ mod tests {
                 assert!(executable.starts_with(&self.working_directory));
                 fs::write(&source, body).expect("write controlled Linux probe helper source");
                 let status = Command::new("/usr/bin/cc")
-                    .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-o"])
+                    // GCC may need an explicit tool directory to find ld after
+                    // env_clear; this is only the controlled fixture compiler.
+                    .args(["-B/usr/bin/", "-std=c11", "-Wall", "-Wextra", "-Werror", "-o"])
                     .arg(&executable)
                     .arg(&source)
                     .env_clear()
@@ -1456,8 +1458,8 @@ int main(int argc, char **argv) {{
     (void)argv;
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    for (size_t index = 0; index < {stdout_bytes}; ++index) {{ fputc('o', stdout); }}
-    for (size_t index = 0; index < {stderr_bytes}; ++index) {{ fputc('e', stderr); }}
+    for (size_t remaining = {stdout_bytes}; remaining != 0; --remaining) {{ fputc('o', stdout); }}
+    for (size_t remaining = {stderr_bytes}; remaining != 0; --remaining) {{ fputc('e', stderr); }}
     return 0;
 }}
 "#

@@ -51,6 +51,37 @@ def runner_args():
     ]
 
 
+class LinuxProviderDocumentationTests(unittest.TestCase):
+    def test_operator_guide_preserves_execution_and_evidence_boundaries(self):
+        guide = (ROOT / "docs/guides/linux-console-preview.md").read_text()
+        for term in ("Linux x86_64 Console Preview", "ELF", "MinGW-w64", "env_clear",
+                     "LD_LIBRARY_PATH", "same-UID", "X11", "entrypoints-only",
+                     "TOCTOU", "detached-client", "1 MiB", "outside Git",
+                     "--materialized-root", "--runtime-store-root", "--storage-root",
+                     "--evidence-root", "--wine", "--wineserver", "--version",
+                     "provider linux probe", "provider linux context", "local linux context",
+                     "prepared-plan", "prepared-launch", "caller-owned Preview roots"):
+            with self.subTest(term=term):
+                self.assertIn(term, guide)
+        self.assertNotRegex(guide, r"(?m)^export (?:HOME|PATH|TMPDIR|LD_LIBRARY_PATH|XDG_\w+)=")
+
+    def test_status_requires_coherent_real_canary_evidence(self):
+        document = (ROOT / "docs/implementation/phase-2-3-linux-x86_64-runtime-provider-preview.md").read_text()
+        blocks = re.findall(r"```json\n(.*?)\n```", document, re.S)
+        self.assertEqual(len(blocks), 1)
+        state = json.loads(blocks[0])
+        self.assertEqual(set(state), {"status", "consoleValidated", "canaryCommit", "canaryReceipt"})
+        if state["status"] == "implemented-awaiting-linux-canary":
+            self.assertIs(state["consoleValidated"], False)
+            self.assertIsNone(state["canaryCommit"])
+            self.assertIsNone(state["canaryReceipt"])
+        else:
+            self.assertEqual(state["status"], "linux-console-preview-passed")
+            self.assertIs(state["consoleValidated"], True)
+            self.assertRegex(state["canaryCommit"], r"^[0-9a-f]{40}$")
+            runner_module().validate_public_summary(state["canaryReceipt"])
+
+
 class FakePlatform:
     def __init__(self, os_name="Linux", machine="x86_64", uid=1000):
         self.os = os_name

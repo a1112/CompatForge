@@ -1779,7 +1779,13 @@ fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountEntry>> {
         let (major, minor) = split_once_byte(fields[2], b':')?;
         parse_ascii_u64(major)?;
         parse_ascii_u64(minor)?;
-        let root = decode_mountinfo_path(fields[3])?;
+        // A bind-mounted mount-namespace handle has an opaque nsfs root,
+        // e.g. mnt:[4026533080]. Keep it in the topology so it can shadow
+        // ordinary paths, but never use it as a Runtime filesystem identity.
+        let root = decode_mountinfo_path(fields[3]).or_else(|| {
+            let inode = fields[3].strip_prefix(b"mnt:[")?.strip_suffix(b"]")?;
+            (fields[separator + 1] == b"nsfs" && parse_ascii_u64(inode).is_some()).then(|| fields[3].to_vec())
+        })?;
         let mount_point = decode_mountinfo_path(fields[4])?;
         entries.push(MountEntry {
             mount_id,
@@ -1963,6 +1969,9 @@ fn selected_mount<'a>(path: &[u8], entries: &'a [MountEntry]) -> Option<&'a Moun
 
 fn physical_identity(path: &[u8], entries: &[MountEntry]) -> Option<PhysicalIdentity> {
     let mount = selected_mount(path, entries)?;
+    if !mount.root.starts_with(b"/") {
+        return None;
+    }
     let relative = if mount.mount_point == b"/" {
         path.strip_prefix(b"/")?
     } else {
@@ -3536,6 +3545,28 @@ int main(void) {
             &snapshot
         )
         .is_err());
+    }
+
+    #[test]
+    fn mountinfo_preserves_nsfs_mounts_without_authorizing_runtime_paths() {
+        let entries = parse_mountinfo(
+            b"24 1 8:1 / / rw - ext4 /dev/root rw\n\
+              25 24 0:5 mnt:[4026533080] /run/ns/example rw - nsfs nsfs rw\n",
+        )
+        .expect("namespace handle mounts are valid mountinfo");
+        let visible = visible_mounts(&entries).expect("valid namespace mount topology");
+        assert!(physical_identity(b"/private/runtime", &visible).is_some());
+        assert!(physical_identity(b"/run/ns/example", &visible).is_none());
+        assert!(physical_identity(b"/run/ns/example/child", &visible).is_none());
+        for (root, filesystem) in [
+            ("mnt:[4026533080]", "ext4"),
+            ("mnt:[]", "nsfs"),
+            ("mnt:[bad]", "nsfs"),
+            ("relative", "nsfs"),
+        ] {
+            let line = format!("25 24 0:5 {root} /run/ns/example rw - {filesystem} nsfs rw\n");
+            assert!(parse_mountinfo(line.as_bytes()).is_none());
+        }
     }
 
     #[test]
@@ -5397,6 +5428,11 @@ int main(void) {
 
             assert!(result.is_err(), "{kind} must not return Context or receipt");
             assert!(storage.exists(), "Storage seam ran for {kind}");
+            if kind == "control-mode" {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(store.join("objects"), fs::Permissions::from_mode(0o700))
+                    .expect("restore owned fixture directory for cleanup");
+            }
         }
     }
 
