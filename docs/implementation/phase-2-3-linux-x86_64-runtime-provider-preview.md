@@ -1,16 +1,38 @@
 # Linux x86_64 Console Preview implementation
 
 The Linux Runtime Provider, CLI trust chain, bounded Console runner and synthetic
-Ubuntu workflow are implemented. A local Wine canary passed, but its tested
-source changes have not yet been committed. Until a receipt is bound to an exact
-committed revision, the checkpoint retains this machine-checked awaiting state:
+Ubuntu workflow are implemented. On 2026-09-25, a real Wine 11.0 Console canary
+passed on Ubuntu 26.04.1 x86_64 against committed source revision
+`4abfbd0fd271e14316e6e8241a0933a9ea1bf8d3`. The runner's complete,
+validated public receipt is:
 
 ```json
 {
-  "status": "implemented-awaiting-linux-canary",
-  "consoleValidated": false,
-  "canaryCommit": null,
-  "canaryReceipt": null
+  "status": "linux-console-preview-passed",
+  "consoleValidated": true,
+  "canaryCommit": "4abfbd0fd271e14316e6e8241a0933a9ea1bf8d3",
+  "canaryReceipt": {
+    "checkpoint": "linux-x86_64-runtime-provider-preview",
+    "cleanupStatus": "complete",
+    "consoleValidated": true,
+    "displayForwarded": false,
+    "exitCode": 0,
+    "graphicsValidated": false,
+    "guestDigest": "sha256:a727b128e871847d39b2528b20b73143feef2b90025331cbf7a8fcd4d4c4ff94",
+    "hostArchitecture": "x86_64",
+    "hostDisplayDetected": false,
+    "hostOs": "linux",
+    "networkIsolationValidated": false,
+    "planCorrelation": "pre-post-canonical-match",
+    "planDigest": "sha256:3905cc590682085e326ee6d530edc1e85c4e7df44bb4c5ed257a7049b5e11992",
+    "runtimeEventKinds": ["started", "output", "wine-server-stop-requested", "exited"],
+    "runtimeEvidenceScope": "entrypoints-only",
+    "runtimePackDigest": "sha256:ae3b3e18ea4e2fda594ab5e3259f9176a795385cae390f831a731ce65e06c106",
+    "runtimePackId": "wine-linux-x86-64-local-preview",
+    "runtimeTreeValidated": false,
+    "runtimeVersion": "11.0",
+    "schemaVersion": "1"
+  }
 }
 ```
 
@@ -63,15 +85,18 @@ All 92 Python tests passed in that namespace, including rejection of unreadable
 live environments. This result applies to the isolated test process tree; it
 does not establish visibility of the desktop host's processes.
 
-A subsequent real Wine 11.0 canary on Ubuntu 26.04 x86_64 passed in a fresh
-namespace with Tini as init: the fixed Console marker appeared once, exitCode
-was 0 and cleanupStatus was complete before namespace teardown. Running Python
-as PID 1 without an init had previously failed cleanup; that evidence was kept.
-WineHQ package signatures and package SHA-256 values were verified, and the
-compiler came from Ubuntu's MinGW-w64 packages. Private evidence and source/CLI
-digest receipts remain outside Git. Recording a committed canary revision is
-pending verification of a committed source revision; this local pass does not yet change the
-checkpoint status above.
+A historical real Wine 11.0 canary on Ubuntu 26.04 x86_64 had passed in a fresh
+namespace with Tini as init, but it used uncommitted source changes. Running
+Python as PID 1 without an init had previously failed cleanup; that evidence
+was kept. On 2026-09-25, the canary was repeated against the exact committed
+revision above in a Hyper-V Ubuntu 26.04.1 VM with WineHQ Wine 11.0 and an
+explicit Ubuntu MinGW-w64 compiler. Tini was PID 1 in a private mount/PID
+namespace; the canary's own cleanup checks completed before namespace teardown.
+The CLI copied for the root-owned runner was byte-identical to the release
+build (SHA-256 `e1b1783074e098b98e0005ec85a77895b893963fc62534f62b304246301321c3`).
+The public summary passed `validate_public_summary` and has SHA-256
+`ef80dd04d59dfd776d75187cf0ac78810e1bb30648b6421eb00dbf2a175e4e25`.
+Private evidence and the verification receipt remain outside Git.
 
 The same validation run found and fixed mount-namespace `nsfs` parsing (opaque
 namespace roots remain ineligible for Runtime filesystem identity), explicit
@@ -79,8 +104,10 @@ linker lookup and zero-output C fixture compilation, and cleanup of an owned
 test directory whose permissions had intentionally been reduced. After those
 fixes, the workspace Rust tests under `umask 077`, formatting, Clippy, release
 build, repository contracts and synthetic ELF/CLI workflow steps passed. Together
-with the isolated Python suite, the local offline checks passed. A real Wine
-canary still needs its own explicit Runtime and cleanup evidence.
+with the isolated Python suite, the local offline checks passed. The 2026-09-25
+VM run repeated the Linux Python suite (94 tests), workspace Rust tests,
+formatting, Clippy, repository validation and release CLI build before the
+committed canary.
 
 ## Evidence limits and next gate
 
@@ -90,9 +117,7 @@ false, and `networkIsolationValidated` is false: the recorded network policy
 does not prove Linux network isolation. Pathname TOCTOU and product-level
 detached-client cleanup remain follow-up work.
 
-After a real pass, change the state to `linux-console-preview-passed`, set
-`consoleValidated` to true, record the tested 40-character commit and copy only
-the runner's complete path-free public summary into `canaryReceipt`. Its success
-cleanup value is `complete`, as enforced by `validate_public_summary`. Keep
-private contexts, plans, binaries and logs outside Git. Without that receipt,
-retain the awaiting state even if every synthetic and offline gate passes.
+The checkpoint records the tested 40-character commit and only the runner's
+complete path-free public summary in `canaryReceipt`. Its success cleanup value
+is `complete`, as enforced by `validate_public_summary`. Private contexts,
+plans, binaries and logs stay outside Git.

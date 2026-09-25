@@ -3,7 +3,7 @@
 This developer preview runs only the repository's fixed Windows Console fixture.
 It does not establish Beta, Tier 1, GUI or arbitrary application support. The
 [implementation status](../implementation/phase-2-3-linux-x86_64-runtime-provider-preview.md)
-remains `implemented-awaiting-linux-canary` until a real canary receipt exists.
+records a real Wine 11.0 Console canary bound to an exact committed revision.
 
 ## Prerequisites
 
