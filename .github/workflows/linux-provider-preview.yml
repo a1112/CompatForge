@@ -13,15 +13,19 @@ jobs:
   synthetic-provider:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/linux-provider-target
-      CF_FIXTURE_ROOT: ${{ runner.temp }}/linux-provider-fixture
-      CF_BUILD_ROOT: ${{ runner.temp }}/linux-provider-build
-      CF_EVIDENCE_ROOT: ${{ runner.temp }}/linux-provider-evidence
     defaults:
       run:
         shell: bash
     steps:
+      - name: Initialize external build and evidence roots
+        run: |
+          set -euo pipefail
+          {
+            printf 'CARGO_TARGET_DIR=%s/linux-provider-target\n' "$RUNNER_TEMP"
+            printf 'CF_FIXTURE_ROOT=%s/linux-provider-fixture\n' "$RUNNER_TEMP"
+            printf 'CF_BUILD_ROOT=%s/linux-provider-build\n' "$RUNNER_TEMP"
+            printf 'CF_EVIDENCE_ROOT=%s/linux-provider-evidence\n' "$RUNNER_TEMP"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:

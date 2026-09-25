@@ -1547,6 +1547,16 @@ class MacOsDualRuntimeAcceptanceContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validator._validate_macos_acceptance_report(mutant)
 
+    def test_historical_report_rejects_current_desktop_port_rewrite(self) -> None:
+        report = ACCEPTANCE_REPORT.read_text(encoding="utf-8")
+        self.assertEqual(report.count("127.0.0.1:1421"), 1)
+        rewritten = report.replace("127.0.0.1:1421", "127.0.0.1:16040", 1)
+        with self.assertRaisesRegex(
+            ValueError,
+            r"macOS acceptance report marker drifted: 127\.0\.0\.1:1421",
+        ):
+            validator._validate_macos_acceptance_report(rewritten)
+
     def test_interaction_template_exists_and_has_four_independent_records(self) -> None:
         self.assertTrue(ACCEPTANCE_INTERACTIONS.is_file())
         document = json.loads(ACCEPTANCE_INTERACTIONS.read_text(encoding="utf-8"))

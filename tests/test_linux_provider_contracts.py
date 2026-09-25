@@ -1713,6 +1713,52 @@ class LinuxProviderCiContractTests(unittest.TestCase):
         self.assertTrue(path.is_file(), "dedicated Ubuntu workflow is missing")
         return path.read_text(encoding="utf-8")
 
+    def environment_initialization_script(self):
+        metadata, separator, steps = self.workflow().partition("    steps:\n")
+        self.assertTrue(separator, "synthetic-provider steps are missing")
+        self.assertNotRegex(metadata, r"\$\{\{\s*runner\.",
+                            "runner context is unavailable in workflow/job-level env")
+        initialization = re.match(
+            r"      - name: Initialize external build and evidence roots\n"
+            r"        run: \|\n((?:          [^\n]*\n)+)", steps)
+        self.assertIsNotNone(initialization,
+                             "external roots must be initialized before all consumer steps")
+        return textwrap.dedent(initialization.group(1))
+
+    def test_workflow_initializes_external_roots_before_consumer_steps(self):
+        self.environment_initialization_script()
+
+    def test_workflow_exports_external_roots_with_spaces_via_github_env(self):
+        script = self.environment_initialization_script()
+        if os.name == "nt":
+            git = shutil.which("git")
+            bash = Path(git).parent.parent / "bin/bash.exe" if git else None
+            if bash is None or not bash.is_file():
+                self.skipTest("Git Bash is needed to exercise the Ubuntu initialization script")
+        else:
+            bash = shutil.which("bash")
+            if bash is None:
+                self.skipTest("Bash is needed to exercise the Ubuntu initialization script")
+        with linux_provider_fixture_directory() as directory:
+            parent = Path(directory).resolve()
+            runner_temp = parent / "runner temp with spaces"
+            runner_temp.mkdir()
+            environment_file = parent / "github env with spaces"
+            environment_file.write_text("EXISTING_VALUE=preserved\n", encoding="utf-8")
+            environment = dict(os.environ, RUNNER_TEMP=runner_temp.as_posix(),
+                               GITHUB_ENV=environment_file.as_posix())
+            result = subprocess.run(
+                [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                cwd=parent, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(environment_file.read_text(encoding="utf-8").splitlines(), [
+                "EXISTING_VALUE=preserved",
+                f"CARGO_TARGET_DIR={runner_temp.as_posix()}/linux-provider-target",
+                f"CF_FIXTURE_ROOT={runner_temp.as_posix()}/linux-provider-fixture",
+                f"CF_BUILD_ROOT={runner_temp.as_posix()}/linux-provider-build",
+                f"CF_EVIDENCE_ROOT={runner_temp.as_posix()}/linux-provider-evidence",
+            ])
+
     def test_dedicated_workflow_and_fixture_sources_exist(self):
         for name in (".github/workflows/linux-provider-preview.yml",
                      "tests/fixtures/linux_provider_stub.c",
@@ -1740,11 +1786,7 @@ class LinuxProviderCiContractTests(unittest.TestCase):
 
     def test_workflow_only_runs_synthetic_probe_wiring_outside_checkout(self):
         workflow = self.workflow()
-        for value in ('CARGO_TARGET_DIR: ${{ runner.temp }}/linux-provider-target',
-                      'CF_FIXTURE_ROOT: ${{ runner.temp }}/linux-provider-fixture',
-                      'CF_BUILD_ROOT: ${{ runner.temp }}/linux-provider-build',
-                      'CF_EVIDENCE_ROOT: ${{ runner.temp }}/linux-provider-evidence',
-                      'cc -std=c11 -Wall -Wextra -Werror', '-fno-pie -no-pie', '-fPIE -pie',
+        for value in ('cc -std=c11 -Wall -Wextra -Werror', '-fno-pie -no-pie', '-fPIE -pie',
                       'scripts/create_linux_provider_fixture.py', 'runtime install',
                       'provider linux probe', 'provider linux context', 'local linux context',
                       'bootstrap-store', 'bootstrap-storage', 'private-context.json'):

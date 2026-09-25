@@ -788,10 +788,10 @@ impl LinuxProviderSet {
         }
         let observation = match probe_runtime_with(config, command) {
             Ok(observation) => observation,
-            Err(error) => match classify_probe_error(error) {
-                Ok(failure) => return build_provider_snapshot(host_report, config, Err(failure)),
-                Err(error) => return Err(error),
-            },
+            Err(error) => {
+                let failure = classify_probe_error(error)?;
+                return build_provider_snapshot(host_report, config, Err(failure));
+            }
         };
         if let Err(failure) = load_associated_manifest(&store, &config.wine_runtime) {
             return build_provider_snapshot(host_report, config, Err(failure));
