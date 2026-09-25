@@ -139,6 +139,32 @@ let menuOpen = false;
 let busy = false;
 let transientError = "";
 let requestSequence = 0;
+let maximized = false;
+
+function maximizeIcon(): string {
+  return maximized
+    ? '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 5h10v10H6zM4 8H3v9h9v-1" /></svg>'
+    : '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="4" width="12" height="12" rx="1" /></svg>';
+}
+
+function updateMaximizeButton(): void {
+  const button = root.querySelector<HTMLButtonElement>('[data-action="window-toggle-maximize"]');
+  if (!button) return;
+  const label = maximized ? "还原" : "最大化";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  button.innerHTML = maximizeIcon();
+}
+
+async function syncMaximizedState(): Promise<void> {
+  try {
+    maximized = await appWindow.isMaximized();
+    updateMaximizeButton();
+  } catch (error) {
+    transientError = String(error);
+    render();
+  }
+}
 
 function escapeHtml(value: unknown): string {
   return String(value)
@@ -317,7 +343,8 @@ function render(): void {
   root.innerHTML = `<div class="window-shell"><header class="titlebar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i></span><h1>${navigation.find((item) => item.id === currentView)?.label}</h1></div>
     <button class="runtime-pill ${runtime.runtimeReady ? "ready" : ""}" data-action="go-runtime"><i></i><span>${runtime.runtimeReady ? "运行环境就绪" : "等待运行环境"}</span></button><div class="titlebar-spacer"></div>
     <label class="search-box"><span></span><input id="app-search" type="search" value="${escapeHtml(searchText)}" placeholder="搜索应用" /></label>
-    <button class="toolbar-button" data-action="refresh" aria-label="刷新">↻</button><div class="menu-anchor"><button class="toolbar-button menu-button" data-action="toggle-menu">•••</button>${menuOpen ? `<div class="popover-menu"><button data-action="open-settings">设置…</button><button data-action="go-runtime">兼容环境</button><button data-action="go-jobs">自动化记录</button><hr><button data-action="cancel-all" ${active.length ? "" : "disabled"}>终止所有任务</button></div>` : ""}</div></header>
+    <button class="toolbar-button" data-action="refresh" aria-label="刷新">↻</button><div class="menu-anchor"><button class="toolbar-button menu-button" data-action="toggle-menu">•••</button>${menuOpen ? `<div class="popover-menu"><button data-action="open-settings">设置…</button><button data-action="go-runtime">兼容环境</button><button data-action="go-jobs">自动化记录</button><hr><button data-action="cancel-all" ${active.length ? "" : "disabled"}>终止所有任务</button></div>` : ""}</div>
+    <div class="window-controls" role="group" aria-label="窗口控制"><button type="button" class="window-control" data-action="window-minimize" aria-label="最小化" title="最小化"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12" /></svg></button><button type="button" class="window-control" data-action="window-toggle-maximize" aria-label="${maximized ? "还原" : "最大化"}" title="${maximized ? "还原" : "最大化"}">${maximizeIcon()}</button><button type="button" class="window-control close" data-action="window-close" aria-label="关闭" title="关闭"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg></button></div></header>
     <nav class="primary-nav">${navigation.map((item) => `<button data-action="navigate" data-view="${item.id}" class="${currentView === item.id ? "selected" : ""}">${item.label}</button>`).join("")}</nav>
     ${currentView === "applications" ? `<div class="filter-bar"><div class="filters">${filters.map((filter) => `<button data-action="filter" data-filter="${filter.id}" class="${currentFilter === filter.id ? "selected" : ""}">${filter.label}</button>`).join("")}</div><button class="sort-button" data-action="sort">名称 <span>${sortDirection === "asc" ? "⌃" : "⌄"}</span></button></div>` : `<div class="context-strip">${escapeHtml(runtime.runtimeStatus)}</div>`}
     <main id="main-content">${viewContent()}</main><footer class="status-bar"><span><i class="${active.length ? "running" : ""}"></i>${applications.length} 个应用 · ${active.length} 个活动任务</span><div><button data-action="refresh">↻&nbsp; 刷新 API</button><span class="footer-divider"></span><button class="terminate-link" data-action="cancel-all" ${active.length ? "" : "disabled"}>⊙&nbsp; 全部终止</button></div></footer>
@@ -393,6 +420,19 @@ root.addEventListener("click", async (event) => {
   const target = (event.target as HTMLElement).closest<HTMLElement>("[data-action]");
   if (!target || target.hasAttribute("disabled")) return;
   const action = target.dataset.action;
+  if (action === "window-minimize" || action === "window-toggle-maximize" || action === "window-close") {
+    try {
+      if (action === "window-minimize") await appWindow.minimize();
+      else if (action === "window-toggle-maximize") {
+        await appWindow.toggleMaximize();
+        await syncMaximizedState();
+      } else await appWindow.close();
+    } catch (error) {
+      transientError = String(error);
+      render();
+    }
+    return;
+  }
   if (action === "navigate") currentView = (target.dataset.view ?? "applications") as ViewId;
   else if (action === "filter") currentFilter = (target.dataset.filter ?? "all") as FilterId;
   else if (action === "sort") sortDirection = sortDirection === "asc" ? "desc" : "asc";
@@ -416,6 +456,8 @@ root.addEventListener("click", async (event) => {
 
 async function start(): Promise<void> {
   render();
+  void appWindow.onResized(() => { void syncMaximizedState(); });
+  await syncMaximizedState();
   try {
     runtime = await invoke<RuntimeSnapshot>("state_snapshot");
     if (!runtime.smokeMode) await bootstrap();

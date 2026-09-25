@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const INVALID_LAUNCH_ARGUMENTS: &str = "CompatForge 开发者验收启动参数无效";
@@ -311,6 +313,61 @@ fn open_settings(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn ensure_tray(app: &AppHandle) -> Result<(), String> {
+    if app.tray_by_id("compatforge").is_some() {
+        return Ok(());
+    }
+    let icon = app.default_window_icon().ok_or("缺少托盘图标")?;
+    let show = MenuItem::with_id(app, "show-main", "显示 CompatForge", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let quit = MenuItem::with_id(app, "quit", "退出 CompatForge", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let menu = Menu::with_items(app, &[&show, &quit]).map_err(|error| error.to_string())?;
+    TrayIconBuilder::with_id("compatforge")
+        .icon(icon.clone())
+        .tooltip("CompatForge")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show-main" => show_main_window(app),
+            "quit" => {
+                app.state::<AppState>().shutdown();
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn close_to_background_enabled(state: &AppState) -> bool {
+    let service = state.runtime.lock().ok().and_then(|runtime| runtime.service.clone());
+    service
+        .and_then(|service| service.get_settings().ok())
+        .is_some_and(|settings| settings.close_to_background)
+}
+
 fn bootstrap_core(
     runtime_store_root: &Path,
     storage_root: &Path,
@@ -460,19 +517,30 @@ where
         .build(tauri::generate_context!())
         .map_err(|_| DESKTOP_LAUNCH_FAILED)?;
 
-    application.run(|app_handle, event| {
-        if matches!(event, RunEvent::Exit)
-            || matches!(
-                event,
-                RunEvent::WindowEvent {
-                    ref label,
-                    event: WindowEvent::CloseRequested { .. },
-                    ..
-                } if label == "main"
-            )
-        {
-            app_handle.state::<AppState>().shutdown();
+    application.run(|app_handle, event| match event {
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            let state = app_handle.state::<AppState>();
+            if close_to_background_enabled(&state)
+                && ensure_tray(app_handle).is_ok()
+                && app_handle
+                    .get_webview_window("main")
+                    .is_some_and(|window| window.hide().is_ok())
+            {
+                if let Some(settings) = app_handle.get_webview_window("settings") {
+                    let _ = settings.hide();
+                }
+                api.prevent_close();
+            } else {
+                state.shutdown();
+                app_handle.exit(0);
+            }
         }
+        RunEvent::Exit => app_handle.state::<AppState>().shutdown(),
+        _ => {}
     });
     Ok(())
 }
@@ -480,8 +548,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use compatforge_domain::CoreConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(windows)]
     use std::os::windows::ffi::OsStringExt;
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn close_to_background_follows_persisted_setting() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("compatforge-close-setting-{}-{id}", std::process::id()));
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples/context-config.linux-arm64.json");
+        let mut config: CoreConfig = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        config.storage_root = root.join("storage").to_string_lossy().into_owned();
+        let service = Arc::new(
+            AutomationService::new(
+                config,
+                ServiceConfig {
+                    schema_version: SCHEMA_VERSION_V1.into(),
+                    service_root: root.join("service").to_string_lossy().into_owned(),
+                },
+            )
+            .unwrap(),
+        );
+        let mut runtime = DesktopRuntime::new(root.clone(), false, DesktopLaunchOptions::default());
+        runtime.service = Some(service.clone());
+        let state = AppState::new(runtime);
+
+        assert!(!close_to_background_enabled(&state));
+        let mut settings = service.get_settings().unwrap();
+        settings.close_to_background = true;
+        service.update_settings(&settings).unwrap();
+        assert!(close_to_background_enabled(&state));
+        state.shutdown();
+        assert!(!close_to_background_enabled(&state));
+
+        drop(service);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn crossover_arguments() -> [&'static str; 11] {
         [
