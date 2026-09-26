@@ -1259,7 +1259,7 @@ mod tests {
                 version: Some("test".into()),
             },
             graphics: compatforge_domain::GraphicsSelection {
-                backend: GraphicsBackendKind::Dxvk,
+                backend: GraphicsBackendKind::WineD3d,
                 version: Some("test".into()),
                 options: std::collections::BTreeMap::new(),
             },
