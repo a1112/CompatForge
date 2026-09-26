@@ -1717,7 +1717,7 @@ mod tests {
         assert_eq!(plan.graphics.backend, GraphicsBackendKind::Dxvk);
         assert_eq!(
             plan.process.environment["WINEDLLOVERRIDES"],
-            "d3d11,dxgi=n,b;mscoree,mshtml="
+            "d3d11,dxgi=n;mscoree,mshtml="
         );
         PolicyEngine::authorize(&config, &plan).unwrap();
         let mut tampered = plan.clone();
@@ -1725,6 +1725,11 @@ mod tests {
             .process
             .environment
             .insert("WINEDLLOVERRIDES".into(), "d3d11=b".into());
+        assert!(PolicyEngine::authorize(&config, &tampered).is_err());
+        tampered.process.environment.insert(
+            "WINEDLLOVERRIDES".into(),
+            "d3d11,dxgi=n,b;mscoree,mshtml=".into(),
+        );
         assert!(PolicyEngine::authorize(&config, &tampered).is_err());
         config.capabilities.graphics_backends = vec![provider("wined3d-local", "wined3d")];
         let plain = PolicyEngine::compile(&config, &request()).unwrap();

@@ -5502,7 +5502,15 @@ mod tests {
             .insert("VK_ICD_FILENAMES".into(), icd.to_string_lossy().into_owned());
         plan.process
             .environment
+            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n;mscoree,mshtml=".into());
+        assert!(verify_pinned_runtime(&plan).is_ok());
+        plan.process
+            .environment
             .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+        assert!(verify_pinned_runtime(&plan).is_err());
+        plan.process
+            .environment
+            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n;mscoree,mshtml=".into());
         verify_pinned_runtime(&plan).unwrap();
         std::fs::write(&dxgi, b"changed").unwrap();
         assert!(matches!(
@@ -5545,7 +5553,7 @@ mod tests {
             .insert("VK_ICD_FILENAMES".into(), icd.to_string_lossy().into_owned());
         plan.process
             .environment
-            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n;mscoree,mshtml=".into());
         plan.process
             .environment
             .insert("WINEPREFIX".into(), prefix.to_string_lossy().into_owned());
