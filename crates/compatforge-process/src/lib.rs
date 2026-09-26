@@ -1010,7 +1010,7 @@ fn verify_dxvk_evidence(plan: &LaunchPlan) -> Result<(), ProcessError> {
         return Ok(());
     }
     if plan.runtime.provider != RuntimeKind::Wine
-        || env.get("WINEDLLOVERRIDES").map(String::as_str) != Some("d3d11,dxgi=n,b;mscoree,mshtml=")
+        || env.get("WINEDLLOVERRIDES").map(String::as_str) != Some("d3d11,dxgi=n;mscoree,mshtml=")
     {
         return Err(ProcessError::InvalidRuntimeEvidence("DXVK override"));
     }

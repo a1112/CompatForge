@@ -37,7 +37,7 @@ fn protected_graphics_environment(
         && environment.contains_key("COMPATFORGE_DXVK_D3D11")
         && environment.contains_key("COMPATFORGE_DXVK_DXGI")
     {
-        environment.insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+        environment.insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n;mscoree,mshtml=".into());
         if let Some(icd) = environment.get("COMPATFORGE_VULKAN_ICD").cloned() {
             environment.insert("VK_ICD_FILENAMES".into(), icd);
         }
