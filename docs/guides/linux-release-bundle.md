@@ -46,8 +46,8 @@ For a downloaded release asset, verify its provenance before staging it:
 
 ```sh
 gh attestation verify /absolute/release/compatforge-linux-x86_64-linux-runtime-v0.12.0-rc.1.tar.gz \
-  -R lcxinc/CompatForge \
-  --signer-workflow lcxinc/CompatForge/.github/workflows/linux-runtime-release.yml \
+  -R a1112/CompatForge \
+  --signer-workflow a1112/CompatForge/.github/workflows/linux-runtime-release.yml \
   --source-digest "$EXPECTED_SOURCE_COMMIT" \
   --source-ref refs/tags/linux-runtime-v0.12.0-rc.1
 ```
