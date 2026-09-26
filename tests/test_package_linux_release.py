@@ -32,7 +32,14 @@ def elf_x86_64(payload: bytes) -> bytes:
     header[5] = 1
     header[16:18] = (3).to_bytes(2, "little")
     header[18:20] = (62).to_bytes(2, "little")
-    return bytes(header) + payload
+    header[32:40] = (64).to_bytes(8, "little")
+    header[54:56] = (56).to_bytes(2, "little")
+    header[56:58] = (1).to_bytes(2, "little")
+    program = bytearray(56)
+    program[:4] = (1).to_bytes(4, "little")
+    program[32:40] = (120 + len(payload)).to_bytes(8, "little")
+    program[40:48] = (120 + len(payload)).to_bytes(8, "little")
+    return bytes(header) + bytes(program) + payload
 
 
 def tar_bytes(members: dict[str, bytes], *, symlink: str | None = None) -> bytes:
@@ -113,8 +120,26 @@ class LinuxReleasePackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "clean"):
             self.build()
 
+    def test_assume_unchanged_cannot_hide_changed_source(self) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.source), "update-index", "--assume-unchanged", "Cargo.toml"],
+            check=True,
+        )
+        (self.source / "Cargo.toml").write_text(
+            '[workspace.package]\nversion = "9.9.9"\n', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "clean"):
+            self.build()
+
     def test_wrong_architecture_is_rejected(self) -> None:
         self.cli.write_bytes(b"not an ELF".ljust(64, b"x"))
+        with self.assertRaisesRegex(ValueError, "ELF"):
+            self.build()
+
+    def test_elf_without_load_segment_is_rejected(self) -> None:
+        fake = bytearray(elf_x86_64(b"CLI"))
+        fake[64:68] = (2).to_bytes(4, "little")
+        self.cli.write_bytes(fake)
         with self.assertRaisesRegex(ValueError, "ELF"):
             self.build()
 
@@ -154,6 +179,31 @@ class LinuxReleasePackageTests(unittest.TestCase):
                     archive.addfile(entry, io.BytesIO(body))
         self.bundle.write_bytes(buffer.getvalue())
         with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.verify()
+
+    def test_pax_control_header_is_rejected(self) -> None:
+        self.build()
+        original = self.members()
+        buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=buffer, mode="wb", filename="", mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT,
+                              pax_headers={"comment": "extra"}) as archive:
+                for name, body in original.items():
+                    entry = tarfile.TarInfo(name)
+                    entry.size = len(body)
+                    archive.addfile(entry, io.BytesIO(body))
+        self.bundle.write_bytes(buffer.getvalue())
+        with self.assertRaisesRegex(ValueError, "member|header|format"):
+            self.verify()
+
+    def test_boolean_schema_version_is_rejected(self) -> None:
+        self.build()
+        original = self.members()
+        manifest = json.loads(original["manifest.json"])
+        manifest["schemaVersion"] = True
+        original["manifest.json"] = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        self.bundle.write_bytes(tar_bytes(original))
+        with self.assertRaisesRegex(ValueError, "manifest"):
             self.verify()
 
     def test_embedded_binary_and_manifest_mutation_are_rejected(self) -> None:
