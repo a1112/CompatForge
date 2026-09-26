@@ -45,9 +45,10 @@ def elf_x86_64(payload: bytes) -> bytes:
 def tar_bytes(members: dict[str, bytes], *, symlink: str | None = None) -> bytes:
     buffer = io.BytesIO()
     with gzip.GzipFile(fileobj=buffer, mode="wb", filename="", mtime=0) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w") as archive:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
             for name, body in members.items():
                 entry = tarfile.TarInfo(name)
+                entry.mode = 0o644 if name == "manifest.json" else 0o755
                 if name == symlink:
                     entry.type = tarfile.SYMTYPE
                     entry.linkname = "../../escape"
@@ -55,6 +56,19 @@ def tar_bytes(members: dict[str, bytes], *, symlink: str | None = None) -> bytes
                     entry.size = len(body)
                 archive.addfile(entry, None if name == symlink else io.BytesIO(body))
     return buffer.getvalue()
+
+
+def with_ustar_prefix(blob: bytes) -> bytes:
+    raw = bytearray(gzip.decompress(blob))
+    header = bytearray(raw[:512])
+    header[345:355] = b"../escape\0"
+    header[148:156] = b" " * 8
+    header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+    raw[:512] = header
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
+        compressed.write(raw)
+    return output.getvalue()
 
 
 class LinuxReleasePackageTests(unittest.TestCase):
@@ -171,10 +185,11 @@ class LinuxReleasePackageTests(unittest.TestCase):
         original = self.members()
         buffer = io.BytesIO()
         with gzip.GzipFile(fileobj=buffer, mode="wb", filename="", mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w") as archive:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
                 for name in (*original, "bin/compatforge-cli"):
                     body = original[name]
                     entry = tarfile.TarInfo(name)
+                    entry.mode = 0o644 if name == "manifest.json" else 0o755
                     entry.size = len(body)
                     archive.addfile(entry, io.BytesIO(body))
         self.bundle.write_bytes(buffer.getvalue())
@@ -194,6 +209,12 @@ class LinuxReleasePackageTests(unittest.TestCase):
                     archive.addfile(entry, io.BytesIO(body))
         self.bundle.write_bytes(buffer.getvalue())
         with self.assertRaisesRegex(ValueError, "member|header|format"):
+            self.verify()
+
+    def test_ustar_path_prefix_is_rejected(self) -> None:
+        self.build()
+        self.bundle.write_bytes(with_ustar_prefix(self.bundle.read_bytes()))
+        with self.assertRaisesRegex(ValueError, "member|header|prefix"):
             self.verify()
 
     def test_boolean_schema_version_is_rejected(self) -> None:

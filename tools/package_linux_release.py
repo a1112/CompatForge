@@ -231,6 +231,12 @@ def _closed_ustar_members(blob: bytes) -> dict[str, bytes]:
         limit = MAX_MANIFEST_BYTES if name == "manifest.json" else MAX_ARTIFACT_BYTES
         if not 1 <= size <= limit:
             raise ValueError("release bundle member size is invalid")
+        expected_header = tarfile.TarInfo(name)
+        expected_header.mode = 0o644 if name == "manifest.json" else 0o755
+        expected_header.size = size
+        expected_header.mtime = 0
+        if expected_header.tobuf(format=tarfile.USTAR_FORMAT) != header:
+            raise ValueError("release bundle member header is not canonical USTAR")
         start = position + 512
         end = start + size
         next_position = start + ((size + 511) // 512) * 512
