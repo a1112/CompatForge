@@ -41,7 +41,12 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          python3 -B -m unittest tests.test_package_linux_release tests.test_linux_provider_contracts -q
+          # A dedicated UID has no unrelated, non-dumpable same-UID /proc entries.
+          # The process observer intentionally fails closed on unreadable entries.
+          python_bin="$(command -v python3)"
+          sudo -n setpriv --reuid 65534 --regid "$(id -g)" --clear-groups \
+            env HOME=/nonexistent "$python_bin" -B -m unittest \
+              tests.test_package_linux_release tests.test_linux_provider_contracts -q
           python3 -B scripts/validate_repository.py
           cargo fmt --all --check
           cargo test --workspace --locked
