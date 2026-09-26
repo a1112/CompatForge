@@ -552,7 +552,11 @@ impl PolicyEngine {
         let graphics = Self::select_graphics(&config.capabilities, request, runtime_kind)?;
         if config.capabilities.host.os == HostOs::Linux
             && runtime_kind == RuntimeKind::Wine
-            && request.constraints.required_capabilities.iter().any(|capability| capability == "vulkan")
+            && request
+                .constraints
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == "vulkan")
             && (graphics.backend != GraphicsBackendKind::Dxvk
                 || !available_provider(&config.capabilities.graphics_backends, "dxvk")
                     .is_some_and(|provider| provider.capabilities.iter().any(|capability| capability == "vulkan")))
@@ -1692,7 +1696,9 @@ mod tests {
             Err(PlanError::MissingRequiredCapability(ref name)) if name == "vulkan"
         ));
         config.capabilities.features.remove("vulkan");
-        config.capabilities.runtime_providers[0].capabilities.push("vulkan".into());
+        config.capabilities.runtime_providers[0]
+            .capabilities
+            .push("vulkan".into());
         assert!(matches!(
             PolicyEngine::compile(&config, &request),
             Err(PlanError::MissingRequiredCapability(ref name)) if name == "vulkan"
@@ -1709,7 +1715,9 @@ mod tests {
             PolicyEngine::compile(&config, &request),
             Err(PlanError::MissingRequiredCapability(ref name)) if name == "vulkan"
         ));
-        config.capabilities.graphics_backends[1].capabilities.push("vulkan".into());
+        config.capabilities.graphics_backends[1]
+            .capabilities
+            .push("vulkan".into());
         let plan = PolicyEngine::compile(&config, &request).unwrap();
         assert_eq!(plan.graphics.backend, GraphicsBackendKind::Dxvk);
     }
@@ -1751,10 +1759,10 @@ mod tests {
             .environment
             .insert("WINEDLLOVERRIDES".into(), "d3d11=b".into());
         assert!(PolicyEngine::authorize(&config, &tampered).is_err());
-        tampered.process.environment.insert(
-            "WINEDLLOVERRIDES".into(),
-            "d3d11,dxgi=n,b;mscoree,mshtml=".into(),
-        );
+        tampered
+            .process
+            .environment
+            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
         assert!(PolicyEngine::authorize(&config, &tampered).is_err());
         config.capabilities.graphics_backends = vec![provider("wined3d-local", "wined3d")];
         let plain = PolicyEngine::compile(&config, &request()).unwrap();
