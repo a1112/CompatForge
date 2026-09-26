@@ -1,0 +1,81 @@
+name: Linux runtime release
+
+on:
+  push:
+    tags:
+      - "linux-runtime-v*-rc.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Check release tag and initialize external output
+        run: |
+          set -euo pipefail
+          version="$(sed -n '/^\[workspace.package\]$/,/^\[/{s/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p;}' Cargo.toml)"
+          test -n "$version"
+          [[ "$GITHUB_REF_NAME" == "linux-runtime-v${version}-rc."* ]]
+          suffix="${GITHUB_REF_NAME##*.}"
+          [[ "$suffix" =~ ^[1-9][0-9]*$ ]]
+          printf 'CARGO_TARGET_DIR=%s/compatforge-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'CF_BUNDLE=%s/compatforge-linux-x86_64-%s.tar.gz\n' "$RUNNER_TEMP" "$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+      - name: Verify Linux release gates
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m unittest tests.test_package_linux_release tests.test_linux_provider_contracts -q
+          python3 -B scripts/validate_repository.py
+          cargo fmt --all --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build and verify the closed bundle
+        run: |
+          set -euo pipefail
+          umask 077
+          cargo build --release --locked -p compatforge-cli -p compatforge-ffi
+          python3 -B tools/package_linux_release.py build \
+            --source-root . \
+            --cli "$CARGO_TARGET_DIR/release/compatforge-cli" \
+            --library "$CARGO_TARGET_DIR/release/libcompatforge_ffi.so" \
+            --output "$CF_BUNDLE" > "$RUNNER_TEMP/release-receipt.json"
+          digest="$(sha256sum "$CF_BUNDLE" | cut -d' ' -f1)"
+          python3 -B tools/package_linux_release.py verify \
+            --bundle "$CF_BUNDLE" --sha256 "$digest" \
+            --source-commit "$(git rev-parse HEAD)"
+          printf 'CompatForge source: %s\nBundle SHA-256: %s\n' \
+            "$(git rev-parse HEAD)" "$digest" > "$RUNNER_TEMP/release-notes.txt"
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ env.CF_BUNDLE }}
+      - name: Publish immutable prerelease asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo 'release tag already has an asset; refusing replacement' >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$CF_BUNDLE" \
+            --verify-tag --prerelease --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/release-notes.txt"

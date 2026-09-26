@@ -41,7 +41,16 @@ python3 tools/package_linux_release.py verify \
 
 The release workflow builds the asset from a pushed tag, runs Linux gates,
 generates a GitHub build-provenance attestation, and attaches the asset to a
-prerelease. Consumers should verify its attestation and pin the resulting
+prerelease. Tags use `linux-runtime-v<workspace version>-rc.<positive number>`.
+For a downloaded release asset, verify its provenance before staging it:
+
+```sh
+gh attestation verify /absolute/release/compatforge-linux-x86_64-linux-runtime-v0.12.0-rc.1.tar.gz \
+  -R lcxinc/CompatForge \
+  --signer-workflow lcxinc/CompatForge/.github/workflows/linux-runtime-release.yml
+```
+
+Consumers should pin the resulting
 archive digest in their own source lock before any offline image build. A
 local bundle is a candidate until that verification and release publication
 have happened. Never substitute the manifest's self-declared commit or hashes
