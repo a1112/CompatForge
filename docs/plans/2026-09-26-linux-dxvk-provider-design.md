@@ -24,17 +24,19 @@ probe, wrong architecture, or unrecognized output leaves DXVK unavailable.
 
 The Provider reports WineD3D as before plus DXVK only after the evidence
 passes. A D3D11 LaunchRequest can require the `vulkan` capability; the
-planner's Linux preference selects DXVK. The plan records the DXVK version and
-protected DLL path/digests in its environment. Process startup checks that
-`graphics.backend=dxvk` matches the protected environment, the two DLLs are
-adjacent to the bound Guest PE, and both digests still match, then uses native
-overrides for `d3d11` and `dxgi`. It rejects a missing/changed pair before Wine
-spawns. The exact ForgeOS sample then demonstrates actual D3D11 rendering and
-DXVK runtime evidence in QEMU; a selected plan alone is insufficient.
+planner's Linux preference selects DXVK. The plan records the verified DLL
+paths and digests plus the ICD manifest in its environment. Process startup
+checks that `graphics.backend=dxvk` matches the protected environment and
+that all three digests still match. After Wine creates its private prefix,
+the process layer installs the exact DLL pair into that prefix's `system32`,
+verifies those installed bytes, and uses native overrides for `d3d11` and
+`dxgi`. It rechecks the source and installed pair before Wine spawns the guest.
+The exact ForgeOS sample then demonstrates actual D3D11 rendering and DXVK
+runtime evidence in QEMU; a selected plan alone is insufficient.
 
 ## Limits
 
-This slice supports only x64 DLLs next to an immutable Guest PE. It does not
+This slice supports only x64 DLLs in a private Wine prefix. It does not
 manage general Bottle installs, 32-bit DXVK, D3D12, hardware-driver
 certification or arbitrary Windows applications. A software Vulkan device is
 the development gate, not a performance claim. The existing local Linux

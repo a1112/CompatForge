@@ -19,6 +19,36 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+const DXVK_EVIDENCE_NAMES: [&str; 6] = [
+    "COMPATFORGE_DXVK_D3D11",
+    "COMPATFORGE_DXVK_D3D11_SHA256",
+    "COMPATFORGE_DXVK_DXGI",
+    "COMPATFORGE_DXVK_DXGI_SHA256",
+    "COMPATFORGE_VULKAN_ICD",
+    "COMPATFORGE_VULKAN_ICD_SHA256",
+];
+
+fn protected_graphics_environment(
+    binding: &BTreeMap<String, String>,
+    backend: GraphicsBackendKind,
+) -> BTreeMap<String, String> {
+    let mut environment = binding.clone();
+    if backend == GraphicsBackendKind::Dxvk
+        && environment.contains_key("COMPATFORGE_DXVK_D3D11")
+        && environment.contains_key("COMPATFORGE_DXVK_DXGI")
+    {
+        environment.insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+        if let Some(icd) = environment.get("COMPATFORGE_VULKAN_ICD").cloned() {
+            environment.insert("VK_ICD_FILENAMES".into(), icd);
+        }
+    } else {
+        for name in DXVK_EVIDENCE_NAMES {
+            environment.remove(name);
+        }
+    }
+    environment
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     InvalidConfig(ContractError),
@@ -523,27 +553,11 @@ impl PolicyEngine {
         let bottle_directory = join_host_path(&config.storage_root, &["bottles", &request.bottle_id]);
 
         let mut environment = request.environment.clone();
-        environment.extend(binding.environment.clone());
-        if graphics.backend == GraphicsBackendKind::Dxvk
-            && environment.contains_key("COMPATFORGE_DXVK_D3D11")
-            && environment.contains_key("COMPATFORGE_DXVK_DXGI")
-        {
-            environment.insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
-            if let Some(icd) = environment.get("COMPATFORGE_VULKAN_ICD").cloned() {
-                environment.insert("VK_ICD_FILENAMES".into(), icd);
-            }
-        } else {
-            for name in [
-                "COMPATFORGE_DXVK_D3D11",
-                "COMPATFORGE_DXVK_D3D11_SHA256",
-                "COMPATFORGE_DXVK_DXGI",
-                "COMPATFORGE_DXVK_DXGI_SHA256",
-                "COMPATFORGE_VULKAN_ICD",
-                "COMPATFORGE_VULKAN_ICD_SHA256",
-            ] {
-                environment.remove(name);
-            }
+        for name in DXVK_EVIDENCE_NAMES {
+            environment.remove(name);
         }
+        environment.remove("VK_ICD_FILENAMES");
+        environment.extend(protected_graphics_environment(&binding.environment, graphics.backend));
         let wine_prefix = (runtime_kind == RuntimeKind::Wine).then(|| join_host_path(&bottle_directory, &["prefix"]));
         if let Some(prefix) = &wine_prefix {
             environment.insert("WINEPREFIX".into(), prefix.clone());
@@ -702,10 +716,17 @@ impl PolicyEngine {
         if !host_path_is_within(&config.storage_root, &plan.process.working_directory) {
             return Err(PlanError::PlanMismatch("working directory"));
         }
-        for (key, value) in &binding.environment {
-            if plan.process.environment.get(key) != Some(value) {
+        for (key, value) in protected_graphics_environment(&binding.environment, plan.graphics.backend) {
+            if plan.process.environment.get(&key) != Some(&value) {
                 return Err(PlanError::PlanMismatch("protected runtime environment"));
             }
+        }
+        if plan.graphics.backend != GraphicsBackendKind::Dxvk
+            && DXVK_EVIDENCE_NAMES
+                .iter()
+                .any(|name| plan.process.environment.contains_key(*name))
+        {
+            return Err(PlanError::PlanMismatch("unexpected DXVK environment"));
         }
         if plan.runtime.provider == RuntimeKind::Wine {
             let wine_prefix = plan
@@ -1666,6 +1687,50 @@ mod tests {
         });
         let plan = PolicyEngine::compile(&config, &request).unwrap();
         assert_eq!(plan.graphics.backend, GraphicsBackendKind::Dxvk);
+    }
+
+    #[test]
+    fn dxvk_graphics_environment_is_authorized_from_pinned_binding() {
+        let mut config = config(CpuArchitecture::X86_64);
+        let binding = &mut config.runtime_bindings[0];
+        for (name, value) in [
+            ("COMPATFORGE_DXVK_D3D11", "/usr/lib/dxvk/d3d11.dll"),
+            (
+                "COMPATFORGE_DXVK_D3D11_SHA256",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ("COMPATFORGE_DXVK_DXGI", "/usr/lib/dxvk/dxgi.dll"),
+            (
+                "COMPATFORGE_DXVK_DXGI_SHA256",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            ("COMPATFORGE_VULKAN_ICD", "/usr/share/vulkan/icd.d/lvp_icd.json"),
+            (
+                "COMPATFORGE_VULKAN_ICD_SHA256",
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+            ("WINEDLLOVERRIDES", "mscoree,mshtml="),
+        ] {
+            binding.environment.insert(name.into(), value.into());
+        }
+        let plan = PolicyEngine::compile(&config, &request()).unwrap();
+        assert_eq!(plan.graphics.backend, GraphicsBackendKind::Dxvk);
+        assert_eq!(
+            plan.process.environment["WINEDLLOVERRIDES"],
+            "d3d11,dxgi=n,b;mscoree,mshtml="
+        );
+        PolicyEngine::authorize(&config, &plan).unwrap();
+        let mut tampered = plan.clone();
+        tampered
+            .process
+            .environment
+            .insert("WINEDLLOVERRIDES".into(), "d3d11=b".into());
+        assert!(PolicyEngine::authorize(&config, &tampered).is_err());
+        config.capabilities.graphics_backends = vec![provider("wined3d-local", "wined3d")];
+        let plain = PolicyEngine::compile(&config, &request()).unwrap();
+        assert_eq!(plain.graphics.backend, GraphicsBackendKind::WineD3d);
+        assert!(!plain.process.environment.contains_key("COMPATFORGE_DXVK_D3D11"));
+        PolicyEngine::authorize(&config, &plain).unwrap();
     }
 
     #[test]
