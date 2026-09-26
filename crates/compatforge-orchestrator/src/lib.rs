@@ -550,6 +550,15 @@ impl PolicyEngine {
 
         let translator = Self::select_translator(&config.capabilities, request, runtime_kind)?;
         let graphics = Self::select_graphics(&config.capabilities, request, runtime_kind)?;
+        if config.capabilities.host.os == HostOs::Linux
+            && runtime_kind == RuntimeKind::Wine
+            && request.constraints.required_capabilities.iter().any(|capability| capability == "vulkan")
+            && (graphics.backend != GraphicsBackendKind::Dxvk
+                || !available_provider(&config.capabilities.graphics_backends, "dxvk")
+                    .is_some_and(|provider| provider.capabilities.iter().any(|capability| capability == "vulkan")))
+        {
+            return Err(PlanError::MissingRequiredCapability("vulkan".into()));
+        }
         let bottle_directory = join_host_path(&config.storage_root, &["bottles", &request.bottle_id]);
 
         let mut environment = request.environment.clone();
@@ -1694,8 +1703,13 @@ mod tests {
             version: "2.7.1".into(),
             available: true,
             reason: None,
-            capabilities: vec!["vulkan".into()],
+            capabilities: Vec::new(),
         });
+        assert!(matches!(
+            PolicyEngine::compile(&config, &request),
+            Err(PlanError::MissingRequiredCapability(ref name)) if name == "vulkan"
+        ));
+        config.capabilities.graphics_backends[1].capabilities.push("vulkan".into());
         let plan = PolicyEngine::compile(&config, &request).unwrap();
         assert_eq!(plan.graphics.backend, GraphicsBackendKind::Dxvk);
     }
