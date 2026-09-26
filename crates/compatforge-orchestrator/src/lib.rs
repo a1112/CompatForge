@@ -1677,6 +1677,17 @@ mod tests {
         let mut request = request();
         request.constraints.required_capabilities = vec!["vulkan".into()];
         assert!(PolicyEngine::compile(&config, &request).is_err());
+        config.capabilities.features.insert("vulkan".into(), true.into());
+        assert!(matches!(
+            PolicyEngine::compile(&config, &request),
+            Err(PlanError::MissingRequiredCapability(ref name)) if name == "vulkan"
+        ));
+        config.capabilities.features.remove("vulkan");
+        config.capabilities.runtime_providers[0].capabilities.push("vulkan".into());
+        assert!(matches!(
+            PolicyEngine::compile(&config, &request),
+            Err(PlanError::MissingRequiredCapability(ref name)) if name == "vulkan"
+        ));
         config.capabilities.graphics_backends.push(ProviderDescriptor {
             id: "dxvk-local".into(),
             kind: "dxvk".into(),
