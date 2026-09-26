@@ -2,11 +2,15 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod dxvk;
 mod elf;
 mod probe;
 #[cfg(target_os = "linux")]
 mod unix_process_group;
 
+pub use dxvk::{
+    verify_dxvk_pair, verify_vulkan_device, DxvkSource, VerifiedDxvkPair, VerifiedVulkanDevice, VulkanSource,
+};
 pub use probe::{
     probe_runtime_with, ProbeCommand, ProbeCommandFailure, ProbeCommandOutput, ProbeCommandSpec, ProbeCommandStatus,
     RuntimeProbeObservation, SystemProbeCommand,
