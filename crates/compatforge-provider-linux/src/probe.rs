@@ -378,16 +378,37 @@ mod linux_system_probe {
     }
 
     fn validate_specification(specification: &ProbeCommandSpec) -> Result<(), ProbeCommandFailure> {
-        let expected_environment = BTreeMap::from([
+        let wine_environment = BTreeMap::from([
             (OsString::from("LANG"), OsString::from("C")),
             (OsString::from("LC_ALL"), OsString::from("C")),
             (OsString::from("WINEDEBUG"), OsString::from("-all")),
         ]);
+        let wine_probe = specification.arguments == [OsString::from("--version")]
+            && specification.environment == wine_environment
+            && specification.combined_output_limit == MAX_COMBINED_OUTPUT_BYTES;
+        let icd = specification
+            .environment
+            .get(&OsString::from("VK_ICD_FILENAMES"))
+            .map(PathBuf::from);
+        let vulkan_probe = icd.as_ref().is_some_and(|path| {
+            specification.arguments == [OsString::from("--text")]
+                && specification.executable.file_name() == Some(std::ffi::OsStr::new("vulkaninfo"))
+                && specification.combined_output_limit == 128 * 1024
+                && path.file_name() == Some(std::ffi::OsStr::new("lvp_icd.json"))
+                && path.is_absolute()
+                && path.starts_with(&specification.working_directory)
+                && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+                && std::fs::canonicalize(path).ok().as_deref() == Some(path.as_path())
+                && specification.environment
+                    == BTreeMap::from([
+                        (OsString::from("LANG"), OsString::from("C")),
+                        (OsString::from("LC_ALL"), OsString::from("C")),
+                        (OsString::from("VK_ICD_FILENAMES"), path.as_os_str().to_os_string()),
+                    ])
+        });
         if !specification.executable.is_absolute()
             || !specification.working_directory.is_absolute()
-            || specification.arguments != [OsString::from("--version")]
-            || specification.environment != expected_environment
-            || specification.combined_output_limit != MAX_COMBINED_OUTPUT_BYTES
+            || !(wine_probe || vulkan_probe)
         {
             return Err(ProbeCommandFailure::Spawn);
         }
@@ -406,6 +427,39 @@ mod linux_system_probe {
             return Err(ProbeCommandFailure::Spawn);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn vulkan_probe_contract_allows_only_pinned_text_device_probe() {
+        let root = std::env::temp_dir().join(format!("compatforge-vulkan-command-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("share/vulkan/icd.d")).unwrap();
+        std::fs::write(root.join("bin/vulkaninfo"), b"probe").unwrap();
+        std::fs::write(root.join("share/vulkan/icd.d/lvp_icd.json"), b"{}").unwrap();
+        let mut spec = ProbeCommandSpec {
+            executable: root.join("bin/vulkaninfo"),
+            arguments: vec![OsString::from("--text")],
+            working_directory: root.clone(),
+            environment: BTreeMap::from([
+                (OsString::from("LANG"), OsString::from("C")),
+                (OsString::from("LC_ALL"), OsString::from("C")),
+                (
+                    OsString::from("VK_ICD_FILENAMES"),
+                    root.join("share/vulkan/icd.d/lvp_icd.json").into_os_string(),
+                ),
+            ]),
+            deadline: Instant::now() + Duration::from_secs(10),
+            combined_output_limit: 128 * 1024,
+        };
+        assert_eq!(validate_specification(&spec), Ok(()));
+        spec.arguments = vec![OsString::from("--summary")];
+        assert_eq!(validate_specification(&spec), Err(ProbeCommandFailure::Spawn));
+        spec.arguments = vec![OsString::from("--text")];
+        spec.environment
+            .insert(OsString::from("VK_ICD_FILENAMES"), OsString::from("/tmp/other.json"));
+        assert_eq!(validate_specification(&spec), Err(ProbeCommandFailure::Spawn));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn start_readers(stdout: ChildStdout, stderr: ChildStderr) -> (Readers, bool) {
