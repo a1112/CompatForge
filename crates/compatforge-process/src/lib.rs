@@ -5,8 +5,8 @@
 #[cfg(any(test, target_os = "macos"))]
 use compatforge_domain::BottleExecutableBinding;
 use compatforge_domain::{
-    ContractError, LaunchPlan, OutputStream, ProcessExit, ProcessOutput, RuntimeEvent, RuntimeEventKind, RuntimeKind,
-    WineServerLifecycle, SCHEMA_VERSION_V1,
+    ContractError, GraphicsBackendKind, LaunchPlan, OutputStream, ProcessExit, ProcessOutput, RuntimeEvent,
+    RuntimeEventKind, RuntimeKind, WineServerLifecycle, SCHEMA_VERSION_V1,
 };
 use compatforge_guest_artifact::{
     verify_binding_contents, verify_in_place_binding_contents, GuestArtifactError, PinnedBottleExecutable,
@@ -152,6 +152,11 @@ impl ProcessSupervisor {
         startup_step(&mut startup_guard, StartupStage::Wineboot, operations.wineboot(plan))?;
         startup_step(
             &mut startup_guard,
+            StartupStage::RuntimeVerification,
+            install_dxvk_pair(plan),
+        )?;
+        startup_step(
+            &mut startup_guard,
             StartupStage::GuestVerification,
             verify_guest_inputs(plan),
         )?;
@@ -195,7 +200,8 @@ impl ProcessSupervisor {
             // Recheck the actual alias too; the binding source alone cannot
             // prove that a replaced alias still names the approved bytes.
             prepare_guest_execution_alias(plan)?;
-            verify_pinned_runtime(plan)
+            verify_pinned_runtime(plan)?;
+            verify_installed_dxvk_pair(plan)
         })
     }
 
@@ -941,6 +947,7 @@ fn ensure_directory(path: &Path, field: &'static str) -> Result<(), ProcessError
 }
 
 fn verify_pinned_runtime(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    verify_dxvk_evidence(plan)?;
     let environment = &plan.process.environment;
     let managed = plan.lifecycle.wineserver.is_some()
         || [
@@ -992,6 +999,110 @@ fn verify_pinned_runtime(plan: &LaunchPlan) -> Result<(), ProcessError> {
         wineserver_digest,
         "wineserver executable",
     )
+}
+
+fn verify_dxvk_evidence(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    let env = &plan.process.environment;
+    if plan.graphics.backend != GraphicsBackendKind::Dxvk {
+        if env.keys().any(|key| key.starts_with("COMPATFORGE_DXVK_")) {
+            return Err(ProcessError::InvalidRuntimeEvidence("unexpected DXVK evidence"));
+        }
+        return Ok(());
+    }
+    if plan.runtime.provider != RuntimeKind::Wine
+        || env.get("WINEDLLOVERRIDES").map(String::as_str) != Some("d3d11,dxgi=n,b;mscoree,mshtml=")
+    {
+        return Err(ProcessError::InvalidRuntimeEvidence("DXVK override"));
+    }
+    let mut paths = Vec::new();
+    for (name, field) in [
+        ("COMPATFORGE_DXVK_D3D11", "DXVK d3d11"),
+        ("COMPATFORGE_DXVK_DXGI", "DXVK dxgi"),
+        ("COMPATFORGE_VULKAN_ICD", "Vulkan ICD"),
+    ] {
+        let path = env.get(name).ok_or(ProcessError::InvalidRuntimeEvidence(field))?;
+        let digest = env
+            .get(&format!("{name}_SHA256"))
+            .ok_or(ProcessError::InvalidRuntimeEvidence(field))?;
+        verify_pinned_regular_file(Path::new(path), digest, field)?;
+        paths.push(Path::new(path));
+    }
+    if paths[0].parent() != paths[1].parent()
+        || paths[0].file_name().and_then(|name| name.to_str()) != Some("d3d11.dll")
+        || paths[1].file_name().and_then(|name| name.to_str()) != Some("dxgi.dll")
+        || env.get("VK_ICD_FILENAMES").map(String::as_str) != env.get("COMPATFORGE_VULKAN_ICD").map(String::as_str)
+    {
+        return Err(ProcessError::InvalidRuntimeEvidence("DXVK paths"));
+    }
+    Ok(())
+}
+
+fn dxvk_target_directory(plan: &LaunchPlan) -> Result<PathBuf, ProcessError> {
+    let prefix = plan
+        .process
+        .environment
+        .get("WINEPREFIX")
+        .ok_or(ProcessError::InvalidRuntimeEvidence("WINEPREFIX"))?;
+    Ok(Path::new(prefix).join("drive_c/windows/system32"))
+}
+
+fn install_dxvk_pair(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    if plan.graphics.backend != GraphicsBackendKind::Dxvk {
+        return Ok(());
+    }
+    verify_dxvk_evidence(plan)?;
+    let target = dxvk_target_directory(plan)?;
+    let metadata =
+        std::fs::symlink_metadata(&target).map_err(|_| ProcessError::InvalidRuntimeEvidence("DXVK system32"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProcessError::InvalidRuntimeEvidence("DXVK system32"));
+    }
+    for name in ["d3d11", "dxgi"] {
+        let source = Path::new(
+            plan.process
+                .environment
+                .get(&format!("COMPATFORGE_DXVK_{}", name.to_ascii_uppercase()))
+                .ok_or(ProcessError::InvalidRuntimeEvidence("DXVK source"))?,
+        );
+        let destination = target.join(format!("{name}.dll"));
+        if let Ok(existing) = std::fs::symlink_metadata(&destination) {
+            if !existing.is_file() || existing.file_type().is_symlink() {
+                return Err(ProcessError::InvalidRuntimeEvidence("DXVK destination"));
+            }
+        }
+        let temporary = target.join(format!(".compatforge-dxvk-{}-{name}", std::process::id()));
+        let copied = (|| {
+            let mut input = std::fs::File::open(source)?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            std::fs::rename(&temporary, &destination)
+        })();
+        if copied.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(ProcessError::InvalidRuntimeEvidence("DXVK install"));
+        }
+    }
+    verify_installed_dxvk_pair(plan)
+}
+
+fn verify_installed_dxvk_pair(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    if plan.graphics.backend != GraphicsBackendKind::Dxvk {
+        return Ok(());
+    }
+    let target = dxvk_target_directory(plan)?;
+    for name in ["d3d11", "dxgi"] {
+        let digest = plan
+            .process
+            .environment
+            .get(&format!("COMPATFORGE_DXVK_{}_SHA256", name.to_ascii_uppercase()))
+            .ok_or(ProcessError::InvalidRuntimeEvidence("DXVK digest"))?;
+        verify_pinned_regular_file(&target.join(format!("{name}.dll")), digest, "installed DXVK DLL")?;
+    }
+    Ok(())
 }
 
 fn verify_pinned_font_config(plan: &LaunchPlan) -> Result<(), ProcessError> {
@@ -5359,6 +5470,91 @@ mod tests {
             .environment
             .insert(WINESERVER_EXECUTABLE_DIGEST_ENV.into(), digest);
         verify_pinned_runtime(&plan).unwrap();
+    }
+
+    #[test]
+    fn dxvk_plan_requires_pinned_pair_and_rejects_changed_bytes() {
+        let root = std::env::temp_dir().join(format!("compatforge-dxvk-evidence-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let d3d11 = root.join("d3d11.dll");
+        let dxgi = root.join("dxgi.dll");
+        let icd = root.join("lvp_icd.json");
+        for (path, data) in [(&d3d11, b"d3d11".as_slice()), (&dxgi, b"dxgi"), (&icd, b"{}")] {
+            std::fs::write(path, data).unwrap();
+        }
+        let mut plan = fixture_plan();
+        plan.graphics.backend = GraphicsBackendKind::Dxvk;
+        assert!(verify_pinned_runtime(&plan).is_err());
+        for (name, path) in [
+            ("COMPATFORGE_DXVK_D3D11", &d3d11),
+            ("COMPATFORGE_DXVK_DXGI", &dxgi),
+            ("COMPATFORGE_VULKAN_ICD", &icd),
+        ] {
+            plan.process
+                .environment
+                .insert(name.into(), path.to_string_lossy().into_owned());
+            plan.process
+                .environment
+                .insert(format!("{name}_SHA256"), sha256_file(path).unwrap());
+        }
+        plan.process
+            .environment
+            .insert("VK_ICD_FILENAMES".into(), icd.to_string_lossy().into_owned());
+        plan.process
+            .environment
+            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+        verify_pinned_runtime(&plan).unwrap();
+        std::fs::write(&dxgi, b"changed").unwrap();
+        assert!(matches!(
+            verify_pinned_runtime(&plan),
+            Err(ProcessError::InvalidRuntimeEvidence("DXVK dxgi"))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dxvk_pair_installs_only_after_prefix_exists_and_rechecks_installed_bytes() {
+        let root = std::env::temp_dir().join(format!("compatforge-dxvk-install-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        let prefix = root.join("prefix");
+        let system32 = prefix.join("drive_c/windows/system32");
+        let mut plan = fixture_plan();
+        plan.graphics.backend = GraphicsBackendKind::Dxvk;
+        for (name, bytes) in [("D3D11", b"d3d11".as_slice()), ("DXGI", b"dxgi")] {
+            let path = source.join(format!("{}.dll", name.to_ascii_lowercase()));
+            std::fs::write(&path, bytes).unwrap();
+            plan.process
+                .environment
+                .insert(format!("COMPATFORGE_DXVK_{name}"), path.to_string_lossy().into_owned());
+            plan.process
+                .environment
+                .insert(format!("COMPATFORGE_DXVK_{name}_SHA256"), sha256_file(&path).unwrap());
+        }
+        let icd = root.join("lvp_icd.json");
+        std::fs::write(&icd, b"{}").unwrap();
+        plan.process
+            .environment
+            .insert("COMPATFORGE_VULKAN_ICD".into(), icd.to_string_lossy().into_owned());
+        plan.process
+            .environment
+            .insert("COMPATFORGE_VULKAN_ICD_SHA256".into(), sha256_file(&icd).unwrap());
+        plan.process
+            .environment
+            .insert("VK_ICD_FILENAMES".into(), icd.to_string_lossy().into_owned());
+        plan.process
+            .environment
+            .insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+        plan.process
+            .environment
+            .insert("WINEPREFIX".into(), prefix.to_string_lossy().into_owned());
+        assert!(install_dxvk_pair(&plan).is_err());
+        std::fs::create_dir_all(&system32).unwrap();
+        install_dxvk_pair(&plan).unwrap();
+        std::fs::write(system32.join("d3d11.dll"), b"tampered").unwrap();
+        assert!(verify_installed_dxvk_pair(&plan).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

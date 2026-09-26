@@ -524,6 +524,26 @@ impl PolicyEngine {
 
         let mut environment = request.environment.clone();
         environment.extend(binding.environment.clone());
+        if graphics.backend == GraphicsBackendKind::Dxvk
+            && environment.contains_key("COMPATFORGE_DXVK_D3D11")
+            && environment.contains_key("COMPATFORGE_DXVK_DXGI")
+        {
+            environment.insert("WINEDLLOVERRIDES".into(), "d3d11,dxgi=n,b;mscoree,mshtml=".into());
+            if let Some(icd) = environment.get("COMPATFORGE_VULKAN_ICD").cloned() {
+                environment.insert("VK_ICD_FILENAMES".into(), icd);
+            }
+        } else {
+            for name in [
+                "COMPATFORGE_DXVK_D3D11",
+                "COMPATFORGE_DXVK_D3D11_SHA256",
+                "COMPATFORGE_DXVK_DXGI",
+                "COMPATFORGE_DXVK_DXGI_SHA256",
+                "COMPATFORGE_VULKAN_ICD",
+                "COMPATFORGE_VULKAN_ICD_SHA256",
+            ] {
+                environment.remove(name);
+            }
+        }
         let wine_prefix = (runtime_kind == RuntimeKind::Wine).then(|| join_host_path(&bottle_directory, &["prefix"]));
         if let Some(prefix) = &wine_prefix {
             environment.insert("WINEPREFIX".into(), prefix.clone());
@@ -1627,6 +1647,25 @@ mod tests {
                 .supervisor
                 .termination_grace_milliseconds
         );
+    }
+
+    #[test]
+    fn vulkan_requirement_never_selects_wined3d() {
+        let mut config = config(CpuArchitecture::X86_64);
+        config.capabilities.graphics_backends = vec![provider("wined3d-local", "wined3d")];
+        let mut request = request();
+        request.constraints.required_capabilities = vec!["vulkan".into()];
+        assert!(PolicyEngine::compile(&config, &request).is_err());
+        config.capabilities.graphics_backends.push(ProviderDescriptor {
+            id: "dxvk-local".into(),
+            kind: "dxvk".into(),
+            version: "2.7.1".into(),
+            available: true,
+            reason: None,
+            capabilities: vec!["vulkan".into()],
+        });
+        let plan = PolicyEngine::compile(&config, &request).unwrap();
+        assert_eq!(plan.graphics.backend, GraphicsBackendKind::Dxvk);
     }
 
     #[test]

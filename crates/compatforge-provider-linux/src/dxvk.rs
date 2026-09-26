@@ -48,6 +48,24 @@ pub struct VerifiedVulkanDevice {
     pub icd_manifest: PathBuf,
 }
 
+impl VulkanSource {
+    pub fn validate(&self) -> Result<(), EvidenceFailure> {
+        for entrypoint in [&self.probe, &self.icd_manifest] {
+            validate_linux_relative_path("vulkan.path", &entrypoint.path).map_err(|_| EvidenceFailure::Entrypoint)?;
+            validate_linux_digest("vulkan.digest", &entrypoint.digest).map_err(|_| EvidenceFailure::Digest)?;
+        }
+        if Path::new(&self.probe.path).file_name().and_then(|name| name.to_str()) != Some("vulkaninfo")
+            || Path::new(&self.icd_manifest.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some("lvp_icd.json")
+        {
+            return Err(EvidenceFailure::Entrypoint);
+        }
+        Ok(())
+    }
+}
+
 impl DxvkSource {
     pub fn validate(&self) -> Result<(), EvidenceFailure> {
         if !valid_version(&self.version) {
@@ -83,18 +101,7 @@ pub fn verify_vulkan_device(
     source: &VulkanSource,
     command: &dyn ProbeCommand,
 ) -> Result<VerifiedVulkanDevice, EvidenceFailure> {
-    for entrypoint in [&source.probe, &source.icd_manifest] {
-        validate_linux_relative_path("vulkan.path", &entrypoint.path).map_err(|_| EvidenceFailure::Entrypoint)?;
-        validate_linux_digest("vulkan.digest", &entrypoint.digest).map_err(|_| EvidenceFailure::Digest)?;
-    }
-    if Path::new(&source.probe.path).file_name().and_then(|name| name.to_str()) != Some("vulkaninfo")
-        || Path::new(&source.icd_manifest.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            != Some("lvp_icd.json")
-    {
-        return Err(EvidenceFailure::Entrypoint);
-    }
+    source.validate()?;
     let root = fs::canonicalize(root).map_err(|_| EvidenceFailure::MaterializedRoot)?;
     let probe = verify_entrypoint(&root, &source.probe)?;
     let icd_manifest = verify_regular_file(&root, &source.icd_manifest)?;

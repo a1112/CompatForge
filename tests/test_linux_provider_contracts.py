@@ -209,7 +209,11 @@ class LinuxProviderSchemaTests(unittest.TestCase):
         self.assertFalse(runtime["additionalProperties"])
         root_fields = {"schemaVersion", "runtimeStoreRoot", "wineRuntime"}
         self.assertEqual(set(schema["required"]), root_fields)
-        self.assertEqual(set(schema["properties"]), root_fields)
+        self.assertEqual(set(schema["properties"]), root_fields | {"dxvkGraphics"})
+        self.assertEqual(
+            schema["properties"]["dxvkGraphics"]["$ref"],
+            "#/$defs/dxvkGraphics",
+        )
         self.assertEqual(
             schema["properties"]["runtimeStoreRoot"]["$ref"],
             "#/$defs/absoluteLinuxPath",
@@ -282,7 +286,13 @@ class LinuxProviderSchemaTests(unittest.TestCase):
             "version",
         }
         self.assertEqual(set(schema["required"]), fields)
-        self.assertEqual(set(schema["properties"]), fields)
+        self.assertEqual(set(schema["properties"]), fields | {"dxvkGraphics"})
+        self.assertEqual(schema["properties"]["dxvkGraphics"]["$ref"], "#/$defs/dxvkGraphics")
+        graphics = schema["$defs"]["dxvkGraphics"]
+        self.assertFalse(graphics["additionalProperties"])
+        self.assertEqual(set(graphics["required"]), {"dxvk", "vulkan"})
+        self.assertEqual(set(graphics["properties"]["dxvk"]["required"]), {"version", "d3d11", "dxgi"})
+        self.assertEqual(set(graphics["properties"]["vulkan"]["required"]), {"probe", "icdManifest"})
         for path_name in ("runtimeStoreRoot", "storageRoot", "materializedRoot"):
             self.assertEqual(
                 schema["properties"][path_name]["$ref"],

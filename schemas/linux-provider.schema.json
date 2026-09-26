@@ -8,6 +8,7 @@
   "properties": {
     "schemaVersion": {"const": "1"},
     "runtimeStoreRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
+    "dxvkGraphics": {"$ref": "#/$defs/dxvkGraphics"},
     "wineRuntime": {
       "type": "object",
       "additionalProperties": false,
@@ -38,6 +39,29 @@
     }
   },
   "$defs": {
+    "dxvkGraphics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dxvk", "vulkan"],
+      "properties": {
+        "dxvk": {
+          "type": "object", "additionalProperties": false,
+          "required": ["version", "d3d11", "dxgi"],
+          "properties": {
+            "version": {"$ref": "#/$defs/version"},
+            "d3d11": {"$ref": "#/$defs/entrypoint"},
+            "dxgi": {"$ref": "#/$defs/entrypoint"}
+          }
+        },
+        "vulkan": {
+          "type": "object", "additionalProperties": false,
+          "required": ["probe", "icdManifest"],
+          "properties": {
+            "probe": {"$ref": "#/$defs/entrypoint"},
+            "icdManifest": {"$ref": "#/$defs/entrypoint"}
+          }
+        }
+      }
+    },
     "id": {
       "type": "string",
       "minLength": 2,

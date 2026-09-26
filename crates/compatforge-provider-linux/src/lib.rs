@@ -127,6 +127,22 @@ pub struct LinuxProviderConfig {
     pub schema_version: String,
     pub runtime_store_root: String,
     pub wine_runtime: WineRuntimeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dxvk_graphics: Option<DxvkGraphicsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DxvkGraphicsConfig {
+    pub dxvk: DxvkSource,
+    pub vulkan: VulkanSource,
+}
+
+impl DxvkGraphicsConfig {
+    fn validate(&self) -> Result<(), LinuxProviderError> {
+        self.dxvk.validate().map_err(LinuxProviderError::Evidence)?;
+        self.vulkan.validate().map_err(LinuxProviderError::Evidence)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -162,6 +178,8 @@ pub struct LinuxLocalContextRequest {
     pub wine: String,
     pub wineserver: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dxvk_graphics: Option<DxvkGraphicsConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -188,7 +206,11 @@ impl LinuxProviderConfig {
         if !serialized_linux_absolute_path(&self.runtime_store_root) {
             return Err(LinuxProviderError::InvalidConfig("runtimeStoreRoot"));
         }
-        self.wine_runtime.validate()
+        self.wine_runtime.validate()?;
+        if let Some(graphics) = &self.dxvk_graphics {
+            graphics.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -246,6 +268,9 @@ impl LinuxLocalContextRequest {
         validate_linux_relative_path("wineserver", &self.wineserver)?;
         if !valid_version(&self.version) {
             return Err(LinuxProviderError::InvalidRequest("version"));
+        }
+        if let Some(graphics) = &self.dxvk_graphics {
+            graphics.validate()?;
         }
         Ok(())
     }
@@ -780,6 +805,56 @@ impl LinuxProviderSet {
         config: &LinuxProviderConfig,
         command: &dyn ProbeCommand,
     ) -> Result<LinuxProviderSnapshot, LinuxProviderError> {
+        let mut snapshot = Self::probe_wine_with(host_report, config, command)?;
+        if let Some(graphics) = &config.dxvk_graphics {
+            let evidence = if snapshot.runtime_binding.is_some() {
+                verify_dxvk_pair(Path::new(&config.wine_runtime.materialized_root), &graphics.dxvk).and_then(|_| {
+                    verify_vulkan_device(
+                        Path::new(&config.wine_runtime.materialized_root),
+                        &graphics.vulkan,
+                        command,
+                    )
+                    .map(|_| ())
+                })
+            } else {
+                Err(EvidenceFailure::RuntimePack)
+            };
+            let available = evidence.is_ok();
+            snapshot.capabilities.graphics_backends.push(ProviderDescriptor {
+                id: "linux-dxvk".into(),
+                kind: "dxvk".into(),
+                version: graphics.dxvk.version.clone(),
+                available,
+                reason: evidence.err().map(|failure| failure.to_string()),
+                capabilities: vec!["vulkan".into()],
+            });
+            if available {
+                let root = &config.wine_runtime.materialized_root;
+                let binding = snapshot.runtime_binding.as_mut().expect("available Wine binding");
+                for (name, entry) in [
+                    ("COMPATFORGE_DXVK_D3D11", &graphics.dxvk.d3d11),
+                    ("COMPATFORGE_DXVK_DXGI", &graphics.dxvk.dxgi),
+                    ("COMPATFORGE_VULKAN_ICD", &graphics.vulkan.icd_manifest),
+                ] {
+                    let path = Path::new(root).join(&entry.path);
+                    binding
+                        .environment
+                        .insert(name.into(), path.to_string_lossy().into_owned());
+                    binding
+                        .environment
+                        .insert(format!("{name}_SHA256"), entry.digest.clone());
+                }
+            }
+            snapshot.capabilities.validate()?;
+        }
+        Ok(snapshot)
+    }
+
+    fn probe_wine_with(
+        host_report: &CapabilityReport,
+        config: &LinuxProviderConfig,
+        command: &dyn ProbeCommand,
+    ) -> Result<LinuxProviderSnapshot, LinuxProviderError> {
         host_report.validate()?;
         config.validate()?;
         if host_report.host.os != HostOs::Linux || host_report.host.architecture != CpuArchitecture::X86_64 {
@@ -1257,6 +1332,7 @@ fn prepare_bootstrap(
     let provider_config = LinuxProviderConfig {
         schema_version: SCHEMA_VERSION_V1.into(),
         runtime_store_root: store_text,
+        dxvk_graphics: request.dxvk_graphics.clone(),
         wine_runtime: WineRuntimeConfig {
             provider_id: LOCAL_PREVIEW_PROVIDER_ID.into(),
             pack_id: LOCAL_PREVIEW_PACK_ID.into(),
@@ -3062,6 +3138,27 @@ mod tests {
     }
 
     #[test]
+    fn optional_dxvk_config_is_closed_and_validated() {
+        let mut value = valid_config_json();
+        value["dxvkGraphics"] = serde_json::json!({
+            "dxvk": {
+                "version": "2.7.1",
+                "d3d11": {"path": "lib/dxvk/d3d11.dll", "digest": format!("sha256:{}", "a".repeat(64))},
+                "dxgi": {"path": "lib/dxvk/dxgi.dll", "digest": format!("sha256:{}", "b".repeat(64))}
+            },
+            "vulkan": {
+                "probe": {"path": "bin/vulkaninfo", "digest": format!("sha256:{}", "c".repeat(64))},
+                "icdManifest": {"path": "share/vulkan/icd.d/lvp_icd.json", "digest": format!("sha256:{}", "d".repeat(64))}
+            }
+        });
+        let config: LinuxProviderConfig = serde_json::from_value(value.clone()).unwrap();
+        config.validate().unwrap();
+        value["dxvkGraphics"]["dxvk"]["d3d11"]["path"] = "../d3d11.dll".into();
+        let invalid: LinuxProviderConfig = serde_json::from_value(value).unwrap();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn provider_planner_compiles_one_exact_wine_native_wined3d_plan() {
         let (config, snapshot) = successful_snapshot();
         let binding = snapshot.runtime_binding.clone().expect("available runtime binding");
@@ -4545,6 +4642,7 @@ int main(void) {
             wine: "bin/wine".into(),
             wineserver: "bin/wineserver".into(),
             version: "9.0".into(),
+            dxvk_graphics: None,
         }
     }
 
@@ -4774,6 +4872,7 @@ int main(void) {
             wine: fixture.config.wine_runtime.wine.path.clone(),
             wineserver: fixture.config.wine_runtime.wineserver.path.clone(),
             version: fixture.config.wine_runtime.version.clone(),
+            dxvk_graphics: None,
         }
     }
 
@@ -6193,6 +6292,7 @@ int main(void) {
                 wine: "bin/wine".into(),
                 wineserver: "bin/wineserver".into(),
                 version: "9.0".into(),
+                dxvk_graphics: None,
             };
             let before = snapshot_tree(&case.root);
             assert!(
@@ -6217,6 +6317,7 @@ int main(void) {
                 wine: "bin/wine".into(),
                 wineserver: "bin/wineserver".into(),
                 version: "9.0".into(),
+                dxvk_graphics: None,
             };
             let before = snapshot_tree(&case.root);
             assert!(
@@ -6248,6 +6349,7 @@ int main(void) {
                 wine: "bin/wine".into(),
                 wineserver: "bin/wineserver".into(),
                 version: "9.0".into(),
+                dxvk_graphics: None,
             };
             let before = snapshot_tree(&case.root);
             assert!(create_local_context_with(&linux_host_report(), &request, &PanicProbeCommand).is_err());

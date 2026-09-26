@@ -20,6 +20,7 @@
     "materializedRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
     "wine": {"$ref": "#/$defs/relativePath"},
     "wineserver": {"$ref": "#/$defs/relativePath"},
+    "dxvkGraphics": {"$ref": "#/$defs/dxvkGraphics"},
     "version": {
       "type": "string",
       "minLength": 1,
@@ -28,6 +29,35 @@
     }
   },
   "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "entrypoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "digest"],
+      "properties": {"path": {"$ref": "#/$defs/relativePath"}, "digest": {"$ref": "#/$defs/digest"}}
+    },
+    "dxvkGraphics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dxvk", "vulkan"],
+      "properties": {
+        "dxvk": {
+          "type": "object", "additionalProperties": false,
+          "required": ["version", "d3d11", "dxgi"],
+          "properties": {
+            "version": {"type": "string", "pattern": "^[0-9][0-9A-Za-z._+-]{0,127}$", "maxLength": 128},
+            "d3d11": {"$ref": "#/$defs/entrypoint"},
+            "dxgi": {"$ref": "#/$defs/entrypoint"}
+          }
+        },
+        "vulkan": {
+          "type": "object", "additionalProperties": false,
+          "required": ["probe", "icdManifest"],
+          "properties": {
+            "probe": {"$ref": "#/$defs/entrypoint"},
+            "icdManifest": {"$ref": "#/$defs/entrypoint"}
+          }
+        }
+      }
+    },
     "absoluteLinuxPath": {
       "type": "string",
       "minLength": 2,
