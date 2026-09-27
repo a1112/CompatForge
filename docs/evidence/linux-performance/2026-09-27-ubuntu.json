@@ -1,0 +1,1796 @@
+{
+  "architecture": "x86_64",
+  "cliSourceCommit": "9f2bfadf6d8c323f45f4eeeff9a9257bd8f50268",
+  "commandCount": 74,
+  "commands": [
+    {
+      "elapsedSeconds": 0.6166257930000256,
+      "failure": null,
+      "name": "compile",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "000-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "000-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.04108254099992337,
+      "failure": null,
+      "name": "bootstrap",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "001-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 291,
+        "file": "001-stdout.txt",
+        "sha256": "72beb993d984754d6c5a127bee581d5f1a63f576621f2b7503a62f6d24246059"
+      }
+    },
+    {
+      "elapsedSeconds": 0.005063607000010961,
+      "failure": null,
+      "name": "startup-plan",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "002-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 2653,
+        "file": "002-stdout.txt",
+        "sha256": "2f8b11fcf9a12ab2fac1ce4edf990ea150a6261d92a5b7ff18985bf1cf0a9674"
+      }
+    },
+    {
+      "elapsedSeconds": 13.484632884999996,
+      "failure": null,
+      "name": "startup-initialization",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "003-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 848,
+        "file": "003-stdout.txt",
+        "sha256": "2d1ab2805c5458f16c5990e3851210e9be8afcf04c69c14d88aba694e6a460d8"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5892669209999895,
+      "failure": null,
+      "name": "startup-0-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "004-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "004-stdout.txt",
+        "sha256": "8362be404f8d66d754a9bf9408821b32a780d915af760881b2b60af6fe14a3ff"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4500418740000214,
+      "failure": null,
+      "name": "startup-0-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "005-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "005-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05123562199992193,
+      "failure": null,
+      "name": "startup-0-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "006-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "006-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006482630000164136,
+      "failure": null,
+      "name": "startup-0-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "007-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "007-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.47458313599997837,
+      "failure": null,
+      "name": "startup-1-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "008-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "008-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05083146900005886,
+      "failure": null,
+      "name": "startup-1-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "009-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "009-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0008154100000865583,
+      "failure": null,
+      "name": "startup-1-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "010-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "010-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5479937129999826,
+      "failure": null,
+      "name": "startup-1-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "011-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "011-stdout.txt",
+        "sha256": "5c145ae8efa63ca13424edb7e1d1e7c4905a170c074b824a5759f93a76d1c89e"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5890376319999859,
+      "failure": null,
+      "name": "startup-2-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "012-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "012-stdout.txt",
+        "sha256": "03291d83fb549d294a2bed2b928495c34f099beec68a357ddbb2610bc7cac8e4"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4654163210000206,
+      "failure": null,
+      "name": "startup-2-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "013-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "013-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.050814431999924636,
+      "failure": null,
+      "name": "startup-2-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "014-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "014-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006434699999999793,
+      "failure": null,
+      "name": "startup-2-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "015-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "015-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.44812241300007827,
+      "failure": null,
+      "name": "startup-3-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "016-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "016-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.050835443999972085,
+      "failure": null,
+      "name": "startup-3-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "017-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "017-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0007786529999975755,
+      "failure": null,
+      "name": "startup-3-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "018-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "018-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5280112570000028,
+      "failure": null,
+      "name": "startup-3-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "019-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "019-stdout.txt",
+        "sha256": "33da7281800ca5b5da02a52f716d355ecb719f970a8a77c80cb4c4b8abb6a49a"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5480575419999241,
+      "failure": null,
+      "name": "startup-4-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "020-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "020-stdout.txt",
+        "sha256": "b0301959f2e0aa6f8d1b72d1adc56bd28ad545edd658e154a586ba97eb3890a9"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4544790819999207,
+      "failure": null,
+      "name": "startup-4-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "021-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "021-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05087330499998188,
+      "failure": null,
+      "name": "startup-4-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "022-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "022-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006248099999766055,
+      "failure": null,
+      "name": "startup-4-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "023-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "023-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4326091089999409,
+      "failure": null,
+      "name": "startup-5-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "024-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "024-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05108964700002616,
+      "failure": null,
+      "name": "startup-5-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "025-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "025-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006082349999587677,
+      "failure": null,
+      "name": "startup-5-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "026-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "026-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5483223439999847,
+      "failure": null,
+      "name": "startup-5-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "027-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "027-stdout.txt",
+        "sha256": "368e940acf538a0646acd4baba4631e5cdc755dc94df4ee6b2a9d4bd10058fe9"
+      }
+    },
+    {
+      "elapsedSeconds": 0.568285952999986,
+      "failure": null,
+      "name": "startup-6-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "028-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1083,
+        "file": "028-stdout.txt",
+        "sha256": "9885ff08579305f590625180c2f8d7dc259b0c7f9f877c649f977bfc087e6d45"
+      }
+    },
+    {
+      "elapsedSeconds": 0.45239381300007153,
+      "failure": null,
+      "name": "startup-6-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "029-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "029-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0508064819999845,
+      "failure": null,
+      "name": "startup-6-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "030-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "030-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006225970000741654,
+      "failure": null,
+      "name": "startup-6-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "031-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "031-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4642003779999868,
+      "failure": null,
+      "name": "startup-7-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "032-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 95,
+        "file": "032-stdout.txt",
+        "sha256": "5996ba8c70486919315f2df51e280658877b8b7a70879ffb4eea38b94b2756d2"
+      }
+    },
+    {
+      "elapsedSeconds": 0.051091086999917934,
+      "failure": null,
+      "name": "startup-7-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "033-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "033-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0007329339999841977,
+      "failure": null,
+      "name": "startup-7-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "034-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "034-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5683695369999668,
+      "failure": null,
+      "name": "startup-7-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "035-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1084,
+        "file": "035-stdout.txt",
+        "sha256": "2a6909f66135a4881504438d172653e798fc53ab38cd72a365432f84ce1ebaef"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0015810959999953411,
+      "failure": null,
+      "name": "startup-post-plan",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "036-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 2653,
+        "file": "036-stdout.txt",
+        "sha256": "2f8b11fcf9a12ab2fac1ce4edf990ea150a6261d92a5b7ff18985bf1cf0a9674"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0015861250000170912,
+      "failure": null,
+      "name": "cpu-plan",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "037-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 2660,
+        "file": "037-stdout.txt",
+        "sha256": "44815c051be1406005e20f88fff928975a462aca4afea9385724a5e753b6b039"
+      }
+    },
+    {
+      "elapsedSeconds": 0.649300487000005,
+      "failure": null,
+      "name": "cpu-initialization",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "038-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "038-stdout.txt",
+        "sha256": "58d33c2fcc9eac4c49509f376e698d17ac3928816e38d8ce9da1529844f68f0c"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5684968070000878,
+      "failure": null,
+      "name": "cpu-0-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "039-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "039-stdout.txt",
+        "sha256": "2fe7d74ed0d8fd37692e4f5ce93c045c53faa7b59d55af404b6e8a646a510f5b"
+      }
+    },
+    {
+      "elapsedSeconds": 0.48674372200002836,
+      "failure": null,
+      "name": "cpu-0-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "040-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "040-stdout.txt",
+        "sha256": "1c480f878c0183ddce5a76c41edfb8c296b803e3d9714b9599464c6027480414"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05086975799997617,
+      "failure": null,
+      "name": "cpu-0-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "041-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "041-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0007785080000530797,
+      "failure": null,
+      "name": "cpu-0-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "042-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "042-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4734107759999233,
+      "failure": null,
+      "name": "cpu-1-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "043-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "043-stdout.txt",
+        "sha256": "2d5d3946cc8311cb72356fb80faed6ac16b3677f0832711c557aa330b842f52f"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05082400300000245,
+      "failure": null,
+      "name": "cpu-1-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "044-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "044-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.000823882000076992,
+      "failure": null,
+      "name": "cpu-1-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "045-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "045-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5897312450000527,
+      "failure": null,
+      "name": "cpu-1-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "046-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "046-stdout.txt",
+        "sha256": "b1d0800ff30e407cd959bf4affc9fa8da164fea2f2f1239c8090c81239768932"
+      }
+    },
+    {
+      "elapsedSeconds": 0.6084175560000631,
+      "failure": null,
+      "name": "cpu-2-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "047-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "047-stdout.txt",
+        "sha256": "9d5227719583bdbbe10ebce0b916309647c8edc0676f3d5fb6bf7711becf4ac5"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4834415520000448,
+      "failure": null,
+      "name": "cpu-2-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "048-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "048-stdout.txt",
+        "sha256": "240379c20764d1da9451a0915b0e588a0cfe63dcc92b2883eee3616fcf4e89cc"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05083119100004296,
+      "failure": null,
+      "name": "cpu-2-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "049-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "049-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0007687369999302973,
+      "failure": null,
+      "name": "cpu-2-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "050-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "050-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.4829807050000454,
+      "failure": null,
+      "name": "cpu-3-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "051-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "051-stdout.txt",
+        "sha256": "fa795cf70e1038a5e38c956d8f6571c27b9d56a3961f64d790d0b6644dfe32ab"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05085832899999332,
+      "failure": null,
+      "name": "cpu-3-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "052-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "052-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006187230000023192,
+      "failure": null,
+      "name": "cpu-3-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "053-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "053-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5480531580000161,
+      "failure": null,
+      "name": "cpu-3-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "054-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "054-stdout.txt",
+        "sha256": "56712f769574af2a1468b1afa84d88a338ee5d4a9ef2358bf7abd668a81be853"
+      }
+    },
+    {
+      "elapsedSeconds": 0.6084935979999955,
+      "failure": null,
+      "name": "cpu-4-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "055-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "055-stdout.txt",
+        "sha256": "b217a405d114ce93cff87faea385b829d994f2102143b3f7084a997a49e3d161"
+      }
+    },
+    {
+      "elapsedSeconds": 0.47712846800004627,
+      "failure": null,
+      "name": "cpu-4-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "056-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "056-stdout.txt",
+        "sha256": "5804dca664b1f6fbf12ea909d9f75dc09ea13c345cce3c8d1ec2c6f1ea77b0bb"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05087557100000595,
+      "failure": null,
+      "name": "cpu-4-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "057-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "057-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006308990000434278,
+      "failure": null,
+      "name": "cpu-4-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "058-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "058-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.48103318599999056,
+      "failure": null,
+      "name": "cpu-5-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "059-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "059-stdout.txt",
+        "sha256": "0def233649556e44b9ddffd752cd03089e8c8a175b818641793060c43a87082b"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05087466800000584,
+      "failure": null,
+      "name": "cpu-5-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "060-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "060-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0006242509999765389,
+      "failure": null,
+      "name": "cpu-5-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "061-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "061-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5488069790000054,
+      "failure": null,
+      "name": "cpu-5-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "062-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "062-stdout.txt",
+        "sha256": "69e348b7fa1d43147018ab661cb1546efe00eec6701ccdcf50a5e32ac68bba99"
+      }
+    },
+    {
+      "elapsedSeconds": 0.6286735810000437,
+      "failure": null,
+      "name": "cpu-6-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "063-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1096,
+        "file": "063-stdout.txt",
+        "sha256": "362ca86c48d94557ad129039440a2d993e46c7519eabf453755d5c983f7aca5e"
+      }
+    },
+    {
+      "elapsedSeconds": 0.5783428549999599,
+      "failure": null,
+      "name": "cpu-6-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "064-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "064-stdout.txt",
+        "sha256": "0285444624de9314d2ef1e16698f93cd71b9d08465e5d7f40220accb00608c48"
+      }
+    },
+    {
+      "elapsedSeconds": 0.05126779800002623,
+      "failure": null,
+      "name": "cpu-6-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "065-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "065-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.001113019999934295,
+      "failure": null,
+      "name": "cpu-6-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "066-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "066-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.6406579690000171,
+      "failure": null,
+      "name": "cpu-7-direct",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 65,
+        "file": "067-stderr.txt",
+        "sha256": "f88c93af9ad8a41bd8c0c285e21ecc1cf7a68437dce4c86ced84e35276eac5c8"
+      },
+      "stdout": {
+        "bytes": 107,
+        "file": "067-stdout.txt",
+        "sha256": "35a47b345860efb0a3e489c925c3b099d889d2bcc46a019a73a0c6458fddc0cd"
+      }
+    },
+    {
+      "elapsedSeconds": 0.051336472000002686,
+      "failure": null,
+      "name": "cpu-7-direct-server-stop",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "068-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "068-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0011765790000026755,
+      "failure": null,
+      "name": "cpu-7-direct-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "069-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "069-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 1.0571499329998915,
+      "failure": null,
+      "name": "cpu-7-compatforge",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "070-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 1098,
+        "file": "070-stdout.txt",
+        "sha256": "f669035a46a8dbcf46c16578f85c074db36152242701eefe4b0de050b0650fd4"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0018447829999104215,
+      "failure": null,
+      "name": "cpu-post-plan",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "071-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 2660,
+        "file": "071-stdout.txt",
+        "sha256": "44815c051be1406005e20f88fff928975a462aca4afea9385724a5e753b6b039"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0011084090000395008,
+      "failure": null,
+      "name": "final-server-stop",
+      "returnCode": 1,
+      "stderr": {
+        "bytes": 0,
+        "file": "072-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "072-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "elapsedSeconds": 0.0008369749999701526,
+      "failure": null,
+      "name": "final-server-wait",
+      "returnCode": 0,
+      "stderr": {
+        "bytes": 0,
+        "file": "073-stderr.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stdout": {
+        "bytes": 0,
+        "file": "073-stdout.txt",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ],
+  "compilerVersion": "MinGW-w64 GCC 13-win32",
+  "date": "2026-09-27",
+  "forgeOSSandboxMeasured": false,
+  "graphicsValidated": false,
+  "identitiesSha256": {
+    "b410e7c9962e75ba3f1d890477329f22db1a7cd81535dca855772e0bd722aee1.exe": "b410e7c9962e75ba3f1d890477329f22db1a7cd81535dca855772e0bd722aee1",
+    "benchmark_linux_console.py": "e2fa32c3a6878522289001252068155aec16d036ab0835c4ecf11aab55fd5733",
+    "compatforge-cli": "1be19795693bbf267222c6963d585137755f33d26c9a32e246804519e4a85869",
+    "console.c": "577987e210c75518cfe6477993e6bb9f3c9f716eeb6768f6cc5f2d06345bef83",
+    "console.exe": "b410e7c9962e75ba3f1d890477329f22db1a7cd81535dca855772e0bd722aee1",
+    "context.json": "98436e2300ff17b7fb1dd113c7b5ca4d84f115c824f91ac8baa2712e732a0ef9",
+    "cpu-request.json": "8244fe28145a31709fb4bbdcc892daf1c15bea9478eb3982fc058813b4712808",
+    "startup-request.json": "28453216e9676157c5c02d6d157cc4fea050e9f7da20e1555e1d91367748bd37",
+    "wine": "0f3a7085de3c80201caa35015d70304f88872727e709002b2f73b5537b796c7b",
+    "wineserver": "5cd165352a18c7992b10bcf66aa5a0df8d6f00dbe03271f03d4f56dbd84d5673",
+    "x86_64-w64-mingw32-gcc": "260b0d734871a82030aaaa446338cd1dd1a48efeec119a110c0379b73a7ce972"
+  },
+  "kernel": "7.0.0-34-generic",
+  "measurementExitCode": 0,
+  "nativeWindowsComparison": false,
+  "networkIsolationValidated": false,
+  "os": "Ubuntu 26.04.1 LTS",
+  "productionRustMatchesCommit": "11a56d117ad7ae3f9017597057ea876fda69dde0",
+  "pythonVersion": "3.14.4",
+  "results": {
+    "cpu": {
+      "compatforge": {
+        "count": 7,
+        "maximumSeconds": 1.0571499329998915,
+        "medianSeconds": 0.6084175560000631,
+        "minimumSeconds": 0.5480531580000161,
+        "probeWorkNanoseconds": {
+          "maximum": 17123800,
+          "median": 16325700,
+          "minimum": 15475400
+        }
+      },
+      "direct": {
+        "count": 7,
+        "maximumSeconds": 0.6931710200000225,
+        "medianSeconds": 0.5344577570000411,
+        "minimumSeconds": 0.5250586610000028,
+        "probeWorkNanoseconds": {
+          "maximum": 16634000,
+          "median": 15740000,
+          "minimum": 15394700
+        }
+      }
+    },
+    "startup": {
+      "compatforge": {
+        "count": 7,
+        "maximumSeconds": 0.5890376319999859,
+        "medianSeconds": 0.5483223439999847,
+        "minimumSeconds": 0.5280112570000028,
+        "probeWorkNanoseconds": {
+          "maximum": 200,
+          "median": 100,
+          "minimum": 100
+        }
+      },
+      "direct": {
+        "count": 7,
+        "maximumSeconds": 0.5262300150001238,
+        "medianSeconds": 0.5059771969998792,
+        "minimumSeconds": 0.4843069909999258,
+        "probeWorkNanoseconds": {
+          "maximum": 100,
+          "median": 100,
+          "minimum": 100
+        }
+      }
+    }
+  },
+  "runtimeReceipt": {
+    "architecture": "x86_64",
+    "capabilities": [
+      "guest-x86_64"
+    ],
+    "packDigest": "sha256:ae3b3e18ea4e2fda594ab5e3259f9176a795385cae390f831a731ce65e06c106",
+    "packId": "wine-linux-x86-64-local-preview",
+    "schemaVersion": "1",
+    "source": "explicit-override",
+    "version": "11.0"
+  },
+  "runtimeVersion": "11.0",
+  "sampleCounts": {
+    "initialization": 2,
+    "warm": 28,
+    "warmup": 4
+  },
+  "samples": [
+    {
+      "elapsedSeconds": 13.484632884999996,
+      "name": "startup-initialization",
+      "path": "compatforge",
+      "phase": "initialization",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5892669209999895,
+      "name": "startup-0-compatforge",
+      "path": "compatforge",
+      "phase": "warmup",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5019257589999597,
+      "name": "startup-0-direct",
+      "path": "direct",
+      "phase": "warmup",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5262300150001238,
+      "name": "startup-1-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5479937129999826,
+      "name": "startup-1-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5890376319999859,
+      "name": "startup-2-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5168742229999452,
+      "name": "startup-2-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.49973651000004793,
+      "name": "startup-3-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5280112570000028,
+      "name": "startup-3-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 200
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5480575419999241,
+      "name": "startup-4-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5059771969998792,
+      "name": "startup-4-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.4843069909999258,
+      "name": "startup-5-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5483223439999847,
+      "name": "startup-5-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.568285952999986,
+      "name": "startup-6-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5038228920001302,
+      "name": "startup-6-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.516024398999889,
+      "name": "startup-7-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.5683695369999668,
+      "name": "startup-7-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "12345678",
+        "iterations": 0,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "startup"
+    },
+    {
+      "elapsedSeconds": 0.649300487000005,
+      "name": "cpu-initialization",
+      "path": "compatforge",
+      "phase": "initialization",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16122000
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5684968070000878,
+      "name": "cpu-0-compatforge",
+      "path": "compatforge",
+      "phase": "warmup",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16330300
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5383919880000576,
+      "name": "cpu-0-direct",
+      "path": "direct",
+      "phase": "warmup",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15870300
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5250586610000028,
+      "name": "cpu-1-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15428600
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5897312450000527,
+      "name": "cpu-1-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 17123800
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.6084175560000631,
+      "name": "cpu-2-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15968300
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.535041480000018,
+      "name": "cpu-2-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15394700
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5344577570000411,
+      "name": "cpu-3-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15488100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5480531580000161,
+      "name": "cpu-3-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15786800
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.6084935979999955,
+      "name": "cpu-4-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16353800
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5286349380000956,
+      "name": "cpu-4-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15785900
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5325321049999729,
+      "name": "cpu-5-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15740000
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.5488069790000054,
+      "name": "cpu-5-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 15475400
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.6286735810000437,
+      "name": "cpu-6-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16325700
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.6307236729999204,
+      "name": "cpu-6-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16634000
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 0.6931710200000225,
+      "name": "cpu-7-direct",
+      "path": "direct",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16372100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    },
+    {
+      "elapsedSeconds": 1.0571499329998915,
+      "name": "cpu-7-compatforge",
+      "path": "compatforge",
+      "phase": "warm",
+      "probe": {
+        "checksum": "608eb778",
+        "iterations": 20000000,
+        "probe": "compatforge-console-v1",
+        "workNanoseconds": 16416100
+      },
+      "returnCode": 0,
+      "valid": true,
+      "workload": "cpu"
+    }
+  ],
+  "schemaVersion": "1",
+  "scope": "ubuntu-runtime-control"
+}
