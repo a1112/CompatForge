@@ -177,12 +177,21 @@ def initialize(home, template, run=command):
         return {"initialized": True, "reused": True}
     stage = parent / ".compatforge-init-v1"
     private_directory(stage)
-    permitted = {"context.json", "service.json", "bootstrap.json", "seed.json", "init-v1.json"}
+    intent = {"schemaVersion": 1, "home": str(home), "configurationSha256": configuration_pin}
+    marker = stage / "intent-v1.json"
+    if any(stage.iterdir()):
+        require(marker.is_file(), "preexisting staging is not owned by this initializer; preserving files")
+        require(read_json(marker, owner) == intent, "interrupted initialization belongs to a different configuration")
+    else:
+        write_new(marker, intent)
+        sync_directory(stage)
+    permitted = {"context.json", "service.json", "bootstrap.json", "seed.json", "init-v1.json", "intent-v1.json"}
     # Interrupted preparation can only contain these bounded private artifacts.
     for path in stage.iterdir():
         require(path.name in permitted, "unrecognized interrupted initialization file; preserving directory")
         read_regular(path, owner)
-    for path in stage.iterdir(): path.unlink()
+    for path in stage.iterdir():
+        if path != marker: path.unlink()
     root = home / ".local/share/compatforge"
     private_directory(root)
     for name in ("runtime-store", "storage", "service"): private_directory(root / name)
@@ -240,5 +249,4 @@ if __name__ == "__main__":
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         print("compatforge.init.rejected: " + str(error), file=sys.stderr)
         sys.exit(1)
-
 

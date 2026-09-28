@@ -21,6 +21,19 @@ def template():
 
 
 class TemplateTests(unittest.TestCase):
+    def test_preexisting_unowned_staging_context_is_not_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            stage = home / ".config/.compatforge-init-v1"; stage.mkdir(parents=True, mode=0o700)
+            personal = stage / "context.json"; personal.write_text("preexisting user file")
+            def run(argv):
+                if argv[1] == "local":
+                    Path(argv[-1]).write_text('{}')
+                    return {"packDigest": template()["runtimePackDigest"]}
+                return {"operation": "applications.seed-defaults", "result": {"seeded": True}}
+            with self.assertRaises(ValueError): init.initialize(home, template(), run)
+            self.assertEqual(personal.read_text(), "preexisting user file")
+
     @unittest.skipUnless(os.name == "posix", "FIFO is POSIX")
     def test_fifo_is_rejected_immediately_and_preserved(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -47,7 +47,8 @@ implements runtime orchestration. Configuration is staged under
 `~/.config/.compatforge-init-v1` and published by a directory rename only after
 context validation and registry seeding succeed. A private initialization lock
 serializes attempts. Interrupted staging is recovered only when its files are
-bounded, caller-owned and from the closed preparation file set; unexpected
+bounded, caller-owned, from the closed preparation file set and backed by a
+durable intent matching this home and runtime configuration; unexpected
 files and modified user configurations are preserved and rejected.
 
 The private context/service configuration lives in `~/.config/compatforge`;
@@ -83,3 +84,47 @@ the existing directory and apply a reviewed migration; do not delete the
 context or application storage to silence the error. Selecting XFCE remains
 available through the login manager. Stopping the service synchronously joins
 owned jobs; image replacement and backup remain ForgeOS responsibilities.
+
+## Repeatable acceptance runner
+
+Run these commands **inside the ordinary user's candidate graphical session**,
+using the source checkout matching the candidate. Each invocation requires a
+new evidence directory and records bounded typed requests/responses and hashes.
+The runner never starts a second daemon or calls Wine directly.
+
+```sh
+python3 tools/linux_gui_acceptance.py --output /absolute/evidence/transactions \
+  exercise --assets /absolute/pinned-installers
+python3 tools/linux_gui_acceptance.py --output /absolute/evidence/editor \
+  launch --app notepad-plus-plus /home/forge/Documents/中文文档.txt
+```
+
+`exercise` installs all three pinned applications, verifies exported launchers,
+cancels a second 7-Zip installation, completes an independent update, rolls back,
+uninstalls and restores the selected generation. Cancellation waits for the
+supervisor's `streamEnded` cleanup acknowledgement, not merely a persisted
+terminal job label. A launch receipt gives the job ID. Observe the real window,
+edit and save through its UI, record screenshots, then close it or use:
+
+```sh
+python3 tools/linux_gui_acceptance.py --output /absolute/evidence/cancel \
+  cancel --job JOB_ID
+python3 tools/linux_gui_acceptance.py --output /absolute/evidence/before \
+  before-reboot /home/forge/Documents/中文文档.txt
+```
+
+After a **normal VM reboot**, log in and run:
+
+```sh
+python3 tools/linux_gui_acceptance.py --output /absolute/evidence/after \
+  after-reboot --before /absolute/evidence/before/before-reboot.json
+```
+
+The comparison rejects an unchanged kernel boot ID, a changed selected
+generation or a changed/missing observed file. It hashes existing files and
+never writes application documents. This proves persistence of the observed
+bytes; the associated real UI Save screenshots/notes establish their origin.
+Use separate real Windows-file inputs for 7-Zip and SumatraPDF, verify menu/Dock
+launches and task grouping, and preserve declined permissions/fault results as
+separate evidence. None of these checks substitutes for developer breakpoint
+debugging or the desktop's longer stability gates.
