@@ -3,12 +3,14 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod desktop_lifecycle;
 mod jobs;
 mod model;
 mod registry;
 pub mod transport;
 
 use jobs::{JobError, JobManager};
+pub use jobs::{ShutdownError, ShutdownFailure, ShutdownPhase};
 use model::{ApplicationPayload, ArchivePayload, AssessmentPayload, IdPayload, PollPayload};
 use registry::{Registry, RegistryError};
 use serde::de::DeserializeOwned;
@@ -33,6 +35,12 @@ pub struct AutomationService {
 }
 
 impl AutomationService {
+    /// Call only after stopping and draining clients. Stops owned jobs and joins
+    /// their supervisor workers; this is a blocking desktop/service-owner API.
+    pub fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
+        self.jobs.shutdown_and_wait()
+    }
+
     pub fn new(core_config: CoreConfig, service_config: ServiceConfig) -> Result<Self, ServiceError> {
         core_config
             .validate()

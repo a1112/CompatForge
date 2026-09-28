@@ -30,6 +30,76 @@ struct ActiveJob {
     cancel_requested: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutdownFailure {
+    pub job_id: Option<String>,
+    pub phase: ShutdownPhase,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownPhase {
+    Snapshot,
+    Terminate,
+    Join,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutdownError {
+    pub failures: Vec<ShutdownFailure>,
+}
+
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} process cleanup operation(s) failed", self.failures.len())
+    }
+}
+
+impl std::error::Error for ShutdownError {}
+
+trait ShutdownTarget {
+    fn request_stop(&self) -> Result<(), String>;
+    fn wait_for_stop(&self, grace: Duration) -> Result<(), String>;
+}
+
+impl ShutdownTarget for Arc<LaunchHandle> {
+    fn request_stop(&self) -> Result<(), String> {
+        self.terminate().map_err(|error| error.to_string())
+    }
+    fn wait_for_stop(&self, grace: Duration) -> Result<(), String> {
+        self.terminate_and_wait(grace).map_err(|error| error.to_string())
+    }
+}
+
+fn shutdown_handles(handles: &[(String, impl ShutdownTarget)], grace: Duration) -> Result<(), ShutdownError> {
+    let mut failures = Vec::new();
+    // Request every stop before waiting for any one process. An error from one
+    // supervisor must not prevent stopping or joining the remaining jobs.
+    for (job_id, handle) in handles {
+        if let Err(message) = handle.request_stop() {
+            failures.push(ShutdownFailure {
+                job_id: Some(job_id.clone()),
+                phase: ShutdownPhase::Terminate,
+                message,
+            });
+        }
+    }
+    for (job_id, handle) in handles {
+        if let Err(message) = handle.wait_for_stop(grace) {
+            failures.push(ShutdownFailure {
+                job_id: Some(job_id.clone()),
+                phase: ShutdownPhase::Join,
+                message,
+            });
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ShutdownError { failures })
+    }
+}
+
 impl JobManager {
     pub(crate) fn new(registry: Arc<Registry>, config: CoreConfig) -> Self {
         Self {
@@ -247,6 +317,25 @@ impl JobManager {
         }
     }
 
+    pub(crate) fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
+        let handles = self
+            .lock_active()
+            .map_err(|error| ShutdownError {
+                failures: vec![ShutdownFailure {
+                    job_id: None,
+                    phase: ShutdownPhase::Snapshot,
+                    message: error.to_string(),
+                }],
+            })?
+            .iter()
+            .map(|(id, job)| (id.clone(), Arc::clone(&job.handle)))
+            .collect::<Vec<_>>();
+        shutdown_handles(
+            &handles,
+            Duration::from_millis(self.config.supervisor.termination_grace_milliseconds),
+        )
+    }
+
     fn resolve_launch(
         &self,
         application: &crate::model::ApplicationDefinition,
@@ -403,3 +492,146 @@ impl fmt::Display for JobError {
 }
 
 impl std::error::Error for JobError {}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use compatforge_domain::{LaunchPlan, NativeCommand, ProcessLifecycle};
+
+    #[test]
+    fn shutdown_attempts_all_handles_and_preserves_every_failure() {
+        struct Target {
+            id: &'static str,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+        impl ShutdownTarget for Target {
+            fn request_stop(&self) -> Result<(), String> {
+                self.events.lock().unwrap().push(format!("stop-{}", self.id));
+                if self.id == "first" {
+                    Err("stop failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn wait_for_stop(&self, _: Duration) -> Result<(), String> {
+                self.events.lock().unwrap().push(format!("join-{}", self.id));
+                if self.id == "first" {
+                    Err("join failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let handles = ["first", "second"].map(|id| {
+            (
+                id.to_owned(),
+                Target {
+                    id,
+                    events: events.clone(),
+                },
+            )
+        });
+        let error = shutdown_handles(&handles, Duration::ZERO).unwrap_err();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["stop-first", "stop-second", "join-first", "join-second"]
+        );
+        assert_eq!(error.failures.len(), 2);
+        assert_eq!(error.failures[0].phase, ShutdownPhase::Terminate);
+        assert_eq!(error.failures[1].phase, ShutdownPhase::Join);
+        assert!(error
+            .failures
+            .iter()
+            .all(|failure| failure.job_id.as_deref() == Some("first")));
+    }
+
+    #[test]
+    fn active_job_shutdown_waits_for_real_supervisor_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "compatforge-shutdown-{}-{}",
+            std::process::id(),
+            now_milliseconds()
+        ));
+        let mut config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        config.storage_root = root.join("storage").to_string_lossy().into_owned();
+        config.supervisor.termination_grace_milliseconds = 20;
+        let registry = Arc::new(Registry::new(root.join("service"), root.join("storage")).unwrap());
+        let manager = JobManager::new(registry, config);
+        let mut plan: LaunchPlan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        plan.process = NativeCommand {
+            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            arguments: vec![
+                "--exact".into(),
+                "jobs::shutdown_tests::sleeping_child_helper".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            environment: BTreeMap::from([("COMPATFORGE_SERVICE_SHUTDOWN_HELPER".into(), "sleep".into())]),
+            working_directory: std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+        };
+        plan.mounts.clear();
+        plan.graphics.backend = compatforge_domain::GraphicsBackendKind::WineD3d;
+        plan.graphics.version = None;
+        plan.translator.provider = compatforge_domain::TranslatorKind::Native;
+        plan.translator.version = None;
+        plan.lifecycle = ProcessLifecycle::default();
+        plan.lifecycle.maximum_runtime_milliseconds = Some(10_000);
+        let handle = Arc::new(ProcessSupervisor::start(&plan).unwrap());
+        let event = handle.next_event(Duration::from_secs(5));
+        assert!(matches!(event, EventPoll::Event(event) if event.kind == RuntimeEventKind::Started));
+        let record = JobRecord {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            id: "cleanup-job".into(),
+            application_id: "cleanup-test".into(),
+            kind: JobKind::Launch,
+            status: JobStatus::Running,
+            created_at_milliseconds: 1,
+            updated_at_milliseconds: 1,
+            inspection: None,
+            launch_plan: None,
+            events: Vec::new(),
+            assessment: None,
+            error: None,
+        };
+        manager.active.lock().unwrap().insert(
+            record.id.clone(),
+            ActiveJob {
+                handle: handle.clone(),
+                record,
+                cancel_requested: false,
+            },
+        );
+        assert!(!handle.is_finished());
+        let lifecycle = Arc::new(crate::desktop_lifecycle::DesktopLifecycle::default());
+        let in_flight = lifecycle.admit().unwrap();
+        assert!(lifecycle.begin_close());
+        let closing = lifecycle.clone();
+        let caller = std::thread::current().id();
+        let cleanup = std::thread::spawn(move || {
+            closing.wait_for_workers();
+            manager.shutdown_and_wait().unwrap();
+            drop(manager);
+            closing.complete_cleanup();
+            std::thread::current().id()
+        });
+        assert!(!lifecycle.cleanup_complete());
+        drop(in_flight);
+        assert_ne!(cleanup.join().unwrap(), caller);
+        assert!(lifecycle.cleanup_complete());
+        assert!(handle.is_finished(), "shutdown returned before supervisor completion");
+        // Repeated cleanup must acknowledge completed worker joins, not merely
+        // observe the guest's exit or a requested termination.
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawned only as the bounded supervisor child"]
+    fn sleeping_child_helper() {
+        if std::env::var("COMPATFORGE_SERVICE_SHUTDOWN_HELPER").as_deref() == Ok("sleep") {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+}

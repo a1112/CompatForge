@@ -4,6 +4,7 @@ use compatforge_capability::{ContextCapabilityQuery, HostProbe};
 use compatforge_domain::{validate_portable_relative_path, CapabilityReport, ProviderDescriptor, SCHEMA_VERSION_V1};
 use compatforge_provider_macos::MacOsLocalContextRequest;
 use compatforge_service::bootstrap::{create_desktop_context, read_linux_provider_config, select_desktop_context};
+use compatforge_service::desktop_lifecycle::{DesktopLifecycle, WorkerPermit};
 use compatforge_service::{AutomationService, ServiceConfig, ServiceRequest, ServiceResponse};
 use serde::Serialize;
 use serde_json::Value;
@@ -14,6 +15,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const INVALID_LAUNCH_ARGUMENTS: &str = "CompatForge 开发者验收启动参数无效";
 const DESKTOP_LAUNCH_FAILED: &str = "CompatForge 桌面应用启动失败";
@@ -236,6 +238,7 @@ struct BootstrapResult {
 struct AppState {
     runtime: Arc<Mutex<DesktopRuntime>>,
     bootstrap: Arc<Mutex<()>>,
+    lifecycle: Arc<DesktopLifecycle>,
 }
 
 impl AppState {
@@ -243,13 +246,45 @@ impl AppState {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             bootstrap: Arc::new(Mutex::new(())),
+            lifecycle: Arc::new(DesktopLifecycle::default()),
         }
     }
 
-    fn shutdown(&self) {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.service = None;
+    fn shutdown(&self, app: AppHandle) {
+        if !self.lifecycle.begin_close() {
+            return;
         }
+        let state = self.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            state.lifecycle.wait_for_workers();
+            let service = state
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .service
+                .take();
+            // Termination and supervisor joins can wait for child processes.
+            // Keep them off the event thread and outside the runtime mutex.
+            if let Some(service) = service {
+                if let Err(error) = service.shutdown_and_wait() {
+                    let mut runtime = state.runtime.lock().unwrap_or_else(|error| error.into_inner());
+                    runtime.runtime_status = "应用清理失败；请再次关闭窗口以重试".into();
+                    runtime.error = Some(format!("{error}: {:?}", error.failures));
+                    runtime.service = Some(service);
+                    drop(runtime);
+                    state.lifecycle.cleanup_failed();
+                    app.dialog()
+                        .message("部分应用未能完成停止。桌面将保留运行状态并禁止启动新应用，请再次关闭窗口以重试。")
+                        .title("CompatForge：应用清理失败")
+                        .kind(MessageDialogKind::Error)
+                        .show(|_| {});
+                    return;
+                }
+                drop(service);
+            }
+            state.lifecycle.complete_cleanup();
+            app.exit(0);
+        });
     }
 }
 
@@ -257,7 +292,7 @@ fn lock_runtime(state: &AppState) -> Result<MutexGuard<'_, DesktopRuntime>, Stri
     state.runtime.lock().map_err(|_| "桌面运行状态锁已损坏".into())
 }
 
-fn service(state: &State<'_, AppState>) -> Result<Arc<AutomationService>, String> {
+fn service(state: &AppState) -> Result<Arc<AutomationService>, String> {
     lock_runtime(state)?
         .service
         .clone()
@@ -271,14 +306,27 @@ fn state_snapshot(state: State<'_, AppState>) -> Result<RuntimeSnapshot, String>
 
 #[tauri::command]
 async fn bootstrap_runtime(state: State<'_, AppState>) -> Result<RuntimeSnapshot, String> {
+    let permit = state.lifecycle.admit().map_err(str::to_owned)?;
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || bootstrap_runtime_blocking(&state))
+    tauri::async_runtime::spawn_blocking(move || bootstrap_runtime_blocking(&state, permit))
         .await
         .map_err(|error| format!("Bootstrap 工作线程失败：{error}"))?
 }
 
-fn bootstrap_runtime_blocking(state: &AppState) -> Result<RuntimeSnapshot, String> {
+fn bootstrap_runtime_blocking(state: &AppState, permit: WorkerPermit) -> Result<RuntimeSnapshot, String> {
     let _bootstrap = state.bootstrap.lock().map_err(|_| "Bootstrap 状态锁已损坏")?;
+    permit.ensure_open().map_err(str::to_owned)?;
+    // Bootstrap is idempotent while this desktop owns a ready service. Never
+    // replace it behind active jobs or lose the only cleanup owner.
+    if let Some(snapshot) = permit
+        .publish(|| {
+            let runtime = lock_runtime(state)?;
+            Ok::<_, String>(runtime.service.as_ref().map(|_| runtime.snapshot()))
+        })
+        .map_err(str::to_owned)??
+    {
+        return Ok(snapshot);
+    }
     let (runtime_store_root, storage_root, service_root, runtime_override, linux_provider_config) = {
         let runtime = lock_runtime(state)?;
         (
@@ -296,30 +344,46 @@ fn bootstrap_runtime_blocking(state: &AppState) -> Result<RuntimeSnapshot, Strin
         runtime_override.as_ref(),
         linux_provider_config.as_deref(),
     );
-    let mut runtime = lock_runtime(state)?;
-    match result {
-        Ok(result) => {
-            runtime.runtime_status = format!("运行环境就绪 · {} · {}", result.version, result.pack_id);
-            runtime.service = Some(result.service);
-            runtime.receipt = Some(result.receipt);
-            runtime.capabilities = Some(result.capabilities);
-            runtime.error = None;
-            Ok(runtime.snapshot())
-        }
-        Err(message) => {
-            runtime.runtime_status = "Runtime Bootstrap 失败".into();
-            runtime.error = Some(message.clone());
-            Err(message)
-        }
-    }
+    permit
+        .publish(|| {
+            let mut runtime = lock_runtime(state)?;
+            match result {
+                Ok(result) => {
+                    runtime.runtime_status = format!("运行环境就绪 · {} · {}", result.version, result.pack_id);
+                    runtime.service = Some(result.service);
+                    runtime.receipt = Some(result.receipt);
+                    runtime.capabilities = Some(result.capabilities);
+                    runtime.error = None;
+                    Ok(runtime.snapshot())
+                }
+                Err(message) => {
+                    runtime.runtime_status = "Runtime Bootstrap 失败".into();
+                    runtime.error = Some(message.clone());
+                    Err(message)
+                }
+            }
+        })
+        .map_err(str::to_owned)?
 }
 
 #[tauri::command]
 async fn service_call(request: ServiceRequest, state: State<'_, AppState>) -> Result<ServiceResponse, String> {
-    let service = service(&state)?;
-    tauri::async_runtime::spawn_blocking(move || service.call(request).map_err(|error| error.to_string()))
+    let permit = state.lifecycle.admit().map_err(str::to_owned)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service_call_blocking(&state, permit, request))
         .await
         .map_err(|error| format!("应用服务工作线程失败：{error}"))?
+}
+
+fn service_call_blocking(
+    state: &AppState,
+    permit: WorkerPermit,
+    request: ServiceRequest,
+) -> Result<ServiceResponse, String> {
+    // Admission to actual dispatch is checked on the worker, not before it is
+    // queued. The permit remains live until the call's service clone is dropped.
+    let service = permit.publish(|| service(state)).map_err(str::to_owned)??;
+    service.call(request).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -506,17 +570,21 @@ where
         .map_err(|_| DESKTOP_LAUNCH_FAILED)?;
 
     application.run(|app_handle, event| {
-        if matches!(event, RunEvent::Exit)
-            || matches!(
-                event,
-                RunEvent::WindowEvent {
-                    ref label,
-                    event: WindowEvent::CloseRequested { .. },
-                    ..
-                } if label == "main"
-            )
-        {
-            app_handle.state::<AppState>().shutdown();
+        let state = app_handle.state::<AppState>();
+        match event {
+            RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::CloseRequested { api, .. },
+                ..
+            } if label == "main" => {
+                api.prevent_close();
+                state.shutdown(app_handle.clone());
+            }
+            RunEvent::ExitRequested { api, .. } if !state.lifecycle.cleanup_complete() => {
+                api.prevent_exit();
+                state.shutdown(app_handle.clone());
+            }
+            _ => {}
         }
     });
     Ok(())

@@ -32,7 +32,16 @@ this is not a new system-wide trust boundary or a filesystem sandbox.
 Bootstrap probing and service operations run in Tauri blocking workers so disk,
 process and job polling work does not run on the UI event loop. The UI still owns
 this service's lifetime; a persistent daemon and disconnect recovery are separate
-work. Closing this desktop retains existing supervised-job cleanup behavior.
+work. Closing the main window or requesting application exit closes worker
+admission, rejects queued requests and prevents late bootstrap publication. A
+tracked cleanup worker drains requests already in flight, stops all owned jobs
+and joins their supervisor workers before exiting (including settings windows).
+Bootstrap is idempotent while the service is ready. No runtime replacement or
+process cleanup occurs while holding the UI's state lock. Cleanup failures retain
+the service and closed admission, show an error, and allow another close action
+to retry; failures never count as successful cleanup. `shutdown_and_wait()` is
+also available to other Rust owners after they drain their clients, and returns
+typed per-job termination/join failures while still attempting every job.
 
 ## Other local clients
 
