@@ -987,7 +987,8 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
     def test_tauri_uses_the_shared_application_service(self) -> None:
         rust = rust_without_comments((TAURI / "src" / "lib.rs").read_text(encoding="utf-8"))
         for symbol in (
-            "create_local_context",
+            "select_desktop_context(",
+            "create_desktop_context(",
             "AutomationService::new",
             "ServiceRequest",
             "service_call",
