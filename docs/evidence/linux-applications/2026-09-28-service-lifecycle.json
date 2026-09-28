@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "1",
+  "date": "2026-09-28",
+  "candidateRevision": "7e36ff2c33fd3d204e95dcb295ce1558e01fba5f",
+  "baselineRevision": "3e0522e",
+  "environment": "Pinned Arch Linux chroot with Wine 11.14, private Xvfb, ordinary UID 1000, separate mount/PID/network namespaces and tini PID 1",
+  "linuxGates": {
+    "cliTestsPassed": 71,
+    "serviceTestsPassed": 23,
+    "serviceHelperTestsIntentionallyIgnored": 1,
+    "tauriLibraryTestsPassed": 13,
+    "repositoryValidator": "passed"
+  },
+  "realEofComparison": {
+    "procedure": [
+      "Start api-session using a previously installed reviewed 7-Zip prefix",
+      "Submit a GUI launch and verify a live 7zFM.exe process",
+      "Close service stdin while the GUI remains running",
+      "Wait for the service process, then inspect all namespace processes after two seconds"
+    ],
+    "baseline": {
+      "serviceExitCode": 0,
+      "remainingWineProcesses": ["wineserver", "services.exe", "winedevice.exe", "plugplay.exe", "svchost.exe", "winedevice.exe", "rpcss.exe"],
+      "result": "failed"
+    },
+    "candidate": {
+      "serviceExitCode": 0,
+      "remainingWineProcesses": [],
+      "namespaceProcessesAfter": ["tini", "python3", "Xvfb", "ps"],
+      "result": "passed"
+    }
+  },
+  "limits": [
+    "The test demonstrates API disconnect cleanup, not application transaction or desktop acceptance",
+    "The running ForgeOS virtual machine was not modified",
+    "Windows Tauri build has a pre-existing unrelated unsafe-code lint failure in project_window_corners.rs; the Linux desktop library was actually built and tested"
+  ]
+}
