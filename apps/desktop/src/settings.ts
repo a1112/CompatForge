@@ -28,6 +28,7 @@ interface RuntimeSnapshot {
 }
 
 interface BottleSummary {
+  managed: boolean;
   id: string;
   status: string;
   applicationIds: string[];
@@ -100,7 +101,7 @@ function runtimePane(): string {
 }
 
 function bottlesPane(): string {
-  return `${paneHeader("Bottle", "查看活动 Bottle，并管理可恢复归档。")}<section class="settings-card bottle-settings-list">${bottles.length ? bottles.map((bottle) => `<div class="settings-row"><div><h3>${escapeHtml(bottle.id)}</h3><p>${escapeHtml(bottle.applicationIds.join("、") || "未绑定应用")} · ${bottle.installedLauncherCount} 个入口</p></div><button class="plain-button danger-text" data-archive-bottle="${escapeHtml(bottle.id)}">归档</button></div>`).join("") : '<div class="settings-empty">还没有活动 Bottle</div>'}</section><h2 class="settings-subheading">最近归档</h2><section class="settings-card">${archives.length ? archives.map((archive) => `<div class="settings-row"><div><h3>${escapeHtml(archive.bottleId)}</h3><p>${new Date(archive.archivedAtMilliseconds).toLocaleString("zh-CN")}</p></div><button class="plain-button" data-restore-archive="${escapeHtml(archive.archiveId)}">恢复</button></div>`).join("") : '<div class="settings-empty">没有可恢复归档</div>'}</section>`;
+  return `${paneHeader("Bottle", "查看活动 Bottle，并管理可恢复归档。")}<section class="settings-card bottle-settings-list">${bottles.length ? bottles.map((bottle) => `<div class="settings-row"><div><h3>${escapeHtml(bottle.id)}</h3><p>${escapeHtml(bottle.applicationIds.join("、") || "未绑定应用")} · ${bottle.installedLauncherCount} 个入口${bottle.managed ? " · 托管版本，由应用统一管理" : ""}</p></div><button class="plain-button danger-text" data-archive-bottle="${escapeHtml(bottle.id)}"${bottle.managed ? ' disabled title="托管版本保留应用和恢复数据，不能直接归档"' : ""}>归档</button></div>`).join("") : '<div class="settings-empty">还没有活动 Bottle</div>'}</section><h2 class="settings-subheading">最近归档</h2><section class="settings-card">${archives.length ? archives.map((archive) => `<div class="settings-row"><div><h3>${escapeHtml(archive.bottleId)}</h3><p>${new Date(archive.archivedAtMilliseconds).toLocaleString("zh-CN")}</p></div><button class="plain-button" data-restore-archive="${escapeHtml(archive.archiveId)}">恢复</button></div>`).join("") : '<div class="settings-empty">没有可恢复归档</div>'}</section>`;
 }
 
 function automationPane(): string {

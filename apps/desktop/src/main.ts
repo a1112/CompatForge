@@ -60,6 +60,7 @@ interface ApplicationSummary {
 }
 
 interface BottleSummary {
+  managed: boolean;
   id: string;
   status: "ready" | "empty" | "archived";
   applicationIds: string[];
@@ -266,7 +267,7 @@ function installersView(): string {
 
 function bottlesView(): string {
   return `<section class="feature-page"><div class="page-intro"><div><h2>Bottle 管理</h2><p>创建、查询、可恢复归档和恢复均由 Service API 持久化。</p></div></div>
-    <div class="bottle-grid">${bottles.length ? bottles.map((bottle) => `<article class="bottle-card"><div class="bottle-glyph">B</div><div><h3>${escapeHtml(bottle.id)}</h3><p>${escapeHtml(bottle.applicationIds.join("、") || "未绑定应用")} · ${bottle.installedLauncherCount} 个入口</p></div><span class="badge">${bottle.status === "ready" ? "就绪" : "空 Bottle"}</span><button class="secondary-button compact-action" data-action="archive-bottle" data-bottle-id="${escapeHtml(bottle.id)}" ${activeJobs().length ? "disabled" : ""}>归档</button></article>`).join("") : '<div class="empty-state"><h3>还没有 Bottle</h3><p>开始安装应用时将自动创建。</p></div>'}</div>
+    <div class="bottle-grid">${bottles.length ? bottles.map((bottle) => `<article class="bottle-card"><div class="bottle-glyph">B</div><div><h3>${escapeHtml(bottle.id)}</h3><p>${escapeHtml(bottle.applicationIds.join("、") || "未绑定应用")} · ${bottle.installedLauncherCount} 个入口${bottle.managed ? " · 由应用统一管理" : ""}</p></div><span class="badge">${bottle.managed ? "托管版本" : bottle.status === "ready" ? "就绪" : "空 Bottle"}</span><button class="secondary-button compact-action" data-action="archive-bottle" data-bottle-id="${escapeHtml(bottle.id)}" ${activeJobs().length || bottle.managed ? "disabled" : ""}${bottle.managed ? ' title="托管版本保留应用和恢复数据，不能直接归档"' : ""}>归档</button></article>`).join("") : '<div class="empty-state"><h3>还没有 Bottle</h3><p>开始安装应用时将自动创建。</p></div>'}</div>
     <div class="security-note warning"><strong>安全说明</strong><span>Bottle 不是安全沙箱；相邻 DLL、插件和资源不包含在 EXE 摘要内。</span></div></section>`;
 }
 
