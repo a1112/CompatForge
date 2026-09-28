@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "1",
+  "scope": "Task 3 shared service and desktop integration source verification",
+  "recordedAtUtc": "2026-09-28T15:57:48Z",
+  "sourceBase": "d7e5ac2",
+  "checks": [
+    {"command": "cargo test -p compatforge-service -p compatforge-cli --locked --quiet", "host": "Windows", "cliPassed": 74, "servicePassed": 68, "serviceIgnoredHelpers": 2},
+    {"command": "cargo clippy -p compatforge-service -p compatforge-cli --all-targets --locked -- -D warnings", "host": "Windows", "result": "passed"},
+    {"command": "python -m unittest discover -s tools/tests -p test_*.py", "repository": "ForgeDesktop", "host": "Windows", "passed": 56},
+    {"command": "git diff --check", "repositories": ["CompatForge", "ForgeDesktop"], "result": "passed"}
+  ],
+  "observedRedGreenRegressions": [
+    "desktop serializer and individual Unicode, quote and percent argv",
+    "selected frozen generation export and changed executable rejection",
+    "bounded length-prefixed transport and recoverable request errors",
+    "exact desktop command parser and required file separator",
+    "automatic polling does not rewrite idle job records",
+    "bounded configuration file reads",
+    "consumer foreign-file preservation and owned install/update/uninstall",
+    "consumer rejects capacity overflow before entry writes",
+    "durable intent recovers first-install and partial multi-entry interruption",
+    "complete desktop filename rejects NAME_MAX overflow",
+    "bundle allowlist and executable mode for the fixed sync consumer"
+  ],
+  "limitations": [
+    "The direct dirty-worktree repository validator sees ignored dependency/build output; acceptance uses a clean source export.",
+    "Linux-specific socket tests and real Wine daemon tests are recorded separately by the parent integration task.",
+    "Plasma user timer, menu/Dock grouping, file-manager open, application save and reboot remain Task 4 VM gates.",
+    "No debugger, marketplace, final image or M3-M5 completion claim is made here."
+  ]
+}

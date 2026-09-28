@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 pub mod bootstrap;
+pub mod daemon;
+pub mod desktop;
 pub mod desktop_lifecycle;
 mod jobs;
 mod lifecycle;
@@ -230,6 +232,15 @@ impl AutomationService {
         self.registry.list_jobs().map_err(ServiceError::Registry)
     }
 
+    pub fn desktop_launchers(&self) -> Result<Vec<desktop::DesktopLauncher>, ServiceError> {
+        self.jobs.desktop_launchers()
+    }
+
+    /// Advance supervised jobs even when no desktop client is connected.
+    pub fn poll_active_jobs(&self) -> Result<(), ServiceError> {
+        self.jobs.poll_active_jobs().map_err(ServiceError::Job)
+    }
+
     pub fn get_job(&self, id: &str) -> Result<JobRecord, ServiceError> {
         self.registry.read_job(id).map_err(ServiceError::Registry)
     }
@@ -254,6 +265,14 @@ impl AutomationService {
                 json!({ "seeded": true })
             }
             "applications.list" => to_value(self.list_applications()?)?,
+            "desktop.launchers" => {
+                if request.payload != json!({}) {
+                    return Err(ServiceError::Invalid(
+                        "desktop.launchers requires an empty object".into(),
+                    ));
+                }
+                to_value(self.desktop_launchers()?)?
+            }
             "applications.get" => {
                 let payload: IdPayload = parse_payload(request.payload)?;
                 to_value(self.get_application(&payload.id)?)?
@@ -410,6 +429,50 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn desktop_exports_only_verified_selected_frozen_generations() {
+        let service = service();
+        service.seed_default_applications().unwrap();
+        assert!(service.desktop_launchers().unwrap().is_empty());
+        let app = service.get_application("7zip").unwrap().application;
+        let staged = service.registry.lifecycle.stage(&app, "job-desktop-1").unwrap();
+        let config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        let binding = &config.runtime_bindings[0];
+        let runtime = InstalledRuntime::from_config(
+            &config,
+            &compatforge_domain::RuntimeSelection {
+                provider: compatforge_domain::RuntimeKind::Wine,
+                pack_id: binding.pack_id.clone(),
+                pack_digest: binding.pack_digest.clone(),
+            },
+        )
+        .unwrap();
+        service
+            .registry
+            .lifecycle
+            .bind_runtime(&app.id, "job-desktop-1", runtime)
+            .unwrap();
+        let path = service
+            .registry
+            .lifecycle
+            .launcher_path(&staged, &app.launchers[0].executable);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
+        let job: JobRecord = serde_json::from_value(json!({"schemaVersion":"1","id":"job-desktop-1","applicationId":"7zip","generationId":staged.id,"kind":"install","status":"succeeded","createdAtMilliseconds":1,"updatedAtMilliseconds":1})).unwrap();
+        service.registry.lifecycle.finish(&job).unwrap();
+        let mut changed = app;
+        changed.name = "Different pending recipe".into();
+        service.upsert_application(changed).unwrap();
+        let entries = service.desktop_launchers().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "7-Zip");
+        fs::write(&path, b"tampered").unwrap();
+        assert!(service.desktop_launchers().is_err());
+        service.uninstall_application("7zip").unwrap();
+        assert!(service.desktop_launchers().unwrap().is_empty());
     }
 
     #[test]

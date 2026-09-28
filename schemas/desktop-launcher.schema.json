@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/desktop-launcher.schema.json",
+  "title": "Verified CompatForge Linux Desktop Launcher",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "entryId",
+    "applicationId",
+    "launcherId",
+    "generationId",
+    "name",
+    "icon",
+    "startupWmClass",
+    "mimeTypes"
+  ],
+  "properties": {
+    "entryId": {
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^org\\.forgeos\\.CompatForge\\.[a-z0-9][a-z0-9-]{0,127}\\.[a-z0-9][a-z0-9-]{0,127}\\.desktop$"
+    },
+    "applicationId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"
+    },
+    "launcherId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,127}$"
+    },
+    "generationId": {
+      "type": "string",
+      "pattern": "^gen-job-[a-z0-9-]+$",
+      "maxLength": 128
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "icon": {
+      "enum": [
+        "package-x-generic",
+        "text-editor",
+        "application-pdf",
+        "application-x-executable"
+      ]
+    },
+    "startupWmClass": {
+      "enum": [
+        "7zfm.exe",
+        "notepad++.exe",
+        "sumatrapdf.exe",
+        ""
+      ]
+    },
+    "mimeTypes": {
+      "type": "array",
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "application/zip",
+          "application/x-7z-compressed",
+          "text/plain",
+          "application/pdf"
+        ]
+      }
+    }
+  }
+}

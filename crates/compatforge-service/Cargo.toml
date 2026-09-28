@@ -22,5 +22,8 @@ serde_json.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=0.38.44", features = ["net", "process", "fs"] }
+
 [lints]
 workspace = true

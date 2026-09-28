@@ -468,6 +468,7 @@ dependencies = [
  "compatforge-storage",
  "fs4",
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

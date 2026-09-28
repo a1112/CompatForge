@@ -125,6 +125,49 @@ fn shutdown_handles(handles: &[(String, impl ShutdownTarget)], grace: Duration) 
 }
 
 impl JobManager {
+    pub(crate) fn poll_active_jobs(&self) -> Result<(), JobError> {
+        let ids: Vec<String> = self.lock_active()?.keys().cloned().collect();
+        for id in ids {
+            match self.poll(&id, 0) {
+                Ok(_) | Err(JobError::Conflict("job is already being polled")) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn desktop_launchers(&self) -> Result<Vec<crate::desktop::DesktopLauncher>, crate::ServiceError> {
+        let _operation = self.lock_operation().map_err(crate::ServiceError::Job)?;
+        let mut entries = Vec::new();
+        for state in self
+            .registry
+            .lifecycle
+            .all_states()
+            .map_err(crate::ServiceError::Registry)?
+        {
+            if state.selected_generation.is_none() {
+                continue;
+            }
+            let generation = self
+                .registry
+                .lifecycle
+                .selected(&state.application_id)
+                .map_err(crate::ServiceError::Registry)?;
+            generation
+                .runtime
+                .as_ref()
+                .ok_or(crate::ServiceError::Conflict("selected generation has no runtime"))?
+                .check_config(&self.config)
+                .map_err(crate::ServiceError::Registry)?;
+            self.registry
+                .lifecycle
+                .verify_launchers(&generation)
+                .map_err(crate::ServiceError::Registry)?;
+            entries.extend(crate::desktop::from_generation(&generation)?);
+        }
+        Ok(entries)
+    }
+
     pub(crate) fn new(registry: Arc<Registry>, config: CoreConfig) -> Self {
         Self {
             registry,
@@ -338,6 +381,13 @@ impl JobManager {
         let state = active
             .get_mut(id)
             .ok_or(JobError::Conflict("job changed while polling"))?;
+        if new_events.is_empty() && !state.record.status.is_terminal() {
+            return Ok(JobPollResult {
+                job: state.record.clone(),
+                events: Vec::new(),
+                stream_ended: false,
+            });
+        }
         for event in &new_events {
             apply_event(state, event);
         }
@@ -926,6 +976,25 @@ mod shutdown_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
         path
+    }
+
+    #[test]
+    fn daemon_tick_activates_install_without_client_poll_and_does_not_rewrite_idle_jobs() {
+        let (manager, handle, root, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        let events = std::mem::take(&mut *handle.events.lock().unwrap());
+        let before = std::fs::read(root.join("service/jobs/job-managed.json")).unwrap();
+        manager.poll_active_jobs().unwrap();
+        assert_eq!(
+            std::fs::read(root.join("service/jobs/job-managed.json")).unwrap(),
+            before,
+            "idle daemon polling must not rewrite persistent job metadata"
+        );
+        *handle.events.lock().unwrap() = events;
+        manager.poll_active_jobs().unwrap();
+        assert_eq!(manager.registry.lifecycle.selected(&app.id).unwrap().definition, app);
+        assert_eq!(handle.joins.load(Ordering::SeqCst), 1);
+        assert!(manager.active.lock().unwrap().is_empty());
     }
 
     struct PausedFirstEvent {

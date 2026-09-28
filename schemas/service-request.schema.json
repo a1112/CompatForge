@@ -43,7 +43,8 @@
         "applications.generations",
         "applications.rollback",
         "applications.uninstall",
-        "applications.recover"
+        "applications.recover",
+        "desktop.launchers"
       ]
     },
     "payload": {}
@@ -119,6 +120,23 @@
         "properties": {
           "payload": {
             "$ref": "job.schema.json#/$defs/request"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "desktop.launchers"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false
           }
         }
       }

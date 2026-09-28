@@ -30,6 +30,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod shared;
+
 const PINNED_SUMATRAPDF_FAILURE: &str = "pinned SumatraPDF launch failed";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -254,6 +256,9 @@ fn main() {
 }
 
 fn run_arguments(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if let Some(result) = shared::run(arguments) {
+        return result;
+    }
     if let Some(command) = parse_linux_command(arguments)? {
         return run_linux_command(command);
     }
@@ -1989,6 +1994,9 @@ fn print_help() {
     println!("  compatforge-cli launch-terminate <context-config.json> <launch-request.json> <delay-ms>");
     println!("  compatforge-cli api <context-config.json> <service-config.json> <service-request.json>");
     println!("  compatforge-cli api-session <context-config.json> <service-config.json>  # JSON Lines on stdin/stdout");
+    println!("  compatforge-cli service-daemon <context-config.json> <service-config.json>  # Linux shared user owner");
+    println!("  compatforge-cli service-call <request.json> | service-stop | desktop-export");
+    println!("  compatforge-cli desktop-launch <application-id> <launcher-id> -- [absolute files...]");
     println!("  compatforge-cli runtime manifest-digest <manifest.json>");
     println!("  compatforge-cli runtime install <store-root> <bundle-root> <manifest-relative-path>");
     println!("  compatforge-cli runtime verify <store-root> <pack-digest>");

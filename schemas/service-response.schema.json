@@ -104,6 +104,26 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "desktop.launchers"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "array",
+            "maxItems": 262144,
+            "items": {
+              "$ref": "desktop-launcher.schema.json"
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
