@@ -1,0 +1,96 @@
+{
+  "schemaVersion": "1",
+  "date": "2026-09-28",
+  "scope": "Approved Stage 1 Task 4: real Windows GUI applications in a separate ForgeOS candidate; original user image and overlay were not replaced",
+  "sourceRevisions": {
+    "compatforgeRuntime": "76f3c3c3e6aa4dc1ec183adfc6f3f7af107101bb",
+    "compatforgeReviewedTests": "a6f70bd2ff585e134b9d22e2060df9247cd09957",
+    "forgeDesktop": "4ac05421f534c3ec0c75b526aeac32ebcb7bb668",
+    "forgeOS": "62371160b5dabf1fd6112d172a3176dec3df8981"
+  },
+  "candidate": {
+    "location": "/srv/forge-apps-fast/lab/apps-v3",
+    "image": "/srv/forge-apps-fast/images/forgeos-windows-apps-v3.raw",
+    "imageSha256": "812a4421f3394a7ea744ddf45353334bdd2bffd0ed3083a6ead9ee0b22d343eb",
+    "compatforgeCliSha256": "aa2d2c79a6d67aa3f0695fdd1a38c3abd396a09434fb2dade4ed8937d477519d",
+    "bundleSha256": "d501c4d0bb91d1e749b5297adfbf86c5e1ac517eb0722eac67d801f736d0c64e",
+    "ordinaryUserId": 1000,
+    "desktop": "ForgeDesktop KWin/Plasma, Chinese locale, XWayland, noVNC on the private test relay",
+    "bootReadiness": ["FORGEOS_COMPAT_READY", "FORGEOS_INSPECT_READY", "FORGEOS_CONSOLE_READY", "FORGEOS_READY"]
+  },
+  "applicationPins": {
+    "7zipInstallerSha256": "d64a0468f5b5b0b0fc5b2188450bcd655b70809d97b1c4535f2884635094377d",
+    "notepadPlusPlusInstallerSha256": "7c243203265ce8fdac76c839bf744ae35dcf620760eb97c2ea279af498560e45",
+    "sumatraPdfInstallerSha256": "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381"
+  },
+  "transactions": {
+    "result": "passed",
+    "cases": ["install all three pinned applications", "desktop-export all three launchers", "cancel a separate 7-Zip installation", "update 7-Zip into a second generation", "rollback", "uninstall without user-file deletion", "restore the selected generation"],
+    "selectedGenerations": {
+      "7zip": "gen-job-1790617936756-1",
+      "notepad-plus-plus": "gen-job-1790617954457-2",
+      "sumatrapdf": "gen-job-1790617970040-3"
+    },
+    "receipt": "/home/forge/forge-apps-acceptance/transactions/transactions.json"
+  },
+  "gui": {
+    "notepadPlusPlus": {
+      "observation": "Launched from the Plasma menu; the native Wine window opened a Chinese-named UTF-8 file, appended a line through noVNC keyboard input and saved with Ctrl+S",
+      "file": "/home/forge/forge-apps-acceptance/inputs/中文 文档 100%.txt",
+      "savedSha256": "190a28fbde338e955b1b0713af07fe21ef9b03d951899b22c4c7294ea74d3d99",
+      "screenshot": "screenshots/notepad-saved.png",
+      "screenshotSha256": "1c727e9fc54425d5334e806fc905610133368c044464238a8ce3868eaa0ff8a9"
+    },
+    "sevenZip": {
+      "observation": "Launched from the Plasma menu, then opened a Chinese-named ZIP through the desktop-launch file argument with DISPLAY and XAUTHORITY inherited from the actual graphical session; F5 and the Wine Copy dialog extracted one member",
+      "archive": "/home/forge/forge-apps-acceptance/inputs/中文 压缩包.zip",
+      "archiveSha256": "a6c707d678c514a172706fa5563e9566e8fa239bb7191ce82892e6841304e8a9",
+      "extractedFile": "/home/forge/forge-apps-acceptance/inputs/资料/你好 100%.txt",
+      "extractedSha256": "e9de5fe7ed76059e3d3ac2c04126d13833691369c47fc587766a2217f68dae0c",
+      "screenshot": "screenshots/7zip-chinese-archive.jpg",
+      "screenshotSha256": "a3468955ebb1a61fba0cb16282be1ea9240bcd96709869ddfee34cbcd5a24ef8"
+    },
+    "sumatraPdf": {
+      "observation": "Launched from the Plasma menu, opened a Chinese-named PDF through the graphical desktop-launch file argument, then used Ctrl+S and the Wine Save As dialog to create a copy",
+      "sourceFile": "/home/forge/forge-apps-acceptance/inputs/中文 文件名 100%.pdf",
+      "copyFile": "/home/forge/.local/share/compatforge/storage/bottles/gen-job-1790617970040-3/prefix/drive_c/users/forge/Documents/copy.pdf",
+      "sourceAndCopySha256": "7295797c972d8f64a1b2f562862d232ee877443f7c6526cd2547f6151db81499",
+      "screenshot": "screenshots/sumatrapdf-chinese-pdf.jpg",
+      "screenshotSha256": "6bcec37b2dac9e6eaf1e18c1b6a4de18aaab005b51b33325f55284bf6e240907"
+    }
+  },
+  "persistenceAndRecovery": {
+    "bootIds": ["230374ea-9960-42b4-8beb-3d201c7d47bc", "20d27ebc-b9ce-43af-8ca3-075f345efdf7", "0e760bd1-da82-4ff1-abf0-a8577263d18f"],
+    "normalShutdowns": 2,
+    "firstReboot": "Three selected generations and the Notepad++-saved text digest survived a changed kernel boot identity",
+    "crashMethod": "SIGKILL of the checked ordinary-user CompatForge service PID while SumatraPDF was active, in the isolated candidate only",
+    "crashResult": "systemd completed service-group cleanup after approximately the configured 120-second stop timeout and restarted the service; the interrupted job-1790623929149-7 was marked failed with error: service process ended before the job reached a terminal event",
+    "secondReboot": "Three selected generations and all three GUI-produced file digests survived another normal shutdown and new kernel boot identity",
+    "beforeSecondRebootReceipt": "/home/forge/forge-apps-acceptance/before-crash-and-reboot/before-reboot.json",
+    "afterSecondRebootReceipt": "/home/forge/forge-apps-acceptance/after-crash-and-reboot/after-reboot.json",
+    "serviceAfterSecondReboot": "active",
+    "desktopSyncTimerAfterSecondReboot": "active"
+  },
+  "verification": {
+    "forgeOSRequiredLinuxGatesPassed": 12,
+    "forgeOSPythonTestsPassed": 225,
+    "forgeDesktopLinuxPythonTestsPassed": 57,
+    "compatforgeLinuxGuiContractTestsPassed": 103,
+    "compatforgeFullPythonSuite": "Not all passing: two migration failures reproduce at pre-Task-1 revision 83079328; three host /proc permission errors passed in the required ordinary-user private PID/proc environment"
+  },
+  "guestReceiptSha256": {
+    "transactions/transactions.json": "e673d1b04698c663d803e4729beecf3dfb51e4c13d8369ec3389a6c15e37c515",
+    "before-reboot-notepad/before-reboot.json": "603168190c7751878fb2d87be32ac437e4c3356531e64e546484ef21012f1f93",
+    "after-reboot-notepad/after-reboot.json": "1d8df2855d7826c099645871d6fd0997d8cac6902cd3b2b3c771f22cba3f3204",
+    "before-crash-and-reboot/before-reboot.json": "dedb796fd57a09b6fa5d3a562b813f684bef9980e4fc01a44aa15f829fb5c587",
+    "after-crash-job-status/status.json": "74593ce69f2433e2f62b2731a44c10a396ef806024f46f8f849f3db17a3822bd",
+    "after-crash-and-reboot/after-reboot.json": "604e9bc7c52cfafb1a929c3755c4b376e28302f6b6af60ee6244e4a16fedf2d6"
+  },
+  "limits": [
+    "This is a three-application x86_64 Wine/ForgeOS candidate acceptance, not general Windows compatibility or a completed application store/debugger",
+    "The candidate retains the development image's automatic login and has not been switched to the default user session",
+    "Plasma PowerDevil held the ACPI power-key inhibitor in the test VM. For each graceful shutdown, the ordinary user stopped plasma-powerdevil.service transiently, verified the inhibitor was gone, and then sent QEMU system_powerdown; no forced reset or guest-root operation was used",
+    "The service intentionally limits concurrent long-running application jobs to its configured maximum; the acceptance sequence closed each observed GUI app before the next file launch",
+    "A remote acceptance client must inherit DISPLAY and XAUTHORITY from the graphical session; SSH without them yields a headless launch and is not GUI evidence"
+  ]
+}
