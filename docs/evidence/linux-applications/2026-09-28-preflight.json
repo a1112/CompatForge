@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "1",
+  "date": "2026-09-28",
+  "scope": "Installation prerequisites only; not desktop, transaction, debugger or market acceptance",
+  "sourceRevision": "3e0522e",
+  "environment": {
+    "host": "Ubuntu 26.04 Hyper-V builder",
+    "userspace": "Independent pinned Arch chroot",
+    "runtime": "Wine 11.14 x86_64",
+    "display": "Private Xvfb, 1280x800x24, TCP disabled",
+    "isolation": "Mount, PID and network namespaces; ordinary UID 1000; no network",
+    "init": "tini as namespace PID 1",
+    "runtimePackDigest": "sha256:6b2a66327849bd5da3933011afdd5db6129f6cf2e246b8082daeb601f0b3afba"
+  },
+  "observations": [
+    {
+      "case": "cold-prefix-without-init",
+      "result": "failed",
+      "detail": "Wineboot cleanup returned TreeTermination. Process snapshot showed orphaned Wine descendants as zombies parented to Python PID 1."
+    },
+    {
+      "case": "cold-prefix-with-init",
+      "result": "passed",
+      "detail": "The same 7-Zip payload and runtime installed into a fresh prefix under tini. Completion snapshot contained only tini, the fixture, Xvfb, CLI and ps; no Wine process remained. Production cleanup was not weakened."
+    },
+    {
+      "case": "three-app-baseline",
+      "result": "failed",
+      "detail": "7-Zip and Notepad++ returned success and expected launchers existed. SumatraPDF returned exit success but its declared launcher did not exist: the default installer wrote to per-user AppData/Local instead of declared Program Files. This confirms process exit alone cannot certify installation."
+    },
+    {
+      "case": "sumatrapdf-explicit-destination",
+      "result": "passed",
+      "detail": "A separate fresh prefix with the same installer and explicit -install -silent -d destination produced the expected Program Files/SumatraPDF/SumatraPDF.exe. The recipe is a fixture override pending its managed-install source change.",
+      "source": "https://www.sumatrapdfreader.org/docs/Installer-cmd-line-arguments"
+    }
+  ],
+  "artifacts": [
+    {
+      "filename": "7z2601-x64.exe",
+      "sha256": "d64a0468f5b5b0b0fc5b2188450bcd655b70809d97b1c4535f2884635094377d"
+    },
+    {
+      "filename": "npp.8.9.6.2.Installer.x64.exe",
+      "sha256": "7c243203265ce8fdac76c839bf744ae35dcf620760eb97c2ea279af498560e45"
+    },
+    {
+      "filename": "SumatraPDF-3.6.1-64-install.exe",
+      "sha256": "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381"
+    }
+  ],
+  "remaining": [
+    "Managed generation activation, rollback, cancellation and uninstall",
+    "Real application file operations and desktop launch",
+    "Persistence and image integration",
+    "Developer debugger and ForgeStore"
+  ]
+}
