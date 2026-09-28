@@ -43,6 +43,16 @@ to retry; failures never count as successful cleanup. `shutdown_and_wait()` is
 also available to other Rust owners after they drain their clients, and returns
 typed per-job termination/join failures while still attempting every job.
 
+`jobs.poll.timeoutMilliseconds` bounds waiting for the next runtime event only.
+After observing a terminal guest exit, polling additionally acknowledges and
+joins supervisor cleanup using its existing forced-completion deadline (up to
+16 seconds). Clients must budget for both bounds; a zero event timeout does not
+mean a terminal poll is instantaneous. This wait runs on the service worker and
+holds no job-map mutex. Only successful acknowledgement releases the handle.
+Failed cleanup keeps the job `failed` and retains its handle for shutdown;
+repeating a normal poll does not repeat the failed cleanup wait. An earlier
+`failed` event cannot be erased by a later guest exit code of zero.
+
 ## Other local clients
 
 Rust clients can use `bootstrap::select_desktop_context` and
@@ -64,6 +74,11 @@ request is bounded to 1 MiB **before copying the next input buffer**. CRLF and a
 complete final request without newline are accepted. Oversized, malformed or
 invalid UTF-8 requests terminate the session with a nonzero error, as do existing
 service errors; the client must not keep writing after a terminal transport error.
+Before returning on EOF or any read, decode, service, write or flush error, the CLI
+explicitly stops and joins its owned jobs. A cleanup failure makes the CLI exit
+nonzero even after a clean EOF; when the request loop and cleanup both fail, both
+original errors are retained and reported. This is a private owned session, not
+a daemon whose applications survive a disconnected client.
 
 This change establishes Linux bootstrap and bounded local transport only. It does
 not certify everyday applications, debugger support, or application installation

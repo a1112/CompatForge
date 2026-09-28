@@ -25,9 +25,20 @@ pub(crate) struct JobManager {
 }
 
 struct ActiveJob {
-    handle: Arc<LaunchHandle>,
+    handle: Arc<dyn JobProcess>,
     record: JobRecord,
     cancel_requested: bool,
+    cleanup_join_failed: bool,
+}
+
+trait JobProcess: ShutdownTarget + Send + Sync {
+    fn next_event(&self, timeout: Duration) -> EventPoll;
+}
+
+impl JobProcess for LaunchHandle {
+    fn next_event(&self, timeout: Duration) -> EventPoll {
+        LaunchHandle::next_event(self, timeout)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,12 +73,21 @@ trait ShutdownTarget {
     fn wait_for_stop(&self, grace: Duration) -> Result<(), String>;
 }
 
-impl ShutdownTarget for Arc<LaunchHandle> {
+impl ShutdownTarget for LaunchHandle {
     fn request_stop(&self) -> Result<(), String> {
         self.terminate().map_err(|error| error.to_string())
     }
     fn wait_for_stop(&self, grace: Duration) -> Result<(), String> {
         self.terminate_and_wait(grace).map_err(|error| error.to_string())
+    }
+}
+
+impl<T: ShutdownTarget + ?Sized> ShutdownTarget for Arc<T> {
+    fn request_stop(&self) -> Result<(), String> {
+        self.as_ref().request_stop()
+    }
+    fn wait_for_stop(&self, grace: Duration) -> Result<(), String> {
+        self.as_ref().wait_for_stop(grace)
     }
 }
 
@@ -197,6 +217,7 @@ impl JobManager {
                         handle: Arc::new(handle),
                         record: record.clone(),
                         cancel_requested: false,
+                        cleanup_join_failed: false,
                     },
                 );
                 Ok(record)
@@ -257,10 +278,37 @@ impl JobManager {
         }
         state.record.updated_at_milliseconds = now_milliseconds();
         self.registry.write_job(&state.record).map_err(JobError::Registry)?;
-        let job = state.record.clone();
+        let mut job = state.record.clone();
         let stream_ended = job.status.is_terminal();
-        if stream_ended {
-            active.remove(id);
+        let needs_join = stream_ended && !state.cleanup_join_failed;
+        drop(active);
+        if needs_join {
+            // Exited describes the guest, not the supervisor's cleanup result.
+            // This terminal-only acknowledgement has the existing supervisor's
+            // 16-second forced-completion bound, separate from the event timeout.
+            // Do not hold the job map while waiting or hide a failed join.
+            let cleanup = handle.wait_for_stop(Duration::ZERO);
+            let mut active = self.lock_active()?;
+            if let Some(state) = active.get_mut(id) {
+                match cleanup {
+                    Ok(()) => {
+                        job = state.record.clone();
+                        active.remove(id);
+                    }
+                    Err(message) => {
+                        state.cleanup_join_failed = true;
+                        state.record.status = JobStatus::Failed;
+                        let detail = format!("process cleanup not confirmed: {message}");
+                        state.record.error = Some(match state.record.error.take() {
+                            Some(previous) => format!("{previous}; {detail}"),
+                            None => detail,
+                        });
+                        state.record.updated_at_milliseconds = now_milliseconds();
+                        self.registry.write_job(&state.record).map_err(JobError::Registry)?;
+                        job = state.record.clone();
+                    }
+                }
+            }
         }
         Ok(JobPollResult {
             job,
@@ -277,15 +325,16 @@ impl JobManager {
                 Ok(_) => JobError::Conflict("job is not active in this service process"),
                 Err(error) => JobError::Registry(error),
             })?;
+            if state.record.status.is_terminal() {
+                return Err(JobError::Conflict("job is already terminal"));
+            }
             state.cancel_requested = true;
             state.record.status = JobStatus::Cancelling;
             state.record.updated_at_milliseconds = now_milliseconds();
             self.registry.write_job(&state.record).map_err(JobError::Registry)?;
             Arc::clone(&state.handle)
         };
-        handle
-            .terminate()
-            .map_err(|error| JobError::Process(error.to_string()))?;
+        handle.request_stop().map_err(JobError::Process)?;
         self.registry.read_job(id).map_err(JobError::Registry)
     }
 
@@ -313,7 +362,7 @@ impl JobManager {
             .map(|active| active.values().map(|job| Arc::clone(&job.handle)).collect::<Vec<_>>())
             .unwrap_or_default();
         for handle in handles {
-            let _ = handle.terminate();
+            let _ = handle.request_stop();
         }
     }
 
@@ -425,7 +474,9 @@ fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
     match event.kind {
         RuntimeEventKind::Exited => {
             let success = event.exit.as_ref().is_some_and(|exit| exit.success);
-            state.record.status = if state.cancel_requested {
+            state.record.status = if state.record.error.is_some() {
+                JobStatus::Failed
+            } else if state.cancel_requested {
                 JobStatus::Cancelled
             } else if success {
                 JobStatus::Succeeded
@@ -497,6 +548,166 @@ impl std::error::Error for JobError {}
 mod shutdown_tests {
     use super::*;
     use compatforge_domain::{LaunchPlan, NativeCommand, ProcessLifecycle};
+
+    struct CompletedProcess {
+        events: Mutex<std::collections::VecDeque<RuntimeEvent>>,
+        cleanup_failed: bool,
+        joins: AtomicU64,
+    }
+
+    impl ShutdownTarget for CompletedProcess {
+        fn request_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait_for_stop(&self, grace: Duration) -> Result<(), String> {
+            assert!(grace <= Duration::from_millis(20));
+            self.joins.fetch_add(1, Ordering::SeqCst);
+            if self.cleanup_failed {
+                Err("supervisor cleanup failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl JobProcess for CompletedProcess {
+        fn next_event(&self, _: Duration) -> EventPoll {
+            self.events
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map_or(EventPoll::Closed, EventPoll::Event)
+        }
+    }
+
+    fn terminal_poll_fixture(cleanup_failed: bool) -> (JobManager, Arc<CompletedProcess>, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "compatforge-terminal-poll-{}-{}",
+            std::process::id(),
+            JOB_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let mut config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        config.storage_root = root.join("storage").to_string_lossy().into_owned();
+        config.supervisor.termination_grace_milliseconds = 20;
+        let registry = Arc::new(Registry::new(root.join("service"), root.join("storage")).unwrap());
+        let manager = JobManager::new(registry, config);
+        let mut events = std::collections::VecDeque::new();
+        if cleanup_failed {
+            events.push_back(serde_json::from_value(serde_json::json!({
+                "schemaVersion":"1", "sequence":1, "kind":"failed", "requestId":"cleanup-job", "elapsedMilliseconds":1,
+                "message":"supervisor cleanup failed"
+            })).unwrap());
+        }
+        events.push_back(
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion":"1", "sequence":2, "kind":"exited", "requestId":"cleanup-job", "elapsedMilliseconds":2,
+                "exit":{"code":0,"success":true}
+            }))
+            .unwrap(),
+        );
+        let handle = Arc::new(CompletedProcess {
+            events: Mutex::new(events),
+            cleanup_failed,
+            joins: AtomicU64::new(0),
+        });
+        let record = JobRecord {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            id: "cleanup-job".into(),
+            application_id: "cleanup-test".into(),
+            kind: JobKind::Launch,
+            status: JobStatus::Running,
+            created_at_milliseconds: 1,
+            updated_at_milliseconds: 1,
+            inspection: None,
+            launch_plan: None,
+            events: Vec::new(),
+            assessment: None,
+            error: None,
+        };
+        manager.active.lock().unwrap().insert(
+            record.id.clone(),
+            ActiveJob {
+                handle: handle.clone(),
+                record,
+                cancel_requested: false,
+                cleanup_join_failed: false,
+            },
+        );
+        (manager, handle, root)
+    }
+
+    #[test]
+    fn poll_preserves_failed_cleanup_for_close_and_failure_is_not_overwritten_by_successful_exit() {
+        let (manager, handle, root) = terminal_poll_fixture(true);
+        let polled = manager.poll("cleanup-job", 0).unwrap();
+        assert_eq!(polled.job.status, JobStatus::Failed);
+        assert!(polled.stream_ended);
+        assert!(manager.active.lock().unwrap().contains_key("cleanup-job"));
+        assert_eq!(manager.poll("cleanup-job", 0).unwrap().job.status, JobStatus::Failed);
+        assert_eq!(
+            handle.joins.load(Ordering::SeqCst),
+            1,
+            "ordinary repeat poll must not repeat failed cleanup waits"
+        );
+        let failure = manager.shutdown_and_wait().unwrap_err();
+        assert!(failure
+            .failures
+            .iter()
+            .any(|failure| failure.job_id.as_deref() == Some("cleanup-job") && failure.phase == ShutdownPhase::Join));
+        assert!(handle.joins.load(Ordering::SeqCst) >= 2);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn poll_reclaims_successful_terminal_handle_only_after_join_acknowledgement() {
+        let (manager, handle, root) = terminal_poll_fixture(false);
+        let polled = manager.poll("cleanup-job", 0).unwrap();
+        assert_eq!(polled.job.status, JobStatus::Succeeded);
+        assert!(polled.stream_ended);
+        assert_eq!(handle.joins.load(Ordering::SeqCst), 1);
+        assert!(!manager.active.lock().unwrap().contains_key("cleanup-job"));
+        manager.shutdown_and_wait().unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_cleanup_failure_cannot_be_changed_back_to_cancelling() {
+        let (manager, _, root) = terminal_poll_fixture(true);
+        manager.poll("cleanup-job", 0).unwrap();
+        assert!(matches!(
+            manager.cancel("cleanup-job"),
+            Err(JobError::Conflict("job is already terminal"))
+        ));
+        assert_eq!(
+            manager.registry.read_job("cleanup-job").unwrap().status,
+            JobStatus::Failed
+        );
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_runtime_event_is_sticky_even_when_cleanup_join_succeeds() {
+        let (manager, handle, root) = terminal_poll_fixture(false);
+        handle.events.lock().unwrap().push_front(
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion":"1", "sequence":1, "kind":"failed", "requestId":"cleanup-job", "elapsedMilliseconds":1,
+                "message":"runtime reported failure"
+            }))
+            .unwrap(),
+        );
+        let polled = manager.poll("cleanup-job", 0).unwrap();
+        assert_eq!(polled.job.status, JobStatus::Failed);
+        assert_eq!(polled.job.error.as_deref(), Some("runtime reported failure"));
+        assert_eq!(handle.joins.load(Ordering::SeqCst), 1);
+        assert!(!manager.active.lock().unwrap().contains_key("cleanup-job"));
+        manager.shutdown_and_wait().unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn shutdown_attempts_all_handles_and_preserves_every_failure() {
@@ -601,6 +812,7 @@ mod shutdown_tests {
                 handle: handle.clone(),
                 record,
                 cancel_requested: false,
+                cleanup_join_failed: false,
             },
         );
         assert!(!handle.is_finished());

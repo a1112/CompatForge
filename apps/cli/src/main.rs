@@ -20,13 +20,13 @@ use compatforge_provider_macos::{
     create_local_context as create_macos_local_context, MacOsLocalContextRequest, MacOsProviderConfig, MacOsProviderSet,
 };
 use compatforge_runtime::{sha256_digest_bytes, RejectAllSignatures, RuntimePackStore};
-use compatforge_service::{AutomationService, ServiceConfig, ServiceRequest};
+use compatforge_service::{AutomationService, ServiceConfig, ServiceRequest, ServiceResponse};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1486,14 +1486,202 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Box<dyn E
 
 fn run_api_session(service: AutomationService) -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut input = stdin.lock();
-    while let Some(request) = compatforge_service::transport::read_request(&mut input)? {
-        serde_json::to_writer(&mut stdout, &service.call(request)?)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+    run_api_session_io(&service, &mut stdin.lock(), &mut io::stdout().lock())
+}
+
+trait ApiSessionService {
+    fn call(&self, request: ServiceRequest) -> Result<ServiceResponse, Box<dyn Error>>;
+    fn shutdown_and_wait(&self) -> Result<(), Box<dyn Error>>;
+}
+
+impl ApiSessionService for AutomationService {
+    fn call(&self, request: ServiceRequest) -> Result<ServiceResponse, Box<dyn Error>> {
+        AutomationService::call(self, request).map_err(Into::into)
     }
-    Ok(())
+    fn shutdown_and_wait(&self) -> Result<(), Box<dyn Error>> {
+        AutomationService::shutdown_and_wait(self).map_err(Into::into)
+    }
+}
+
+fn run_api_session_io(
+    service: &impl ApiSessionService,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<(), Box<dyn Error>> {
+    let operation = (|| -> Result<(), Box<dyn Error>> {
+        while let Some(request) = compatforge_service::transport::read_request(input)? {
+            serde_json::to_writer(&mut *output, &service.call(request)?)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
+        }
+        Ok(())
+    })();
+    // Every loop exit, including EOF and broken pipes, drains owned process
+    // supervision before the CLI may exit. Keep both errors when both fail.
+    let cleanup = service.shutdown_and_wait();
+    match (operation, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (operation, cleanup) => Err(Box::new(ApiSessionFailure {
+            operation_error: operation.err(),
+            cleanup_error: cleanup.err(),
+        })),
+    }
+}
+
+#[derive(Debug)]
+struct ApiSessionFailure {
+    operation_error: Option<Box<dyn Error>>,
+    cleanup_error: Option<Box<dyn Error>>,
+}
+
+impl fmt::Display for ApiSessionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(error) = &self.operation_error {
+            write!(formatter, "API session failed: {error}")?;
+        }
+        if let Some(error) = &self.cleanup_error {
+            if self.operation_error.is_some() {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "service cleanup failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for ApiSessionFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.operation_error.as_deref().or(self.cleanup_error.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod api_session_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const REQUEST: &str =
+        "{\"schemaVersion\":\"1\",\"requestId\":\"session-test\",\"operation\":\"applications.list\",\"payload\":{}}\n";
+
+    #[derive(Default)]
+    struct SessionService {
+        cleanup_count: Cell<usize>,
+        fail_call: bool,
+        fail_cleanup: bool,
+    }
+    impl ApiSessionService for SessionService {
+        fn call(&self, request: ServiceRequest) -> Result<ServiceResponse, Box<dyn Error>> {
+            if self.fail_call {
+                return Err(io::Error::other("call failed").into());
+            }
+            Ok(ServiceResponse {
+                schema_version: "1".into(),
+                request_id: request.request_id,
+                operation: request.operation,
+                result: serde_json::json!({}),
+            })
+        }
+        fn shutdown_and_wait(&self) -> Result<(), Box<dyn Error>> {
+            self.cleanup_count.set(self.cleanup_count.get() + 1);
+            if self.fail_cleanup {
+                Err(io::Error::other("cleanup failed").into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn eof_joins_service_cleanup_before_session_returns() {
+        let service = SessionService::default();
+        let mut output = Vec::new();
+        run_api_session_io(&service, &mut io::Cursor::new(REQUEST), &mut output).unwrap();
+        assert_eq!(service.cleanup_count.get(), 1);
+        assert!(output.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn malformed_and_oversized_input_still_join_service_cleanup() {
+        let oversized = vec![b' '; compatforge_service::transport::MAX_REQUEST_BYTES + 1];
+        for input in [b"not JSON\n".to_vec(), oversized] {
+            let service = SessionService::default();
+            assert!(run_api_session_io(&service, &mut io::Cursor::new(input), &mut Vec::new()).is_err());
+            assert_eq!(service.cleanup_count.get(), 1);
+        }
+    }
+
+    #[test]
+    fn input_io_error_still_joins_service_cleanup() {
+        struct BrokenReader;
+        impl io::Read for BrokenReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("read failed"))
+            }
+        }
+        let service = SessionService::default();
+        let error = run_api_session_io(&service, &mut io::BufReader::new(BrokenReader), &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("read failed"));
+        assert_eq!(service.cleanup_count.get(), 1);
+    }
+
+    #[test]
+    fn output_write_and_flush_errors_still_join_service_cleanup() {
+        struct BrokenWriter {
+            write_fails: bool,
+        }
+        impl Write for BrokenWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.write_fails {
+                    Err(io::Error::other("write failed"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush failed"))
+            }
+        }
+        for write_fails in [false, true] {
+            let service = SessionService::default();
+            let error = run_api_session_io(
+                &service,
+                &mut io::Cursor::new(REQUEST),
+                &mut BrokenWriter { write_fails },
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(if write_fails { "write failed" } else { "flush failed" }));
+            assert_eq!(service.cleanup_count.get(), 1);
+        }
+    }
+
+    #[test]
+    fn call_and_cleanup_failures_are_both_reported() {
+        let service = SessionService {
+            fail_call: true,
+            fail_cleanup: true,
+            ..Default::default()
+        };
+        let error = run_api_session_io(&service, &mut io::Cursor::new(REQUEST), &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("call failed"));
+        assert!(error.to_string().contains("cleanup failed"));
+        assert_eq!(service.cleanup_count.get(), 1);
+        let failure = error.downcast_ref::<ApiSessionFailure>().unwrap();
+        assert_eq!(failure.operation_error.as_ref().unwrap().to_string(), "call failed");
+        assert_eq!(failure.cleanup_error.as_ref().unwrap().to_string(), "cleanup failed");
+    }
+
+    #[test]
+    fn cleanup_failure_after_eof_is_not_reported_as_success() {
+        let service = SessionService {
+            fail_cleanup: true,
+            ..Default::default()
+        };
+        let error = run_api_session_io(&service, &mut io::Cursor::new(""), &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("cleanup failed"));
+        assert_eq!(service.cleanup_count.get(), 1);
+    }
 }
 
 fn print_plan(config: &CoreConfig, request: &LaunchRequest) -> Result<(), Box<dyn Error>> {
