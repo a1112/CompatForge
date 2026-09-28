@@ -102,6 +102,9 @@ impl ApplicationDefinition {
             validate_arguments(&launcher.arguments)?;
             validate_environment(&launcher.environment)?;
         }
+        if self.tags.len() > 256 {
+            return Err(ModelError::Invalid("too many application tags"));
+        }
         for tag in &self.tags {
             validate_text("application.tags", tag)?;
         }
@@ -141,6 +144,7 @@ pub enum ApplicationStatus {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplicationSummary {
+    pub generations: crate::lifecycle::ApplicationGenerations,
     pub application: ApplicationDefinition,
     pub status: ApplicationStatus,
     pub installed: bool,
@@ -294,11 +298,36 @@ impl JobRequest {
         validate_environment(&self.environment_overrides)?;
         match self.kind {
             JobKind::Install => {
+                if !self.argument_overrides.is_empty() || self.launcher_id.is_some() {
+                    return Err(ModelError::Invalid(
+                        "managed install jobs cannot override the reviewed recipe",
+                    ));
+                }
+                for (key, value) in &self.environment_overrides {
+                    let allowed = match key.as_str() {
+                        "DISPLAY" => value.strip_prefix(':').is_some_and(|display| {
+                            let parts: Vec<&str> = display.split('.').collect();
+                            (1..=2).contains(&parts.len())
+                                && parts.iter().all(|part| {
+                                    !part.is_empty()
+                                        && part.len() <= 5
+                                        && part.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                        }),
+                        "XAUTHORITY" => Path::new(value).is_absolute() && !value.as_bytes().contains(&0),
+                        _ => false,
+                    };
+                    if !allowed {
+                        return Err(ModelError::Invalid(
+                            "installer environment accepts only local DISPLAY and absolute XAUTHORITY session values",
+                        ));
+                    }
+                }
                 let path = self
                     .executable_path
                     .as_deref()
                     .ok_or(ModelError::Invalid("install jobs require executablePath"))?;
-                if !Path::new(path).is_absolute() {
+                if !Path::new(path).is_absolute() || path.len() > MAX_TEXT_BYTES || path.as_bytes().contains(&0) {
                     return Err(ModelError::Invalid("job executablePath must be absolute"));
                 }
             }
@@ -315,6 +344,8 @@ impl JobRequest {
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
     pub schema_version: String,
     pub id: String,
     pub application_id: String,
@@ -332,6 +363,27 @@ pub struct JobRecord {
     pub assessment: Option<JobAssessment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl JobRecord {
+    pub(crate) fn validate(&self) -> Result<(), ModelError> {
+        validate_schema(&self.schema_version)?;
+        validate_domain_id("job.id", &self.id)?;
+        validate_domain_id("job.applicationId", &self.application_id)?;
+        if let Some(id) = &self.generation_id {
+            validate_domain_id("job.generationId", id)?;
+        }
+        if self.events.len() > MAX_JOB_EVENTS {
+            return Err(ModelError::Invalid("too many job events"));
+        }
+        if let Some(error) = &self.error {
+            validate_text("job.error", error)?;
+        }
+        if let Some(assessment) = &self.assessment {
+            assessment.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -416,6 +468,13 @@ pub struct ServiceRequest {
 impl ServiceRequest {
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_schema(&self.schema_version)?;
+        if serde_json::to_vec(self)
+            .map_err(|_| ModelError::Invalid("invalid service request"))?
+            .len()
+            > crate::transport::MAX_REQUEST_BYTES
+        {
+            return Err(ModelError::Invalid("service request exceeds 1 MiB"));
+        }
         validate_text("requestId", &self.request_id)?;
         validate_domain_id("operation", &self.operation.replace('.', "-"))?;
         Ok(())
@@ -490,6 +549,9 @@ fn validate_schema(value: &str) -> Result<(), ModelError> {
 }
 
 fn validate_domain_id(field: &'static str, value: &str) -> Result<(), ModelError> {
+    if value.len() > 128 || value.ends_with('.') {
+        return Err(ModelError::Invalid("identifier exceeds portable bounds"));
+    }
     validate_id(field, value).map_err(contract_error)
 }
 
@@ -507,6 +569,9 @@ fn validate_text(_field: &'static str, value: &str) -> Result<(), ModelError> {
 
 fn validate_file_name(_field: &'static str, value: &str) -> Result<(), ModelError> {
     let path = Path::new(value);
+    if value.contains('\\') || value.contains(':') || value.as_bytes().contains(&0) {
+        return Err(ModelError::Invalid("path is not portable"));
+    }
     if value.is_empty()
         || value.len() > 255
         || path.components().count() != 1
@@ -520,6 +585,9 @@ fn validate_file_name(_field: &'static str, value: &str) -> Result<(), ModelErro
 
 fn validate_relative_path(_field: &'static str, value: &str) -> Result<(), ModelError> {
     let path = Path::new(value);
+    if value.contains('\\') || value.contains(':') || value.as_bytes().contains(&0) {
+        return Err(ModelError::Invalid("path is not portable"));
+    }
     if value.is_empty()
         || value.len() > MAX_TEXT_BYTES
         || path.is_absolute()

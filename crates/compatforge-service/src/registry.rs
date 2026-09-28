@@ -1,9 +1,10 @@
+use crate::lifecycle::{acquire_root_lock, check_path, ensure_directory, read_record, LifecycleStore};
 use crate::model::{
     ApplicationDefinition, ApplicationRecord, ApplicationStatus, ApplicationSummary, BottleArchive, BottleStatus,
     BottleSummary, CompatibilityRating, InstallerDefinition, JobKind, JobRecord, JobStatus, LauncherDefinition,
     ModelError, ServiceSettings, MAX_APPLICATIONS,
 };
-use compatforge_domain::{validate_id, SCHEMA_VERSION_V1};
+use compatforge_domain::SCHEMA_VERSION_V1;
 use compatforge_storage::JsonStore;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -23,12 +24,18 @@ pub(crate) struct Registry {
     storage_root: PathBuf,
     store: JsonStore,
     mutation: Mutex<()>,
+    pub(crate) lifecycle: LifecycleStore,
+    _owners: Vec<fs::File>,
 }
 
 impl Registry {
     pub(crate) fn new(service_root: PathBuf, storage_root: PathBuf) -> Result<Self, RegistryError> {
         if !service_root.is_absolute() || !storage_root.is_absolute() {
             return Err(RegistryError::Invalid("service and storage roots must be absolute"));
+        }
+        let mut owners = vec![acquire_root_lock(&service_root)?];
+        if service_root != storage_root {
+            owners.push(acquire_root_lock(&storage_root)?);
         }
         create_directory(&service_root)?;
         create_directory(&service_root.join("applications"))?;
@@ -38,22 +45,40 @@ impl Registry {
         create_directory(&storage_root.join("bottles"))?;
         create_directory(&storage_root.join("archives"))?;
         let store = JsonStore::new(&service_root);
+        let lifecycle = LifecycleStore::new(service_root.join("generations"), storage_root.clone())?;
         let registry = Self {
+            lifecycle,
+            _owners: owners,
             service_root,
             storage_root,
             store,
             mutation: Mutex::new(()),
         };
+        check_path(&registry.service_root.join("settings.json"), true)?;
         if !registry.store.exists("settings.json") {
             registry.write_settings(&ServiceSettings::default())?;
         }
         Ok(registry)
     }
 
+    fn write_record<T: serde::Serialize>(&self, path: impl AsRef<Path>, value: &T) -> Result<(), RegistryError> {
+        check_path(&self.service_root.join(path.as_ref()), true)?;
+        if serde_json::to_vec(value).map_err(RegistryError::Json)?.len() as u64 > MAX_RECORD_BYTES {
+            return Err(RegistryError::Invalid("registry record exceeds 4 MiB"));
+        }
+        self.store
+            .write(path, value)
+            .map_err(|error| RegistryError::Store(error.to_string()))
+    }
+
     pub(crate) fn seed_defaults(&self) -> Result<(), RegistryError> {
         for application in baseline_applications() {
-            if self.get_application(&application.id).is_err() {
-                self.upsert_application(application)?;
+            match self.get_application(&application.id) {
+                Ok(_) => {}
+                Err(RegistryError::NotFound(_)) => {
+                    self.upsert_application(application)?;
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -79,8 +104,7 @@ impl Registry {
             created_at_milliseconds: created,
             updated_at_milliseconds: now,
         };
-        self.store
-            .write(application_relative_path(&record.application.id), &record)
+        self.write_record(application_relative_path(&record.application.id), &record)
             .map_err(|error| RegistryError::Store(error.to_string()))?;
         Ok(record)
     }
@@ -99,14 +123,18 @@ impl Registry {
     }
 
     fn get_application_unlocked(&self, id: &str) -> Result<ApplicationRecord, RegistryError> {
-        self.store
-            .read(application_relative_path(id))
-            .map_err(|error| match error {
-                compatforge_storage::StoreError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
+        let record: ApplicationRecord =
+            read_record(&self.service_root.join(application_relative_path(id))).map_err(|error| match error {
+                RegistryError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
                     RegistryError::NotFound("application")
                 }
-                other => RegistryError::Store(other.to_string()),
-            })
+                other => other,
+            })?;
+        record.application.validate().map_err(RegistryError::Model)?;
+        if record.application.id != id {
+            return Err(RegistryError::Invalid("application record identity mismatch"));
+        }
+        Ok(record)
     }
 
     pub(crate) fn list_application_records(&self) -> Result<Vec<ApplicationRecord>, RegistryError> {
@@ -127,7 +155,7 @@ impl Registry {
 
     pub(crate) fn application_summaries(&self, jobs: &[JobRecord]) -> Result<Vec<ApplicationSummary>, RegistryError> {
         let records = self.list_application_records()?;
-        Ok(records
+        records
             .into_iter()
             .map(|record| {
                 let mut related: Vec<&JobRecord> = jobs
@@ -140,6 +168,7 @@ impl Registry {
                     .copied()
                     .filter(|job| !job.status.is_terminal())
                     .collect();
+                let generations = self.lifecycle.state(&record.application.id)?;
                 let installed = self.application_installed(&record.application);
                 let status = if active.iter().any(|job| job.kind == JobKind::Install) {
                     ApplicationStatus::Installing
@@ -152,22 +181,22 @@ impl Registry {
                 } else {
                     ApplicationStatus::Installable
                 };
-                ApplicationSummary {
+                Ok(ApplicationSummary {
+                    generations,
                     application: record.application,
                     status,
                     installed,
                     active_job_ids: active.iter().map(|job| job.id.clone()).collect(),
                     last_job_id: related.last().map(|job| job.id.clone()),
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub(crate) fn application_installed(&self, application: &ApplicationDefinition) -> bool {
-        application
-            .launchers
-            .iter()
-            .any(|launcher| is_regular_file(&self.launcher_path(application, launcher)))
+        self.lifecycle
+            .selected(&application.id)
+            .is_ok_and(|generation| self.lifecycle.verify_launchers(&generation).is_ok())
     }
 
     pub(crate) fn launcher_path(&self, application: &ApplicationDefinition, launcher: &LauncherDefinition) -> PathBuf {
@@ -183,18 +212,14 @@ impl Registry {
     }
 
     pub(crate) fn read_settings(&self) -> Result<ServiceSettings, RegistryError> {
-        let settings: ServiceSettings = self
-            .store
-            .read("settings.json")
-            .map_err(|error| RegistryError::Store(error.to_string()))?;
+        let settings: ServiceSettings = read_record(&self.service_root.join("settings.json"))?;
         settings.validate().map_err(RegistryError::Model)?;
         Ok(settings)
     }
 
     pub(crate) fn write_settings(&self, settings: &ServiceSettings) -> Result<ServiceSettings, RegistryError> {
         settings.validate().map_err(RegistryError::Model)?;
-        self.store
-            .write("settings.json", settings)
+        self.write_record("settings.json", settings)
             .map_err(|error| RegistryError::Store(error.to_string()))?;
         Ok(settings.clone())
     }
@@ -278,8 +303,7 @@ impl Registry {
             bottle_id: id.into(),
             archived_at_milliseconds: now,
         };
-        self.store
-            .write(archive_relative_path(&archive_id), &archive)
+        self.write_record(archive_relative_path(&archive_id), &archive)
             .map_err(|error| RegistryError::Store(error.to_string()))?;
         Ok(archive)
     }
@@ -293,10 +317,12 @@ impl Registry {
     pub(crate) fn restore_bottle(&self, archive_id: &str) -> Result<BottleSummary, RegistryError> {
         validate_registry_id(archive_id)?;
         let _guard = self.lock_mutation()?;
-        let archive: BottleArchive = self
-            .store
-            .read(archive_relative_path(archive_id))
-            .map_err(|_| RegistryError::NotFound("bottle archive"))?;
+        let archive: BottleArchive = read_record(&self.service_root.join(archive_relative_path(archive_id)))?;
+        validate_registry_id(&archive.bottle_id)?;
+        validate_registry_id(&archive.archive_id)?;
+        if archive.archive_id != archive_id {
+            return Err(RegistryError::Invalid("archive identity mismatch"));
+        }
         let source = self.storage_root.join("archives").join(archive_id);
         require_directory(&source, "bottle archive")?;
         let destination = self.storage_root.join("bottles").join(&archive.bottle_id);
@@ -309,33 +335,96 @@ impl Registry {
     }
 
     pub(crate) fn write_job(&self, job: &JobRecord) -> Result<(), RegistryError> {
-        validate_registry_id(&job.id)?;
-        self.store
-            .write(job_relative_path(&job.id), job)
+        job.validate().map_err(RegistryError::Model)?;
+        check_path(&self.service_root.join(job_relative_path(&job.id)), true)?;
+        self.write_record(job_relative_path(&job.id), job)
             .map_err(|error| RegistryError::Store(error.to_string()))
+    }
+
+    fn reconcile_install_job(&self, mut job: JobRecord) -> Result<JobRecord, RegistryError> {
+        // Generation state is the atomic installation commit. A standalone
+        // installer-exit record cannot certify installation, including across
+        // a crash or an error between the two JSON replacements.
+        if job.kind == JobKind::Install {
+            if let Some(generation_id) = &job.generation_id {
+                let state = self.lifecycle.state(&job.application_id)?;
+                if let Some(generation) = state
+                    .generations
+                    .iter()
+                    .find(|generation| &generation.id == generation_id)
+                {
+                    match generation.status {
+                        crate::GenerationStatus::Ready => {
+                            job.status = JobStatus::Succeeded;
+                            job.error = None;
+                        }
+                        crate::GenerationStatus::Failed | crate::GenerationStatus::Quarantined => {
+                            job.status = JobStatus::Failed;
+                            job.error = generation.error.clone();
+                        }
+                        crate::GenerationStatus::Cancelled => {
+                            job.status = JobStatus::Cancelled;
+                            job.error = generation.error.clone();
+                        }
+                        crate::GenerationStatus::Staging if job.status == JobStatus::Succeeded => {
+                            job.status = JobStatus::Running;
+                        }
+                        crate::GenerationStatus::Staging => {}
+                    }
+                } else if job.status == JobStatus::Succeeded {
+                    job.status = JobStatus::Failed;
+                    job.error = Some("installation has no verified generation".into());
+                }
+            } else if job.status == JobStatus::Succeeded {
+                job.status = JobStatus::Failed;
+                job.error = Some("legacy installer exit does not certify a managed generation".into());
+            }
+        }
+        Ok(job)
     }
 
     pub(crate) fn read_job(&self, id: &str) -> Result<JobRecord, RegistryError> {
         validate_registry_id(id)?;
-        self.store.read(job_relative_path(id)).map_err(|error| match error {
-            compatforge_storage::StoreError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
-                RegistryError::NotFound("job")
-            }
-            other => RegistryError::Store(other.to_string()),
-        })
+        let job: JobRecord =
+            read_record(&self.service_root.join(job_relative_path(id))).map_err(|error| match error {
+                RegistryError::Io(source) if source.kind() == io::ErrorKind::NotFound => RegistryError::NotFound("job"),
+                other => other,
+            })?;
+        job.validate().map_err(RegistryError::Model)?;
+        if job.id != id {
+            return Err(RegistryError::Invalid("job identity mismatch"));
+        }
+        self.reconcile_install_job(job)
     }
 
     pub(crate) fn list_jobs(&self) -> Result<Vec<JobRecord>, RegistryError> {
         let mut jobs: Vec<JobRecord> = read_json_directory(&self.service_root.join("jobs"))?;
+        for job in &jobs {
+            job.validate().map_err(RegistryError::Model)?;
+        }
         jobs.sort_by_key(|job| Reverse(job.updated_at_milliseconds));
-        Ok(jobs)
+        jobs.into_iter().map(|job| self.reconcile_install_job(job)).collect()
     }
 
     pub(crate) fn recover_interrupted_jobs(&self) -> Result<(), RegistryError> {
         let _guard = self.lock_mutation()?;
+        for state in self.lifecycle.all_states()? {
+            if state.operation.is_some() {
+                self.lifecycle.quarantine(&state.application_id, "service interrupted before supervisor cleanup was confirmed; inspect recoveryCapability and recover after host reboot")?;
+            }
+        }
         for mut job in self.list_jobs()? {
-            if job.status.is_terminal() {
+            let interrupted = self
+                .lifecycle
+                .state(&job.application_id)?
+                .operation
+                .is_some_and(|operation| operation.job_id == job.id);
+            if job.status.is_terminal() && !interrupted {
                 continue;
+            }
+            if job.generation_id.is_none() {
+                let application = self.get_application(&job.application_id)?.application;
+                job.generation_id = Some(self.lifecycle.quarantine_legacy(&application, &job)?);
             }
             job.status = JobStatus::Failed;
             job.updated_at_milliseconds = now_milliseconds();
@@ -417,7 +506,16 @@ fn baseline_application(
         installer: Some(InstallerDefinition {
             file_name: installer_name.into(),
             sha256: Some(installer_sha256.into()),
-            arguments: vec![installer_argument.into()],
+            arguments: if id == "sumatrapdf" {
+                vec![
+                    "-install".into(),
+                    "-silent".into(),
+                    "-d".into(),
+                    "C:\\Program Files\\SumatraPDF".into(),
+                ]
+            } else {
+                vec![installer_argument.into()]
+            },
         }),
         launchers: vec![LauncherDefinition {
             id: "main".into(),
@@ -444,7 +542,7 @@ fn archive_relative_path(id: &str) -> PathBuf {
 }
 
 fn validate_registry_id(id: &str) -> Result<(), RegistryError> {
-    validate_id("id", id).map_err(|error| RegistryError::InvalidOwned(error.to_string()))
+    crate::lifecycle::checked_id(id)
 }
 
 fn read_json_directory<T: serde::de::DeserializeOwned>(directory: &Path) -> Result<Vec<T>, RegistryError> {
@@ -463,8 +561,10 @@ fn read_json_directory<T: serde::de::DeserializeOwned>(directory: &Path) -> Resu
         if metadata.len() > MAX_RECORD_BYTES {
             return Err(RegistryError::Invalid("registry record exceeds 4 MiB"));
         }
-        let bytes = fs::read(&path).map_err(RegistryError::Io)?;
-        values.push(serde_json::from_slice(&bytes).map_err(RegistryError::Json)?);
+        if values.len() >= MAX_APPLICATIONS {
+            return Err(RegistryError::Invalid("registry directory exceeds entry bound"));
+        }
+        values.push(read_record(&path)?);
     }
     Ok(values)
 }
@@ -487,12 +587,7 @@ fn list_directories(root: &Path) -> Result<Vec<String>, RegistryError> {
 }
 
 fn create_directory(path: &Path) -> Result<(), RegistryError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
-        Ok(_) => Err(RegistryError::Conflict("directory path is not a real directory")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path).map_err(RegistryError::Io),
-        Err(error) => Err(RegistryError::Io(error)),
-    }
+    ensure_directory(path)
 }
 
 fn create_directory_chain(root: &Path, children: &[&str]) -> Result<(), RegistryError> {
@@ -592,6 +687,75 @@ mod tests {
         assert_eq!(registry.list_archives().unwrap(), vec![archive.clone()]);
         let restored = registry.restore_bottle(&archive.archive_id).unwrap();
         assert_eq!(restored.id, "gui-7zip");
+    }
+
+    #[test]
+    fn legacy_files_are_not_certified_as_managed_installation() {
+        let (service_root, storage_root) = roots("legacy");
+        let registry = Registry::new(service_root, storage_root).unwrap();
+        let app = baseline_applications()[0].clone();
+        let path = registry.launcher_path(&app, &app.launchers[0]);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"legacy executable").unwrap();
+        assert!(!registry.application_installed(&app));
+    }
+
+    #[test]
+    fn a_second_owner_cannot_recover_a_running_service_or_shared_storage() {
+        let (service_root, storage_root) = roots("ownership");
+        let _registry = Registry::new(service_root.clone(), storage_root.clone()).unwrap();
+        assert!(Registry::new(service_root.clone(), storage_root.clone()).is_err());
+        assert!(Registry::new(service_root.with_file_name("other-service"), storage_root).is_err());
+    }
+
+    #[test]
+    fn service_root_lock_is_exclusive_across_processes_and_released_on_drop() {
+        let (service_root, storage_root) = roots("ownership-process");
+        let registry = Registry::new(service_root.clone(), storage_root.clone()).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "registry::tests::ownership_child", "--ignored"])
+            .env("COMPATFORGE_OWNER_TEST_SERVICE", &service_root)
+            .env("COMPATFORGE_OWNER_TEST_STORAGE", &storage_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        drop(registry);
+        assert!(Registry::new(service_root, storage_root).is_ok());
+    }
+
+    #[test]
+    #[ignore = "spawned only as an isolated service ownership client"]
+    fn ownership_child() {
+        if let (Some(service), Some(storage)) = (
+            std::env::var_os("COMPATFORGE_OWNER_TEST_SERVICE"),
+            std::env::var_os("COMPATFORGE_OWNER_TEST_STORAGE"),
+        ) {
+            assert!(matches!(
+                Registry::new(service.into(), storage.into()),
+                Err(RegistryError::Conflict(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sumatra_recipe_selects_the_declared_install_directory() {
+        let app = baseline_applications()[1].clone();
+        assert_eq!(
+            app.installer.unwrap().arguments,
+            ["-install", "-silent", "-d", "C:\\Program Files\\SumatraPDF"]
+        );
+    }
+
+    #[test]
+    fn legacy_interrupted_job_is_quarantined_without_certifying_old_files() {
+        let (service_root, storage_root) = roots("legacy-interrupted");
+        let registry = Registry::new(service_root, storage_root).unwrap();
+        registry.seed_defaults().unwrap();
+        let job: JobRecord = serde_json::from_value(serde_json::json!({"schemaVersion":"1","id":"job-old-service","applicationId":"7zip","kind":"install","status":"running","createdAtMilliseconds":1,"updatedAtMilliseconds":1})).unwrap();
+        registry.write_job(&job).unwrap();
+        registry.recover_interrupted_jobs().unwrap();
+        assert!(registry.lifecycle.state("7zip").unwrap().operation.unwrap().quarantined);
+        assert!(registry.lifecycle.selected("7zip").is_err());
     }
 
     #[test]

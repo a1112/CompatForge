@@ -5,6 +5,11 @@
 pub mod bootstrap;
 pub mod desktop_lifecycle;
 mod jobs;
+mod lifecycle;
+pub use lifecycle::{
+    ApplicationGeneration, ApplicationGenerations, GenerationOperation, GenerationStatus, InstalledRuntime,
+    RecoveryCapability, RollbackRequest,
+};
 mod model;
 mod registry;
 pub mod transport;
@@ -74,13 +79,76 @@ impl AutomationService {
     }
 
     pub fn upsert_application(&self, application: ApplicationDefinition) -> Result<ApplicationRecord, ServiceError> {
+        let _operation = self.jobs.lock_operation().map_err(ServiceError::Job)?;
+        self.jobs
+            .ensure_idle(&application.id, &application.bottle_id)
+            .map_err(ServiceError::Job)?;
+        if let Ok(previous) = self.registry.get_application(&application.id) {
+            self.jobs
+                .ensure_idle(&application.id, &previous.application.bottle_id)
+                .map_err(ServiceError::Job)?;
+        }
         self.registry
             .upsert_application(application)
             .map_err(ServiceError::Registry)
     }
 
     pub fn remove_application(&self, id: &str) -> Result<ApplicationRecord, ServiceError> {
+        let _operation = self.jobs.lock_operation().map_err(ServiceError::Job)?;
+        let application = self
+            .registry
+            .get_application(id)
+            .map_err(ServiceError::Registry)?
+            .application;
+        self.jobs
+            .ensure_idle(id, &application.bottle_id)
+            .map_err(ServiceError::Job)?;
+        if !self
+            .registry
+            .lifecycle
+            .state(id)
+            .map_err(ServiceError::Registry)?
+            .generations
+            .is_empty()
+        {
+            return Err(ServiceError::Conflict(
+                "managed generations are retained; use applications.uninstall",
+            ));
+        }
         self.registry.remove_application(id).map_err(ServiceError::Registry)
+    }
+
+    pub fn application_generations(&self, id: &str) -> Result<ApplicationGenerations, ServiceError> {
+        self.registry.lifecycle.state(id).map_err(ServiceError::Registry)
+    }
+
+    pub fn rollback_application(&self, request: &RollbackRequest) -> Result<ApplicationGenerations, ServiceError> {
+        self.jobs.rollback(request).map_err(ServiceError::Job)
+    }
+
+    pub fn uninstall_application(&self, id: &str) -> Result<ApplicationGenerations, ServiceError> {
+        self.jobs.uninstall(id).map_err(ServiceError::Job)
+    }
+
+    pub fn recover_application(&self, id: &str) -> Result<ApplicationGenerations, ServiceError> {
+        self.jobs.recover(id).map_err(ServiceError::Job)
+    }
+
+    fn reject_managed_bottle(&self, id: &str) -> Result<(), ServiceError> {
+        if id.starts_with("gen-")
+            || self
+                .registry
+                .lifecycle
+                .all_states()
+                .map_err(ServiceError::Registry)?
+                .iter()
+                .any(|state| state.generations.iter().any(|generation| generation.bottle_id == id))
+        {
+            return Err(ServiceError::Conflict(
+                "managed generation bottles are retained; use application lifecycle operations",
+            ));
+        }
+        Ok(())
     }
 
     pub fn get_settings(&self) -> Result<ServiceSettings, ServiceError> {
@@ -100,10 +168,20 @@ impl AutomationService {
     }
 
     pub fn create_bottle(&self, id: &str) -> Result<BottleSummary, ServiceError> {
+        let _operation = self.jobs.lock_operation().map_err(ServiceError::Job)?;
+        self.jobs
+            .ensure_idle("create-operation", id)
+            .map_err(ServiceError::Job)?;
+        self.reject_managed_bottle(id)?;
         self.registry.create_bottle(id).map_err(ServiceError::Registry)
     }
 
     pub fn archive_bottle(&self, id: &str) -> Result<BottleArchive, ServiceError> {
+        let _operation = self.jobs.lock_operation().map_err(ServiceError::Job)?;
+        self.jobs
+            .ensure_idle("archive-operation", id)
+            .map_err(ServiceError::Job)?;
+        self.reject_managed_bottle(id)?;
         let bound_applications: Vec<String> = self
             .registry
             .list_application_records()
@@ -129,6 +207,18 @@ impl AutomationService {
     }
 
     pub fn restore_bottle(&self, archive_id: &str) -> Result<BottleSummary, ServiceError> {
+        let _operation = self.jobs.lock_operation().map_err(ServiceError::Job)?;
+        let archive = self
+            .registry
+            .list_archives()
+            .map_err(ServiceError::Registry)?
+            .into_iter()
+            .find(|archive| archive.archive_id == archive_id)
+            .ok_or(ServiceError::NotFound("bottle archive"))?;
+        self.jobs
+            .ensure_idle("restore-operation", &archive.bottle_id)
+            .map_err(ServiceError::Job)?;
+        self.reject_managed_bottle(&archive.bottle_id)?;
         self.registry.restore_bottle(archive_id).map_err(ServiceError::Registry)
     }
 
@@ -175,6 +265,22 @@ impl AutomationService {
             "applications.remove" => {
                 let payload: IdPayload = parse_payload(request.payload)?;
                 to_value(self.remove_application(&payload.id)?)?
+            }
+            "applications.generations" => {
+                let payload: IdPayload = parse_payload(request.payload)?;
+                to_value(self.application_generations(&payload.id)?)?
+            }
+            "applications.rollback" => {
+                let payload: RollbackRequest = parse_payload(request.payload)?;
+                to_value(self.rollback_application(&payload)?)?
+            }
+            "applications.uninstall" => {
+                let payload: IdPayload = parse_payload(request.payload)?;
+                to_value(self.uninstall_application(&payload.id)?)?
+            }
+            "applications.recover" => {
+                let payload: IdPayload = parse_payload(request.payload)?;
+                to_value(self.recover_application(&payload.id)?)?
             }
             "bottles.list" => to_value(self.list_bottles()?)?,
             "bottles.get" => {
@@ -258,7 +364,8 @@ impl ServiceError {
             Self::NotFound(_) => "not-found",
             Self::Conflict(_) => "conflict",
             Self::Registry(RegistryError::NotFound(_)) | Self::Job(JobError::NotFound(_)) => "not-found",
-            Self::Registry(RegistryError::Conflict(_)) | Self::Job(JobError::Conflict(_)) => "conflict",
+            Self::Registry(RegistryError::Conflict(_))
+            | Self::Job(JobError::Conflict(_) | JobError::Registry(RegistryError::Conflict(_))) => "conflict",
             Self::Registry(_) | Self::Job(_) => "service-failed",
         }
     }
@@ -303,6 +410,56 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn lifecycle_dispatcher_is_typed_and_never_deletes_user_files() {
+        let service = service();
+        service.seed_default_applications().unwrap();
+        let response = service
+            .call(ServiceRequest {
+                schema_version: "1".into(),
+                request_id: "lifecycle-list".into(),
+                operation: "applications.generations".into(),
+                payload: json!({"id":"7zip"}),
+            })
+            .unwrap();
+        assert_eq!(response.result["schemaVersion"], "1");
+        assert!(response.result["generations"].as_array().unwrap().is_empty());
+        let response = service
+            .call(ServiceRequest {
+                schema_version: "1".into(),
+                request_id: "lifecycle-uninstall".into(),
+                operation: "applications.uninstall".into(),
+                payload: json!({"id":"7zip"}),
+            })
+            .unwrap();
+        assert!(response.result.get("selectedGeneration").is_none());
+        for operation in [
+            "applications.uninstall",
+            "applications.generations",
+            "applications.recover",
+        ] {
+            let error = service
+                .call(ServiceRequest {
+                    schema_version: "1".into(),
+                    request_id: "reject-extra".into(),
+                    operation: operation.into(),
+                    payload: json!({"id":"7zip","deleteUserData":true}),
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), "invalid-request");
+        }
+        let error = service
+            .call(ServiceRequest {
+                schema_version: "1".into(),
+                request_id: "reject-executor".into(),
+                operation: "applications.rollback".into(),
+                payload: json!({"applicationId":"7zip","generationId":"gen-job-missing","executor":"shell"}),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid-request");
+        assert!(service.create_bottle("gen-job-foreign").is_err());
     }
 
     #[test]

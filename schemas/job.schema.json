@@ -14,45 +14,222 @@
     "updatedAtMilliseconds"
   ],
   "properties": {
-    "schemaVersion": { "const": "1" },
-    "id": { "$ref": "#/$defs/id" },
-    "applicationId": { "$ref": "#/$defs/id" },
-    "kind": { "enum": ["install", "launch", "compatibility-test", "adaptation-trial"] },
-    "status": { "enum": ["preparing", "running", "cancelling", "succeeded", "failed", "cancelled"] },
-    "createdAtMilliseconds": { "type": "integer", "minimum": 0 },
-    "updatedAtMilliseconds": { "type": "integer", "minimum": 0 },
-    "inspection": { "type": "object" },
-    "launchPlan": { "type": "object" },
-    "events": { "type": "array", "maxItems": 4096 },
+    "schemaVersion": {
+      "const": "1"
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "applicationId": {
+      "$ref": "#/$defs/id"
+    },
+    "kind": {
+      "enum": [
+        "install",
+        "launch",
+        "compatibility-test",
+        "adaptation-trial"
+      ]
+    },
+    "status": {
+      "enum": [
+        "preparing",
+        "running",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "createdAtMilliseconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "updatedAtMilliseconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "inspection": {
+      "type": "object"
+    },
+    "launchPlan": {
+      "type": "object"
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 4096
+    },
     "assessment": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schemaVersion", "outcome", "summary", "checks", "assessedAtMilliseconds"],
+      "required": [
+        "schemaVersion",
+        "outcome",
+        "summary",
+        "checks",
+        "assessedAtMilliseconds"
+      ],
       "properties": {
-        "schemaVersion": { "const": "1" },
-        "outcome": { "enum": ["accepted", "failed", "unverified"] },
-        "summary": { "type": "string", "minLength": 1, "maxLength": 4096 },
-        "assessedAtMilliseconds": { "type": "integer", "minimum": 0 },
+        "schemaVersion": {
+          "const": "1"
+        },
+        "outcome": {
+          "enum": [
+            "accepted",
+            "failed",
+            "unverified"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "assessedAtMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
         "checks": {
           "type": "array",
           "maxItems": 256,
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "outcome"],
+            "required": [
+              "id",
+              "outcome"
+            ],
             "properties": {
-              "id": { "$ref": "#/$defs/id" },
-              "outcome": { "enum": ["passed", "failed", "blocked", "skipped"] },
-              "message": { "type": "string", "minLength": 1, "maxLength": 4096 },
-              "evidence": { "type": "array", "maxItems": 64, "items": { "type": "string", "minLength": 1, "maxLength": 4096 } }
+              "id": {
+                "$ref": "#/$defs/id"
+              },
+              "outcome": {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "blocked",
+                  "skipped"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "evidence": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096
+                }
+              }
             }
           }
         }
       }
     },
-    "error": { "type": "string" }
+    "error": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "generationId": {
+      "$ref": "application.schema.json#/$defs/id"
+    }
   },
   "$defs": {
-    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$" }
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]+$",
+      "maxLength": 128
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "applicationId",
+        "kind"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "1"
+        },
+        "applicationId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "install",
+            "launch",
+            "compatibility-test",
+            "adaptation-trial"
+          ]
+        },
+        "launcherId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "executablePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "argumentOverrides": {
+          "$ref": "application.schema.json#/$defs/arguments"
+        },
+        "environmentOverrides": {
+          "$ref": "application.schema.json#/$defs/environment"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "install"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "executablePath"
+            ],
+            "not": {
+              "required": [
+                "launcherId"
+              ]
+            },
+            "properties": {
+              "argumentOverrides": {
+                "maxItems": 0
+              },
+              "environmentOverrides": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "DISPLAY": {
+                    "type": "string",
+                    "pattern": "^:[0-9]{1,5}(\\.[0-9]{1,5})?$"
+                  },
+                  "XAUTHORITY": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "executablePath"
+              ]
+            }
+          }
+        }
+      ]
+    }
   }
 }

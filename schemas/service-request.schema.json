@@ -4,10 +4,21 @@
   "title": "CompatForge Headless Service Request",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "requestId", "operation", "payload"],
+  "required": [
+    "schemaVersion",
+    "requestId",
+    "operation",
+    "payload"
+  ],
   "properties": {
-    "schemaVersion": { "const": "1" },
-    "requestId": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "schemaVersion": {
+      "const": "1"
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
     "operation": {
       "enum": [
         "applications.seed-defaults",
@@ -28,9 +39,89 @@
         "jobs.get",
         "jobs.poll",
         "jobs.cancel",
-        "jobs.assess"
+        "jobs.assess",
+        "applications.generations",
+        "applications.rollback",
+        "applications.uninstall",
+        "applications.recover"
       ]
     },
     "payload": {}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "applications.generations",
+              "applications.uninstall",
+              "applications.recover"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "application.schema.json#/$defs/id"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "applications.rollback"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "applicationId",
+              "generationId"
+            ],
+            "properties": {
+              "applicationId": {
+                "$ref": "application.schema.json#/$defs/id"
+              },
+              "generationId": {
+                "$ref": "application.schema.json#/$defs/id"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "jobs.submit"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "job.schema.json#/$defs/request"
+          }
+        }
+      }
+    }
+  ]
 }

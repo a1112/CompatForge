@@ -6,6 +6,9 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+compatforge-bottle = { path = "../compatforge-bottle" }
+fs4 = { version = "=0.8.4", default-features = false, features = ["sync"] }
+sha2.workspace = true
 compatforge-domain = { path = "../compatforge-domain" }
 compatforge-inspect = { path = "../compatforge-inspect" }
 compatforge-orchestrator = { path = "../compatforge-orchestrator" }

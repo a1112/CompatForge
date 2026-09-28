@@ -1,3 +1,4 @@
+use crate::lifecycle::{ApplicationGenerations, InstalledRuntime, RollbackRequest};
 use crate::model::{
     JobAssessment, JobKind, JobPollResult, JobRecord, JobRequest, JobStatus, MAX_JOB_EVENTS, MAX_POLL_MILLISECONDS,
 };
@@ -22,6 +23,7 @@ pub(crate) struct JobManager {
     registry: Arc<Registry>,
     config: CoreConfig,
     active: Mutex<HashMap<String, ActiveJob>>,
+    operation: Mutex<()>,
 }
 
 struct ActiveJob {
@@ -53,6 +55,7 @@ pub enum ShutdownPhase {
     Snapshot,
     Terminate,
     Join,
+    Persist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,17 +129,15 @@ impl JobManager {
             registry,
             config,
             active: Mutex::new(HashMap::new()),
+            operation: Mutex::new(()),
         }
     }
 
     pub(crate) fn submit(&self, request: JobRequest) -> Result<JobRecord, JobError> {
         request.validate().map_err(JobError::Model)?;
+        let _operation = self.lock_operation()?;
         let settings = self.registry.read_settings().map_err(JobError::Registry)?;
-        let active_count = self
-            .lock_active()?
-            .values()
-            .filter(|active| !active.record.status.is_terminal())
-            .count();
+        let active_count = self.lock_active()?.len();
         if active_count >= usize::from(settings.maximum_parallel_jobs) {
             return Err(JobError::Conflict("maximum parallel jobs reached"));
         }
@@ -146,13 +147,12 @@ impl JobManager {
             .get_application(&request.application_id)
             .map_err(JobError::Registry)?
             .application;
-        self.registry
-            .create_bottle(&application.bottle_id)
-            .map_err(JobError::Registry)?;
+        self.ensure_idle(&application.id, &application.bottle_id)?;
 
         let job_id = next_job_id();
         let now = now_milliseconds();
         let mut record = JobRecord {
+            generation_id: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             id: job_id.clone(),
             application_id: application.id.clone(),
@@ -169,13 +169,34 @@ impl JobManager {
         self.registry.write_job(&record).map_err(JobError::Registry)?;
 
         let start_result = (|| {
-            let resolved = self.resolve_launch(&application, &request)?;
+            let generation = if request.kind == JobKind::Install {
+                self.registry.lifecycle.stage(&application, &job_id)
+            } else {
+                let selected = self
+                    .registry
+                    .lifecycle
+                    .selected(&application.id)
+                    .map_err(JobError::Registry)?;
+                self.ensure_idle(&application.id, &selected.definition.bottle_id)?;
+                self.registry
+                    .lifecycle
+                    .begin_launch(&application.id, &job_id, request.kind)
+            }
+            .map_err(JobError::Registry)?;
+            record.generation_id = Some(generation.id.clone());
+            self.registry.write_job(&record).map_err(JobError::Registry)?;
+            if let Some(runtime) = &generation.runtime {
+                runtime.check_config(&self.config).map_err(JobError::Registry)?;
+            }
+            let mut bound_application = generation.definition.clone();
+            bound_application.bottle_id = generation.bottle_id.clone();
+            let resolved = self.resolve_launch(&bound_application, &request)?;
             let inspection = inspect_path(&resolved.source).map_err(|error| JobError::Inspection(error.to_string()))?;
             let architecture = map_architecture(inspection.architecture)?;
             let launch_request = LaunchRequest {
                 schema_version: SCHEMA_VERSION_V1.into(),
                 request_id: job_id.clone(),
-                bottle_id: application.bottle_id.clone(),
+                bottle_id: generation.bottle_id.clone(),
                 recipe_id: Some(application.id.clone()),
                 executable: ExecutableRequest {
                     path: resolved.source.to_string_lossy().into_owned(),
@@ -196,6 +217,18 @@ impl JobManager {
             };
             let prepared = PreparedLaunch::prepare(&self.config, &resolved.source, &launch_request)
                 .map_err(|error| JobError::Preparation(error.to_string()))?;
+            let runtime =
+                InstalledRuntime::from_config(&self.config, &prepared.plan().runtime).map_err(JobError::Registry)?;
+            if request.kind == JobKind::Install {
+                self.registry
+                    .lifecycle
+                    .bind_runtime(&application.id, &job_id, runtime)
+                    .map_err(JobError::Registry)?;
+            } else if generation.runtime.as_ref() != Some(&runtime) {
+                return Err(JobError::Conflict(
+                    "prepared runtime differs from the installed generation",
+                ));
+            }
             record.inspection = Some(serde_json::to_value(prepared.inspection()).map_err(JobError::Serialization)?);
             record.launch_plan = Some(serde_json::to_value(prepared.plan()).map_err(JobError::Serialization)?);
             record.updated_at_milliseconds = now_milliseconds();
@@ -210,9 +243,22 @@ impl JobManager {
             Ok(handle) => self.adopt_started_job(record, Arc::new(handle)),
             Err(error) => {
                 record.status = JobStatus::Failed;
-                record.error = Some(error.to_string());
+                record.error = Some(crate::lifecycle::bounded_error(&error.to_string()));
                 record.updated_at_milliseconds = now_milliseconds();
                 self.registry.write_job(&record).map_err(JobError::Registry)?;
+                if record.generation_id.is_some() {
+                    if matches!(error, JobError::Process(_)) {
+                        self.registry
+                            .lifecycle
+                            .quarantine(
+                                &record.application_id,
+                                "runtime startup failed; cleanup is not independently confirmed",
+                            )
+                            .map_err(JobError::Registry)?;
+                    } else {
+                        self.registry.lifecycle.finish(&record).map_err(JobError::Registry)?;
+                    }
+                }
                 Err(error)
             }
         }
@@ -282,7 +328,11 @@ impl JobManager {
             state.record.events.drain(..excess);
         }
         state.record.updated_at_milliseconds = now_milliseconds();
-        self.registry.write_job(&state.record).map_err(JobError::Registry)?;
+        let mut observed = state.record.clone();
+        if observed.status == JobStatus::Succeeded {
+            observed.status = JobStatus::Running;
+        }
+        self.registry.write_job(&observed).map_err(JobError::Registry)?;
         let mut job = state.record.clone();
         let stream_ended = job.status.is_terminal();
         let needs_join = stream_ended && !state.cleanup_join_failed;
@@ -293,15 +343,31 @@ impl JobManager {
             // 16-second forced-completion bound, separate from the event timeout.
             // Do not hold the job map while waiting or hide a failed join.
             let cleanup = handle.wait_for_stop(Duration::ZERO);
+            let _operation = self.lock_operation()?;
             let mut active = self.lock_active()?;
             if let Some(state) = active.get_mut(id) {
                 match cleanup {
                     Ok(()) => {
+                        // Persist terminal evidence before the one atomic generation
+                        // selection. A crash in between leaves the lease quarantined.
+                        self.registry.write_job(&state.record).map_err(JobError::Registry)?;
+                        if let Err(error) = self.registry.lifecycle.finish(&state.record) {
+                            state.record.status = JobStatus::Failed;
+                            state.record.error = Some(crate::lifecycle::bounded_error(&error.to_string()));
+                            self.registry.write_job(&state.record).map_err(JobError::Registry)?;
+                        }
                         job = state.record.clone();
                         active.remove(id);
                     }
                     Err(message) => {
                         state.cleanup_join_failed = true;
+                        self.registry
+                            .lifecycle
+                            .quarantine(
+                                &state.record.application_id,
+                                "supervisor cleanup failed; recovery required",
+                            )
+                            .map_err(JobError::Registry)?;
                         state.record.status = JobStatus::Failed;
                         let detail = format!("process cleanup not confirmed: {message}");
                         state.record.error = Some(match state.record.error.take() {
@@ -372,7 +438,124 @@ impl JobManager {
         shutdown_handles(
             &handles,
             Duration::from_millis(self.config.supervisor.termination_grace_milliseconds),
-        )
+        )?;
+        let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
+        let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        let mut failures = Vec::new();
+        for (id, _) in &handles {
+            if let Some(state) = active.get_mut(id) {
+                // Closing never activates an installer based on an unconsumed exit.
+                if !state.record.status.is_terminal() || state.record.status == JobStatus::Succeeded {
+                    state.record.status = JobStatus::Cancelled;
+                    state.record.error = Some("service closed after confirmed supervisor cleanup".into());
+                }
+                state.record.updated_at_milliseconds = now_milliseconds();
+                let result = self
+                    .registry
+                    .write_job(&state.record)
+                    .and_then(|()| self.registry.lifecycle.finish(&state.record));
+                if let Err(error) = result {
+                    failures.push(ShutdownFailure {
+                        job_id: Some(id.clone()),
+                        phase: ShutdownPhase::Persist,
+                        message: error.to_string(),
+                    });
+                } else {
+                    active.remove(id);
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ShutdownError { failures })
+        }
+    }
+
+    pub(crate) fn lock_operation(&self) -> Result<MutexGuard<'_, ()>, JobError> {
+        self.operation
+            .lock()
+            .map_err(|_| JobError::Conflict("service operation lock is poisoned"))
+    }
+
+    pub(crate) fn ensure_idle(&self, app_id: &str, bottle_id: &str) -> Result<(), JobError> {
+        for active in self.lock_active()?.values() {
+            if active.record.application_id == app_id {
+                return Err(JobError::Conflict("application has a live or uncleared cleanup handle"));
+            }
+            if self
+                .registry
+                .get_application(&active.record.application_id)
+                .is_ok_and(|record| record.application.bottle_id == bottle_id)
+            {
+                return Err(JobError::Conflict("bottle has a live or uncleared cleanup handle"));
+            }
+        }
+        for state in self.registry.lifecycle.all_states().map_err(JobError::Registry)? {
+            if let Some(operation) = &state.operation {
+                if state.application_id == app_id
+                    || state.generations.iter().any(|generation| {
+                        generation.id == operation.generation_id && generation.definition.bottle_id == bottle_id
+                    })
+                {
+                    return Err(JobError::Conflict("application or bottle has an active or quarantined operation; inspect applications.generations"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rollback(&self, request: &RollbackRequest) -> Result<ApplicationGenerations, JobError> {
+        let _operation = self.lock_operation()?;
+        let application = self
+            .registry
+            .get_application(&request.application_id)
+            .map_err(JobError::Registry)?
+            .application;
+        self.ensure_idle(&application.id, &application.bottle_id)?;
+        let state = self
+            .registry
+            .lifecycle
+            .state(&application.id)
+            .map_err(JobError::Registry)?;
+        let generation = state
+            .generations
+            .iter()
+            .find(|generation| generation.id == request.generation_id)
+            .ok_or(JobError::NotFound("generation"))?;
+        self.ensure_idle(&application.id, &generation.definition.bottle_id)?;
+        generation
+            .runtime
+            .as_ref()
+            .ok_or(JobError::Conflict("generation has no completed runtime binding"))?
+            .check_config(&self.config)
+            .map_err(JobError::Registry)?;
+        self.registry.lifecycle.rollback(request).map_err(JobError::Registry)
+    }
+
+    pub(crate) fn uninstall(&self, app_id: &str) -> Result<ApplicationGenerations, JobError> {
+        let _operation = self.lock_operation()?;
+        let application = self
+            .registry
+            .get_application(app_id)
+            .map_err(JobError::Registry)?
+            .application;
+        self.ensure_idle(app_id, &application.bottle_id)?;
+        self.registry.lifecycle.uninstall(app_id).map_err(JobError::Registry)
+    }
+
+    pub(crate) fn recover(&self, app_id: &str) -> Result<ApplicationGenerations, JobError> {
+        let _operation = self.lock_operation()?;
+        if self
+            .lock_active()?
+            .values()
+            .any(|active| active.record.application_id == app_id)
+        {
+            return Err(JobError::Conflict(
+                "supervisor is still owned by this service; cleanup must complete before recovery",
+            ));
+        }
+        self.registry.lifecycle.recover(app_id).map_err(JobError::Registry)
     }
 
     fn owned_cleanup_handles(&self) -> Vec<(String, Arc<dyn JobProcess>)> {
@@ -409,8 +592,10 @@ impl JobManager {
                         "installer file name does not match application definition",
                     ));
                 }
-                let mut arguments = installer.arguments.clone();
-                arguments.extend(request.argument_overrides.clone());
+                if installer.sha256.is_none() {
+                    return Err(JobError::Invalid("managed installation requires a reviewed SHA-256"));
+                }
+                let arguments = installer.arguments.clone();
                 Ok(ResolvedLaunch {
                     source,
                     executable: ResolvedExecutable {
@@ -613,6 +798,7 @@ mod shutdown_tests {
             joins: AtomicU64::new(0),
         });
         let record = JobRecord {
+            generation_id: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             id: "cleanup-job".into(),
             application_id: "cleanup-test".into(),
@@ -636,6 +822,250 @@ mod shutdown_tests {
             },
         );
         (manager, handle, root)
+    }
+
+    fn managed_fixture(
+        cleanup_failed: bool,
+    ) -> (JobManager, Arc<CompletedProcess>, PathBuf, crate::ApplicationDefinition) {
+        let (manager, handle, root) = terminal_poll_fixture(cleanup_failed);
+        manager.registry.seed_defaults().unwrap();
+        let app = manager.registry.get_application("7zip").unwrap().application;
+        let mut active = manager.active.lock().unwrap().remove("cleanup-job").unwrap();
+        active.record.id = "job-managed".into();
+        active.record.application_id = app.id.clone();
+        active.record.kind = JobKind::Install;
+        let generation = manager.registry.lifecycle.stage(&app, &active.record.id).unwrap();
+        active.record.generation_id = Some(generation.id);
+        let binding = &manager.config.runtime_bindings[0];
+        let runtime = InstalledRuntime::from_config(
+            &manager.config,
+            &compatforge_domain::RuntimeSelection {
+                provider: compatforge_domain::RuntimeKind::Wine,
+                pack_id: binding.pack_id.clone(),
+                pack_digest: binding.pack_digest.clone(),
+            },
+        )
+        .unwrap();
+        manager
+            .registry
+            .lifecycle
+            .bind_runtime(&app.id, &active.record.id, runtime)
+            .unwrap();
+        manager.registry.write_job(&active.record).unwrap();
+        manager.active.lock().unwrap().insert(active.record.id.clone(), active);
+        (manager, handle, root, app)
+    }
+
+    fn write_managed_launcher(manager: &JobManager, app: &crate::ApplicationDefinition) -> PathBuf {
+        let state = manager.registry.lifecycle.state(&app.id).unwrap();
+        let generation = &state.generations[0];
+        let path = manager
+            .registry
+            .lifecycle
+            .launcher_path(generation, &app.launchers[0].executable);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
+        path
+    }
+
+    #[test]
+    fn managed_poll_requires_all_launchers_and_confirmed_cleanup() {
+        let (manager, handle, _, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+        let result = manager.poll("job-managed", 0).unwrap();
+        assert_eq!(result.job.status, JobStatus::Succeeded);
+        assert_eq!(handle.joins.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.registry.lifecycle.selected(&app.id).unwrap().definition, app);
+        assert!(manager.registry.lifecycle.state(&app.id).unwrap().operation.is_none());
+    }
+
+    #[test]
+    fn saved_success_event_cannot_bypass_generation_commit_or_failed_activation() {
+        let (manager, _, _, app) = managed_fixture(false);
+        let mut record = manager.registry.read_job("job-managed").unwrap();
+        record.status = JobStatus::Succeeded;
+        manager.registry.write_job(&record).unwrap();
+        assert_eq!(
+            manager.registry.read_job("job-managed").unwrap().status,
+            JobStatus::Running
+        );
+        assert!(manager.registry.lifecycle.finish(&record).is_err()); // missing launcher
+                                                                      // The old job file still says success, as after a job-file write error.
+        assert_eq!(
+            manager.registry.read_job("job-managed").unwrap().status,
+            JobStatus::Failed
+        );
+        assert_eq!(manager.registry.list_jobs().unwrap()[0].status, JobStatus::Failed);
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+        manager.active.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn managed_cancellation_and_cleanup_failure_cannot_select_partial_files() {
+        let (manager, _, _, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        manager.cancel("job-managed").unwrap();
+        assert_eq!(manager.poll("job-managed", 0).unwrap().job.status, JobStatus::Cancelled);
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+        let (manager, _, _, app) = managed_fixture(true);
+        write_managed_launcher(&manager, &app);
+        assert_eq!(manager.poll("job-managed", 0).unwrap().job.status, JobStatus::Failed);
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+        assert!(
+            manager
+                .registry
+                .lifecycle
+                .state(&app.id)
+                .unwrap()
+                .operation
+                .unwrap()
+                .quarantined
+        );
+        assert!(manager.uninstall(&app.id).is_err());
+        assert!(manager.recover(&app.id).is_err());
+    }
+
+    #[test]
+    fn managed_shutdown_persists_cancellation_and_reopen_does_not_quarantine() {
+        let (manager, handle, root, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        manager.shutdown_and_wait().unwrap();
+        assert_eq!(handle.joins.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.registry.read_job("job-managed").unwrap().status,
+            JobStatus::Cancelled
+        );
+        drop(manager);
+        let registry = Registry::new(root.join("service"), root.join("storage")).unwrap();
+        registry.recover_interrupted_jobs().unwrap();
+        assert!(registry.lifecycle.state(&app.id).unwrap().operation.is_none());
+        assert!(!registry.application_installed(&app));
+    }
+
+    #[test]
+    fn crash_recovery_preserves_unselected_state_and_blocks_install_conflicts() {
+        let (manager, _, root, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        let mut settings = manager.registry.read_settings().unwrap();
+        settings.maximum_parallel_jobs = 4;
+        manager.registry.write_settings(&settings).unwrap();
+        let request: JobRequest = serde_json::from_value(serde_json::json!({"schemaVersion":"1","applicationId":app.id,"kind":"install","executablePath":std::env::current_exe().unwrap()})).unwrap();
+        assert!(matches!(manager.submit(request), Err(JobError::Conflict(_))));
+        assert!(manager.uninstall(&app.id).is_err());
+        drop(manager);
+        let registry = Registry::new(root.join("service"), root.join("storage")).unwrap();
+        registry.recover_interrupted_jobs().unwrap();
+        assert_eq!(registry.read_job("job-managed").unwrap().status, JobStatus::Failed);
+        assert!(
+            registry
+                .lifecycle
+                .state(&app.id)
+                .unwrap()
+                .operation
+                .unwrap()
+                .quarantined
+        );
+        assert!(registry.lifecycle.selected(&app.id).is_err());
+    }
+
+    #[test]
+    fn changed_installer_hash_fails_before_runtime_and_preserves_selected_version() {
+        let (manager, _, root, mut app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        let old = manager.registry.lifecycle.selected(&app.id).unwrap();
+        app.version = "updated".into();
+        app.launchers[0].executable = "different/new.exe".into();
+        manager.registry.upsert_application(app.clone()).unwrap();
+        let installer = root.join(&app.installer.as_ref().unwrap().file_name);
+        std::fs::write(&installer, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
+        let request: JobRequest = serde_json::from_value(
+            serde_json::json!({"schemaVersion":"1","applicationId":app.id,"kind":"install","executablePath":installer}),
+        )
+        .unwrap();
+        let error = manager.submit(request).unwrap_err();
+        assert!(matches!(error, JobError::Preparation(_)), "{error}");
+        assert!(manager.active.lock().unwrap().is_empty());
+        assert_eq!(manager.registry.lifecycle.selected(&app.id).unwrap(), old);
+        assert_eq!(
+            manager.registry.lifecycle.state(&app.id).unwrap().generations[1].status,
+            crate::GenerationStatus::Failed
+        );
+    }
+
+    #[test]
+    fn successful_cleanup_retry_releases_owned_quarantine() {
+        let (manager, _, _, app) = managed_fixture(true);
+        write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        manager.active.lock().unwrap().get_mut("job-managed").unwrap().handle = Arc::new(CompletedProcess {
+            events: Mutex::new(std::collections::VecDeque::new()),
+            cleanup_failed: false,
+            joins: AtomicU64::new(0),
+        });
+        manager.shutdown_and_wait().unwrap();
+        assert!(manager.registry.lifecycle.state(&app.id).unwrap().operation.is_none());
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+    }
+
+    #[test]
+    fn shared_logical_bottle_and_uncleared_terminal_handles_conflict() {
+        let (manager, _, _, app) = managed_fixture(true);
+        write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        let mut other = app.clone();
+        other.id = "other-app".into();
+        manager.registry.upsert_application(other.clone()).unwrap();
+        assert!(manager.ensure_idle(&other.id, &other.bottle_id).is_err());
+        assert!(manager
+            .rollback(&RollbackRequest {
+                application_id: app.id,
+                generation_id: "gen-job-managed".into()
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn successful_installer_exit_without_verified_generation_is_not_installed() {
+        let (manager, _, _) = terminal_poll_fixture(false);
+        manager
+            .active
+            .lock()
+            .unwrap()
+            .get_mut("cleanup-job")
+            .unwrap()
+            .record
+            .kind = JobKind::Install;
+        assert_eq!(manager.poll("cleanup-job", 0).unwrap().job.status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn installer_accepts_local_display_session_but_rejects_runtime_environment_override() {
+        let mut request: JobRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1", "applicationId":"7zip", "kind":"install", "executablePath": std::env::current_exe().unwrap(),
+            "environmentOverrides":{"DISPLAY":":98"}
+        })).unwrap();
+        assert!(request.validate().is_ok());
+        request
+            .environment_overrides
+            .insert("WINEPREFIX".into(), "/tmp/unreviewed".into());
+        assert!(request.validate().is_err());
+        request.environment_overrides.clear();
+        request
+            .environment_overrides
+            .insert("DISPLAY".into(), "remote:0".into());
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn install_cannot_override_reviewed_arguments_or_environment() {
+        let request: JobRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1", "applicationId":"7zip", "kind":"install",
+            "executablePath": std::env::current_exe().unwrap(), "argumentOverrides":["/unreviewed"]
+        }))
+        .unwrap();
+        assert!(request.validate().is_err());
     }
 
     #[test]
@@ -680,6 +1110,10 @@ mod shutdown_tests {
             manager.active.lock().unwrap().contains_key("cleanup-job"),
             "live handle was lost after post-start persistence failure"
         );
+        let error = manager.shutdown_and_wait().unwrap_err();
+        assert_eq!(error.failures[0].phase, ShutdownPhase::Persist);
+        // Process cleanup succeeds even though persisting that fact failed.
+        std::fs::remove_dir(&job_path).unwrap();
         manager.shutdown_and_wait().unwrap();
         assert!(handle.is_finished());
         handle.terminate_and_wait(Duration::ZERO).unwrap();
@@ -861,6 +1295,7 @@ mod shutdown_tests {
         let event = handle.next_event(Duration::from_secs(5));
         assert!(matches!(event, EventPoll::Event(event) if event.kind == RuntimeEventKind::Started));
         let record = JobRecord {
+            generation_id: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             id: "cleanup-job".into(),
             application_id: "cleanup-test".into(),

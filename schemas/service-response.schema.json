@@ -4,11 +4,67 @@
   "title": "CompatForge Headless Service Response",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "requestId", "operation", "result"],
+  "required": [
+    "schemaVersion",
+    "requestId",
+    "operation",
+    "result"
+  ],
   "properties": {
-    "schemaVersion": { "const": "1" },
-    "requestId": { "type": "string", "minLength": 1 },
-    "operation": { "type": "string", "minLength": 1 },
+    "schemaVersion": {
+      "const": "1"
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "operation": {
+      "type": "string",
+      "minLength": 1
+    },
     "result": {}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "applications.generations",
+              "applications.rollback",
+              "applications.uninstall",
+              "applications.recover"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "$ref": "application.schema.json#/$defs/generations"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "applications.list"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "$ref": "application.schema.json#/$defs/summary"
+            }
+          }
+        }
+      }
+    }
+  ]
 }

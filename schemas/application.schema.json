@@ -16,22 +16,48 @@
     "compatibilityRating"
   ],
   "properties": {
-    "schemaVersion": { "const": "1" },
-    "id": { "$ref": "#/$defs/id" },
-    "name": { "$ref": "#/$defs/text" },
-    "version": { "$ref": "#/$defs/text" },
-    "publisher": { "$ref": "#/$defs/text" },
-    "category": { "$ref": "#/$defs/text" },
-    "bottleId": { "$ref": "#/$defs/id" },
+    "schemaVersion": {
+      "const": "1"
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "name": {
+      "$ref": "#/$defs/text"
+    },
+    "version": {
+      "$ref": "#/$defs/text"
+    },
+    "publisher": {
+      "$ref": "#/$defs/text"
+    },
+    "category": {
+      "$ref": "#/$defs/text"
+    },
+    "bottleId": {
+      "$ref": "#/$defs/id"
+    },
     "installer": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["fileName"],
+      "required": [
+        "fileName"
+      ],
       "properties": {
-        "fileName": { "type": "string", "minLength": 1, "maxLength": 255 },
-        "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
-        "arguments": { "$ref": "#/$defs/arguments" }
-      }
+        "fileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        },
+        "arguments": {
+          "$ref": "#/$defs/arguments"
+        }
+      },
+      "description": "Managed installation requires sha256. Legacy definitions may omit it but cannot be executed by jobs.submit."
     },
     "launchers": {
       "type": "array",
@@ -40,36 +66,328 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "name", "executable"],
+        "required": [
+          "id",
+          "name",
+          "executable"
+        ],
         "properties": {
-          "id": { "$ref": "#/$defs/id" },
-          "name": { "$ref": "#/$defs/text" },
-          "executable": { "type": "string", "minLength": 1, "maxLength": 4096 },
-          "arguments": { "$ref": "#/$defs/arguments" },
-          "environment": { "$ref": "#/$defs/environment" }
+          "id": {
+            "$ref": "#/$defs/id"
+          },
+          "name": {
+            "$ref": "#/$defs/text"
+          },
+          "executable": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "arguments": {
+            "$ref": "#/$defs/arguments"
+          },
+          "environment": {
+            "$ref": "#/$defs/environment"
+          }
         }
       }
     },
-    "compatibilityRating": { "enum": ["excellent", "good", "limited", "experimental", "unknown"] },
+    "compatibilityRating": {
+      "enum": [
+        "excellent",
+        "good",
+        "limited",
+        "experimental",
+        "unknown"
+      ]
+    },
     "tags": {
       "type": "array",
-      "items": { "$ref": "#/$defs/text" },
+      "items": {
+        "$ref": "#/$defs/text"
+      },
       "maxItems": 256
     }
   },
   "$defs": {
-    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$" },
-    "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]+$",
+      "maxLength": 128
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
     "arguments": {
       "type": "array",
       "maxItems": 256,
-      "items": { "type": "string", "maxLength": 4096 }
+      "items": {
+        "type": "string",
+        "maxLength": 4096
+      }
     },
     "environment": {
       "type": "object",
       "maxProperties": 256,
-      "propertyNames": { "minLength": 1, "maxLength": 256 },
-      "additionalProperties": { "type": "string", "maxLength": 4096 }
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 4096
+      }
+    },
+    "runtimeSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "packId",
+        "packDigest"
+      ],
+      "properties": {
+        "provider": {
+          "enum": [
+            "wine",
+            "virtual-machine",
+            "remote"
+          ]
+        },
+        "packId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "packDigest": {
+          "type": "string",
+          "pattern": "^sha256:[a-fA-F0-9]{64}$"
+        }
+      }
+    },
+    "installedRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selection",
+        "binding",
+        "version"
+      ],
+      "properties": {
+        "selection": {
+          "$ref": "#/$defs/runtimeSelection"
+        },
+        "binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "providerId",
+            "packId",
+            "packDigest",
+            "executable"
+          ],
+          "properties": {
+            "providerId": {
+              "$ref": "application.schema.json#/$defs/id"
+            },
+            "packId": {
+              "$ref": "application.schema.json#/$defs/id"
+            },
+            "packDigest": {
+              "type": "string",
+              "pattern": "^sha256:[a-fA-F0-9]{64}$"
+            },
+            "executable": {
+              "$ref": "application.schema.json#/$defs/text"
+            },
+            "wineserverExecutable": {
+              "$ref": "application.schema.json#/$defs/text"
+            },
+            "environment": {
+              "$ref": "application.schema.json#/$defs/environment"
+            },
+            "workingDirectory": {
+              "$ref": "application.schema.json#/$defs/text"
+            }
+          }
+        },
+        "version": {
+          "$ref": "application.schema.json#/$defs/text"
+        }
+      }
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "bottleId",
+        "definition",
+        "definitionDigest",
+        "status",
+        "createdAtMilliseconds",
+        "updatedAtMilliseconds",
+        "launcherDigests"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "bottleId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "definition": {
+          "$ref": "application.schema.json"
+        },
+        "definitionDigest": {
+          "type": "string",
+          "pattern": "^sha256:[a-fA-F0-9]{64}$"
+        },
+        "status": {
+          "enum": [
+            "staging",
+            "ready",
+            "failed",
+            "cancelled",
+            "quarantined"
+          ]
+        },
+        "createdAtMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updatedAtMilliseconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/installedRuntime"
+        },
+        "launcherDigests": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "application.schema.json#/$defs/id"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^sha256:[a-fA-F0-9]{64}$"
+          }
+        },
+        "error": {
+          "$ref": "application.schema.json#/$defs/text"
+        }
+      }
+    },
+    "generationOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jobId",
+        "generationId",
+        "kind",
+        "quarantined"
+      ],
+      "properties": {
+        "jobId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "generationId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "install",
+            "launch",
+            "compatibility-test",
+            "adaptation-trial"
+          ]
+        },
+        "bootId": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{8}(-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$"
+        },
+        "quarantined": {
+          "type": "boolean"
+        }
+      }
+    },
+    "generations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "applicationId",
+        "generations",
+        "recoveryCapability"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "1"
+        },
+        "applicationId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "selectedGeneration": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "generations": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/generation"
+          }
+        },
+        "operation": {
+          "$ref": "#/$defs/generationOperation"
+        },
+        "recoveryCapability": {
+          "enum": [
+            "kernel-boot-identity",
+            "unavailable"
+          ]
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "application",
+        "status",
+        "installed",
+        "activeJobIds",
+        "generations"
+      ],
+      "properties": {
+        "application": {
+          "$ref": "application.schema.json"
+        },
+        "status": {
+          "enum": [
+            "installable",
+            "installed",
+            "installing",
+            "running",
+            "failed"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "activeJobIds": {
+          "type": "array",
+          "items": {
+            "$ref": "application.schema.json#/$defs/id"
+          }
+        },
+        "lastJobId": {
+          "$ref": "application.schema.json#/$defs/id"
+        },
+        "generations": {
+          "$ref": "#/$defs/generations"
+        }
+      }
     }
   }
 }
