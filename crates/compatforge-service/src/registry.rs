@@ -30,7 +30,17 @@ pub(crate) struct Registry {
     mutation: Mutex<()>,
     job_mutation: Mutex<()>,
     pub(crate) lifecycle: LifecycleStore,
-    _owners: Vec<fs::File>,
+    _owners: Vec<RootOwner>,
+}
+
+/// The logical service owns the lease, not a transient fork's inherited file
+/// description. Unlock explicitly before close, including partial construction.
+struct RootOwner(fs::File);
+
+impl Drop for RootOwner {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.0);
+    }
 }
 
 impl Registry {
@@ -38,9 +48,9 @@ impl Registry {
         if !service_root.is_absolute() || !storage_root.is_absolute() {
             return Err(RegistryError::Invalid("service and storage roots must be absolute"));
         }
-        let mut owners = vec![acquire_root_lock(&service_root)?];
+        let mut owners = vec![RootOwner(acquire_root_lock(&service_root)?)];
         if service_root != storage_root {
-            owners.push(acquire_root_lock(&storage_root)?);
+            owners.push(RootOwner(acquire_root_lock(&storage_root)?));
         }
         create_directory(&service_root)?;
         create_directory(&service_root.join("applications"))?;
@@ -726,6 +736,26 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_owner_drop_releases_flock_even_while_pre_exec_duplicate_survives() {
+        let (service, storage) = roots("duplicated-owner-fd");
+        let registry = Registry::new(service.clone(), storage.clone()).unwrap();
+        let inherited = registry
+            ._owners
+            .iter()
+            .map(|file| file.0.try_clone().unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            Registry::new(service.clone(), storage.clone()),
+            Err(RegistryError::Conflict(_))
+        ));
+        drop(registry);
+        let next = Registry::new(service, storage).expect("logical owner ended despite inherited pre-exec descriptors");
+        drop(inherited);
+        drop(next);
+    }
 
     fn roots(label: &str) -> (PathBuf, PathBuf) {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
