@@ -267,6 +267,7 @@ fn backend_sources_return_to_public_paths_and_ambiguous_reverse_maps_are_rejecte
     }}});
     let nested = binding.rewrite_backend_message(nested).unwrap();
     assert!(nested["body"]["source"].get("path").is_none());
+    assert_eq!(nested["body"]["source"]["name"], "Mapped sources");
     assert_eq!(nested["body"]["source"]["sources"][0]["path"], "/workspace/probe.c");
     assert!(nested["body"]["source"]["sources"][0].get("sourceReference").is_none());
     let attached = binding

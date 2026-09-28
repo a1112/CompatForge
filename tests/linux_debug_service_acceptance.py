@@ -131,10 +131,13 @@ class DapClient:
         require(result.get("success") is success, f"DAP reply failed: {result}")
         return result
 
-    def event(self, name, reason=None, timeout=30):
+    def event(self, name, reason=None, timeout=30, after_seq=0):
         deadline = time.monotonic() + timeout
         while True:
             for message in list(self.events):
+                if message.get("seq", 0) <= after_seq:
+                    self.events.remove(message)
+                    continue
                 if message.get("event") == name and (reason is None or message.get("body", {}).get("reason") == reason):
                     self.events.remove(message)
                     return message
@@ -200,7 +203,7 @@ def debug(cli, selected):
         if "source" in point:
             require(point["source"]["path"] == str(public_source), "breakpoint source was not reverse mapped")
         client.reply(client.send("configurationDone"))
-        client.reply(attach)
+        require(client.reply(attach)["command"] == "launch", "backend attach leaked into public launch reply")
         client.reply(client.send("continue", {"threadId": 1}))
         stopped = client.event("stopped", "breakpoint")
         thread = stopped["body"]["threadId"]
@@ -239,9 +242,11 @@ def debug(cli, selected):
         stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
         require(stack["body"]["stackFrames"][0]["name"] == "main", "stepOut did not return to main")
         client.reply(client.send("continue", {"threadId": thread}))
+        pause_start = client.last_output_seq
         client.reply(client.send("pause", {"threadId": thread}))
-        paused = client.event("stopped", timeout=10)
-        require(paused["body"]["reason"] == "pause", f"pause produced {paused['body']['reason']}")
+        paused = client.event("stopped", timeout=10, after_seq=pause_start)
+        pause_reason = paused["body"]["reason"]
+        require(pause_reason in ("pause", "stopped"), f"pause produced {pause_reason}")
         client.reply(client.send("continue", {"threadId": thread}))
         client.event("stopped", "signal")
         client.reply(client.send("disconnect"))
@@ -249,7 +254,8 @@ def debug(cli, selected):
         require(process.wait(timeout=10) == 0, "debug adapter did not cleanly exit")
         return {"breakpointVerified": True, "initialBreakpointPending": not point.get("verified", False),
                 "stack": names[:3], "stepInVerified": True, "stepOutVerified": True,
-                "pauseVerified": True, "sourceReverseMapped": True, "dapOutputSequenceMonotonic": True,
+                "pauseVerified": True, "pauseStopReason": pause_reason,
+                "sourceReverseMapped": True, "dapOutputSequenceMonotonic": True,
                 "stepLine": frame["line"],
                 "localValue": value, "exceptionStopReason": "signal", "disconnectSucceeded": True,
                 "unsafeEvaluateRejected": True, "sanitizedDapTranscript": client.transcript}

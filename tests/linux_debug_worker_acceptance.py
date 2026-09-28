@@ -127,6 +127,7 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--crash", action="store_true")
     parser.add_argument("--terminate", action="store_true")
+    parser.add_argument("--extended", action="store_true")
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text())
     if Path(args.output).exists():
@@ -152,7 +153,7 @@ def main() -> None:
         attach = client.send("attach", {"program": config["program"], "target": "127.0.0.1:25000"})
         client.event("initialized")
         client.reply(client.send("setBreakpoints", {"source": {"path": config["backendSources"][0]},
-                                                    "breakpoints": [{"line": 7}]}))
+                                                    "breakpoints": [{"line": 17 if args.extended else 7}]}))
         client.reply(client.send("configurationDone"))
         client.reply(attach)
         client.reply(client.send("continue", {"threadId": 1}))
@@ -160,6 +161,16 @@ def main() -> None:
         thread = stopped["body"]["threadId"]
         stack = client.reply(client.send("stackTrace", {"threadId": thread, "startFrame": 0, "levels": 8}))
         names = [item["name"] for item in stack["body"]["stackFrames"]]
+        if args.extended:
+            assert names[0] == "main", names
+            client.reply(client.send("stepIn", {"threadId": thread}))
+            client.event("stopped", "step")
+            stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+            assert stack["body"]["stackFrames"][0]["name"] == "outer", stack
+            client.reply(client.send("stepIn", {"threadId": thread}))
+            client.event("stopped", "step")
+            stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+            names = [item["name"] for item in stack["body"]["stackFrames"]]
         assert names[:3] == ["inner", "outer", "main"]
         client.reply(client.send("next", {"threadId": thread}))
         client.event("stopped", "step")
@@ -170,7 +181,22 @@ def main() -> None:
         reference = next(scope["variablesReference"] for scope in scopes["body"]["scopes"] if scope["name"] == "Locals")
         variables = client.reply(client.send("variables", {"variablesReference": reference}))
         assert {item["name"]: item["value"] for item in variables["body"]["variables"]}["local_value"] == "17"
+        if args.extended:
+            client.reply(client.send("stepOut", {"threadId": thread}))
+            client.event("stopped", "step")
+            stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+            assert stack["body"]["stackFrames"][0]["name"] == "outer", stack
+            client.reply(client.send("stepOut", {"threadId": thread}))
+            client.event("stopped", "step")
+            stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+            assert stack["body"]["stackFrames"][0]["name"] == "main", stack
         client.reply(client.send("continue", {"threadId": thread}))
+        if args.extended:
+            client.reply(client.send("pause", {"threadId": thread}))
+            paused = client.event("stopped")
+            assert paused["body"]["reason"] in ("pause", "stopped"), paused
+            pause_reason = paused["body"]["reason"]
+            client.reply(client.send("continue", {"threadId": thread}))
         client.event("stopped", "signal")
         client.reply(client.send("disconnect", {"terminateDebuggee": False}))
         assert client.control({"op": "shutdown"}) == {"requestId": client.control_seq, "stopped": True}
@@ -197,6 +223,9 @@ def main() -> None:
         raise RuntimeError("worker did not cleanly exit")
     receipt = {"privateWorkerCompleted": True, "breakpointVerified": True, "stack": names[:3],
                "stepLocalValue": "17", "exceptionStopReason": "signal", "cleanDisconnect": True}
+    if args.extended:
+        receipt.update(stepInVerified=True, stepOutVerified=True, pauseVerified=True,
+                       pauseStopReason=pause_reason)
     Path(args.output).write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt))
 

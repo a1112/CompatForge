@@ -486,6 +486,9 @@ impl DapBinding {
             }
             if !retained.is_empty() {
                 public.insert("sources".into(), Value::Array(retained));
+                if !public.contains_key("name") {
+                    public.insert("name".into(), Value::String("Mapped sources".into()));
+                }
             }
         }
         Ok(if public.is_empty() {
