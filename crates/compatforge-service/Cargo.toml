@@ -10,9 +10,14 @@ compatforge-domain = { path = "../compatforge-domain" }
 compatforge-inspect = { path = "../compatforge-inspect" }
 compatforge-orchestrator = { path = "../compatforge-orchestrator" }
 compatforge-process = { path = "../compatforge-process" }
+compatforge-provider-linux = { path = "../compatforge-provider-linux" }
+compatforge-provider-macos = { path = "../compatforge-provider-macos" }
 compatforge-storage = { path = "../compatforge-storage" }
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

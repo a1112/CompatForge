@@ -166,7 +166,10 @@ dependencies = [
  "compatforge-inspect",
  "compatforge-orchestrator",
  "compatforge-process",
+ "compatforge-provider-linux",
+ "compatforge-provider-macos",
  "compatforge-storage",
+ "libc",
  "serde",
  "serde_json",
 ]

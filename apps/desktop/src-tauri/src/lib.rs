@@ -2,7 +2,8 @@
 
 use compatforge_capability::{ContextCapabilityQuery, HostProbe};
 use compatforge_domain::{validate_portable_relative_path, CapabilityReport, ProviderDescriptor, SCHEMA_VERSION_V1};
-use compatforge_provider_macos::{create_local_context, MacOsLocalContextReceipt, MacOsLocalContextRequest};
+use compatforge_provider_macos::MacOsLocalContextRequest;
+use compatforge_service::bootstrap::{create_desktop_context, read_linux_provider_config, select_desktop_context};
 use compatforge_service::{AutomationService, ServiceConfig, ServiceRequest, ServiceResponse};
 use serde::Serialize;
 use serde_json::Value;
@@ -22,6 +23,7 @@ const MAX_RUNTIME_VERSION_BYTES: usize = 128;
 struct DesktopLaunchOptions {
     acceptance_root: Option<PathBuf>,
     runtime_override: Option<RuntimeOverride>,
+    linux_provider_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +48,7 @@ impl DesktopLaunchOptions {
         let mut wine = None;
         let mut wineserver = None;
         let mut version = None;
+        let mut linux_provider_config = None;
         while let Some(flag) = arguments.next() {
             let flag = flag.to_str().ok_or(INVALID_LAUNCH_ARGUMENTS)?;
             let value = arguments.next().ok_or(INVALID_LAUNCH_ARGUMENTS)?;
@@ -59,10 +62,29 @@ impl DesktopLaunchOptions {
                 "--wine" => set_once(&mut wine, value.to_owned())?,
                 "--wineserver" => set_once(&mut wineserver, value.to_owned())?,
                 "--version" => set_once(&mut version, value.to_owned())?,
+                "--linux-provider-config" => set_once(&mut linux_provider_config, value.to_owned())?,
                 _ => return Err(INVALID_LAUNCH_ARGUMENTS),
             }
         }
 
+        if let Some(provider) = linux_provider_config {
+            if !posix_path_is_absolute(&provider)
+                || acceptance_root
+                    .as_ref()
+                    .is_some_and(|root| !posix_path_is_absolute(root))
+                || wine_root.is_some()
+                || wine.is_some()
+                || wineserver.is_some()
+                || version.is_some()
+            {
+                return Err(INVALID_LAUNCH_ARGUMENTS);
+            }
+            return Ok(Self {
+                acceptance_root: acceptance_root.map(PathBuf::from),
+                runtime_override: None,
+                linux_provider_config: Some(PathBuf::from(provider)),
+            });
+        }
         let supplied = [
             acceptance_root.is_some(),
             wine_root.is_some(),
@@ -99,6 +121,7 @@ impl DesktopLaunchOptions {
                 wineserver,
                 version,
             }),
+            linux_provider_config: None,
         })
     }
 }
@@ -147,12 +170,13 @@ struct RuntimeSnapshot {
 struct DesktopRuntime {
     acceptance_root: Option<PathBuf>,
     runtime_override: Option<RuntimeOverride>,
+    linux_provider_config: Option<PathBuf>,
     runtime_store_root: PathBuf,
     storage_root: PathBuf,
     service_root: PathBuf,
     smoke_mode: bool,
     service: Option<Arc<AutomationService>>,
-    receipt: Option<MacOsLocalContextReceipt>,
+    receipt: Option<Value>,
     capabilities: Option<CapabilityReport>,
     runtime_status: String,
     error: Option<String>,
@@ -167,6 +191,7 @@ impl DesktopRuntime {
         Self {
             acceptance_root: options.acceptance_root,
             runtime_override: options.runtime_override,
+            linux_provider_config: options.linux_provider_config,
             runtime_store_root,
             storage_root,
             service_root,
@@ -193,10 +218,7 @@ impl DesktopRuntime {
                 .as_ref()
                 .map(capability_views)
                 .unwrap_or_else(waiting_capabilities),
-            receipt: self
-                .receipt
-                .as_ref()
-                .and_then(|receipt| serde_json::to_value(receipt).ok()),
+            receipt: self.receipt.clone(),
             error: self.error.clone(),
         }
     }
@@ -204,20 +226,23 @@ impl DesktopRuntime {
 
 struct BootstrapResult {
     service: Arc<AutomationService>,
-    receipt: MacOsLocalContextReceipt,
+    receipt: Value,
+    version: String,
+    pack_id: String,
     capabilities: CapabilityReport,
 }
 
+#[derive(Clone)]
 struct AppState {
-    runtime: Mutex<DesktopRuntime>,
-    bootstrap: Mutex<()>,
+    runtime: Arc<Mutex<DesktopRuntime>>,
+    bootstrap: Arc<Mutex<()>>,
 }
 
 impl AppState {
     fn new(runtime: DesktopRuntime) -> Self {
         Self {
-            runtime: Mutex::new(runtime),
-            bootstrap: Mutex::new(()),
+            runtime: Arc::new(Mutex::new(runtime)),
+            bootstrap: Arc::new(Mutex::new(())),
         }
     }
 
@@ -228,7 +253,7 @@ impl AppState {
     }
 }
 
-fn lock_runtime<'a>(state: &'a State<'_, AppState>) -> Result<MutexGuard<'a, DesktopRuntime>, String> {
+fn lock_runtime(state: &AppState) -> Result<MutexGuard<'_, DesktopRuntime>, String> {
     state.runtime.lock().map_err(|_| "桌面运行状态锁已损坏".into())
 }
 
@@ -246,14 +271,22 @@ fn state_snapshot(state: State<'_, AppState>) -> Result<RuntimeSnapshot, String>
 
 #[tauri::command]
 async fn bootstrap_runtime(state: State<'_, AppState>) -> Result<RuntimeSnapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || bootstrap_runtime_blocking(&state))
+        .await
+        .map_err(|error| format!("Bootstrap 工作线程失败：{error}"))?
+}
+
+fn bootstrap_runtime_blocking(state: &AppState) -> Result<RuntimeSnapshot, String> {
     let _bootstrap = state.bootstrap.lock().map_err(|_| "Bootstrap 状态锁已损坏")?;
-    let (runtime_store_root, storage_root, service_root, runtime_override) = {
-        let runtime = lock_runtime(&state)?;
+    let (runtime_store_root, storage_root, service_root, runtime_override, linux_provider_config) = {
+        let runtime = lock_runtime(state)?;
         (
             runtime.runtime_store_root.clone(),
             runtime.storage_root.clone(),
             runtime.service_root.clone(),
             runtime.runtime_override.clone(),
+            runtime.linux_provider_config.clone(),
         )
     };
     let result = bootstrap_core(
@@ -261,11 +294,12 @@ async fn bootstrap_runtime(state: State<'_, AppState>) -> Result<RuntimeSnapshot
         &storage_root,
         &service_root,
         runtime_override.as_ref(),
+        linux_provider_config.as_deref(),
     );
-    let mut runtime = lock_runtime(&state)?;
+    let mut runtime = lock_runtime(state)?;
     match result {
         Ok(result) => {
-            runtime.runtime_status = format!("运行环境就绪 · {} · {}", result.receipt.version, result.receipt.pack_id);
+            runtime.runtime_status = format!("运行环境就绪 · {} · {}", result.version, result.pack_id);
             runtime.service = Some(result.service);
             runtime.receipt = Some(result.receipt);
             runtime.capabilities = Some(result.capabilities);
@@ -282,7 +316,10 @@ async fn bootstrap_runtime(state: State<'_, AppState>) -> Result<RuntimeSnapshot
 
 #[tauri::command]
 async fn service_call(request: ServiceRequest, state: State<'_, AppState>) -> Result<ServiceResponse, String> {
-    service(&state)?.call(request).map_err(|error| error.to_string())
+    let service = service(&state)?;
+    tauri::async_runtime::spawn_blocking(move || service.call(request).map_err(|error| error.to_string()))
+        .await
+        .map_err(|error| format!("应用服务工作线程失败：{error}"))?
 }
 
 #[tauri::command]
@@ -316,13 +353,16 @@ fn bootstrap_core(
     storage_root: &Path,
     service_root: &Path,
     runtime_override: Option<&RuntimeOverride>,
+    linux_provider_config: Option<&Path>,
 ) -> Result<BootstrapResult, String> {
     create_directory(runtime_store_root, "Runtime Store")?;
     create_directory(storage_root, "存储目录")?;
     create_directory(service_root, "服务目录")?;
     let host = HostProbe::probe().map_err(|error| format!("主机能力探测失败：{error}"))?;
-    let request = local_context_request(runtime_store_root, storage_root, runtime_override)?;
-    let local = create_local_context(&host, &request).map_err(|error| format!("Runtime Bootstrap 失败：{error}"))?;
+    let macos = local_context_request(runtime_store_root, storage_root, runtime_override)?;
+    let linux = linux_provider_config.map(read_linux_provider_config).transpose()?;
+    let request = select_desktop_context(host.host.os, macos, linux)?;
+    let local = create_desktop_context(&host, request).map_err(|error| format!("Runtime Bootstrap 失败：{error}"))?;
     let capabilities =
         ContextCapabilityQuery::report(&local.config).map_err(|error| format!("能力报告生成失败：{error}"))?;
     let service = AutomationService::new(
@@ -339,6 +379,8 @@ fn bootstrap_core(
     Ok(BootstrapResult {
         service: Arc::new(service),
         receipt: local.receipt,
+        version: local.version,
+        pack_id: local.pack_id,
         capabilities,
     })
 }
@@ -430,7 +472,8 @@ where
     S: Into<OsString>,
 {
     let options = DesktopLaunchOptions::parse(arguments)?;
-    let application = tauri::Builder::default().plugin(project_window_chrome::init())
+    let application = tauri::Builder::default()
+        .plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -515,6 +558,36 @@ mod tests {
         let options = DesktopLaunchOptions::parse(crossover_arguments()).unwrap();
         assert!(options.acceptance_root.is_some());
         assert!(options.runtime_override.is_some());
+    }
+
+    #[test]
+    fn linux_provider_argument_is_explicit_and_cannot_mix_with_macos() {
+        let options = DesktopLaunchOptions::parse([
+            "compatforge-desktop",
+            "--linux-provider-config",
+            "/private/provider.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.linux_provider_config,
+            Some(PathBuf::from("/private/provider.json"))
+        );
+        assert!(options.runtime_override.is_none());
+        assert_invalid(["app", "--linux-provider-config", "relative.json"]);
+        assert_invalid([
+            "app",
+            "--linux-provider-config",
+            "/private/provider.json",
+            "--wine",
+            "bin/wine",
+        ]);
+        assert_invalid([
+            "app",
+            "--linux-provider-config",
+            "/first.json",
+            "--linux-provider-config",
+            "/second.json",
+        ]);
     }
 
     #[test]

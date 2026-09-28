@@ -2,9 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bootstrap;
 mod jobs;
 mod model;
 mod registry;
+pub mod transport;
 
 use jobs::{JobError, JobManager};
 use model::{ApplicationPayload, ArchivePayload, AssessmentPayload, IdPayload, PollPayload};

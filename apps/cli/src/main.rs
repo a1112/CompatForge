@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1487,12 +1487,8 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Box<dyn E
 fn run_api_session(service: AutomationService) -> Result<(), Box<dyn Error>> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: ServiceRequest = serde_json::from_str(&line)?;
+    let mut input = stdin.lock();
+    while let Some(request) = compatforge_service::transport::read_request(&mut input)? {
         serde_json::to_writer(&mut stdout, &service.call(request)?)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
