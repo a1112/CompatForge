@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub(crate) const MAX_JOB_RECORDS: usize = 4096;
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 static ARCHIVE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -24,6 +25,7 @@ pub(crate) struct Registry {
     storage_root: PathBuf,
     store: JsonStore,
     mutation: Mutex<()>,
+    job_mutation: Mutex<()>,
     pub(crate) lifecycle: LifecycleStore,
     _owners: Vec<fs::File>,
 }
@@ -53,6 +55,7 @@ impl Registry {
             storage_root,
             store,
             mutation: Mutex::new(()),
+            job_mutation: Mutex::new(()),
         };
         check_path(&registry.service_root.join("settings.json"), true)?;
         if !registry.store.exists("settings.json") {
@@ -142,7 +145,8 @@ impl Registry {
     }
 
     fn list_application_records_unlocked(&self) -> Result<Vec<ApplicationRecord>, RegistryError> {
-        let mut records: Vec<ApplicationRecord> = read_json_directory(&self.service_root.join("applications"))?;
+        let mut records: Vec<ApplicationRecord> =
+            read_json_directory(&self.service_root.join("applications"), MAX_APPLICATIONS)?;
         records.sort_by(|left, right| left.application.name.cmp(&right.application.name));
         if records.len() > MAX_APPLICATIONS {
             return Err(RegistryError::Invalid("application registry exceeds maximum entries"));
@@ -309,7 +313,8 @@ impl Registry {
     }
 
     pub(crate) fn list_archives(&self) -> Result<Vec<BottleArchive>, RegistryError> {
-        let mut records: Vec<BottleArchive> = read_json_directory(&self.service_root.join("archives"))?;
+        let mut records: Vec<BottleArchive> =
+            read_json_directory(&self.service_root.join("archives"), MAX_APPLICATIONS)?;
         records.sort_by_key(|record| Reverse(record.archived_at_milliseconds));
         Ok(records)
     }
@@ -336,7 +341,31 @@ impl Registry {
 
     pub(crate) fn write_job(&self, job: &JobRecord) -> Result<(), RegistryError> {
         job.validate().map_err(RegistryError::Model)?;
-        check_path(&self.service_root.join(job_relative_path(&job.id)), true)?;
+        let _guard = self
+            .job_mutation
+            .lock()
+            .map_err(|_| RegistryError::Conflict("job persistence lock is poisoned"))?;
+        let path = self.service_root.join(job_relative_path(&job.id));
+        check_path(&path, true)?;
+        if !path.exists() {
+            // Reserve capacity before the first Preparing record, hence before
+            // any generation lease, prefix, or runtime side effect. Existing
+            // records must remain writable at the limit for cleanup/recovery.
+            let mut records = 0;
+            for entry in fs::read_dir(self.service_root.join("jobs")).map_err(RegistryError::Io)? {
+                let entry = entry.map_err(RegistryError::Io)?;
+                let file_type = entry.file_type().map_err(RegistryError::Io)?;
+                if file_type.is_file()
+                    && !file_type.is_symlink()
+                    && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                {
+                    records += 1;
+                    if records >= MAX_JOB_RECORDS {
+                        return Err(RegistryError::Conflict("job history capacity reached (4096); stop the service and archive completed job records before retrying"));
+                    }
+                }
+            }
+        }
         self.write_record(job_relative_path(&job.id), job)
             .map_err(|error| RegistryError::Store(error.to_string()))
     }
@@ -398,7 +427,7 @@ impl Registry {
     }
 
     pub(crate) fn list_jobs(&self) -> Result<Vec<JobRecord>, RegistryError> {
-        let mut jobs: Vec<JobRecord> = read_json_directory(&self.service_root.join("jobs"))?;
+        let mut jobs: Vec<JobRecord> = read_json_directory(&self.service_root.join("jobs"), MAX_JOB_RECORDS)?;
         for job in &jobs {
             job.validate().map_err(RegistryError::Model)?;
         }
@@ -545,7 +574,10 @@ fn validate_registry_id(id: &str) -> Result<(), RegistryError> {
     crate::lifecycle::checked_id(id)
 }
 
-fn read_json_directory<T: serde::de::DeserializeOwned>(directory: &Path) -> Result<Vec<T>, RegistryError> {
+fn read_json_directory<T: serde::de::DeserializeOwned>(
+    directory: &Path,
+    maximum: usize,
+) -> Result<Vec<T>, RegistryError> {
     create_directory(directory)?;
     let mut values = Vec::new();
     for entry in fs::read_dir(directory).map_err(RegistryError::Io)? {
@@ -561,7 +593,7 @@ fn read_json_directory<T: serde::de::DeserializeOwned>(directory: &Path) -> Resu
         if metadata.len() > MAX_RECORD_BYTES {
             return Err(RegistryError::Invalid("registry record exceeds 4 MiB"));
         }
-        if values.len() >= MAX_APPLICATIONS {
+        if values.len() >= maximum {
             return Err(RegistryError::Invalid("registry directory exceeds entry bound"));
         }
         values.push(read_record(&path)?);

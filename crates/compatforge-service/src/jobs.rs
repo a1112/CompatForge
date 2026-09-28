@@ -31,6 +31,7 @@ struct ActiveJob {
     record: JobRecord,
     cancel_requested: bool,
     cleanup_join_failed: bool,
+    polling: Arc<Mutex<()>>,
 }
 
 trait JobProcess: ShutdownTarget + Send + Sync {
@@ -188,9 +189,7 @@ impl JobManager {
             if let Some(runtime) = &generation.runtime {
                 runtime.check_config(&self.config).map_err(JobError::Registry)?;
             }
-            let mut bound_application = generation.definition.clone();
-            bound_application.bottle_id = generation.bottle_id.clone();
-            let resolved = self.resolve_launch(&bound_application, &request)?;
+            let resolved = self.resolve_launch(&generation, &request)?;
             let inspection = inspect_path(&resolved.source).map_err(|error| JobError::Inspection(error.to_string()))?;
             let architecture = map_architecture(inspection.architecture)?;
             let launch_request = LaunchRequest {
@@ -277,6 +276,7 @@ impl JobManager {
                 record: record.clone(),
                 cancel_requested: false,
                 cleanup_join_failed: false,
+                polling: Arc::new(Mutex::new(())),
             },
         );
         self.registry.write_job(&record).map_err(JobError::Registry)?;
@@ -287,10 +287,10 @@ impl JobManager {
         if timeout_milliseconds > MAX_POLL_MILLISECONDS {
             return Err(JobError::Invalid("poll timeout exceeds 30000 milliseconds"));
         }
-        let handle = {
+        let (handle, polling) = {
             let active = self.lock_active()?;
             match active.get(id) {
-                Some(job) => Arc::clone(&job.handle),
+                Some(job) => (Arc::clone(&job.handle), Arc::clone(&job.polling)),
                 None => {
                     let job = self.registry.read_job(id).map_err(JobError::Registry)?;
                     let stream_ended = job.status.is_terminal();
@@ -302,6 +302,24 @@ impl JobManager {
                 }
             }
         };
+
+        // One consumer owns receive -> apply -> cleanup acknowledgement ->
+        // generation commit. A second poll must not take an exit past an adverse
+        // event already consumed by the first. Reject contention promptly, and
+        // never hold the job map or service operation lock while receiving.
+        let _poll = polling.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => JobError::Conflict("job is already being polled"),
+            std::sync::TryLockError::Poisoned(_) => JobError::Conflict("job poll lock is poisoned"),
+        })?;
+        if !self.lock_active()?.contains_key(id) {
+            let job = self.registry.read_job(id).map_err(JobError::Registry)?;
+            let stream_ended = job.status.is_terminal();
+            return Ok(JobPollResult {
+                job,
+                events: Vec::new(),
+                stream_ended,
+            });
+        }
 
         let mut new_events = Vec::new();
         match handle.next_event(Duration::from_millis(timeout_milliseconds)) {
@@ -348,6 +366,11 @@ impl JobManager {
             if let Some(state) = active.get_mut(id) {
                 match cleanup {
                     Ok(()) => {
+                        // Shutdown may have requested cancellation while this
+                        // terminal poll was acknowledging supervisor completion.
+                        if state.record.status == JobStatus::Cancelling {
+                            state.record.status = JobStatus::Cancelled;
+                        }
                         // Persist terminal evidence before the one atomic generation
                         // selection. A crash in between leaves the lease quarantined.
                         self.registry.write_job(&state.record).map_err(JobError::Registry)?;
@@ -435,14 +458,37 @@ impl JobManager {
 
     pub(crate) fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
         let handles = self.owned_cleanup_handles();
+        {
+            let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+            for (id, _) in &handles {
+                if let Some(state) = active.get_mut(id) {
+                    // A poll already receiving must see cancellation before its
+                    // successful exit can become an activation during shutdown.
+                    state.cancel_requested = true;
+                    if !state.record.status.is_terminal() || state.record.status == JobStatus::Succeeded {
+                        state.record.status = JobStatus::Cancelling;
+                    }
+                }
+            }
+        }
         shutdown_handles(
             &handles,
             Duration::from_millis(self.config.supervisor.termination_grace_milliseconds),
         )?;
-        let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
-        let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
         let mut failures = Vec::new();
         for (id, _) in &handles {
+            let polling = {
+                let active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+                active.get(id).map(|state| Arc::clone(&state.polling))
+            };
+            let Some(polling) = polling else {
+                continue;
+            };
+            // Match poll's lock order: per-job gate -> operation -> job map.
+            // Cleanup recovers poisoned gates only to retain process ownership.
+            let _poll = polling.lock().unwrap_or_else(|error| error.into_inner());
+            let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
+            let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(state) = active.get_mut(id) {
                 // Closing never activates an installer based on an unconsumed exit.
                 if !state.record.status.is_terminal() || state.record.status == JobStatus::Succeeded {
@@ -571,9 +617,10 @@ impl JobManager {
 
     fn resolve_launch(
         &self,
-        application: &crate::model::ApplicationDefinition,
+        generation: &crate::lifecycle::ApplicationGeneration,
         request: &JobRequest,
     ) -> Result<ResolvedLaunch, JobError> {
+        let application = &generation.definition;
         match request.kind {
             JobKind::Install => {
                 let installer = application
@@ -612,7 +659,16 @@ impl JobManager {
                     None => application.launchers.first(),
                 }
                 .ok_or(JobError::NotFound("launcher"))?;
-                let source = self.registry.launcher_path(application, launcher);
+                let source = self.registry.lifecycle.launcher_path(generation, &launcher.executable);
+                // Carry the installed digest through prepare/authorize/start.
+                // A prior filesystem check alone must not authorize a replacement
+                // read by PreparedLaunch after that check.
+                let digest = generation
+                    .launcher_digests
+                    .get(&launcher.id)
+                    .and_then(|digest| digest.strip_prefix("sha256:"))
+                    .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    .ok_or(JobError::Conflict("selected launcher has no verified digest"))?;
                 let mut arguments = launcher.arguments.clone();
                 arguments.extend(request.argument_overrides.clone());
                 let mut environment = launcher.environment.clone();
@@ -621,7 +677,7 @@ impl JobManager {
                     source,
                     executable: ResolvedExecutable {
                         mode: ExecutableMode::BottleInPlace,
-                        sha256: None,
+                        sha256: Some(digest.to_owned()),
                     },
                     arguments,
                     environment,
@@ -822,6 +878,7 @@ mod shutdown_tests {
                 record,
                 cancel_requested: false,
                 cleanup_join_failed: false,
+                polling: Arc::new(Mutex::new(())),
             },
         );
         (manager, handle, root)
@@ -869,6 +926,255 @@ mod shutdown_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
         path
+    }
+
+    struct PausedFirstEvent {
+        events: Mutex<std::collections::VecDeque<RuntimeEvent>>,
+        dequeued: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        stop_requested: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl ShutdownTarget for PausedFirstEvent {
+        fn request_stop(&self) -> Result<(), String> {
+            let _ = self.stop_requested.try_send(());
+            Ok(())
+        }
+        fn wait_for_stop(&self, _: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl JobProcess for PausedFirstEvent {
+        fn next_event(&self, _: Duration) -> EventPoll {
+            let Some(event) = self.events.lock().unwrap().pop_front() else {
+                return EventPoll::Closed;
+            };
+            if event.sequence == 1 {
+                self.dequeued.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            EventPoll::Event(event)
+        }
+    }
+
+    type PausedFixture = (
+        Arc<JobManager>,
+        crate::ApplicationDefinition,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    fn paused_managed_fixture(kind: &str) -> PausedFixture {
+        let (manager, _, _, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        let (dequeued, observed) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        let (stop_requested, stopped) = std::sync::mpsc::sync_channel(1);
+        let first = serde_json::from_value(serde_json::json!({"schemaVersion":"1","sequence":1,"kind":kind,"requestId":"job-managed","elapsedMilliseconds":1,"message":"first event held before state update"})).unwrap();
+        let exited = serde_json::from_value(serde_json::json!({"schemaVersion":"1","sequence":2,"kind":"exited","requestId":"job-managed","elapsedMilliseconds":2,"exit":{"code":0,"success":true}})).unwrap();
+        manager.active.lock().unwrap().get_mut("job-managed").unwrap().handle = Arc::new(PausedFirstEvent {
+            events: Mutex::new([first, exited].into()),
+            dequeued,
+            release: Mutex::new(resume),
+            stop_requested,
+        });
+        (Arc::new(manager), app, observed, release, stopped)
+    }
+
+    #[test]
+    fn concurrent_poll_cannot_commit_exit_before_an_already_dequeued_adverse_event() {
+        for kind in ["timed-out", "failed"] {
+            let (manager, app, observed, release, _) = paused_managed_fixture(kind);
+            let polling = manager.clone();
+            let first = std::thread::spawn(move || polling.poll("job-managed", 0));
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The first reader has consumed the adverse event but cannot apply
+            // it until we resume it. The competing call must reject promptly
+            // without consuming the successful exit behind that event.
+            let second = manager.poll("job-managed", 0);
+            let selected_before_resume = manager.registry.lifecycle.selected(&app.id).is_ok();
+            release.send(()).unwrap();
+            let first = first.join().unwrap();
+            assert!(
+                matches!(second, Err(JobError::Conflict("job is already being polled"))),
+                "competing result for {kind}: {second:?}"
+            );
+            assert!(!selected_before_resume, "exit bypassed the held {kind} event");
+            assert_eq!(first.unwrap().job.status, JobStatus::Failed);
+            assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+        }
+    }
+
+    #[test]
+    fn cancel_can_stop_a_job_while_its_poll_reader_is_paused() {
+        let (manager, app, observed, release, stopped) = paused_managed_fixture("started");
+        let polling = manager.clone();
+        let first = std::thread::spawn(move || polling.poll("job-managed", 0));
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(manager.cancel("job-managed").unwrap().status, JobStatus::Cancelling);
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap().job.status, JobStatus::Cancelled);
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+    }
+
+    #[test]
+    fn shutdown_and_a_paused_poll_do_not_deadlock_or_activate_the_installer() {
+        let (manager, app, observed, release, stopped) = paused_managed_fixture("started");
+        let polling = manager.clone();
+        let first = std::thread::spawn(move || polling.poll("job-managed", 0));
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closing = manager.clone();
+        let (done, completed) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || done.send(closing.shutdown_and_wait()).unwrap());
+        stopped.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown lock ordering deadlocked")
+            .unwrap();
+        shutdown.join().unwrap();
+        let polled = first.join().unwrap().unwrap();
+        assert_eq!(polled.job.status, JobStatus::Cancelled);
+        assert!(manager.registry.lifecycle.state(&app.id).unwrap().operation.is_none());
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+    }
+
+    #[test]
+    fn shutdown_during_terminal_poll_join_returns_cancelled_without_activation() {
+        struct PausedJoin {
+            events: Mutex<std::collections::VecDeque<RuntimeEvent>>,
+            joins: AtomicU64,
+            joining: std::sync::mpsc::SyncSender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            stopped: std::sync::mpsc::SyncSender<()>,
+        }
+        impl ShutdownTarget for PausedJoin {
+            fn request_stop(&self) -> Result<(), String> {
+                let _ = self.stopped.try_send(());
+                Ok(())
+            }
+            fn wait_for_stop(&self, _: Duration) -> Result<(), String> {
+                if self.joins.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.joining.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            }
+        }
+        impl JobProcess for PausedJoin {
+            fn next_event(&self, _: Duration) -> EventPoll {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map_or(EventPoll::Closed, EventPoll::Event)
+            }
+        }
+        let (manager, handle, _, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        let (joining, in_join) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        let (stopped, stopping) = std::sync::mpsc::sync_channel(1);
+        manager.active.lock().unwrap().get_mut("job-managed").unwrap().handle = Arc::new(PausedJoin {
+            events: Mutex::new(handle.events.lock().unwrap().drain(..).collect()),
+            joins: AtomicU64::new(0),
+            joining,
+            release: Mutex::new(resume),
+            stopped,
+        });
+        let manager = Arc::new(manager);
+        let polling = manager.clone();
+        let poll = std::thread::spawn(move || polling.poll("job-managed", 0));
+        in_join.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closing = manager.clone();
+        let (done, completed) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || done.send(closing.shutdown_and_wait()).unwrap());
+        stopping.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown deadlocked during terminal poll join")
+            .unwrap();
+        shutdown.join().unwrap();
+        assert_eq!(poll.join().unwrap().unwrap().job.status, JobStatus::Cancelled);
+        assert_eq!(
+            manager.registry.read_job("job-managed").unwrap().status,
+            JobStatus::Cancelled
+        );
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+    }
+
+    #[test]
+    fn launch_preparation_rejects_content_changed_after_generation_verification() {
+        let (manager, _, _, app) = managed_fixture(false);
+        let launcher_path = write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        let generation = manager
+            .registry
+            .lifecycle
+            .begin_launch(&app.id, "job-mutation-test", JobKind::Launch)
+            .unwrap();
+        let request: JobRequest =
+            serde_json::from_value(serde_json::json!({"schemaVersion":"1","applicationId":app.id,"kind":"launch"}))
+                .unwrap();
+        let resolved = manager.resolve_launch(&generation, &request).unwrap();
+        let mut launch: LaunchRequest =
+            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+        launch.bottle_id = generation.bottle_id;
+        launch.executable.path = resolved.source.to_string_lossy().into_owned();
+        launch.executable.mode = resolved.executable.mode;
+        launch.executable.sha256 = resolved.executable.sha256;
+        let mut bytes = std::fs::read(&launcher_path).unwrap();
+        bytes.push(42);
+        std::fs::write(&launcher_path, bytes).unwrap();
+        let prepared = PreparedLaunch::prepare(&manager.config, &launcher_path, &launch);
+        assert!(
+            matches!(
+                prepared,
+                Err(compatforge_orchestrator::PreparationError::DigestMismatch)
+            ),
+            "changed content was not rejected against the installed digest: {prepared:?}"
+        );
+    }
+
+    #[test]
+    fn job_history_capacity_rejects_new_work_but_allows_terminal_updates_and_restart() {
+        let (manager, _, root) = terminal_poll_fixture(false);
+        let mut record = manager.active.lock().unwrap().remove("cleanup-job").unwrap().record;
+        manager.registry.seed_defaults().unwrap();
+        record.status = JobStatus::Succeeded;
+        for index in 0..crate::registry::MAX_JOB_RECORDS {
+            record.id = format!("job-history-{index}");
+            std::fs::write(
+                root.join("service/jobs").join(format!("{}.json", record.id)),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        let request: JobRequest = serde_json::from_value(serde_json::json!({"schemaVersion":"1","applicationId":"7zip","kind":"install","executablePath":std::env::current_exe().unwrap()})).unwrap();
+        let error = manager.submit(request).unwrap_err();
+        assert!(
+            matches!(error, JobError::Registry(RegistryError::Conflict(message)) if message.contains("job history capacity")),
+            "{error}"
+        );
+        assert!(manager.registry.lifecycle.state("7zip").unwrap().generations.is_empty());
+        assert_eq!(std::fs::read_dir(root.join("storage/bottles")).unwrap().count(), 0);
+        assert_eq!(
+            manager.registry.list_jobs().unwrap().len(),
+            crate::registry::MAX_JOB_RECORDS
+        );
+        record.status = JobStatus::Failed;
+        record.error = Some("existing terminal update remains writable".into());
+        manager.registry.write_job(&record).unwrap();
+        assert_eq!(manager.registry.read_job(&record.id).unwrap().status, JobStatus::Failed);
+        drop(manager);
+        let registry = Registry::new(root.join("service"), root.join("storage")).unwrap();
+        registry.recover_interrupted_jobs().unwrap();
+        assert_eq!(registry.list_jobs().unwrap().len(), crate::registry::MAX_JOB_RECORDS);
+        assert_eq!(registry.read_job(&record.id).unwrap().status, JobStatus::Failed);
     }
 
     #[test]
@@ -1331,6 +1637,7 @@ mod shutdown_tests {
                 record,
                 cancel_requested: false,
                 cleanup_join_failed: false,
+                polling: Arc::new(Mutex::new(())),
             },
         );
         assert!(!handle.is_finished());

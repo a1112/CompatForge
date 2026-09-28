@@ -28,7 +28,9 @@ rejected. Preparation failures, cancellation, failed cleanup, and missing
 launchers retain the old selection. A later definition upsert cannot redirect
 the selected generation's launcher or runtime. Launch and rollback recheck
 launcher digests and the saved runtime against the supplied core configuration;
-runtime changes fail closed.
+runtime changes fail closed. The selected launcher digest is also supplied to
+`PreparedLaunch`, so replacement between generation verification and launch
+preparation cannot become newly authorized content.
 
 Generation state is the installation commit authority. Job reads reconcile
 installer status with that state, so an installer exit record saved immediately
@@ -61,7 +63,20 @@ for its lifetime. A second instance, including one using a different service roo
 with the same storage root, fails before recovery. Lock files are retained and
 never unlinked. A process-local operation mutex serializes preparation and
 application mutations; all owned handles, including failed cleanup handles,
-remain conflicts until cleanup has been confirmed. Service metadata is bounded
+remain conflicts until cleanup has been confirmed. Each job also has one event
+consumer gate spanning receive, state update, supervisor acknowledgement, and
+activation. A concurrent poll is rejected promptly with a conflict so it cannot
+consume an exit past an adverse event held by another reader. Cancel marks the
+job without waiting for that gate. Shutdown marks cancellation before requesting
+stop, then finalizes with the same gate -> operation -> job-map lock order.
+
+Job history is bounded to 4,096 records per service root. A separate persistence
+mutex admits a new `Preparing` record only when a slot exists, before generation
+or runtime effects. Updating an existing record remains allowed at capacity so
+terminal status, cleanup, and restart recovery cannot be blocked by the limit.
+The service does not prune history automatically. Operators can stop it and move
+completed, unreferenced job records into a separate offline archive to free slots;
+see the lifecycle guide for the preservation requirements. Service metadata is bounded
 to 4 MiB per record with bounded collections and IDs. Roots, metadata, launcher
 paths, and lock paths reject symbolic links and Windows reparse points.
 

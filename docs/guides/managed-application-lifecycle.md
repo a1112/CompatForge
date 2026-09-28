@@ -19,6 +19,10 @@ or accept runtime settings such as `WINEPREFIX` or `LD_PRELOAD`.
 {"schemaVersion":"1","requestId":"versions-7zip","operation":"applications.generations","payload":{"id":"7zip"}}
 ```
 
+Use one outstanding `jobs.poll` call per job. A concurrent poll returns the
+retryable conflict `job is already being polled`; retry after the first call
+returns. Cancellation remains available while a poll waits for an event.
+
 Poll until the returned job is terminal. `succeeded` requires successful runtime
 termination, supervisor cleanup, every declared launcher, and committed selection.
 `generationId` connects the job to a physical Bottle. `applications.generations`
@@ -78,3 +82,18 @@ launcher. The destination flag follows the
 [official installer argument documentation](https://www.sumatrapdfreader.org/docs/Installer-cmd-line-arguments).
 An older seeded recipe stays unchanged until explicitly upserted with the reviewed
 definition. Portable Sumatra artifacts belong to a separate recipe.
+
+Job history has a separate limit of 4,096 records per service root. At capacity,
+new jobs fail with `job history capacity reached (4096)` before any generation or
+runtime effects. Existing jobs can still finish, and their records remain
+readable and writable across service restart. No history is deleted automatically.
+
+To free capacity, stop the service, back up its service and runtime storage roots,
+and move only completed (`succeeded`, `failed`, or `cancelled`) job JSON records
+from `service/jobs` to a separate offline archive outside that directory. Keep
+any record referenced by a generation's `operation.jobId`, even if its job status
+is terminal. Preserve the generation records, Bottle prefixes, runtime storage,
+and all personal files. Retain the archived JSON for diagnostics, then reopen the
+service and retry. If an older service already exceeded the limit, use the same
+offline procedure before reopening; this version does not silently remove those
+older records.
