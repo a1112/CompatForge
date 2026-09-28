@@ -1,0 +1,47 @@
+{
+  "schemaVersion": "1",
+  "date": "2026-09-28",
+  "scope": "Unicode launch-argument prerequisite; not managed-generation or daily desktop acceptance",
+  "source": "3deedcd with the accompanying fixed UTF-8 Linux runtime-binding change",
+  "environment": {
+    "userspace": "Independent pinned Arch chroot, Wine 11.14 x86_64",
+    "display": "Private Xvfb 1280x800x24; no user desktop modified",
+    "isolation": "Mount, PID and network namespaces, tini PID 1, ordinary UID 1000",
+    "runtimePackDigest": "sha256:6b2a66327849bd5da3933011afdd5db6129f6cf2e246b8082daeb601f0b3afba"
+  },
+  "observations": [
+    {
+      "case": "original-binding",
+      "result": "failed",
+      "detail": "All three applications started but could not open Chinese file paths. Dialogs showed corrupted file names. The supervised process environment had no LANG or LC_ALL after env_clear."
+    },
+    {
+      "case": "explicit-UTF8-control",
+      "result": "passed",
+      "detail": "Changing only request LANG and LC_ALL to C.UTF-8 allowed all three applications to open the same existing fixtures."
+    },
+    {
+      "case": "new-provider-default",
+      "result": "passed",
+      "detail": "Regenerated contexts using the fixed provider; requests supplied DISPLAY only. 7-Zip displayed the archive, Notepad++ displayed the UTF-8 BOM Chinese text, and SumatraPDF displayed page 1 of the PDF. All service sessions exited successfully after joined cleanup."
+    }
+  ],
+  "checks": {
+    "red": "Existing fixed-binding equality test failed after adding expected LANG/LC_ALL values before changing the provider",
+    "green": "Actual Linux provider: 85 unit tests and 6 DXVK integration tests passed; clippy all-targets with -D warnings passed",
+    "requestOverride": "Planner regression verifies Chinese, spaces and percent arguments survive and request LANG=C/LC_ALL=C cannot replace the fixed binding"
+  },
+  "screenshots": {
+    "builderDirectory": "/srv/forge-apps-build/evidence/app-visual-prerequisites-provider-default",
+    "sha256": {
+      "7zip.png": "dfd7c2795d411014e13b7817fbed2c6a8b8baeba7503f7f1611e93579d37a240",
+      "notepad-plus-plus.png": "8c10a97f69f2f353a2289cd50c570c9d1a8e13c7260e342cee0e6dddcd3cbd72",
+      "sumatrapdf.png": "93a3065588438649d483ed6f3b1eabe846f124653b324ff54e8245e4da65e26a"
+    }
+  },
+  "remaining": [
+    "Some Chinese labels in 7-Zip lists and Notepad++ tabs still show missing-glyph boxes; font fallback is not fixed by the locale change",
+    "Existing serialized contexts must be regenerated to acquire the new binding",
+    "File save, managed lifecycle, desktop launch, reboot persistence and complete Chinese input remain separate acceptance gates"
+  ]
+}

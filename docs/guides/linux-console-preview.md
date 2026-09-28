@@ -16,6 +16,11 @@ records a real Wine 11.0 Console canary bound to an exact committed revision.
   x86_64 ELF executables, not shell wrappers, and report the same declared release.
 - A Runtime that works with `env_clear`, without inherited `LD_LIBRARY_PATH`,
   `HOME` or `PATH`. No Wine download, installation or discovery is performed.
+- Newly generated Linux runtime bindings fix `LANG` and `LC_ALL` to `C.UTF-8`
+  so Wine decodes Unicode command arguments and file names correctly after
+  `env_clear`. Regenerate older context files to obtain this binding; supplying
+  an ASCII locale in a launch request cannot override it. This fixes character
+  decoding, not the application's display language or font fallback.
 - Three new, absent, disjoint Runtime Store, Storage and Evidence roots outside
   the repository and materialized Runtime. The runner refuses reuse and overlap.
 

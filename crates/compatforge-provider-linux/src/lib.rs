@@ -724,6 +724,10 @@ fn build_provider_snapshot(
                 "COMPATFORGE_WINESERVER_EXECUTABLE_SHA256".into(),
                 runtime.wineserver.digest.clone(),
             ),
+            // Supervision clears the inherited environment. Wine must still
+            // decode POSIX argv and file names as UTF-8 on a clean launch.
+            ("LANG".into(), "C.UTF-8".into()),
+            ("LC_ALL".into(), "C.UTF-8".into()),
             ("WINEDEBUG".into(), "-all".into()),
             ("WINESERVER".into(), wineserver),
             ("WINEARCH".into(), "win64".into()),
@@ -3181,8 +3185,8 @@ mod tests {
                 mode: ExecutableMode::ImmutableArtifact,
                 sha256: None,
             },
-            arguments: Vec::new(),
-            environment: BTreeMap::new(),
+            arguments: vec!["Z:\\selected files\\中文 100%.txt".into()],
+            environment: BTreeMap::from([("LANG".into(), "C".into()), ("LC_ALL".into(), "C".into())]),
             constraints: LaunchConstraints {
                 allow_virtual_machine: false,
                 allow_remote: false,
@@ -3193,6 +3197,15 @@ mod tests {
             },
         };
         let plan = PolicyEngine::compile(&core, &request).expect("compile Linux Wine/native/wined3d plan");
+        assert!(plan.process.arguments.ends_with(&request.arguments));
+        assert_eq!(
+            plan.process.environment.get("LANG").map(String::as_str),
+            Some("C.UTF-8")
+        );
+        assert_eq!(
+            plan.process.environment.get("LC_ALL").map(String::as_str),
+            Some("C.UTF-8")
+        );
         assert_eq!(plan.runtime.provider, RuntimeKind::Wine);
         assert_eq!(plan.runtime.pack_id, config.wine_runtime.pack_id);
         assert_eq!(plan.runtime.pack_digest, config.wine_runtime.pack_digest);
@@ -3234,6 +3247,8 @@ mod tests {
                     "COMPATFORGE_WINESERVER_EXECUTABLE_SHA256".into(),
                     config.wine_runtime.wineserver.digest.clone(),
                 ),
+                ("LANG".into(), "C.UTF-8".into()),
+                ("LC_ALL".into(), "C.UTF-8".into()),
                 ("WINEDEBUG".into(), "-all".into()),
                 ("WINESERVER".into(), "/private/provider-runtime/bin/wineserver".into(),),
                 ("WINEARCH".into(), "win64".into()),
