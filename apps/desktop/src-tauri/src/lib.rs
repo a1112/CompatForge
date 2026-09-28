@@ -10,10 +10,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-#[cfg(target_os = "macos")]
-use tauri::TitleBarStyle;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 const INVALID_LAUNCH_ARGUMENTS: &str = "CompatForge 开发者验收启动参数无效";
@@ -328,8 +328,8 @@ fn ensure_tray(app: &AppHandle) -> Result<(), String> {
     let icon = app.default_window_icon().ok_or("缺少托盘图标")?;
     let show = MenuItem::with_id(app, "show-main", "显示 CompatForge", true, None::<&str>)
         .map_err(|error| error.to_string())?;
-    let quit = MenuItem::with_id(app, "quit", "退出 CompatForge", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
+    let quit =
+        MenuItem::with_id(app, "quit", "退出 CompatForge", true, None::<&str>).map_err(|error| error.to_string())?;
     let menu = Menu::with_items(app, &[&show, &quit]).map_err(|error| error.to_string())?;
     TrayIconBuilder::with_id("compatforge")
         .icon(icon.clone())
@@ -518,6 +518,8 @@ where
         .map_err(|_| DESKTOP_LAUNCH_FAILED)?;
 
     application.run(|app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_main_window(app_handle),
         RunEvent::WindowEvent {
             label,
             event: WindowEvent::CloseRequested { api, .. },
@@ -546,48 +548,13 @@ where
 }
 
 #[cfg(test)]
+mod window_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use compatforge_domain::CoreConfig;
-    use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(windows)]
     use std::os::windows::ffi::OsStringExt;
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-    #[test]
-    fn close_to_background_follows_persisted_setting() {
-        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("compatforge-close-setting-{}-{id}", std::process::id()));
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples/context-config.linux-arm64.json");
-        let mut config: CoreConfig = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
-        config.storage_root = root.join("storage").to_string_lossy().into_owned();
-        let service = Arc::new(
-            AutomationService::new(
-                config,
-                ServiceConfig {
-                    schema_version: SCHEMA_VERSION_V1.into(),
-                    service_root: root.join("service").to_string_lossy().into_owned(),
-                },
-            )
-            .unwrap(),
-        );
-        let mut runtime = DesktopRuntime::new(root.clone(), false, DesktopLaunchOptions::default());
-        runtime.service = Some(service.clone());
-        let state = AppState::new(runtime);
-
-        assert!(!close_to_background_enabled(&state));
-        let mut settings = service.get_settings().unwrap();
-        settings.close_to_background = true;
-        service.update_settings(&settings).unwrap();
-        assert!(close_to_background_enabled(&state));
-        state.shutdown();
-        assert!(!close_to_background_enabled(&state));
-
-        drop(service);
-        drop(state);
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
     fn crossover_arguments() -> [&'static str; 11] {
         [
