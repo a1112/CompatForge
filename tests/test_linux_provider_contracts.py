@@ -342,6 +342,20 @@ class LinuxProviderSchemaTests(unittest.TestCase):
             ):
                 self.assertFalse(accepts_string(relative, value), value)
 
+    def test_both_font_paths_reuse_the_canonical_absolute_linux_path_contract(self) -> None:
+        for schema_path in (PROVIDER_SCHEMA, BOOTSTRAP_SCHEMA):
+            with self.subTest(schema=schema_path.name):
+                schema = document(schema_path)
+                path = schema["properties"]["bottleFont"]["properties"]["path"]
+                self.assertEqual(path, {"$ref": "#/$defs/absoluteLinuxPath"})
+                definition = schema["$defs"][path["$ref"].rsplit("/", 1)[1]]
+                for value in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "/tmp/中文 字体.ttc"):
+                    self.assertTrue(accepts_string(definition, value), value)
+                for value in ("/", "/tmp/../font.ttc", "/tmp//font.ttc", "/tmp/./font.ttc",
+                              "/tmp/font.ttc/", "/tmp/font\n.ttc", "/tmp/font\r.ttc",
+                              "/tmp/font\0.ttc", "/tmp\\font.ttc", "font.ttc", "/" + "a" * 4096):
+                    self.assertFalse(accepts_string(definition, value), value)
+
     def test_path_patterns_use_ecma_safe_all_character_scans(self) -> None:
         schemas = (document(PROVIDER_SCHEMA), document(BOOTSTRAP_SCHEMA))
         patterns_by_kind: dict[str, list[str]] = {
