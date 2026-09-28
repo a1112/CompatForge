@@ -32,7 +32,7 @@
       "required": ["applicationId", "generationId", "launcherId"],
       "properties": {
         "applicationId": { "$ref": "#/$defs/token" },
-        "generationId": { "type": "string", "pattern": "^gen-[a-z0-9-]{1,92}$" },
+        "generationId": { "type": "string", "pattern": "^gen-job-[a-z0-9-]{1,88}$" },
         "launcherId": { "$ref": "#/$defs/token" }
       }
     },

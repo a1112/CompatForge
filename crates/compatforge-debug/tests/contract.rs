@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn target() -> DebugTarget {
     DebugTarget {
         application_id: "sample".into(),
-        generation_id: "gen-123".into(),
+        generation_id: "gen-job-123".into(),
         launcher_id: "main".into(),
     }
 }
@@ -29,11 +29,11 @@ fn pin() -> PinnedDebugger {
 
 #[test]
 fn wire_rejects_wrong_version_oversized_payload_and_unknown_commands() {
-    assert!(decode_request(br#"{"schemaVersion":"2","command":"launch","target":{"applicationId":"sample","generationId":"gen-123","launcherId":"main"}}"#).is_err());
+    assert!(decode_request(br#"{"schemaVersion":"2","command":"launch","target":{"applicationId":"sample","generationId":"gen-job-123","launcherId":"main"}}"#).is_err());
     assert!(decode_request(&vec![b' '; 65_537]).is_err());
     assert!(decode_request(br#"{"schemaVersion":"1","command":"attachPid","pid":1}"#).is_err());
     assert!(decode_request(br#"{"schemaVersion":"1","command":"evaluate","expression":"!shell"}"#).is_err());
-    assert!(decode_request(br#"{"schemaVersion":"1","command":"launch","target":{"applicationId":"sample","generationId":"gen-123","launcherId":"main"},"debuggerPath":"/tmp/gdb"}"#).is_err());
+    assert!(decode_request(br#"{"schemaVersion":"1","command":"launch","target":{"applicationId":"sample","generationId":"gen-job-123","launcherId":"main"},"debuggerPath":"/tmp/gdb"}"#).is_err());
 }
 
 #[test]
@@ -47,6 +47,11 @@ fn target_requires_managed_identity_not_host_pid_or_paths() {
     let mut target = target();
     target.generation_id = "1234".into();
     assert!(target.validate().is_err());
+    target.generation_id = "gen-other".into();
+    assert!(
+        target.validate().is_err(),
+        "only managed install job generations are valid"
+    );
 }
 
 #[test]
@@ -214,6 +219,6 @@ fn shutdown_reports_cleanup_failure_and_keeps_owned_session_for_retry() {
 
 #[test]
 fn typed_launch_decodes_without_arbitrary_host_process_fields() {
-    let request = decode_request(br#"{"schemaVersion":"1","command":"launch","target":{"applicationId":"sample","generationId":"gen-123","launcherId":"main"}}"#).unwrap();
+    let request = decode_request(br#"{"schemaVersion":"1","command":"launch","target":{"applicationId":"sample","generationId":"gen-job-123","launcherId":"main"}}"#).unwrap();
     assert_eq!(request, DebugRequest::Launch { target: target() });
 }

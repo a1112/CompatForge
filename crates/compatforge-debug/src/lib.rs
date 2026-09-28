@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -62,7 +64,7 @@ impl DebugTarget {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
         }
         if id(&self.application_id)
-            && self.generation_id.starts_with("gen-")
+            && self.generation_id.starts_with("gen-job-")
             && id(&self.generation_id)
             && id(&self.launcher_id)
         {

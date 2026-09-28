@@ -23,7 +23,12 @@ pub(crate) struct JobManager {
     registry: Arc<Registry>,
     config: CoreConfig,
     active: Mutex<HashMap<String, ActiveJob>>,
+    active_debug: Mutex<HashMap<String, DebugLease>>,
     operation: Mutex<()>,
+}
+
+pub(crate) struct SelectedDebugTarget {
+    pub executable: PathBuf,
 }
 
 struct ActiveJob {
@@ -32,6 +37,11 @@ struct ActiveJob {
     cancel_requested: bool,
     cleanup_join_failed: bool,
     polling: Arc<Mutex<()>>,
+}
+
+struct DebugLease {
+    application_id: String,
+    bottle_id: String,
 }
 
 trait JobProcess: ShutdownTarget + Send + Sync {
@@ -125,6 +135,77 @@ fn shutdown_handles(handles: &[(String, impl ShutdownTarget)], grace: Duration) 
 }
 
 impl JobManager {
+    /// Keep the lifecycle operation gate held until the provider has started.
+    /// Rollback and uninstall acquire the same gate, so a selected generation
+    /// cannot change between validation and process creation.
+    pub(crate) fn launch_selected_debug_session(
+        &self,
+        target: &compatforge_debug::DebugTarget,
+        launch: impl FnOnce(SelectedDebugTarget) -> Result<compatforge_debug::DebugSessionHandle, crate::ServiceError>,
+    ) -> Result<compatforge_debug::DebugSessionHandle, crate::ServiceError> {
+        let _operation = self.lock_operation().map_err(crate::ServiceError::Job)?;
+        let mut active_debug = self
+            .active_debug
+            .lock()
+            .map_err(|_| crate::ServiceError::Conflict("debug lease lock is poisoned"))?;
+        let generation = self
+            .registry
+            .lifecycle
+            .selected(&target.application_id)
+            .map_err(crate::ServiceError::Registry)?;
+        if generation.id != target.generation_id {
+            return Err(crate::ServiceError::Debug(compatforge_debug::DebugError::Unauthorized));
+        }
+        generation
+            .runtime
+            .as_ref()
+            .ok_or(crate::ServiceError::Conflict("selected generation has no runtime"))?
+            .check_config(&self.config)
+            .map_err(crate::ServiceError::Registry)?;
+        self.registry
+            .lifecycle
+            .verify_launchers(&generation)
+            .map_err(crate::ServiceError::Registry)?;
+        let launcher = generation
+            .definition
+            .launchers
+            .iter()
+            .find(|launcher| launcher.id == target.launcher_id)
+            .ok_or(crate::ServiceError::Debug(compatforge_debug::DebugError::Unauthorized))?;
+        let selected = SelectedDebugTarget {
+            executable: self.registry.lifecycle.launcher_path(&generation, &launcher.executable),
+        };
+        let handle = launch(selected)?;
+        active_debug.insert(
+            handle.session_id.clone(),
+            DebugLease {
+                application_id: target.application_id.clone(),
+                bottle_id: generation.definition.bottle_id,
+            },
+        );
+        Ok(handle)
+    }
+
+    /// Call only after the debug provider confirms that its owned process tree
+    /// has stopped. Failed cleanup retains the lease and blocks lifecycle edits.
+    pub(crate) fn end_debug_session(&self, session_id: &str) -> Result<(), JobError> {
+        let _operation = self.lock_operation()?;
+        self.active_debug
+            .lock()
+            .map_err(|_| JobError::Conflict("debug lease lock is poisoned"))?
+            .remove(session_id);
+        Ok(())
+    }
+
+    pub(crate) fn clear_debug_sessions(&self) -> Result<(), JobError> {
+        let _operation = self.lock_operation()?;
+        self.active_debug
+            .lock()
+            .map_err(|_| JobError::Conflict("debug lease lock is poisoned"))?
+            .clear();
+        Ok(())
+    }
+
     pub(crate) fn poll_active_jobs(&self) -> Result<(), JobError> {
         let ids: Vec<String> = self.lock_active()?.keys().cloned().collect();
         for id in ids {
@@ -173,6 +254,7 @@ impl JobManager {
             registry,
             config,
             active: Mutex::new(HashMap::new()),
+            active_debug: Mutex::new(HashMap::new()),
             operation: Mutex::new(()),
         }
     }
@@ -575,6 +657,15 @@ impl JobManager {
     }
 
     pub(crate) fn ensure_idle(&self, app_id: &str, bottle_id: &str) -> Result<(), JobError> {
+        if self
+            .active_debug
+            .lock()
+            .map_err(|_| JobError::Conflict("debug lease lock is poisoned"))?
+            .values()
+            .any(|lease| lease.application_id == app_id || lease.bottle_id == bottle_id)
+        {
+            return Err(JobError::Conflict("application or bottle has an active debug session"));
+        }
         for active in self.lock_active()?.values() {
             if active.record.application_id == app_id {
                 return Err(JobError::Conflict("application has a live or uncleared cleanup handle"));

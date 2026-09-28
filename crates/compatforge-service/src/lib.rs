@@ -47,7 +47,35 @@ impl AutomationService {
     /// Call only after stopping and draining clients. Stops owned jobs and joins
     /// their supervisor workers; this is a blocking desktop/service-owner API.
     pub fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
-        self.jobs.shutdown_and_wait()
+        let mut failures = Vec::new();
+        let debug_result = match self.debug.lock() {
+            Ok(mut sessions) => sessions.shutdown().map_err(|error| error.to_string()),
+            Err(_) => Err("debug supervisor lock is poisoned".to_string()),
+        };
+        match debug_result {
+            Ok(()) => {
+                if let Err(error) = self.jobs.clear_debug_sessions() {
+                    failures.push(ShutdownFailure {
+                        job_id: None,
+                        phase: ShutdownPhase::Persist,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            Err(message) => failures.push(ShutdownFailure {
+                job_id: None,
+                phase: ShutdownPhase::Terminate,
+                message,
+            }),
+        }
+        if let Err(error) = self.jobs.shutdown_and_wait() {
+            failures.extend(error.failures);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ShutdownError { failures })
+        }
     }
 
     pub fn new(core_config: CoreConfig, service_config: ServiceConfig) -> Result<Self, ServiceError> {
@@ -370,33 +398,48 @@ impl AutomationService {
 impl AutomationService {
     fn debug_session(&self, command: DebugRequest) -> Result<Value, ServiceError> {
         let uid = debug_owner_uid();
-        let mut sessions = self
-            .debug
-            .lock()
-            .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
         match command {
             DebugRequest::Launch { target } => {
-                // Reuse the desktop launch trust chain: only a selected Ready
-                // generation whose frozen runtime and launcher digests still
-                // match can become a debug target.
-                let eligible = self.desktop_launchers()?.iter().any(|entry| {
-                    entry.application_id == target.application_id
-                        && entry.generation_id == target.generation_id
-                        && entry.launcher_id == target.launcher_id
-                });
-                if !eligible {
-                    return Err(ServiceError::Debug(compatforge_debug::DebugError::Unauthorized));
-                }
-                let handle = sessions.launch(target, uid).map_err(ServiceError::Debug)?;
+                let handle = self.jobs.launch_selected_debug_session(&target, |_selected| {
+                    let mut sessions = self
+                        .debug
+                        .lock()
+                        .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
+                    sessions.launch(target.clone(), uid).map_err(ServiceError::Debug)
+                })?;
                 to_value(handle)
             }
-            DebugRequest::Status { handle } => to_value(sessions.state(&handle, uid).map_err(ServiceError::Debug)?),
+            DebugRequest::Status { handle } => {
+                let sessions = self
+                    .debug
+                    .lock()
+                    .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
+                to_value(sessions.state(&handle, uid).map_err(ServiceError::Debug)?)
+            }
             DebugRequest::Terminate { handle } => {
-                sessions.terminate(&handle, uid).map_err(ServiceError::Debug)?;
+                {
+                    let mut sessions = self
+                        .debug
+                        .lock()
+                        .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
+                    sessions.terminate(&handle, uid).map_err(ServiceError::Debug)?;
+                }
+                self.jobs
+                    .end_debug_session(&handle.session_id)
+                    .map_err(ServiceError::Job)?;
                 Ok(json!({"terminated":true}))
             }
             DebugRequest::Disconnect { handle } => {
-                sessions.disconnect(&handle, uid).map_err(ServiceError::Debug)?;
+                {
+                    let mut sessions = self
+                        .debug
+                        .lock()
+                        .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
+                    sessions.disconnect(&handle, uid).map_err(ServiceError::Debug)?;
+                }
+                self.jobs
+                    .end_debug_session(&handle.session_id)
+                    .map_err(ServiceError::Job)?;
                 Ok(json!({"disconnected":true}))
             }
         }
@@ -595,6 +638,81 @@ mod tests {
             ..request(&staged.id)
         };
         assert_eq!(service.call(invalid).unwrap_err().code(), "invalid-request");
+    }
+
+    #[test]
+    fn debug_launch_holds_generation_operation_gate_through_backend_start() {
+        let service = service();
+        service.seed_default_applications().unwrap();
+        let app = service.get_application("7zip").unwrap().application;
+        let staged = service.registry.lifecycle.stage(&app, "job-debug-atomic").unwrap();
+        let config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        let binding = &config.runtime_bindings[0];
+        let runtime = InstalledRuntime::from_config(
+            &config,
+            &compatforge_domain::RuntimeSelection {
+                provider: compatforge_domain::RuntimeKind::Wine,
+                pack_id: binding.pack_id.clone(),
+                pack_digest: binding.pack_digest.clone(),
+            },
+        )
+        .unwrap();
+        service
+            .registry
+            .lifecycle
+            .bind_runtime(&app.id, "job-debug-atomic", runtime)
+            .unwrap();
+        let path = service
+            .registry
+            .lifecycle
+            .launcher_path(&staged, &app.launchers[0].executable);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
+        let job: JobRecord = serde_json::from_value(json!({"schemaVersion":"1","id":"job-debug-atomic","applicationId":"7zip","generationId":staged.id,"kind":"install","status":"succeeded","createdAtMilliseconds":1,"updatedAtMilliseconds":1})).unwrap();
+        service.registry.lifecycle.finish(&job).unwrap();
+        let target = compatforge_debug::DebugTarget {
+            application_id: app.id,
+            generation_id: staged.id,
+            launcher_id: app.launchers[0].id.clone(),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let service_ref = &service;
+            scope.spawn(move || {
+                started_rx.recv().unwrap();
+                about_to_lock_tx.send(()).unwrap();
+                let _operation = service_ref.jobs.lock_operation().unwrap();
+                done_tx.send(()).unwrap();
+            });
+            let issued = compatforge_debug::DebugSessionHandle {
+                session_id: "debug-lease-test".into(),
+                capability: "test-capability".into(),
+            };
+            let returned = service
+                .jobs
+                .launch_selected_debug_session(&target, |selected| {
+                    assert_eq!(selected.executable, path);
+                    started_tx.send(()).unwrap();
+                    about_to_lock_rx
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .unwrap();
+                    assert!(done_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+                    Ok::<_, ServiceError>(issued.clone())
+                })
+                .unwrap();
+            assert_eq!(returned.session_id, issued.session_id);
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+            assert!(service
+                .jobs
+                .ensure_idle(&target.application_id, &app.bottle_id)
+                .is_err());
+            assert!(service.uninstall_application(&target.application_id).is_err());
+            service.jobs.end_debug_session(&issued.session_id).unwrap();
+            service.uninstall_application(&target.application_id).unwrap();
+        });
     }
 
     #[test]

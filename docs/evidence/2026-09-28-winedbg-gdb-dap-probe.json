@@ -1,0 +1,27 @@
+{
+  "environment": "isolated ForgeOS v3 x86_64 guest; copied dedicated Wine prefix; user and network namespace",
+  "fixture": "tests/fixtures/windows_debug_probe.c",
+  "observation": {
+    "breakpointVerified": true,
+    "stack": ["inner", "outer", "main"],
+    "stepLine": 8,
+    "localValue": "17",
+    "sehRaisedAtLine": 20,
+    "dapStopReason": "signal",
+    "disconnectSucceeded": true,
+    "privateNetworkNamespace": true,
+    "ownedPrefixProcessesAfterDisconnect": 0
+  },
+  "sha256": {
+    "wineLoader": "2d7731d7532318e06f47bb2b9d6cd7f8a934856f6d4711314c047dc8660b97e9",
+    "winedbgModule": "fde4a49ab5ab0b8a288455e924709590afe5eb69006126993bcc1903ce1d3be9",
+    "gdb": "df0a57e867295b94138de7417ef077e64cdc715ea8b7327b16286dfe038b0a24",
+    "fixtureExecutable": "47223256c1edcd7a0a0c9ebe67fbe54f6173fb9ad21dda726336cfe2ff218fbe",
+    "fixtureSource": "46edf944fd0b3e7ad5cc60c2e85b74a9f3a574d4c5719b0b3926a4907ff4b79b"
+  },
+  "limits": [
+    "Wine RaiseException appears as a DAP signal stop; structured Windows exception metadata was not observed.",
+    "MSVC/PDB and .NET debugging were not tested.",
+    "This probe does not demonstrate a production CompatForge provider or IDE endpoint."
+  ]
+}
