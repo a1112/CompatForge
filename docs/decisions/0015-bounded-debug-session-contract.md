@@ -59,12 +59,12 @@ Existing users require the explicit `user-init --refresh-debugger` migration;
 modified configs are preserved and rejected. The default `sourceMap` is empty,
 so source breakpoints require a reviewed mapping in a candidate configuration.
 
-The isolated ForgeOS v4 evidence in `docs/evidence/2026-09-29-debug-service-v4.md`
-established a real x64 C breakpoint, stack, local, next, Wine exception stop,
-unsafe request denial and cleanup. That was a checkpoint against the v2 bundle;
-the final Task 6 release requires a later immutable bundle/image acceptance for
-reverse source paths, stepIn/stepOut, pause and protocol fixes. Wine
-`RaiseException` appears as a GDB `signal` stop without structured SEH fields.
+The isolated ForgeOS v7 evidence in `docs/evidence/2026-09-29-debug-service-v7.md`
+established real x64 C breakpoints, reverse source paths, stack, local,
+stepIn/stepOut/next, pause, a Wine exception stop, unsafe request denial,
+cleanup and normal reboot persistence against the final pinned bundle. Wine
+`RaiseException` appears as a GDB `signal` stop without structured SEH fields;
+pause appears with the generic `stopped` reason.
 MSVC/PDB and .NET debugging are unverified, as is full Windows debugger parity.
 
 ## Dependency decision

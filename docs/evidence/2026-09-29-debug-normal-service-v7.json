@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "selectedGeneration": "gen-job-1790634842935-1",
+  "cliSha256": "b0fb6755ec12d552a3846197281e982ccdbc761fffef0b3dfd30030e0f23e332",
+  "workerSha256": "70c966863f34d12cf98e7e71fe612f61aa86a89fb93d80f282a7c9cd67f0483a",
+  "serviceConfigSha256": "a634335fcb742179c8f253b7dc9c9e09fb9de3d105a26cc3be4ff06e9557ae77",
+  "ordinaryServiceActive": true,
+  "launchDisconnectSucceeded": true,
+  "sessionDirectoryEmpty": true,
+  "privateListenerAbsent": true
+}

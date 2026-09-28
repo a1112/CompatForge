@@ -188,8 +188,7 @@ session and its copied Wine prefix. Source maps expose only reviewed paths;
 unknown backend paths are omitted from DAP source fields.
 
 The x64 C acceptance uses `tests/linux_debug_service_acceptance.py` and a
-test-only managed installer. See `docs/evidence/2026-09-29-debug-service-v4.md`
-for the first real breakpoint checkpoint. The final corrected bundle/image
-acceptance must include differing public/backend source paths and explicit
-stepIn, stepOut and pause evidence before claiming those operations. MSVC/PDB,
-.NET and Windows-native debugging parity are separate gates.
+test-only managed installer. The final pinned bundle, different public/backend
+source paths, stepIn, stepOut, pause, cleanup and normal reboot are recorded in
+`docs/evidence/2026-09-29-debug-service-v7.md`. MSVC/PDB, .NET, complete IDE UI
+integration and Windows-native debugging parity are separate gates.
