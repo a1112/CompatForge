@@ -207,21 +207,7 @@ impl JobManager {
         })();
 
         match start_result {
-            Ok(handle) => {
-                record.status = JobStatus::Running;
-                record.updated_at_milliseconds = now_milliseconds();
-                self.registry.write_job(&record).map_err(JobError::Registry)?;
-                self.lock_active()?.insert(
-                    job_id,
-                    ActiveJob {
-                        handle: Arc::new(handle),
-                        record: record.clone(),
-                        cancel_requested: false,
-                        cleanup_join_failed: false,
-                    },
-                );
-                Ok(record)
-            }
+            Ok(handle) => self.adopt_started_job(record, Arc::new(handle)),
             Err(error) => {
                 record.status = JobStatus::Failed;
                 record.error = Some(error.to_string());
@@ -230,6 +216,25 @@ impl JobManager {
                 Err(error)
             }
         }
+    }
+
+    fn adopt_started_job(&self, mut record: JobRecord, handle: Arc<dyn JobProcess>) -> Result<JobRecord, JobError> {
+        record.status = JobStatus::Running;
+        record.updated_at_milliseconds = now_milliseconds();
+        // A started process must acquire a cleanup owner before any fallible
+        // post-start persistence. Recover solely to retain ownership if the map
+        // was poisoned; ordinary operations still fail closed through lock_active.
+        self.active.lock().unwrap_or_else(|error| error.into_inner()).insert(
+            record.id.clone(),
+            ActiveJob {
+                handle,
+                record: record.clone(),
+                cancel_requested: false,
+                cleanup_join_failed: false,
+            },
+        );
+        self.registry.write_job(&record).map_err(JobError::Registry)?;
+        Ok(record)
     }
 
     pub(crate) fn poll(&self, id: &str, timeout_milliseconds: u64) -> Result<JobPollResult, JobError> {
@@ -357,32 +362,28 @@ impl JobManager {
     }
 
     pub(crate) fn shutdown(&self) {
-        let handles = self
-            .lock_active()
-            .map(|active| active.values().map(|job| Arc::clone(&job.handle)).collect::<Vec<_>>())
-            .unwrap_or_default();
-        for handle in handles {
+        for (_, handle) in self.owned_cleanup_handles() {
             let _ = handle.request_stop();
         }
     }
 
     pub(crate) fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
-        let handles = self
-            .lock_active()
-            .map_err(|error| ShutdownError {
-                failures: vec![ShutdownFailure {
-                    job_id: None,
-                    phase: ShutdownPhase::Snapshot,
-                    message: error.to_string(),
-                }],
-            })?
-            .iter()
-            .map(|(id, job)| (id.clone(), Arc::clone(&job.handle)))
-            .collect::<Vec<_>>();
+        let handles = self.owned_cleanup_handles();
         shutdown_handles(
             &handles,
             Duration::from_millis(self.config.supervisor.termination_grace_milliseconds),
         )
+    }
+
+    fn owned_cleanup_handles(&self) -> Vec<(String, Arc<dyn JobProcess>)> {
+        // Poison must not make already owned processes disappear from shutdown.
+        // This only snapshots handles for cleanup; it does not resume mutations.
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(id, job)| (id.clone(), Arc::clone(&job.handle)))
+            .collect()
     }
 
     fn resolve_launch(
@@ -635,6 +636,73 @@ mod shutdown_tests {
             },
         );
         (manager, handle, root)
+    }
+
+    #[test]
+    fn post_start_persistence_failure_retains_real_handle_for_error_exit_cleanup() {
+        let (manager, _, root) = terminal_poll_fixture(false);
+        let mut record = manager.active.lock().unwrap().remove("cleanup-job").unwrap().record;
+        record.status = JobStatus::Preparing;
+        manager.registry.write_job(&record).unwrap();
+        let mut plan: LaunchPlan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        plan.process = NativeCommand {
+            executable: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            arguments: vec![
+                "--exact".into(),
+                "jobs::shutdown_tests::sleeping_child_helper".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            environment: BTreeMap::from([("COMPATFORGE_SERVICE_SHUTDOWN_HELPER".into(), "sleep".into())]),
+            working_directory: std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+        };
+        plan.mounts.clear();
+        plan.graphics.backend = compatforge_domain::GraphicsBackendKind::WineD3d;
+        plan.graphics.version = None;
+        plan.translator.provider = compatforge_domain::TranslatorKind::Native;
+        plan.translator.version = None;
+        plan.lifecycle = ProcessLifecycle::default();
+        plan.lifecycle.maximum_runtime_milliseconds = Some(10_000);
+        let handle = Arc::new(ProcessSupervisor::start(&plan).unwrap());
+        assert!(
+            matches!(handle.next_event(Duration::from_secs(5)), EventPoll::Event(event) if event.kind == RuntimeEventKind::Started)
+        );
+        // Model a destination/rename failure after the process has really
+        // started, without making the pre-start Preparing write fail.
+        let job_path = root.join("service/jobs/cleanup-job.json");
+        std::fs::remove_file(&job_path).unwrap();
+        std::fs::create_dir(&job_path).unwrap();
+        assert!(matches!(
+            manager.adopt_started_job(record, handle.clone()),
+            Err(JobError::Registry(_))
+        ));
+        assert!(
+            manager.active.lock().unwrap().contains_key("cleanup-job"),
+            "live handle was lost after post-start persistence failure"
+        );
+        manager.shutdown_and_wait().unwrap();
+        assert!(handle.is_finished());
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_does_not_lose_owned_handles_when_the_job_map_is_poisoned() {
+        let (manager, handle, root) = terminal_poll_fixture(false);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _active = manager.active.lock().unwrap();
+            panic!("injected job-map failure");
+        }))
+        .is_err());
+        assert!(
+            manager.lock_active().is_err(),
+            "ordinary mutations must remain fail closed"
+        );
+        manager.shutdown_and_wait().unwrap();
+        assert_eq!(handle.joins.load(Ordering::SeqCst), 1);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

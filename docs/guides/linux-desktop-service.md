@@ -30,8 +30,13 @@ between the type check and open. The configured directory is caller-controlled;
 this is not a new system-wide trust boundary or a filesystem sandbox.
 
 Bootstrap probing and service operations run in Tauri blocking workers so disk,
-process and job polling work does not run on the UI event loop. The UI still owns
-this service's lifetime; a persistent daemon and disconnect recovery are separate
+process and job polling work does not run on the UI event loop. Bootstrap and
+service requests share one serial dispatcher, preventing service mutations from
+interleaving without waiting on that lock on the UI thread. A worker waiting
+for dispatch checks closing again after acquiring the lock. Started processes
+are registered for cleanup before the post-start job record is persisted, so a
+disk/write/rename failure cannot remove them from the error-exit cleanup set.
+The desktop still owns this service's lifetime; a persistent daemon and disconnect recovery are separate
 work. Closing the main window or requesting application exit closes worker
 admission, rejects queued requests and prevents late bootstrap publication. A
 tracked cleanup worker drains requests already in flight, stops all owned jobs

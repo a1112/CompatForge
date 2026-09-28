@@ -237,7 +237,6 @@ struct BootstrapResult {
 #[derive(Clone)]
 struct AppState {
     runtime: Arc<Mutex<DesktopRuntime>>,
-    bootstrap: Arc<Mutex<()>>,
     lifecycle: Arc<DesktopLifecycle>,
 }
 
@@ -245,7 +244,6 @@ impl AppState {
     fn new(runtime: DesktopRuntime) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
-            bootstrap: Arc::new(Mutex::new(())),
             lifecycle: Arc::new(DesktopLifecycle::default()),
         }
     }
@@ -314,8 +312,12 @@ async fn bootstrap_runtime(state: State<'_, AppState>) -> Result<RuntimeSnapshot
 }
 
 fn bootstrap_runtime_blocking(state: &AppState, permit: WorkerPermit) -> Result<RuntimeSnapshot, String> {
-    let _bootstrap = state.bootstrap.lock().map_err(|_| "Bootstrap 状态锁已损坏")?;
-    permit.ensure_open().map_err(str::to_owned)?;
+    permit
+        .dispatch(|| bootstrap_runtime_serialized(state, &permit))
+        .map_err(str::to_owned)?
+}
+
+fn bootstrap_runtime_serialized(state: &AppState, permit: &WorkerPermit) -> Result<RuntimeSnapshot, String> {
     // Bootstrap is idempotent while this desktop owns a ready service. Never
     // replace it behind active jobs or lose the only cleanup owner.
     if let Some(snapshot) = permit
@@ -382,8 +384,12 @@ fn service_call_blocking(
 ) -> Result<ServiceResponse, String> {
     // Admission to actual dispatch is checked on the worker, not before it is
     // queued. The permit remains live until the call's service clone is dropped.
-    let service = permit.publish(|| service(state)).map_err(str::to_owned)??;
-    service.call(request).map_err(|error| error.to_string())
+    permit
+        .dispatch(|| {
+            let service = permit.publish(|| service(state)).map_err(str::to_owned)??;
+            service.call(request).map_err(|error| error.to_string())
+        })
+        .map_err(str::to_owned)?
 }
 
 #[tauri::command]

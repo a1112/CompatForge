@@ -17,6 +17,7 @@ struct State {
 pub struct DesktopLifecycle {
     state: Mutex<State>,
     drained: Condvar,
+    dispatch: Mutex<()>,
 }
 
 pub struct WorkerPermit {
@@ -73,6 +74,14 @@ impl DesktopLifecycle {
 }
 
 impl WorkerPermit {
+    /// Execute on a background worker only. Bootstrap and service mutations use
+    /// this shared serial dispatcher and recheck closing after waiting for it.
+    pub fn dispatch<T>(&self, operation: impl FnOnce() -> T) -> Result<T, &'static str> {
+        let _dispatch = self.lifecycle.dispatch.lock().map_err(|_| "应用服务队列状态锁已损坏")?;
+        self.ensure_open()?;
+        Ok(operation())
+    }
+
     pub fn ensure_open(&self) -> Result<(), &'static str> {
         self.check(&self.lifecycle.state())
     }
@@ -112,6 +121,69 @@ mod tests {
         mpsc,
     };
     use std::thread;
+
+    #[test]
+    fn two_dispatch_requests_do_not_overlap() {
+        let lifecycle = Arc::new(DesktopLifecycle::default());
+        let first = lifecycle.admit().unwrap();
+        let second = lifecycle.admit().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let first_events = events.clone();
+        let second_events = events.clone();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (queued, queued_rx) = mpsc::channel();
+        let first_worker = thread::spawn(move || {
+            first.dispatch(|| {
+                first_events.lock().unwrap().push("first-start");
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                first_events.lock().unwrap().push("first-end");
+            })
+        });
+        entered_rx.recv().unwrap();
+        let protected = lifecycle.dispatch.try_lock().is_err();
+        let second_worker = thread::spawn(move || {
+            queued.send(()).unwrap();
+            second.dispatch(|| second_events.lock().unwrap().push("second"))
+        });
+        queued_rx.recv().unwrap();
+        release.send(()).unwrap();
+        first_worker.join().unwrap().unwrap();
+        second_worker.join().unwrap().unwrap();
+        assert!(protected, "active dispatch did not own the shared serialization lock");
+        assert_eq!(*events.lock().unwrap(), ["first-start", "first-end", "second"]);
+    }
+
+    #[test]
+    fn dispatch_waiter_rechecks_close_before_executing() {
+        let lifecycle = Arc::new(DesktopLifecycle::default());
+        let first = lifecycle.admit().unwrap();
+        let second = lifecycle.admit().unwrap();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (queued, queued_rx) = mpsc::channel();
+        let executed = Arc::new(AtomicBool::new(false));
+        let second_executed = executed.clone();
+        let first_worker = thread::spawn(move || {
+            first.dispatch(|| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+        let second_worker = thread::spawn(move || {
+            queued.send(()).unwrap();
+            second.dispatch(|| second_executed.store(true, Ordering::SeqCst))
+        });
+        queued_rx.recv().unwrap();
+        assert!(lifecycle.begin_close());
+        release.send(()).unwrap();
+        first_worker.join().unwrap().unwrap();
+        assert_eq!(second_worker.join().unwrap(), Err(CLOSING));
+        assert!(!executed.load(Ordering::SeqCst));
+        lifecycle.wait_for_workers();
+    }
 
     #[test]
     fn close_during_bootstrap_prevents_late_publication() {
