@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "1",
+  "date": "2026-09-28",
+  "scope": "Task 2 managed application transactions; desktop and actual reboot gates remain pending",
+  "environment": {
+    "userspace": "Pinned Arch chroot, Wine 11.14 x86_64",
+    "display": "Private Xvfb 1280x800x24",
+    "isolation": "Mount, PID and network namespaces; tini PID 1; ordinary UID 1000",
+    "runtimePackDigest": "sha256:6b2a66327849bd5da3933011afdd5db6129f6cf2e246b8082daeb601f0b3afba"
+  },
+  "realTransactions": {
+    "sourceRevision": "facb72bcd555a4c8357fe86235e598ec441aa22f",
+    "binarySha256": "cd867aea3acf0e86d0507da4cc6d4008150e7321e9f90f586d788fbf666a5f26",
+    "result": "passed",
+    "cases": [
+      "Fresh 7-Zip install, verified launcher, ready selected generation",
+      "Fresh Notepad++ install, verified launcher, ready selected generation",
+      "Fresh SumatraPDF install, verified launcher, ready selected generation",
+      "Second 7-Zip install creates an independent generation",
+      "Rollback selects the retained verified generation",
+      "Changed registry recipe cannot replace the frozen selected launch definition; real launch cancellation cleans up",
+      "EOF during a running application joins cleanup and persists cancelled status across service restart",
+      "Installer exit zero with missing declared launcher cannot replace the previous selection",
+      "Cancelled install retains the previous selected generation",
+      "Competing service owner is rejected while the first owner remains usable",
+      "Uninstall deactivates but retains prefixes and a known personal-file digest; rollback and service restart preserve it",
+      "Changed installer SHA-256 is rejected while selection remains unchanged"
+    ],
+    "cleanup": "No Wine processes remained after normal cleanup; only tini, test Python, Xvfb and ps were observed",
+    "crash": {
+      "method": "SIGKILL the owned CLI during a real Wine launch, then reopen the same service",
+      "remainingWineProcessesObserved": 9,
+      "selectedGenerationPreserved": true,
+      "interruptedOperationQuarantined": true,
+      "sameBootRecoveryRejected": true,
+      "note": "PID namespace exit later reaped the test processes; this is not evidence of a kernel reboot"
+    },
+    "rawEvidenceDirectory": "/srv/forge-apps-build/evidence/apps-managed-task2-c",
+    "rawEvidenceSha256": {
+      "api.jsonl": "e0ecedc6bd18c7979dbd4b09b178898b085217764c6ed840b4e9bf1f82128976",
+      "observations.json": "bb551248bcf08e3e1ae9c5a3656791c80ac4fe02f15c2db914073cc414e47e4f",
+      "crash-same-boot/observations.json": "8ad428b504082b55fdb0d907fddc3b0e3aa88a8c2eeb9d9968e70265edfb72f7"
+    }
+  },
+  "finalDelta": {
+    "sourceRevision": "73bfc277b7c985d85e8b052419e9371eb6e3be62",
+    "binarySha256": "60dc88e238ea27b44cb4c7deb93009f6213051d6f46210b6239c11f47c186f46",
+    "linuxChecks": {
+      "cliTestsPassed": 71,
+      "serviceTestsPassed": 60,
+      "serviceHelperTestsIgnored": 2,
+      "desktopBackendTestsPassed": 13,
+      "clippyAllTargetsWarningsDenied": "passed",
+      "repositoryValidator": "passed",
+      "cliBuild": "passed"
+    },
+    "frontendChecks": "npm run check and npm run build passed for the managed-Bottle consumer change",
+    "readOnlyRealFixtureCheck": "Existing installed generations expose managed=true, applicationIds=[7zip] and one installed launcher; pending quarantine is preserved; service exits cleanly",
+    "review": "Independent specification and quality reviews passed after encoded-size, concurrency, capacity and pinned-launcher corrections",
+    "logs": [
+      "/srv/forge-apps-build/evidence/task2-73bfc277-build.log",
+      "/srv/forge-apps-build/evidence/task2-73bfc277-query.json"
+    ]
+  },
+  "remaining": [
+    "Actual recovery after a different kernel boot identity",
+    "Desktop launcher, icon/task grouping and file association acceptance",
+    "Saving a file through the real application UI and verifying it after VM reboot",
+    "CJK font fallback in Wine GDI labels",
+    "The personal-file retention test wrote its fixture using Python, not the application Save command",
+    "A Wine Bottle is not a security sandbox; the test network namespace does not prove the product image provides that isolation"
+  ]
+}
