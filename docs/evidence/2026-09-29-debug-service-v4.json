@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "selectedGeneration": "gen-job-1790631513090-1",
+  "cliSha256": "1a01d38fbbb1d9ccae45ee01d0301b10b02928652c15150e639cc6ce2c3e5825",
+  "installerSha256": "fda570c4e7a0041d95cd33b2d5c2b74b31782cbc3a12aa059c233cde93c3f55b",
+  "fixtureSha256": "47223256c1edcd7a0a0c9ebe67fbe54f6173fb9ad21dda726336cfe2ff218fbe",
+  "sourceSha256": "46edf944fd0b3e7ad5cc60c2e85b74a9f3a574d4c5719b0b3926a4907ff4b79b",
+  "serviceConfigSha256": "7f5b32509dedab604d458d27833bafd240a38be5f13d20a30fa74b386d18f18a",
+  "workerSha256": "6e9d8045cb6b160314cdde0d7399973ea9bb6087d959edf8e43f29490a6b7872",
+  "gdbSha256": "df0a57e867295b94138de7417ef077e64cdc715ea8b7327b16286dfe038b0a24",
+  "observation": {
+    "breakpointVerified": true,
+    "initialBreakpointPending": true,
+    "stack": [
+      "inner",
+      "outer",
+      "main"
+    ],
+    "stepLine": 8,
+    "localValue": "17",
+    "exceptionStopReason": "signal",
+    "disconnectSucceeded": true,
+    "unsafeEvaluateRejected": true,
+    "sanitizedDapTranscript": [
+      {
+        "type": "response",
+        "command": "initialize",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "initialized"
+      },
+      {
+        "type": "response",
+        "command": "evaluate",
+        "success": false
+      },
+      {
+        "type": "response",
+        "command": "setBreakpoints",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "response",
+        "command": "configurationDone",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "attach",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "breakpoint"
+      },
+      {
+        "type": "event",
+        "event": "process"
+      },
+      {
+        "type": "event",
+        "event": "thread"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "attach"
+      },
+      {
+        "type": "response",
+        "command": "continue",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "breakpoint"
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "breakpoint"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "next",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "step"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "scopes",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "variables",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "continue",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "signal"
+      },
+      {
+        "type": "response",
+        "command": "disconnect",
+        "success": true
+      }
+    ]
+  },
+  "privateListenerAbsent": true,
+  "sessionDirectoryEmpty": true
+}
