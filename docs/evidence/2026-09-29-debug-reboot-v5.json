@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "bootIdBefore": "40879ded-5e14-4e10-b656-365a8fbf46a5",
+  "bootIdAfter": "da83c98e-99cd-48fc-a77b-de35d0e72ee3",
+  "selectedGeneration": "gen-job-1790633717734-1",
+  "serviceConfigSha256": "9d5ac31a6b4ffb959082500e68d42e1968c4fe04a90e1bca04deafe6206e6aec",
+  "cliSha256": "6c4e517a5fd1f5e812d141bb8c52ab94e923a04d927bed40868fd3f98f8c4bdd",
+  "workerSha256": "e18373fc76bae94ba982aa76c4686e5aa34a020654fa97d7ee254ee844042d41",
+  "gdbSha256": "df0a57e867295b94138de7417ef077e64cdc715ea8b7327b16286dfe038b0a24",
+  "ordinaryServiceActive": true,
+  "debugLaunchDisconnectAfterReboot": true,
+  "sessionDirectoryEmpty": true,
+  "privateListenerAbsent": true,
+  "fixtureSha256": "ea376c6a96392c9d369cdd392fcace3d53572e16552c4907e3a6fac7829d2f19"
+}

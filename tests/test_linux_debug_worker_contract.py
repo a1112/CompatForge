@@ -20,6 +20,16 @@ class WorkerContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker.request_id({"requestId": value}, 1)
 
+    def test_overflow_metadata_never_repeats_unbounded_backend_fields(self):
+        huge = {"type": "response", "command": "x" * (worker.MAX - 100),
+                "request_seq": 8, "body": {"value": "private"}}
+        metadata = worker.oversized_metadata(huge)
+        self.assertEqual(metadata, {"type": "response", "command": None, "request_seq": 8})
+        self.assertLess(len(json.dumps({"requestId": 2, "oversized": metadata}).encode()), 256)
+        self.assertEqual(worker.oversized_metadata({"type": "request", "command": "runInTerminal"}),
+                         {"type": "event", "command": None, "request_seq": None})
+        self.assertEqual(worker.oversized_metadata({"type": "response", "command": ["bad"]})["command"], None)
+
     def test_near_limit_dap_body_cannot_overflow_worker_wrapper(self):
         small = {"seq": 1, "type": "event", "event": "output", "body": {"output": "x" * 100}}
         self.assertTrue(worker.response_fits([small]))

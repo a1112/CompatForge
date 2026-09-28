@@ -1,0 +1,271 @@
+{
+  "schemaVersion": 1,
+  "selectedGeneration": "gen-job-1790633717734-1",
+  "cliSha256": "6c4e517a5fd1f5e812d141bb8c52ab94e923a04d927bed40868fd3f98f8c4bdd",
+  "installerSha256": "fda570c4e7a0041d95cd33b2d5c2b74b31782cbc3a12aa059c233cde93c3f55b",
+  "fixtureSha256": "ea376c6a96392c9d369cdd392fcace3d53572e16552c4907e3a6fac7829d2f19",
+  "sourceSha256": "904fa8f4e261accc5e8436e1cc25a0ce39f0dbf4a9272393aeb64aa4c8275d85",
+  "serviceConfigSha256": "06ab8e4882ded34279cb8c7a1229e672c24955c03b14963ad06c4ff1996fde94",
+  "workerSha256": "e18373fc76bae94ba982aa76c4686e5aa34a020654fa97d7ee254ee844042d41",
+  "gdbSha256": "df0a57e867295b94138de7417ef077e64cdc715ea8b7327b16286dfe038b0a24",
+  "observation": {
+    "breakpointVerified": true,
+    "initialBreakpointPending": true,
+    "stack": [
+      "inner",
+      "outer",
+      "main"
+    ],
+    "stepInVerified": true,
+    "stepOutVerified": true,
+    "pauseVerified": true,
+    "pauseStopReason": "stopped",
+    "sourceReverseMapped": true,
+    "dapOutputSequenceMonotonic": true,
+    "stepLine": 8,
+    "localValue": "17",
+    "exceptionStopReason": "signal",
+    "disconnectSucceeded": true,
+    "unsafeEvaluateRejected": true,
+    "sanitizedDapTranscript": [
+      {
+        "type": "response",
+        "command": "initialize",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "initialized"
+      },
+      {
+        "type": "response",
+        "command": "evaluate",
+        "success": false
+      },
+      {
+        "type": "response",
+        "command": "setBreakpoints",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "response",
+        "command": "configurationDone",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "launch",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "breakpoint"
+      },
+      {
+        "type": "event",
+        "event": "process"
+      },
+      {
+        "type": "event",
+        "event": "thread"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "module"
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "attach"
+      },
+      {
+        "type": "response",
+        "command": "continue",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "breakpoint"
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "breakpoint"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "stepIn",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "step"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "stepIn",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "step"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "next",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "step"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "scopes",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "variables",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "stepOut",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "step"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "stepOut",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "step"
+      },
+      {
+        "type": "response",
+        "command": "stackTrace",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "continue",
+        "success": true
+      },
+      {
+        "type": "response",
+        "command": "pause",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "thread"
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "stopped"
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "response",
+        "command": "continue",
+        "success": true
+      },
+      {
+        "type": "event",
+        "event": "thread"
+      },
+      {
+        "type": "event",
+        "event": "stopped",
+        "reason": "signal"
+      },
+      {
+        "type": "event",
+        "event": "output"
+      },
+      {
+        "type": "response",
+        "command": "disconnect",
+        "success": true
+      }
+    ]
+  },
+  "privateListenerAbsent": true,
+  "sessionDirectoryEmpty": true
+}

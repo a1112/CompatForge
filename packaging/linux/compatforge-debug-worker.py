@@ -20,6 +20,9 @@ from collections import deque
 
 MAX = 64 * 1024
 PORT = 25000
+SAFE_DAP_COMMANDS = frozenset({"initialize", "attach", "setBreakpoints", "configurationDone", "threads",
+                               "continue", "pause", "next", "stepIn", "stepOut", "stackTrace", "scopes",
+                               "variables", "terminate", "disconnect"})
 
 
 class OversizedDapResponse(Exception):
@@ -38,6 +41,18 @@ def response_fits(messages: list[dict]) -> bool:
     # Leave room for the control requestId and JSON wrapper emitted below.
     raw = json.dumps({"messages": messages}, separators=(",", ":"), ensure_ascii=False).encode()
     return len(raw) <= MAX - 256
+
+
+def oversized_metadata(message: dict) -> dict:
+    # A malformed backend field must not overflow the control envelope used
+    # to report an oversized DAP body. Rust converts unknown responses to a
+    # bounded stderr output event rather than exposing their contents.
+    kind = "response" if message.get("type") == "response" else "event"
+    command = message.get("command")
+    sequence = message.get("request_seq")
+    return {"type": kind,
+            "command": command if kind == "response" and type(command) is str and command in SAFE_DAP_COMMANDS else None,
+            "request_seq": sequence if type(sequence) is int and 0 < sequence <= 2**63 - 1 else None}
 
 
 class WorkerTerminated(Exception):
@@ -192,10 +207,7 @@ class DapPipe:
 def safe_forward(message: dict, config: dict) -> None:
     command = message.get("command")
     args = message.get("arguments")
-    allowed = {"initialize", "attach", "setBreakpoints", "configurationDone", "threads",
-               "continue", "pause", "next", "stepIn", "stepOut", "stackTrace", "scopes",
-               "variables", "terminate", "disconnect"}
-    if message.get("type") != "request" or command not in allowed or not isinstance(args, dict):
+    if message.get("type") != "request" or command not in SAFE_DAP_COMMANDS or not isinstance(args, dict):
         raise ValueError("unsupported DAP request")
     if command == "attach" and (args != {"program": config["program"], "target": f"127.0.0.1:{PORT}"}):
         raise ValueError("unbound debugger target")
@@ -278,10 +290,7 @@ def run(config: dict) -> None:
             try:
                 messages = dap.drain(0.05 if op == "send" else 0.2)
             except OversizedDapResponse as error:
-                message = error.message
-                emit({"requestId": current_id, "oversized": {
-                    "type": message.get("type"), "command": message.get("command"),
-                    "request_seq": message.get("request_seq")}})
+                emit({"requestId": current_id, "oversized": oversized_metadata(error.message)})
                 continue
             emit({"requestId": current_id, "messages": messages})
     finally:
