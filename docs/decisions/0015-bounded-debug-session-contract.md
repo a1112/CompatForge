@@ -1,60 +1,75 @@
-# ADR 0015: bounded debug session contract before provider execution
+# ADR 0015: bounded managed Windows debug session
 
-Status: accepted for Stage 2 Task 5. Real breakpoints and DAP are Task 6 gates.
+Status: accepted for Stage 2 Tasks 5 and 6. Task 5 established the authority
+contract; Task 6 supplies the Linux WineDbg/GDB provider and stdio DAP adapter.
 
 ## Authority and identity
 
-`compatforge-cli debug-session <debug-request.json>` sends a validated request to
-the existing private Linux user service socket. The service already requires a
-caller-owned 0700 runtime directory, a 0600 socket and matching kernel peer UID.
-No TCP endpoint is opened. The command does not accept a host PID, debugger
-path, debugger console text, expression, shell command or environment override.
-The debug payload is limited to 64 KiB inside the service's 1 MiB outer frame.
+`compatforge-cli debug-session <request.json>` talks to the private Linux user
+service socket. The service checks its caller-owned 0700 runtime directory,
+0600 socket and matching peer UID. A launch names a registered application,
+its **currently selected** Ready generation and declared launcher. The service
+holds its operation lock through selected-generation verification and provider
+startup, then pins the application and Bottle against update, rollback and
+uninstall until the debug process tree is confirmed gone.
 
-A target names an application, selected generation and declared launcher. Before
-provider launch, the service reuses the desktop launch inventory, which verifies
-the selected Ready generation, frozen Runtime Pack binding and installed launcher
-digests. The generic supervisor stores that target and the owning UID, and
-returns an unpredictable 256-bit capability with an opaque session ID. Both UID
-and capability are checked on subsequent operations. A client's disconnect from
-the service socket alone does not transfer ownership or terminate a session.
+The supervisor returns an opaque session ID and 256-bit random capability.
+Subsequent operations check UID and capability. At most eight sessions may be
+live; the last 32 terminal handles permit idempotent replies. `terminate` and
+`disconnect` release a session only after provider cleanup succeeds. Service
+shutdown attempts all owned sessions. On a service crash, the worker's private
+PID namespace and `unshare --kill-child` kill descendants; a replacement
+service refuses a debug session directory while any Wine process retains its
+owned prefix, then reclaims process-free stale directories.
 
-The v1 commands are `launch`, `status`, `terminate` and `disconnect`. The
-supervisor checks state transitions and invokes a backend once for each terminal
-operation; a cleanup failure retains the owned session and surfaces an error.
-At most eight live sessions are admitted. Successful terminal sessions release
-admission immediately; only the most recent 32 terminal handles are retained
-for idempotent replies. An evicted handle receives `unauthorized`, and an active
-session is never evicted to reclaim terminal history.
-Its explicit `shutdown` retries all owned sessions and reports failure. Task 6
-must wire that cleanup into the service shutdown gate when replacing the
-unavailable backend with a real process provider. An unexpected owner-process
-exit still relies on the provider's owned process-tree cleanup contract.
+No request supplies an arbitrary executable, host PID, debugger binary,
+environment, command line, GDB console command or network listener. The
+selected managed executable, pinned Runtime Pack, WineDbg, GDB and worker bytes
+are verified before spawn. The worker runs under the ordinary account in a
+private user, network and PID namespace. Its fixed WineDbg TCP port is visible
+only on that namespace's loopback. Control traffic is bounded JSON over the
+worker's inherited stdin/stdout; only the CLI's DAP interface faces an IDE.
 
-## Runtime binding and current availability
+## Public DAP boundary
 
-`packaging/linux/debugger-runtime.json` names the current Wine Runtime Pack but
-sets `available: false` and leaves WineDbg/GDB digests null. The isolated ForgeOS
-v3 guest has WineDbg but no GDB, so a debugger cannot be claimed as installed.
-`DebuggerPackageBinding::trusted` rejects a missing binary pin, a provider ID
-change or a Runtime Pack digest mismatch. `PinnedDebugger::verify_executable`
-checks each binary digest separately. Task 6 will obtain measured package
-artifacts, pin their digests and verify the actual files before execution.
-No untrusted debugger path is accepted from the public request.
+`compatforge-cli debug-adapter <managed-debug-launch.json>` opens one managed
+session and speaks framed DAP on stdin/stdout. The launch file contains the
+same selected target as `debug-session`. The IDE's `launch` metadata is
+discarded and replaced with that target; the GDB `attach` target, executable
+and source mappings are synthesized by the service. An IDE cannot attach to a
+host process or choose a debugger path. DAP output has positive monotonic
+sequence numbers, including rejected requests and terminal replies.
 
-The production service currently uses `UnavailableBackend`: an eligible launch
-returns `unavailable` without creating a session. Tests use a synthetic backend
-only to exercise ownership, idempotency and state logic. These tests do not prove
-WineDbg/GDB, breakpoints, DAP or IDE debugging. MSVC/PDB and .NET remain separate
-capability gates.
+Only `initialize`, `launch`, `setBreakpoints`, `configurationDone`, `threads`,
+`continue`, `pause`, `next`, `stepIn`, `stepOut`, `stackTrace`, `scopes`,
+`variables`, `terminate` and `disconnect` are admitted. Source paths in
+breakpoints must match a reviewed one-to-one `sourceMap`; source paths returned
+by GDB are mapped back to the public paths, and unmapped source locations are
+omitted. `evaluate`, REPL, memory access, disassembly, reverse DAP requests
+such as `runInTerminal`, and unknown commands are rejected. The initialize
+reply advertises only configuration-done and terminate support. Frames,
+control lines, collections and wait times are bounded; a single oversized
+backend response becomes a failed DAP response without terminating its target.
+
+## Availability and limits
+
+The image must install and pin WineDbg and the GDB runtime, then copy the
+root-owned `debuggerRuntime` template into the ordinary user's service config.
+Existing users require the explicit `user-init --refresh-debugger` migration;
+modified configs are preserved and rejected. The default `sourceMap` is empty,
+so source breakpoints require a reviewed mapping in a candidate configuration.
+
+The isolated ForgeOS v4 evidence in `docs/evidence/2026-09-29-debug-service-v4.md`
+established a real x64 C breakpoint, stack, local, next, Wine exception stop,
+unsafe request denial and cleanup. That was a checkpoint against the v2 bundle;
+the final Task 6 release requires a later immutable bundle/image acceptance for
+reverse source paths, stepIn/stepOut, pause and protocol fixes. Wine
+`RaiseException` appears as a GDB `signal` stop without structured SEH fields.
+MSVC/PDB and .NET debugging are unverified, as is full Windows debugger parity.
 
 ## Dependency decision
 
-The new `compatforge-debug` crate uses the existing pinned workspace `serde`,
-`serde_json` and `sha2`. It adds `getrandom = 0.2.16` solely to obtain session
-capabilities from the operating system CSPRNG; failure refuses a session.
-Upstream: https://github.com/rust-random/getrandom/tree/v0.2.16 . License:
-MIT OR Apache-2.0. `Cargo.lock` records the exact transitive resolution;
-release packaging must retain its license notice. The provider remains separate
-from the contract, so this dependency does not expose a debugger or network
-listener by itself.
+`compatforge-debug` uses workspace `serde`, `serde_json`, `sha2` and
+`getrandom = 0.2.16` for the operating-system CSPRNG. `Cargo.lock` records the
+exact resolution. The dependency is MIT OR Apache-2.0 and release packaging
+retains its notice: <https://github.com/rust-random/getrandom/tree/v0.2.16>.

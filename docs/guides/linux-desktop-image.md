@@ -17,12 +17,15 @@ python3 tools/build_linux_desktop_bundle.py \
   --source-commit FULL_COMMIT --output /absolute/new/bundle
 ```
 
-Pin the reported `bundleSha256` independently in ForgeOS. The closed receipt
-binds eight fixed paths, modes and hashes, source commit and Cargo lock. Both
+Pin the reported `bundleSha256` independently in ForgeOS. The v2 closed receipt
+binds nine fixed paths, modes and hashes, source commit and Cargo lock. Both
 client locations contain identical bytes: the desktop contract uses
 `/usr/bin/compatforge-cli`; existing OS probes use
 `/usr/libexec/forge/compatforge-cli`. The FFI remains at
-`/usr/lib/compatforge/libcompatforge.so`.
+`/usr/lib/compatforge/libcompatforge.so`. The receipt also pins the private
+`/usr/lib/compatforge/compatforge-debug-worker.py` bytes. ForgeOS installs the
+separately verified GDB runtime under `/opt/compatforge/debugger` and checks
+the image's fixed WineDbg executable and module hashes.
 
 `packaging/linux/desktop-runtime.json` pins the reviewed Wine 11.14 executable
 pair and Noto CJK font already present in the source image. The producer adds
@@ -128,3 +131,65 @@ Use separate real Windows-file inputs for 7-Zip and SumatraPDF, verify menu/Dock
 launches and task grouping, and preserve declined permissions/fault results as
 separate evidence. None of these checks substitutes for developer breakpoint
 debugging or the desktop's longer stability gates.
+
+## Managed Windows source debugging
+
+The debug provider requires the bundle's worker, the separately pinned GDB
+runtime, the fixed WineDbg module and an active graphical user service. After
+upgrading an existing user's image from a configuration without the debugger,
+run `/usr/libexec/compatforge/user-init --refresh-debugger` as that ordinary
+user, then restart `compatforge.service`. The migration verifies the root-owned
+template, preserves unrelated settings and refuses a modified user config.
+`journalctl --user -u compatforge.service` shows startup failures. The default
+image has `debuggerRuntime.sourceMap: {}`; create a reviewed candidate template
+with a one-to-one mapping from IDE-visible source paths to installed GDB source
+paths before setting C source breakpoints. A compiled-source substitution may
+also be needed when the EXE's debug info names a build-machine path. Rebuild
+and reverify the image for permanent changes; the isolated acceptance runner
+uses a separate test-only service configuration.
+
+Select a managed Ready generation with `applications.generations`, then create
+an ordinary-user file such as `~/debug/managed-launch.json`:
+
+```json
+{"schemaVersion":"1","command":"launch","target":{"applicationId":"YOUR-APP","generationId":"gen-job-YOUR-SELECTED-GENERATION","launcherId":"main"}}
+```
+
+`/usr/bin/compatforge-cli debug-adapter ~/debug/managed-launch.json` speaks
+framed DAP on stdin/stdout. The target is bound before the IDE connects; IDE
+`launch` arguments cannot change its executable, process, environment or
+debugger. For an IDE using [nvim-dap's executable adapter
+configuration](https://github.com/mfussenegger/nvim-dap/blob/master/doc/dap.txt),
+put the following in Neovim's Lua configuration and replace the absolute launch
+file path and name:
+
+```lua
+local dap = require('dap')
+dap.adapters.compatforge = {
+  type = 'executable',
+  command = '/usr/bin/compatforge-cli',
+  args = { 'debug-adapter', '/home/forge/debug/managed-launch.json' },
+}
+dap.configurations.c = {
+  { type = 'compatforge', request = 'launch', name = 'Managed Windows C app' },
+}
+```
+
+Open the mapped source path, set a normal line breakpoint and start that
+configuration. The adapter accepts only a bounded DAP subset: initialize,
+launch, line breakpoints, configurationDone, threads, continue, pause, next,
+stepIn/stepOut, stackTrace, scopes, variables and terminate/disconnect. The
+initialize reply advertises only configurationDone and terminate. IDE requests
+for expression evaluation or a debugger REPL, conditional breakpoints, memory
+access, disassembly, host-process attach and IDE terminal execution are
+rejected. The WineDbg stub is private to a network namespace; no TCP debugger
+port is available to the desktop or host. A client disconnect closes the owned
+session and its copied Wine prefix. Source maps expose only reviewed paths;
+unknown backend paths are omitted from DAP source fields.
+
+The x64 C acceptance uses `tests/linux_debug_service_acceptance.py` and a
+test-only managed installer. See `docs/evidence/2026-09-29-debug-service-v4.md`
+for the first real breakpoint checkpoint. The final corrected bundle/image
+acceptance must include differing public/backend source paths and explicit
+stepIn, stepOut and pause evidence before claiming those operations. MSVC/PDB,
+.NET and Windows-native debugging parity are separate gates.

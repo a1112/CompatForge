@@ -357,6 +357,7 @@ pub struct DapBinding {
     program: String,
     port: u16,
     sources: BTreeMap<String, String>,
+    reverse_sources: BTreeMap<String, String>,
 }
 
 impl DapBinding {
@@ -371,10 +372,14 @@ impl DapBinding {
             return Err(DebugError::InvalidRequest);
         }
         let mut mapped = BTreeMap::new();
+        let mut reverse = BTreeMap::new();
         for (public, backend) in sources {
             let public = public.into();
             let backend = backend.into();
-            if !safe_absolute_path(&public) || !safe_absolute_path(&backend) || mapped.insert(public, backend).is_some()
+            if !safe_absolute_path(&public)
+                || !safe_absolute_path(&backend)
+                || mapped.insert(public.clone(), backend.clone()).is_some()
+                || reverse.insert(backend, public).is_some()
             {
                 return Err(DebugError::InvalidRequest);
             }
@@ -387,6 +392,106 @@ impl DapBinding {
             program: program.into(),
             port,
             sources: mapped,
+            reverse_sources: reverse,
+        })
+    }
+
+    /// Return source locations using only the public paths registered for the
+    /// selected generation. Unmapped debugger paths have no client source.
+    pub fn rewrite_backend_message(&self, message: Value) -> Result<Value, DebugError> {
+        let mut message = sanitize_backend_message(message)?;
+        match (
+            message.get("type").and_then(Value::as_str),
+            message.get("command").and_then(Value::as_str),
+            message.get("event").and_then(Value::as_str),
+        ) {
+            (Some("response"), Some("attach"), _) => {
+                message["command"] = Value::String("launch".into());
+            }
+            (Some("response"), Some("stackTrace"), _) => {
+                self.rewrite_source_array(&mut message, "/body/stackFrames")?
+            }
+            (Some("response"), Some("setBreakpoints"), _) => {
+                self.rewrite_source_array(&mut message, "/body/breakpoints")?
+            }
+            (Some("response"), Some("scopes"), _) => self.rewrite_source_array(&mut message, "/body/scopes")?,
+            (Some("event"), _, Some("breakpoint")) => {
+                if let Some(point) = message.pointer_mut("/body/breakpoint") {
+                    self.rewrite_source(point)?;
+                }
+            }
+            (Some("event"), _, Some("output")) => {
+                if let Some(body) = message.get_mut("body") {
+                    self.rewrite_source(body)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(message)
+    }
+
+    fn rewrite_source_array(&self, message: &mut Value, pointer: &str) -> Result<(), DebugError> {
+        if let Some(items) = message.pointer_mut(pointer) {
+            for item in items.as_array_mut().ok_or(DebugError::InvalidRequest)? {
+                self.rewrite_source(item)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_source(&self, owner: &mut Value) -> Result<(), DebugError> {
+        let mapped = owner
+            .get("source")
+            .map(|source| self.public_source(source, 0))
+            .transpose()?;
+        let object = owner.as_object_mut().ok_or(DebugError::InvalidRequest)?;
+        match mapped.flatten() {
+            Some(source) => {
+                object.insert("source".into(), source);
+            }
+            None => {
+                object.remove("source");
+            }
+        }
+        Ok(())
+    }
+
+    fn public_source(&self, source: &Value, depth: usize) -> Result<Option<Value>, DebugError> {
+        if depth > 4 {
+            return Err(DebugError::InvalidRequest);
+        }
+        let source = source.as_object().ok_or(DebugError::InvalidRequest)?;
+        let mut public = serde_json::Map::new();
+        if let Some(path) = source
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| self.reverse_sources.get(path))
+        {
+            public.insert("path".into(), Value::String(path.clone()));
+            public.insert(
+                "name".into(),
+                Value::String(path.rsplit('/').next().unwrap_or(path).into()),
+            );
+        }
+        if let Some(children) = source.get("sources") {
+            let children = children.as_array().ok_or(DebugError::InvalidRequest)?;
+            if children.len() > 64 {
+                return Err(DebugError::InvalidRequest);
+            }
+            let mut retained = Vec::new();
+            for child in children {
+                if let Some(child) = self.public_source(child, depth + 1)? {
+                    retained.push(child);
+                }
+            }
+            if !retained.is_empty() {
+                public.insert("sources".into(), Value::Array(retained));
+            }
+        }
+        Ok(if public.is_empty() {
+            None
+        } else {
+            Some(Value::Object(public))
         })
     }
 
@@ -469,8 +574,7 @@ pub fn sanitize_initialize_response(mut response: Value) -> Result<Value, DebugE
         "body".into(),
         json!({
             "supportsConfigurationDoneRequest": true,
-            "supportsTerminateRequest": true,
-            "supportsDelayedStackTraceLoading": true
+            "supportsTerminateRequest": true
         }),
     );
     Ok(response)

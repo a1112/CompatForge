@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/debug-dap-request.schema.json",
+  "title": "CompatForge Bounded DAP Gateway Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "handle"],
+  "properties": {
+    "schemaVersion": { "const": "1" },
+    "handle": { "$ref": "debug-session-request.schema.json#/$defs/handle" },
+    "message": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["seq", "type", "command"],
+          "properties": {
+            "seq": { "type": "integer", "minimum": 1 },
+            "type": { "const": "request" },
+            "command": {
+              "enum": ["initialize", "launch", "setBreakpoints", "configurationDone", "threads",
+                       "continue", "pause", "next", "stepIn", "stepOut", "stackTrace", "scopes",
+                       "variables", "terminate", "disconnect"]
+            },
+            "arguments": { "type": ["object", "null"] }
+          }
+        }
+      ]
+    }
+  }
+}

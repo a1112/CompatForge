@@ -51,8 +51,11 @@ class WorkerClient:
         self.responses: dict[int, dict] = {}
         self.events: deque[dict] = deque()
         self.seq = 0
+        self.control_seq = 0
 
     def control(self, value: dict, timeout: float = 15) -> dict:
+        self.control_seq += 1
+        value = {**value, "requestId": self.control_seq}
         assert self.child.stdin is not None
         self.child.stdin.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
         self.child.stdin.flush()
@@ -62,6 +65,8 @@ class WorkerClient:
                 raw, _, rest = self.bytes.partition(b"\n")
                 self.bytes = bytearray(rest)
                 result = json.loads(raw)
+                if result.get("requestId") != self.control_seq:
+                    raise RuntimeError("worker reply identity differs")
                 self.messages.extend(result.get("messages", []))
                 return result
             if not self.selector.select(max(0, deadline - time.monotonic())):
@@ -134,7 +139,7 @@ def main() -> None:
                                   "XDG_RUNTIME_DIR": os.environ["XDG_RUNTIME_DIR"]})
     client = WorkerClient(child)
     try:
-        assert client.control(config, 30) == {"ready": True}
+        assert client.control(config, 30) == {"requestId": 1, "ready": True}
         if args.crash:
             child.kill()
             raise PlannedCrash
@@ -168,7 +173,7 @@ def main() -> None:
         client.reply(client.send("continue", {"threadId": thread}))
         client.event("stopped", "signal")
         client.reply(client.send("disconnect", {"terminateDebuggee": False}))
-        assert client.control({"op": "shutdown"}) == {"stopped": True}
+        assert client.control({"op": "shutdown"}) == {"requestId": client.control_seq, "stopped": True}
     except PlannedCrash:
         pass
     finally:

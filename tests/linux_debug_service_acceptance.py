@@ -18,7 +18,7 @@ import time
 
 APP = "forge-debug-probe"
 ROOT = Path("/home/forge/forge-debug-probe")
-EXE_SHA = "47223256c1edcd7a0a0c9ebe67fbe54f6173fb9ad21dda726336cfe2ff218fbe"
+EXE_SHA = "ea376c6a96392c9d369cdd392fcace3d53572e16552c4907e3a6fac7829d2f19"
 INSTALLER_SHA = "fda570c4e7a0041d95cd33b2d5c2b74b31782cbc3a12aa059c233cde93c3f55b"
 MAX = 64 * 1024
 
@@ -67,6 +67,7 @@ class DapClient:
         self.responses = {}
         self.events = deque()
         self.seq = 0
+        self.last_output_seq = 0
         self.transcript = []
 
     def send(self, command, arguments=None):
@@ -91,6 +92,10 @@ class DapClient:
                     raw = bytes(self.pending[marker + 4:marker + 4 + length])
                     del self.pending[:marker + 4 + length]
                     message = json.loads(raw)
+                    sequence = message.get("seq")
+                    require(type(sequence) is int and sequence == self.last_output_seq + 1,
+                            "public DAP output sequence is not monotonic")
+                    self.last_output_seq = sequence
                     if message.get("type") == "request":
                         raise RuntimeError("backend reverse request escaped private gateway")
                     # Keep only protocol type, command, status and stop reason.
@@ -165,6 +170,9 @@ def install(cli):
 
 
 def debug(cli, selected):
+    public_source = ROOT / "public/windows_debug_probe.c"
+    require(public_source.is_file() and public_source.read_bytes() == (ROOT / "windows_debug_probe.c").read_bytes(),
+            "public source copy differs")
     launch = {"schemaVersion": "1", "command": "launch",
               "target": {"applicationId": APP, "generationId": selected, "launcherId": "main"}}
     with tempfile.NamedTemporaryFile("w", suffix=".json", dir=ROOT, delete=False) as file:
@@ -178,16 +186,19 @@ def debug(cli, selected):
         require(init["body"]["supportsConfigurationDoneRequest"] is True, "DAP capability missing")
         require(not init["body"].get("supportsEvaluateForHovers", False), "unsafe evaluate advertised")
         client.reply(client.send("evaluate", {"expression": "shell touch /tmp/unsafe", "context": "repl"}), success=False)
-        attach = client.send("launch", {})
+        attach = client.send("launch", {"type": "compatforge", "request": "launch",
+                                        "name": "Managed Windows C app"})
         client.event("initialized")
-        points = client.reply(client.send("setBreakpoints", {"source": {"path": str(ROOT / "windows_debug_probe.c"),
+        points = client.reply(client.send("setBreakpoints", {"source": {"path": str(public_source),
                                                                             "name": "windows_debug_probe.c"},
-                                                              "breakpoints": [{"line": 7}]}))
+                                                              "breakpoints": [{"line": 17}]}))
         # WineDbg has not loaded the program image yet. GDB reports a pending
         # breakpoint here and resolves it when the initial continue runs.
         point = points["body"]["breakpoints"][0]
         require(point.get("id") and point.get("reason") in (None, "pending"),
                 f"source breakpoint was rejected: {points}")
+        if "source" in point:
+            require(point["source"]["path"] == str(public_source), "breakpoint source was not reverse mapped")
         client.reply(client.send("configurationDone"))
         client.reply(attach)
         client.reply(client.send("continue", {"threadId": 1}))
@@ -195,7 +206,20 @@ def debug(cli, selected):
         thread = stopped["body"]["threadId"]
         stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
         names = [frame["name"] for frame in stack["body"]["stackFrames"]]
-        require(names[:3] == ["inner", "outer", "main"], f"stack mismatch: {names}")
+        require(names[0] == "main", f"main breakpoint stack mismatch: {names}")
+        require(stack["body"]["stackFrames"][0]["source"]["path"] == str(public_source),
+                "stack source was not reverse mapped")
+        client.reply(client.send("stepIn", {"threadId": thread}))
+        client.event("stopped", "step")
+        stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+        require(stack["body"]["stackFrames"][0]["name"] == "outer", "stepIn did not enter outer")
+        client.reply(client.send("stepIn", {"threadId": thread}))
+        client.event("stopped", "step")
+        stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+        names = [frame["name"] for frame in stack["body"]["stackFrames"]]
+        require(names[:3] == ["inner", "outer", "main"], f"nested stack mismatch: {names}")
+        require(stack["body"]["stackFrames"][0]["source"]["path"] == str(public_source),
+                "nested source was not reverse mapped")
         client.reply(client.send("next", {"threadId": thread}))
         client.event("stopped", "step")
         stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
@@ -206,13 +230,27 @@ def debug(cli, selected):
         variables = client.reply(client.send("variables", {"variablesReference": reference}))
         value = {item["name"]: item["value"] for item in variables["body"]["variables"]}["local_value"]
         require(value == "17", "local variable differs")
+        client.reply(client.send("stepOut", {"threadId": thread}))
+        client.event("stopped", "step")
+        stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+        require(stack["body"]["stackFrames"][0]["name"] == "outer", "stepOut did not return to outer")
+        client.reply(client.send("stepOut", {"threadId": thread}))
+        client.event("stopped", "step")
+        stack = client.reply(client.send("stackTrace", {"threadId": thread, "levels": 8}))
+        require(stack["body"]["stackFrames"][0]["name"] == "main", "stepOut did not return to main")
+        client.reply(client.send("continue", {"threadId": thread}))
+        client.reply(client.send("pause", {"threadId": thread}))
+        paused = client.event("stopped", timeout=10)
+        require(paused["body"]["reason"] == "pause", f"pause produced {paused['body']['reason']}")
         client.reply(client.send("continue", {"threadId": thread}))
         client.event("stopped", "signal")
         client.reply(client.send("disconnect"))
         process.stdin.close()
         require(process.wait(timeout=10) == 0, "debug adapter did not cleanly exit")
         return {"breakpointVerified": True, "initialBreakpointPending": not point.get("verified", False),
-                "stack": names[:3], "stepLine": frame["line"],
+                "stack": names[:3], "stepInVerified": True, "stepOutVerified": True,
+                "pauseVerified": True, "sourceReverseMapped": True, "dapOutputSequenceMonotonic": True,
+                "stepLine": frame["line"],
                 "localValue": value, "exceptionStopReason": "signal", "disconnectSucceeded": True,
                 "unsafeEvaluateRejected": True, "sanitizedDapTranscript": client.transcript}
     finally:

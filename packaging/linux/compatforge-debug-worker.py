@@ -16,9 +16,28 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 
 MAX = 64 * 1024
 PORT = 25000
+
+
+class OversizedDapResponse(Exception):
+    def __init__(self, message: dict) -> None:
+        self.message = message
+
+
+def request_id(value: dict, expected: int) -> int:
+    actual = value.get("requestId")
+    if type(actual) is not int or actual != expected or actual > 2**63 - 1:
+        raise ValueError("worker request identity differs")
+    return actual
+
+
+def response_fits(messages: list[dict]) -> bool:
+    # Leave room for the control requestId and JSON wrapper emitted below.
+    raw = json.dumps({"messages": messages}, separators=(",", ":"), ensure_ascii=False).encode()
+    return len(raw) <= MAX - 256
 
 
 class WorkerTerminated(Exception):
@@ -111,6 +130,7 @@ class DapPipe:
     def __init__(self, child: subprocess.Popen[bytes]) -> None:
         self.child = child
         self.bytes = bytearray()
+        self.deferred: deque[dict] = deque()
         self.selector = selectors.DefaultSelector()
         assert child.stdout is not None
         self.selector.register(child.stdout, selectors.EVENT_READ)
@@ -125,6 +145,14 @@ class DapPipe:
 
     def drain(self, timeout: float) -> list[dict]:
         messages: list[dict] = []
+        while self.deferred:
+            value = self.deferred.popleft()
+            if not response_fits(messages + [value]):
+                if not messages:
+                    raise OversizedDapResponse(value)
+                self.deferred.appendleft(value)
+                return messages
+            messages.append(value)
         deadline = time.monotonic() + timeout
         while True:
             while b"\r\n\r\n" in self.bytes:
@@ -139,10 +167,13 @@ class DapPipe:
                 value = json.loads(rest[:length])
                 if not isinstance(value, dict):
                     raise ValueError("invalid DAP value")
-                messages.append(value)
                 self.bytes = bytearray(rest[length:])
-                if len(json.dumps(messages).encode()) > MAX - 1024:
+                if not response_fits(messages + [value]):
+                    if not messages:
+                        raise OversizedDapResponse(value)
+                    self.deferred.append(value)
                     return messages
+                messages.append(value)
             if len(self.bytes) > MAX + 128 or time.monotonic() >= deadline:
                 return messages
             if not self.selector.select(max(0, deadline - time.monotonic())):
@@ -175,6 +206,7 @@ def safe_forward(message: dict, config: dict) -> None:
 
 
 def run(config: dict) -> None:
+    request_id(config, 1)
     if os.getpid() != 1 or os.getuid() != 0:
         raise RuntimeError("worker requires private PID and mapped user namespace")
     if not isinstance(config.get("backendSources"), list) or len(config["backendSources"]) > 128:
@@ -226,11 +258,14 @@ def run(config: dict) -> None:
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                start_new_session=True)
         dap = DapPipe(gdb)
-        emit({"ready": True})
+        emit({"requestId": 1, "ready": True})
+        next_request_id = 2
         while (call := line()) is not None:
+            current_id = request_id(call, next_request_id)
+            next_request_id += 1
             op = call.get("op")
             if op == "shutdown":
-                emit({"stopped": True})
+                emit({"requestId": current_id, "stopped": True})
                 return
             if op == "send":
                 message = call.get("message")
@@ -240,7 +275,15 @@ def run(config: dict) -> None:
                 dap.send(message)
             elif op != "poll":
                 raise ValueError("unknown worker operation")
-            emit({"messages": dap.drain(0.05 if op == "send" else 0.2)})
+            try:
+                messages = dap.drain(0.05 if op == "send" else 0.2)
+            except OversizedDapResponse as error:
+                message = error.message
+                emit({"requestId": current_id, "oversized": {
+                    "type": message.get("type"), "command": message.get("command"),
+                    "request_seq": message.get("request_seq")}})
+                continue
+            emit({"requestId": current_id, "messages": messages})
     finally:
         stop(gdb)
         stop(wine)

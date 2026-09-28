@@ -17,6 +17,7 @@ int main(void) {
     int result = outer(5);
     printf("result=%d observed=%d\n", result, observed);
     fflush(stdout);
+    Sleep(5000);
     RaiseException(0xE0424242, 0, 0, NULL);
     return result == 17 ? 0 : 1;
 }

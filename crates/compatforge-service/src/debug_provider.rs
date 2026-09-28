@@ -2,7 +2,7 @@
 
 use crate::jobs::SelectedDebugTarget;
 use crate::model::{DebuggerRuntimeConfig, PinnedDebuggerFile};
-use compatforge_debug::dap::{sanitize_backend_message, DapBinding, SafeDapRequest};
+use compatforge_debug::dap::{DapBinding, SafeDapRequest};
 use compatforge_debug::{Backend, DebugError, DebugTarget};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,8 +25,11 @@ pub(crate) struct WorkerBackend {
 
 pub(crate) struct WorkerOwned {
     child: Child,
-    stdin: ChildStdin,
+    writer: SyncSender<(u64, Vec<u8>)>,
+    write_acks: Receiver<(u64, bool)>,
     replies: Receiver<Result<Value, ()>>,
+    next_request_id: u64,
+    broken: bool,
     session_root: PathBuf,
     prefix: PathBuf,
     binding: DapBinding,
@@ -168,6 +171,9 @@ impl WorkerBackend {
             .map_err(|_| DebugError::BackendFailed)?;
         let stdin = child.stdin.take().ok_or(DebugError::BackendFailed)?;
         let stdout = child.stdout.take().ok_or(DebugError::BackendFailed)?;
+        let (writer, write_queue) = mpsc::sync_channel(1);
+        let (write_ack_sender, write_acks) = mpsc::sync_channel(1);
+        thread::spawn(move || write_control_lines(stdin, write_queue, write_ack_sender));
         let (sender, replies) = mpsc::sync_channel(4);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -183,8 +189,11 @@ impl WorkerBackend {
         });
         let mut owned = WorkerOwned {
             child,
-            stdin,
+            writer,
+            write_acks,
             replies,
+            next_request_id: 1,
+            broken: false,
             session_root,
             prefix,
             binding,
@@ -208,6 +217,9 @@ impl WorkerBackend {
             json!({"op":"poll"})
         };
         let response = owned.call(&payload, Duration::from_secs(2))?;
+        if let Some(metadata) = response.get("oversized") {
+            return Ok(vec![oversized_gateway_reply(&owned.binding, metadata)]);
+        }
         let messages = response
             .get("messages")
             .and_then(Value::as_array)
@@ -215,8 +227,29 @@ impl WorkerBackend {
         if messages.len() > 128 {
             return Err(DebugError::BackendFailed);
         }
-        messages.iter().cloned().map(sanitize_backend_message).collect()
+        messages
+            .iter()
+            .cloned()
+            .map(|message| owned.binding.rewrite_backend_message(message))
+            .collect()
     }
+}
+
+fn oversized_gateway_reply(binding: &DapBinding, metadata: &Value) -> Value {
+    if metadata.get("type").and_then(Value::as_str) == Some("response") {
+        if let (Some(command), Some(request_seq)) = (
+            metadata.get("command").and_then(Value::as_str),
+            metadata.get("request_seq").and_then(Value::as_u64),
+        ) {
+            let candidate = json!({"seq":1,"type":"response","request_seq":request_seq,
+                "command":command,"success":false,"message":"debugger response exceeded 64 KiB"});
+            if let Ok(message) = binding.rewrite_backend_message(candidate) {
+                return message;
+            }
+        }
+    }
+    json!({"seq":1,"type":"event","event":"output",
+        "body":{"category":"stderr","output":"CompatForge omitted an oversized debugger event\n"}})
 }
 
 struct SessionDirectoryGuard {
@@ -226,7 +259,7 @@ struct SessionDirectoryGuard {
 
 impl Drop for SessionDirectoryGuard {
     fn drop(&mut self) {
-        if !self.keep {
+        if !self.keep && owned_prefix_process_exists(&self.path.join("prefix")) == Ok(false) {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
@@ -247,19 +280,41 @@ impl Backend for WorkerBackend {
 
 impl WorkerOwned {
     fn call(&mut self, payload: &Value, timeout: Duration) -> Result<Value, DebugError> {
-        let raw = serde_json::to_vec(payload).map_err(|_| DebugError::InvalidRequest)?;
+        if self.broken {
+            return Err(DebugError::BackendFailed);
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.checked_add(1).ok_or(DebugError::BackendFailed)?;
+        let mut payload = payload.clone();
+        payload
+            .as_object_mut()
+            .ok_or(DebugError::InvalidRequest)?
+            .insert("requestId".into(), Value::from(request_id));
+        let raw = serde_json::to_vec(&payload).map_err(|_| DebugError::InvalidRequest)?;
         if raw.len() + 1 > MAX_CONTROL {
             return Err(DebugError::InvalidRequest);
         }
-        self.stdin
-            .write_all(&raw)
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
-            .map_err(|_| DebugError::BackendFailed)?;
-        self.replies
-            .recv_timeout(timeout)
-            .map_err(|_| DebugError::BackendFailed)?
-            .map_err(|_| DebugError::BackendFailed)
+        let deadline = Instant::now() + timeout;
+        if self.writer.try_send((request_id, raw)).is_err() {
+            self.broken = true;
+            return Err(DebugError::BackendFailed);
+        }
+        match self.write_acks.recv_timeout(timeout) {
+            Ok((ack_id, true)) if ack_id == request_id => {}
+            _ => {
+                self.broken = true;
+                return Err(DebugError::BackendFailed);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let reply = self.replies.recv_timeout(remaining);
+        match reply {
+            Ok(Ok(value)) if value.get("requestId").and_then(Value::as_u64) == Some(request_id) => Ok(value),
+            _ => {
+                self.broken = true;
+                Err(DebugError::BackendFailed)
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<(), DebugError> {
@@ -269,29 +324,32 @@ impl WorkerOwned {
         let acknowledged = self
             .call(&json!({"op":"shutdown"}), Duration::from_secs(5))
             .is_ok_and(|value| value.get("stopped") == Some(&json!(true)));
-        if !acknowledged {
-            self.child.kill().map_err(|_| DebugError::BackendFailed)?;
+        if !acknowledged && self.child.try_wait().map_err(|_| DebugError::BackendFailed)?.is_none() {
+            let _ = self.child.kill();
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(if acknowledged { 15 } else { 5 });
         loop {
-            if let Some(status) = self.child.try_wait().map_err(|_| DebugError::BackendFailed)? {
-                if !status.success() && acknowledged {
-                    return Err(DebugError::BackendFailed);
-                }
+            if self.child.try_wait().map_err(|_| DebugError::BackendFailed)?.is_some() {
                 break;
             }
             if Instant::now() >= deadline {
-                self.child.kill().map_err(|_| DebugError::BackendFailed)?;
-                self.child.wait().map_err(|_| DebugError::BackendFailed)?;
-                return Err(DebugError::BackendFailed);
+                let _ = self.child.kill();
+                let forced_deadline = Instant::now() + Duration::from_secs(5);
+                while self.child.try_wait().map_err(|_| DebugError::BackendFailed)?.is_none() {
+                    if Instant::now() >= forced_deadline {
+                        return Err(DebugError::BackendFailed);
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                break;
             }
             thread::sleep(Duration::from_millis(20));
         }
         if owned_prefix_process_exists(&self.prefix)? {
             return Err(DebugError::BackendFailed);
         }
-        self.stopped = true;
         fs::remove_dir_all(&self.session_root).map_err(|_| DebugError::BackendFailed)?;
+        self.stopped = true;
         Ok(())
     }
 }
@@ -300,7 +358,27 @@ impl Drop for WorkerOwned {
     fn drop(&mut self) {
         if !self.stopped {
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+fn write_control_lines(
+    mut stdin: ChildStdin,
+    queue: Receiver<(u64, Vec<u8>)>,
+    acknowledgements: SyncSender<(u64, bool)>,
+) {
+    while let Ok((request_id, raw)) = queue.recv() {
+        let success = stdin
+            .write_all(&raw)
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .is_ok();
+        if acknowledgements.send((request_id, success)).is_err() || !success {
+            break;
         }
     }
 }
@@ -418,6 +496,90 @@ fn owned_prefix_process_exists(prefix: &Path) -> Result<bool, DebugError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_owned(
+        writer: SyncSender<(u64, Vec<u8>)>,
+        write_acks: Receiver<(u64, bool)>,
+        replies: Receiver<Result<Value, ()>>,
+    ) -> WorkerOwned {
+        let target = DebugTarget {
+            application_id: "probe".into(),
+            generation_id: "gen-job-1".into(),
+            launcher_id: "main".into(),
+        };
+        WorkerOwned {
+            child: Command::new("/usr/bin/sleep").arg("30").spawn().unwrap(),
+            writer,
+            write_acks,
+            replies,
+            next_request_id: 1,
+            broken: false,
+            session_root: PathBuf::from("/tmp/unused-debug-test"),
+            prefix: PathBuf::from("/tmp/unused-debug-test/prefix"),
+            binding: DapBinding::new(
+                target,
+                "/tmp/probe.exe",
+                STUB_PORT,
+                std::iter::empty::<(String, String)>(),
+            )
+            .unwrap(),
+            stopped: false,
+        }
+    }
+
+    #[test]
+    fn wedged_control_writer_cannot_block_service_thread() {
+        let (writer, _queued_write) = mpsc::sync_channel(1);
+        let (_ack_sender, write_acks) = mpsc::sync_channel(1);
+        let (_reply_sender, replies) = mpsc::sync_channel(1);
+        let mut owned = synthetic_owned(writer, write_acks, replies);
+        let started = Instant::now();
+        assert_eq!(
+            owned.call(&json!({"op":"poll"}), Duration::from_millis(50)),
+            Err(DebugError::BackendFailed)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(owned.broken);
+    }
+
+    #[test]
+    fn stale_worker_reply_cannot_satisfy_next_control_call() {
+        let (writer, _queued_write) = mpsc::sync_channel(1);
+        let (ack_sender, write_acks) = mpsc::sync_channel(1);
+        let (reply_sender, replies) = mpsc::sync_channel(1);
+        ack_sender.send((1, true)).unwrap();
+        reply_sender.send(Ok(json!({"requestId":9,"messages":[]}))).unwrap();
+        let mut owned = synthetic_owned(writer, write_acks, replies);
+        assert_eq!(
+            owned.call(&json!({"op":"poll"}), Duration::from_millis(50)),
+            Err(DebugError::BackendFailed)
+        );
+        assert!(owned.broken);
+    }
+
+    #[test]
+    fn oversized_debugger_message_becomes_bounded_dap_failure_without_stopping_session() {
+        let binding = DapBinding::new(
+            DebugTarget {
+                application_id: "probe".into(),
+                generation_id: "gen-job-1".into(),
+                launcher_id: "main".into(),
+            },
+            "/tmp/probe.exe",
+            STUB_PORT,
+            std::iter::empty::<(String, String)>(),
+        )
+        .unwrap();
+        let response = oversized_gateway_reply(
+            &binding,
+            &json!({"type":"response","request_seq":8,"command":"variables"}),
+        );
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["request_seq"], 8);
+        assert_eq!(response["success"], false);
+        let event = oversized_gateway_reply(&binding, &json!({"type":"request","command":"runInTerminal"}));
+        assert_eq!(event["event"], "output");
+    }
 
     #[test]
     fn replacement_owner_refuses_live_debug_prefix_then_reclaims_stale_copy() {

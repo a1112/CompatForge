@@ -122,6 +122,7 @@ fn initialize_response_advertises_only_implemented_safe_features() {
     let safe = sanitize_initialize_response(upstream).unwrap();
     assert_eq!(safe["body"]["supportsConfigurationDoneRequest"], true);
     assert_eq!(safe["body"]["supportsTerminateRequest"], true);
+    assert!(safe["body"].get("supportsDelayedStackTraceLoading").is_none());
     for prohibited in [
         "supportsEvaluateForHovers",
         "supportsReadMemoryRequest",
@@ -223,4 +224,54 @@ fn gateway_binds_program_remote_target_and_source_paths_internally() {
     ))
     .unwrap();
     assert!(binding.forward(&other).is_err());
+}
+
+#[test]
+fn backend_sources_return_to_public_paths_and_ambiguous_reverse_maps_are_rejected() {
+    let target = compatforge_debug::DebugTarget {
+        application_id: "sample".into(),
+        generation_id: "gen-job-1".into(),
+        launcher_id: "main".into(),
+    };
+    assert!(DapBinding::new(
+        target.clone(),
+        "/managed/probe.exe",
+        25000,
+        [
+            ("/workspace/a.c", "/managed/shared.c"),
+            ("/workspace/b.c", "/managed/shared.c")
+        ]
+    )
+    .is_err());
+    let binding = DapBinding::new(
+        target,
+        "/managed/probe.exe",
+        25000,
+        [("/workspace/probe.c", "/managed/src/probe.c")],
+    )
+    .unwrap();
+    let stack = json!({"seq":5,"type":"response","request_seq":3,"command":"stackTrace","success":true,
+    "body":{"stackFrames":[
+        {"id":1,"name":"inner","source":{"name":"probe.c","path":"/managed/src/probe.c"},"line":7},
+        {"id":2,"name":"system","source":{"name":"hidden.c","path":"/private/hidden.c"},"line":1}
+    ]}});
+    let stack = binding.rewrite_backend_message(stack).unwrap();
+    assert_eq!(stack["body"]["stackFrames"][0]["source"]["path"], "/workspace/probe.c");
+    assert!(stack["body"]["stackFrames"][1].get("source").is_none());
+    let breakpoint = json!({"seq":6,"type":"event","event":"breakpoint",
+        "body":{"breakpoint":{"id":1,"verified":true,"source":{"path":"/managed/src/probe.c"}}}});
+    let breakpoint = binding.rewrite_backend_message(breakpoint).unwrap();
+    assert_eq!(breakpoint["body"]["breakpoint"]["source"]["path"], "/workspace/probe.c");
+    let nested = json!({"seq":7,"type":"event","event":"output","body":{"source":{
+        "path":"/private/root.c","sources":[{"path":"/managed/src/probe.c","sourceReference":99}]
+    }}});
+    let nested = binding.rewrite_backend_message(nested).unwrap();
+    assert!(nested["body"]["source"].get("path").is_none());
+    assert_eq!(nested["body"]["source"]["sources"][0]["path"], "/workspace/probe.c");
+    assert!(nested["body"]["source"]["sources"][0].get("sourceReference").is_none());
+    let attached = binding
+        .rewrite_backend_message(json!({"seq":8,"type":"response","request_seq":2,
+            "command":"attach","success":true,"body":{}}))
+        .unwrap();
+    assert_eq!(attached["command"], "launch");
 }

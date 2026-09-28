@@ -453,7 +453,7 @@ impl AutomationService {
             };
             self.debug_session(lifecycle)?;
             return Ok(
-                json!({"messages":[{"seq":0,"request_seq":seq,"type":"response","command":command,"success":true,"body":{}}]}),
+                json!({"messages":[{"seq":1,"request_seq":seq,"type":"response","command":command,"success":true,"body":{}}]}),
             );
         }
         let uid = debug_owner_uid();

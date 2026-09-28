@@ -126,9 +126,49 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn is_benign_ide_launch(arguments: &serde_json::Value) -> bool {
+    let Some(fields) = arguments.as_object() else {
+        return false;
+    };
+    if fields.is_empty() {
+        return true;
+    }
+    fields.len() == 3
+        && fields.get("type").and_then(serde_json::Value::as_str) == Some("compatforge")
+        && fields.get("request").and_then(serde_json::Value::as_str) == Some("launch")
+        && fields
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn encode_numbered_dap(mut message: serde_json::Value, next: &mut u64) -> io::Result<Vec<u8>> {
+    if *next == 0
+        || *next == u64::MAX
+        || !matches!(
+            message.get("type").and_then(serde_json::Value::as_str),
+            Some("response" | "event")
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid outgoing DAP message",
+        ));
+    }
+    message
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "DAP object required"))?
+        .insert("seq".into(), serde_json::Value::from(*next));
+    let framed = compatforge_debug::dap::encode_message(&message).map_err(io::Error::other)?;
+    *next += 1;
+    Ok(framed)
+}
+
 #[cfg(target_os = "linux")]
 fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn Error>> {
-    use compatforge_debug::dap::{encode_message, DapFrameDecoder, SafeDapRequest};
+    use compatforge_debug::dap::{DapFrameDecoder, SafeDapRequest};
     use compatforge_debug::{DebugRequest, DebugSessionHandle};
     use compatforge_service::{daemon, ServiceRequest};
     use serde_json::{json, Value};
@@ -187,13 +227,14 @@ fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn
         }
     });
     let mut terminal = false;
+    let mut next_outgoing_seq = 1_u64;
     let result = (|| -> Result<(), Box<dyn Error>> {
         let mut output = std::io::stdout().lock();
         loop {
             let message = match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(Some(mut message))) => {
                     if message.get("command") == Some(&json!("launch"))
-                        && message.get("arguments").is_some_and(|args| args == &json!({}))
+                        && message.get("arguments").is_some_and(is_benign_ide_launch)
                     {
                         message["arguments"] = serde_json::to_value(&target)?;
                     }
@@ -202,7 +243,7 @@ fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn
                         Err(_) => {
                             let reject = json!({"seq":0,"request_seq":message.get("seq"),"type":"response",
                                 "command":message.get("command"),"success":false,"message":"unsupported DAP request"});
-                            output.write_all(&encode_message(&reject)?)?;
+                            output.write_all(&encode_numbered_dap(reject, &mut next_outgoing_seq)?)?;
                             output.flush()?;
                             continue;
                         }
@@ -234,7 +275,7 @@ fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn
                 .and_then(Value::as_array)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid DAP service reply"))?;
             for item in messages {
-                output.write_all(&encode_message(item)?)?;
+                output.write_all(&encode_numbered_dap(item.clone(), &mut next_outgoing_seq)?)?;
             }
             output.flush()?;
             if terminal_request {
@@ -377,5 +418,39 @@ mod tests {
         );
         assert!(read_shared_json::<serde_json::Value>(&path, 32).unwrap().is_array());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn public_dap_sequences_are_positive_and_monotonic_across_replies_and_rejections() {
+        let mut next = 1;
+        let mut decoder = compatforge_debug::dap::DapFrameDecoder::default();
+        for (index, message) in [
+            serde_json::json!({"seq":90,"type":"event","event":"initialized"}),
+            serde_json::json!({"seq":0,"request_seq":2,"type":"response","command":"evaluate","success":false}),
+            serde_json::json!({"seq":3,"request_seq":1,"type":"response","command":"initialize","success":true}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let encoded = encode_numbered_dap(message, &mut next).unwrap();
+            let parsed = decoder.push(&encoded).unwrap();
+            assert_eq!(parsed[0]["seq"], (index + 1) as u64);
+        }
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn common_ide_launch_metadata_is_discarded_only_for_exact_static_shape() {
+        assert!(is_benign_ide_launch(&serde_json::json!({})));
+        assert!(is_benign_ide_launch(&serde_json::json!({
+            "type":"compatforge","request":"launch","name":"Managed Windows app"
+        })));
+        for forged in [
+            serde_json::json!({"type":"compatforge","request":"attach","name":"x"}),
+            serde_json::json!({"type":"compatforge","request":"launch","name":"x","program":"/tmp/other.exe"}),
+            serde_json::json!({"type":"compatforge","request":"launch","name":"\n"}),
+        ] {
+            assert!(!is_benign_ide_launch(&forged));
+        }
     }
 }
