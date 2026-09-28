@@ -1,5 +1,5 @@
 {
-  "environment": "isolated ForgeOS v3 x86_64 guest; copied dedicated Wine prefix; user and network namespace",
+  "environment": "isolated ForgeOS v3 x86_64 guest; copied dedicated Wine prefix; user, network, PID and mount namespace with --kill-child",
   "fixture": "tests/fixtures/windows_debug_probe.c",
   "observation": {
     "breakpointVerified": true,

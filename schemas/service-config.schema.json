@@ -7,6 +7,31 @@
   "required": ["schemaVersion", "serviceRoot"],
   "properties": {
     "schemaVersion": { "const": "1" },
-    "serviceRoot": { "type": "string", "minLength": 1 }
+    "serviceRoot": { "type": "string", "minLength": 1 },
+    "debuggerRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "runtimePackDigest", "worker", "wine", "winedbgModule", "gdb", "gdbRoot", "sourceMap"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "runtimePackDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "worker": { "$ref": "#/$defs/pinnedDebuggerFile" },
+        "wine": { "$ref": "#/$defs/pinnedDebuggerFile" },
+        "winedbgModule": { "$ref": "#/$defs/pinnedDebuggerFile" },
+        "gdb": { "$ref": "#/$defs/pinnedDebuggerFile" },
+        "gdbRoot": { "type": "string", "pattern": "^/" },
+        "sourceMap": { "type": "object", "maxProperties": 128, "additionalProperties": { "type": "string", "pattern": "^/" } },
+        "sourceSubstitution": {
+          "type": "object", "additionalProperties": false, "required": ["compiled", "installed"],
+          "properties": { "compiled": { "type": "string", "pattern": "^/" }, "installed": { "type": "string", "pattern": "^/" } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "pinnedDebuggerFile": {
+      "type": "object", "additionalProperties": false, "required": ["path", "sha256"],
+      "properties": { "path": { "type": "string", "pattern": "^/" }, "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } }
+    }
   }
 }

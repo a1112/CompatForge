@@ -194,6 +194,7 @@ mod tests {
             crate::ServiceConfig {
                 schema_version: "1".into(),
                 service_root: root.join("service").to_string_lossy().into_owned(),
+                debugger_runtime: None,
             },
         )
         .unwrap();

@@ -13,5 +13,15 @@
     "path": "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "digest": "sha256:b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a",
     "family": "Noto Sans CJK SC"
+  },
+  "debuggerRuntime": {
+    "schemaVersion": 1,
+    "runtimePackDigest": "sha256:6b2a66327849bd5da3933011afdd5db6129f6cf2e246b8082daeb601f0b3afba",
+    "worker": {"path": "/usr/lib/compatforge/compatforge-debug-worker.py", "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+    "wine": {"path": "/usr/bin/winedbg", "sha256": "sha256:2d7731d7532318e06f47bb2b9d6cd7f8a934856f6d4711314c047dc8660b97e9"},
+    "winedbgModule": {"path": "/usr/lib/wine/x86_64-windows/winedbg.exe", "sha256": "sha256:fde4a49ab5ab0b8a288455e924709590afe5eb69006126993bcc1903ce1d3be9"},
+    "gdb": {"path": "/opt/compatforge/debugger/usr/bin/gdb", "sha256": "sha256:df0a57e867295b94138de7417ef077e64cdc715ea8b7327b16286dfe038b0a24"},
+    "gdbRoot": "/opt/compatforge/debugger",
+    "sourceMap": {}
   }
 }

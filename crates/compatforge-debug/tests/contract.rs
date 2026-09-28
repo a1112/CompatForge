@@ -114,6 +114,27 @@ impl Backend for BackendCounter {
 }
 
 #[test]
+fn managed_backend_lease_exposes_owned_process_only_to_authorized_handle() {
+    let mut sessions = DebugSupervisor::new(BackendCounter::default());
+    let handle = sessions
+        .launch_with(target(), 1000, |backend, target| backend.launch(target))
+        .unwrap();
+    assert_eq!(
+        sessions.with_owned(&handle, 1001, |_backend, _owned| Ok(true)),
+        Err(DebugError::Unauthorized)
+    );
+    assert_eq!(
+        sessions.with_owned(&handle, 1000, |_backend, _owned| Ok(true)),
+        Ok(true)
+    );
+    sessions.disconnect(&handle, 1000).unwrap();
+    assert_eq!(
+        sessions.with_owned(&handle, 1000, |_backend, _owned| Ok(true)),
+        Err(DebugError::InvalidTransition)
+    );
+}
+
+#[test]
 fn supervisor_denies_foreign_handle_and_owns_terminal_transitions() {
     let backend = BackendCounter::default();
     let mut sessions = DebugSupervisor::new(backend);

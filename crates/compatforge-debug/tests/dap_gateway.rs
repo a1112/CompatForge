@@ -1,5 +1,5 @@
 use compatforge_debug::dap::{
-    encode_message, sanitize_initialize_response, DapBinding, DapFrameDecoder, SafeDapRequest,
+    encode_message, sanitize_backend_message, sanitize_initialize_response, DapBinding, DapFrameDecoder, SafeDapRequest,
 };
 use serde_json::{json, Value};
 
@@ -136,6 +136,26 @@ fn initialize_response_advertises_only_implemented_safe_features() {
         safe["body"].get("supportsCancelRequest").is_none(),
         "cancel is not an exposed request yet"
     );
+}
+
+#[test]
+fn backend_cannot_request_ide_command_execution_or_invent_new_operations() {
+    for message in [
+        json!({"seq":3,"type":"request","command":"runInTerminal","arguments":{"args":["sh","-c","touch /tmp/marker"]}}),
+        json!({"seq":3,"type":"request","command":"startDebugging","arguments":{}}),
+        json!({"seq":3,"type":"event","event":"unknownExecutionEvent","body":{}}),
+        json!({"seq":3,"type":"response","request_seq":1,"command":"evaluate","success":true}),
+    ] {
+        assert!(sanitize_backend_message(message).is_err());
+    }
+    assert!(
+        sanitize_backend_message(json!({"seq":3,"type":"event","event":"stopped","body":{"reason":"breakpoint"}}))
+            .is_ok()
+    );
+    assert!(sanitize_backend_message(
+        json!({"seq":3,"type":"response","request_seq":1,"command":"threads","success":true,"body":{"threads":[]}})
+    )
+    .is_ok());
 }
 
 #[test]

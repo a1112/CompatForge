@@ -1,12 +1,15 @@
 //! Fixed desktop client commands; never load runtime context from desktop metadata.
 use std::error::Error;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command<'a> {
     Daemon(&'a str, &'a str),
     Call(&'a str),
     Debug(&'a str),
+    DebugAdapter(&'a str),
     Stop,
     Export,
     Launch(&'a str, &'a str, &'a [String]),
@@ -17,6 +20,7 @@ fn parse(arguments: &[String]) -> io::Result<Option<Command<'_>>> {
         [command, config, service] if command == "service-daemon" => Command::Daemon(config, service),
         [command, file] if command == "service-call" => Command::Call(file),
         [command, file] if command == "debug-session" => Command::Debug(file),
+        [command, file] if command == "debug-adapter" => Command::DebugAdapter(file),
         [command] if command == "service-stop" => Command::Stop,
         [command] if command == "desktop-export" => Command::Export,
         [command, app, launcher, separator, files @ ..] if command == "desktop-launch" && separator == "--" => {
@@ -28,6 +32,7 @@ fn parse(arguments: &[String]) -> io::Result<Option<Command<'_>>> {
                 "service-daemon",
                 "service-call",
                 "debug-session",
+                "debug-adapter",
                 "service-stop",
                 "desktop-export",
                 "desktop-launch",
@@ -71,6 +76,9 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
         )
         .map_err(Into::into);
     }
+    if let Command::DebugAdapter(path) = command {
+        return run_debug_adapter(&directory, Path::new(path));
+    }
     let (operation, payload) = match command {
         Command::Stop => ("daemon.stop", json!({})),
         Command::Export => ("desktop.launchers", json!({})),
@@ -103,6 +111,7 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
             compatforge_debug::decode_request(&serde_json::to_vec(&payload)?)?;
             ("debug.session", payload)
         }
+        Command::DebugAdapter(_) => unreachable!(),
         Command::Daemon(_, _) => unreachable!(),
     };
     let request = ServiceRequest {
@@ -115,6 +124,149 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
         daemon::request(&directory, &request)?,
         matches!(command, Command::Export),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn Error>> {
+    use compatforge_debug::dap::{encode_message, DapFrameDecoder, SafeDapRequest};
+    use compatforge_debug::{DebugRequest, DebugSessionHandle};
+    use compatforge_service::{daemon, ServiceRequest};
+    use serde_json::{json, Value};
+    use std::io::{Read, Write};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    let payload: Value = read_shared_json(launch_path, compatforge_debug::MAX_DEBUG_REQUEST_BYTES)?;
+    let command = compatforge_debug::decode_request(&serde_json::to_vec(&payload)?)?;
+    let DebugRequest::Launch { target } = command else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "adapter requires a managed debug launch request",
+        )
+        .into());
+    };
+    let launched = daemon::request(
+        directory,
+        &ServiceRequest {
+            schema_version: "1".into(),
+            request_id: format!("dap-launch-{}", std::process::id()),
+            operation: "debug.session".into(),
+            payload,
+        },
+    )?;
+    let handle: DebugSessionHandle = serde_json::from_value(debug_reply_result(launched)?)?;
+    let (sender, receiver) = mpsc::sync_channel::<Result<Option<Value>, String>>(8);
+    std::thread::spawn(move || {
+        let mut input = std::io::stdin().lock();
+        let mut decoder = DapFrameDecoder::default();
+        let mut bytes = [0_u8; 8192];
+        loop {
+            match input.read(&mut bytes) {
+                Ok(0) => {
+                    let _ = sender.send(Ok(None));
+                    break;
+                }
+                Ok(count) => match decoder.push(&bytes[..count]) {
+                    Ok(messages) => {
+                        for message in messages {
+                            if sender.send(Ok(Some(message))).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error.to_string()));
+                        break;
+                    }
+                },
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    let mut terminal = false;
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let mut output = std::io::stdout().lock();
+        loop {
+            let message = match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(Some(mut message))) => {
+                    if message.get("command") == Some(&json!("launch"))
+                        && message.get("arguments").is_some_and(|args| args == &json!({}))
+                    {
+                        message["arguments"] = serde_json::to_value(&target)?;
+                    }
+                    match SafeDapRequest::parse(&message) {
+                        Ok(_) => Some(message),
+                        Err(_) => {
+                            let reject = json!({"seq":0,"request_seq":message.get("seq"),"type":"response",
+                                "command":message.get("command"),"success":false,"message":"unsupported DAP request"});
+                            output.write_all(&encode_message(&reject)?)?;
+                            output.flush()?;
+                            continue;
+                        }
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => return Err(io::Error::new(io::ErrorKind::InvalidData, error).into()),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            let terminal_request = message.as_ref().is_some_and(|value| {
+                matches!(
+                    SafeDapRequest::parse(value),
+                    Ok(SafeDapRequest::Terminate { .. } | SafeDapRequest::Disconnect { .. })
+                )
+            });
+            let reply = daemon::request(
+                directory,
+                &ServiceRequest {
+                    schema_version: "1".into(),
+                    request_id: format!("dap-{}", std::process::id()),
+                    operation: "debug.dap".into(),
+                    payload: json!({"schemaVersion":"1","handle":handle,"message":message}),
+                },
+            )?;
+            let result = debug_reply_result(reply)?;
+            let messages = result
+                .get("messages")
+                .and_then(Value::as_array)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid DAP service reply"))?;
+            for item in messages {
+                output.write_all(&encode_message(item)?)?;
+            }
+            output.flush()?;
+            if terminal_request {
+                terminal = true;
+                break;
+            }
+        }
+        Ok(())
+    })();
+    if !terminal {
+        let _ = daemon::request(
+            directory,
+            &ServiceRequest {
+                schema_version: "1".into(),
+                request_id: format!("dap-close-{}", std::process::id()),
+                operation: "debug.session".into(),
+                payload: json!({"schemaVersion":"1","command":"disconnect","handle":handle}),
+            },
+        );
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn debug_reply_result(reply: compatforge_service::daemon::DaemonReply) -> Result<serde_json::Value, Box<dyn Error>> {
+    if let Some(error) = reply.error {
+        return Err(io::Error::other(format!("{}: {}", error.code, error.message)).into());
+    }
+    Ok(reply
+        .response
+        .ok_or_else(|| io::Error::other("service returned no response"))?
+        .result)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -206,6 +358,12 @@ mod tests {
         assert_eq!(
             parse(&args(&["debug-session", "request.json"])).unwrap(),
             Some(Command::Debug("request.json"))
+        );
+        assert!(parse(&args(&["debug-adapter"])).is_err());
+        assert!(parse(&args(&["debug-adapter", "request.json", "--eval", "id"])).is_err());
+        assert_eq!(
+            parse(&args(&["debug-adapter", "request.json"])).unwrap(),
+            Some(Command::DebugAdapter("request.json"))
         );
     }
 

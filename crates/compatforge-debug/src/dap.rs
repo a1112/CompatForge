@@ -475,3 +475,79 @@ pub fn sanitize_initialize_response(mut response: Value) -> Result<Value, DebugE
     );
     Ok(response)
 }
+
+/// GDB DAP can ask an IDE to run a terminal command. The private worker never
+/// needs reverse requests, so only bounded reply and event types leave it.
+pub fn sanitize_backend_message(message: Value) -> Result<Value, DebugError> {
+    if message
+        .get("seq")
+        .and_then(Value::as_u64)
+        .filter(|seq| *seq > 0)
+        .is_none()
+    {
+        return Err(DebugError::InvalidRequest);
+    }
+    match message.get("type").and_then(Value::as_str) {
+        Some("response") => {
+            let command = message
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or(DebugError::InvalidRequest)?;
+            if !matches!(
+                command,
+                "initialize"
+                    | "attach"
+                    | "setBreakpoints"
+                    | "configurationDone"
+                    | "threads"
+                    | "continue"
+                    | "pause"
+                    | "next"
+                    | "stepIn"
+                    | "stepOut"
+                    | "stackTrace"
+                    | "scopes"
+                    | "variables"
+                    | "terminate"
+                    | "disconnect"
+            ) || message
+                .get("request_seq")
+                .and_then(Value::as_u64)
+                .filter(|seq| *seq > 0)
+                .is_none()
+                || message.get("success").and_then(Value::as_bool).is_none()
+            {
+                return Err(DebugError::InvalidRequest);
+            }
+            if command == "initialize" {
+                sanitize_initialize_response(message)
+            } else {
+                Ok(message)
+            }
+        }
+        Some("event") => {
+            let event = message
+                .get("event")
+                .and_then(Value::as_str)
+                .ok_or(DebugError::InvalidRequest)?;
+            if matches!(
+                event,
+                "initialized"
+                    | "stopped"
+                    | "continued"
+                    | "thread"
+                    | "breakpoint"
+                    | "exited"
+                    | "terminated"
+                    | "output"
+                    | "process"
+                    | "module"
+            ) {
+                Ok(message)
+            } else {
+                Err(DebugError::InvalidRequest)
+            }
+        }
+        _ => Err(DebugError::InvalidRequest),
+    }
+}

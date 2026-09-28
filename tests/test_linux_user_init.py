@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("linux_user_init", Path(__file__).parents[1] / "tools/linux_user_init.py")
 init = importlib.util.module_from_spec(SPEC)
@@ -20,7 +21,67 @@ def template():
             "bottleFont": {"path": "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "digest": "sha256:" + "e" * 64, "family": "Noto Sans CJK SC"}}
 
 
+def debugger_template():
+    value = template()
+    file = lambda path: {"path": path, "sha256": "sha256:" + "f" * 64}
+    value["debuggerRuntime"] = {"schemaVersion": 1, "runtimePackDigest": value["runtimePackDigest"],
+                                "worker": file("/usr/lib/compatforge/compatforge-debug-worker.py"),
+                                "wine": file("/usr/bin/winedbg"),
+                                "winedbgModule": file("/usr/lib/wine/x86_64-windows/winedbg.exe"),
+                                "gdb": file("/opt/compatforge/debugger/usr/bin/gdb"),
+                                "gdbRoot": "/opt/compatforge/debugger", "sourceMap": {}}
+    return value
+
+
 class TemplateTests(unittest.TestCase):
+    def test_interrupted_debugger_refresh_finishes_only_the_expected_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            def run(argv):
+                if argv[1] == "local":
+                    Path(argv[-1]).write_text('{}')
+                    return {"packDigest": template()["runtimePackDigest"]}
+                return {"operation": "applications.seed-defaults", "result": {"seeded": True}}
+            init.initialize(home, template(), run)
+            root = home / ".config/compatforge"
+            old_context = (root / "context.json").read_bytes()
+            original_replace = os.replace
+            calls = 0
+            def interrupt_after_service(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated power loss")
+                return original_replace(source, target)
+            with patch.object(init.os, "replace", side_effect=interrupt_after_service):
+                with self.assertRaises(OSError):
+                    init.initialize(home, debugger_template(), run, refresh_debugger=True)
+            with self.assertRaises(ValueError):
+                init.initialize(home, debugger_template(), run)
+            self.assertTrue(init.initialize(home, debugger_template(), run, refresh_debugger=True)["refreshedDebugger"])
+            self.assertEqual((root / "context.json").read_bytes(), old_context)
+            self.assertEqual(init.initialize(home, debugger_template(), run)["reused"], True)
+
+    def test_debugger_runtime_is_validated_and_explicit_refresh_preserves_context(self):
+        init.validate_template(debugger_template())
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            def run(argv):
+                if argv[1] == "local":
+                    Path(argv[-1]).write_text('{}')
+                    return {"packDigest": template()["runtimePackDigest"]}
+                return {"operation": "applications.seed-defaults", "result": {"seeded": True}}
+            init.initialize(home, template(), run)
+            root = home / ".config/compatforge"
+            context_bytes = (root / "context.json").read_bytes()
+            with self.assertRaises(ValueError): init.initialize(home, debugger_template(), run)
+            result = init.initialize(home, debugger_template(), run, refresh_debugger=True)
+            self.assertTrue(result["refreshedDebugger"])
+            self.assertEqual((root / "context.json").read_bytes(), context_bytes)
+            self.assertEqual(json.loads((root / "service.json").read_text())["debuggerRuntime"], debugger_template()["debuggerRuntime"])
+            self.assertEqual(init.initialize(home, debugger_template(), run)["reused"], True)
+            altered = debugger_template(); altered["debuggerRuntime"]["gdb"]["path"] = "/tmp/gdb"
+            with self.assertRaises(ValueError): init.initialize(home, altered, run, refresh_debugger=True)
     def test_preexisting_unowned_staging_context_is_not_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

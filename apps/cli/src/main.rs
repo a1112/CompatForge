@@ -1997,6 +1997,7 @@ fn print_help() {
     println!("  compatforge-cli service-daemon <context-config.json> <service-config.json>  # Linux shared user owner");
     println!("  compatforge-cli service-call <request.json> | service-stop | desktop-export");
     println!("  compatforge-cli debug-session <debug-request.json>  # private user service; provider availability is checked");
+    println!("  compatforge-cli debug-adapter <managed-debug-launch.json>  # private DAP stdio adapter");
     println!("  compatforge-cli desktop-launch <application-id> <launcher-id> -- [absolute files...]");
     println!("  compatforge-cli runtime manifest-digest <manifest.json>");
     println!("  compatforge-cli runtime install <store-root> <bundle-root> <manifest-relative-path>");

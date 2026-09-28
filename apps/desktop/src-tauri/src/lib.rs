@@ -440,6 +440,7 @@ fn bootstrap_core(
         ServiceConfig {
             schema_version: SCHEMA_VERSION_V1.into(),
             service_root: path_text(service_root)?,
+            debugger_runtime: None,
         },
     )
     .map_err(|error| format!("应用服务初始化失败：{error}"))?;

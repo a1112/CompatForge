@@ -259,6 +259,17 @@ impl<B: Backend> DebugSupervisor<B> {
     }
 
     pub fn launch(&mut self, target: DebugTarget, owner_uid: u32) -> Result<DebugSessionHandle, DebugError> {
+        self.launch_with(target, owner_uid, |backend, target| backend.launch(target))
+    }
+
+    /// The service supplies a selected-generation launch context while holding
+    /// its lifecycle gate. The supervisor still owns the process and handle.
+    pub fn launch_with(
+        &mut self,
+        target: DebugTarget,
+        owner_uid: u32,
+        launch: impl FnOnce(&B, &DebugTarget) -> Result<B::Owned, DebugError>,
+    ) -> Result<DebugSessionHandle, DebugError> {
         target.validate()?;
         if self.sessions.values().filter(|session| session.owned.is_some()).count() >= MAX_ACTIVE_SESSIONS {
             return Err(DebugError::Capacity);
@@ -267,7 +278,7 @@ impl<B: Backend> DebugSupervisor<B> {
         getrandom::getrandom(&mut random).map_err(|_| DebugError::Unavailable)?;
         let session_id = format!("debug-{}", hex(&random[..16]));
         let capability = hex(&random[16..]);
-        let owned = self.backend.launch(&target)?;
+        let owned = launch(&self.backend, &target)?;
         self.sessions.insert(
             session_id.clone(),
             Session {
@@ -279,6 +290,21 @@ impl<B: Backend> DebugSupervisor<B> {
             },
         );
         Ok(DebugSessionHandle { session_id, capability })
+    }
+
+    pub fn with_owned<T>(
+        &mut self,
+        handle: &DebugSessionHandle,
+        owner_uid: u32,
+        operation: impl FnOnce(&B, &mut B::Owned) -> Result<T, DebugError>,
+    ) -> Result<T, DebugError> {
+        self.authorized(handle, owner_uid)?;
+        let session = self
+            .sessions
+            .get_mut(&handle.session_id)
+            .ok_or(DebugError::Unauthorized)?;
+        let owned = session.owned.as_mut().ok_or(DebugError::InvalidTransition)?;
+        operation(&self.backend, owned)
     }
 
     fn authorized(&self, handle: &DebugSessionHandle, owner_uid: u32) -> Result<&Session<B::Owned>, DebugError> {

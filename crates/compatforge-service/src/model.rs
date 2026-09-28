@@ -18,6 +18,8 @@ pub const MAX_POLL_MILLISECONDS: u64 = 30_000;
 pub struct ServiceConfig {
     pub schema_version: String,
     pub service_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debugger_runtime: Option<DebuggerRuntimeConfig>,
 }
 
 impl ServiceConfig {
@@ -27,8 +29,94 @@ impl ServiceConfig {
         if !root.is_absolute() {
             return Err(ModelError::Invalid("serviceRoot must be absolute"));
         }
+        if let Some(debugger) = &self.debugger_runtime {
+            debugger.validate()?;
+        }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PinnedDebuggerFile {
+    pub path: String,
+    pub sha256: String,
+}
+
+impl PinnedDebuggerFile {
+    fn validate(&self) -> Result<(), ModelError> {
+        if !safe_debug_path(&self.path) || !valid_sha256(&self.sha256) {
+            return Err(ModelError::Invalid(
+                "debugger executable requires an absolute path and SHA-256 pin",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DebugSourceSubstitution {
+    pub compiled: String,
+    pub installed: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DebuggerRuntimeConfig {
+    pub schema_version: u8,
+    pub runtime_pack_digest: String,
+    pub worker: PinnedDebuggerFile,
+    pub wine: PinnedDebuggerFile,
+    pub winedbg_module: PinnedDebuggerFile,
+    pub gdb: PinnedDebuggerFile,
+    pub gdb_root: String,
+    #[serde(default)]
+    pub source_map: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_substitution: Option<DebugSourceSubstitution>,
+}
+
+impl DebuggerRuntimeConfig {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.schema_version != 1 || !valid_sha256(&self.runtime_pack_digest) {
+            return Err(ModelError::Invalid("debugger runtime identity is invalid"));
+        }
+        for file in [&self.worker, &self.wine, &self.winedbg_module, &self.gdb] {
+            file.validate()?;
+        }
+        if !safe_debug_path(&self.gdb_root)
+            || self.source_map.len() > 128
+            || self
+                .source_map
+                .iter()
+                .any(|(source, mapped)| !safe_debug_path(source) || !safe_debug_path(mapped))
+            || self
+                .source_substitution
+                .as_ref()
+                .is_some_and(|mapping| !safe_debug_path(&mapping.compiled) || !safe_debug_path(&mapping.installed))
+        {
+            return Err(ModelError::Invalid("debugger source mapping is invalid"));
+        }
+        Ok(())
+    }
+}
+
+fn safe_debug_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && !path.split('/').any(|part| part == "..")
+        && !path.contains([';', '"'])
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]

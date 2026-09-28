@@ -29,6 +29,9 @@ pub(crate) struct JobManager {
 
 pub(crate) struct SelectedDebugTarget {
     pub executable: PathBuf,
+    pub prefix: PathBuf,
+    pub runtime_pack_digest: String,
+    pub executable_digest: String,
 }
 
 struct ActiveJob {
@@ -174,6 +177,22 @@ impl JobManager {
             .ok_or(crate::ServiceError::Debug(compatforge_debug::DebugError::Unauthorized))?;
         let selected = SelectedDebugTarget {
             executable: self.registry.lifecycle.launcher_path(&generation, &launcher.executable),
+            prefix: PathBuf::from(&self.config.storage_root)
+                .join("bottles")
+                .join(&generation.bottle_id)
+                .join("prefix"),
+            runtime_pack_digest: generation
+                .runtime
+                .as_ref()
+                .ok_or(crate::ServiceError::Conflict("selected generation has no runtime"))?
+                .selection
+                .pack_digest
+                .clone(),
+            executable_digest: generation
+                .launcher_digests
+                .get(&launcher.id)
+                .ok_or(crate::ServiceError::Conflict("selected launcher has no digest"))?
+                .clone(),
         };
         let handle = launch(selected)?;
         active_debug.insert(

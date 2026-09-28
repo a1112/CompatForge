@@ -267,7 +267,7 @@ def main() -> None:
     else:
         if Path(args.output).exists():
             raise RuntimeError("refusing to replace an existing acceptance receipt")
-        command = ["/usr/bin/unshare", "-Urn", sys.executable, __file__, "--inside",
+        command = ["/usr/bin/unshare", "-Urnpf", "--mount-proc", "--kill-child", sys.executable, __file__, "--inside",
                    "--parent-netns", os.readlink("/proc/self/ns/net")]
         for key, value in vars(args).items():
             if key not in ("inside", "parent_netns"):

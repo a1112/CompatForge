@@ -4,6 +4,8 @@
 
 pub mod bootstrap;
 pub mod daemon;
+#[cfg(target_os = "linux")]
+mod debug_provider;
 pub mod desktop;
 pub mod desktop_lifecycle;
 mod jobs;
@@ -16,7 +18,12 @@ mod model;
 mod registry;
 pub mod transport;
 
-use compatforge_debug::{DebugRequest, DebugSupervisor, UnavailableBackend};
+use compatforge_debug::dap::SafeDapRequest;
+#[cfg(not(target_os = "linux"))]
+use compatforge_debug::UnavailableBackend;
+use compatforge_debug::{DebugRequest, DebugSupervisor};
+#[cfg(target_os = "linux")]
+use debug_provider::WorkerBackend;
 use jobs::{JobError, JobManager};
 pub use jobs::{ShutdownError, ShutdownFailure, ShutdownPhase};
 use model::{ApplicationPayload, ArchivePayload, AssessmentPayload, IdPayload, PollPayload};
@@ -40,8 +47,13 @@ use compatforge_domain::{CoreConfig, SCHEMA_VERSION_V1};
 pub struct AutomationService {
     registry: Arc<Registry>,
     jobs: JobManager,
-    debug: Mutex<DebugSupervisor<UnavailableBackend>>,
+    debug: Mutex<DebugSupervisor<SelectedBackend>>,
 }
+
+#[cfg(target_os = "linux")]
+type SelectedBackend = WorkerBackend;
+#[cfg(not(target_os = "linux"))]
+type SelectedBackend = UnavailableBackend;
 
 impl AutomationService {
     /// Call only after stopping and draining clients. Stops owned jobs and joins
@@ -83,19 +95,22 @@ impl AutomationService {
             .validate()
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
         service_config.validate().map_err(ServiceError::Model)?;
+        let service_root = PathBuf::from(&service_config.service_root);
+        #[cfg(target_os = "linux")]
+        let debug_backend = WorkerBackend::new(service_config.debugger_runtime.clone(), service_root.clone());
+        #[cfg(not(target_os = "linux"))]
+        let debug_backend = UnavailableBackend;
         let registry = Arc::new(
-            Registry::new(
-                PathBuf::from(service_config.service_root),
-                PathBuf::from(&core_config.storage_root),
-            )
-            .map_err(ServiceError::Registry)?,
+            Registry::new(service_root, PathBuf::from(&core_config.storage_root)).map_err(ServiceError::Registry)?,
         );
+        #[cfg(target_os = "linux")]
+        debug_backend.recover_stale_sessions().map_err(ServiceError::Debug)?;
         registry.recover_interrupted_jobs().map_err(ServiceError::Registry)?;
         let jobs = JobManager::new(Arc::clone(&registry), core_config);
         Ok(Self {
             registry,
             jobs,
-            debug: Mutex::new(DebugSupervisor::new(UnavailableBackend)),
+            debug: Mutex::new(DebugSupervisor::new(debug_backend)),
         })
     }
 
@@ -299,6 +314,23 @@ impl AutomationService {
                 let command = compatforge_debug::decode_request(&bytes).map_err(ServiceError::Debug)?;
                 to_value(self.debug_session(command)?)?
             }
+            "debug.dap" => {
+                let bytes = serde_json::to_vec(&request.payload).map_err(ServiceError::Json)?;
+                if bytes.len() > compatforge_debug::MAX_DEBUG_REQUEST_BYTES {
+                    return Err(ServiceError::Debug(compatforge_debug::DebugError::InvalidRequest));
+                }
+                let payload: DebugDapPayload = parse_payload(request.payload)?;
+                if payload.schema_version != "1" {
+                    return Err(ServiceError::Debug(compatforge_debug::DebugError::InvalidRequest));
+                }
+                let message = payload
+                    .message
+                    .as_ref()
+                    .map(SafeDapRequest::parse)
+                    .transpose()
+                    .map_err(ServiceError::Debug)?;
+                self.debug_dap(payload.handle, message)?
+            }
             "applications.seed-defaults" => {
                 self.seed_default_applications()?;
                 json!({ "seeded": true })
@@ -395,17 +427,86 @@ impl AutomationService {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DebugDapPayload {
+    schema_version: String,
+    handle: compatforge_debug::DebugSessionHandle,
+    #[serde(default)]
+    message: Option<Value>,
+}
+
 impl AutomationService {
+    #[cfg(target_os = "linux")]
+    fn debug_dap(
+        &self,
+        handle: compatforge_debug::DebugSessionHandle,
+        request: Option<SafeDapRequest>,
+    ) -> Result<Value, ServiceError> {
+        if let Some(SafeDapRequest::Terminate { seq } | SafeDapRequest::Disconnect { seq }) = &request {
+            let terminate = matches!(request, Some(SafeDapRequest::Terminate { .. }));
+            let command = if terminate { "terminate" } else { "disconnect" };
+            let lifecycle = if terminate {
+                DebugRequest::Terminate { handle }
+            } else {
+                DebugRequest::Disconnect { handle }
+            };
+            self.debug_session(lifecycle)?;
+            return Ok(
+                json!({"messages":[{"seq":0,"request_seq":seq,"type":"response","command":command,"success":true,"body":{}}]}),
+            );
+        }
+        let uid = debug_owner_uid();
+        let mut sessions = self
+            .debug
+            .lock()
+            .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
+        let messages = sessions
+            .with_owned(&handle, uid, |backend, owned| backend.exchange(owned, request.as_ref()))
+            .map_err(ServiceError::Debug)?;
+        for message in &messages {
+            if message.get("type") == Some(&json!("event")) {
+                let event = match message.get("event").and_then(Value::as_str) {
+                    Some("stopped") => Some(compatforge_debug::DebugEvent::Stopped),
+                    Some("continued") => Some(compatforge_debug::DebugEvent::Continued),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    let _ = sessions.record(&handle, uid, event);
+                }
+            }
+        }
+        Ok(json!({"messages":messages}))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn debug_dap(
+        &self,
+        _handle: compatforge_debug::DebugSessionHandle,
+        _request: Option<SafeDapRequest>,
+    ) -> Result<Value, ServiceError> {
+        Err(ServiceError::Debug(compatforge_debug::DebugError::Unavailable))
+    }
+
     fn debug_session(&self, command: DebugRequest) -> Result<Value, ServiceError> {
         let uid = debug_owner_uid();
         match command {
             DebugRequest::Launch { target } => {
-                let handle = self.jobs.launch_selected_debug_session(&target, |_selected| {
+                let handle = self.jobs.launch_selected_debug_session(&target, |selected| {
                     let mut sessions = self
                         .debug
                         .lock()
                         .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
-                    sessions.launch(target.clone(), uid).map_err(ServiceError::Debug)
+                    #[cfg(target_os = "linux")]
+                    let launched = sessions.launch_with(target.clone(), uid, |backend, target| {
+                        backend.launch_selected(target, &selected)
+                    });
+                    #[cfg(not(target_os = "linux"))]
+                    let launched = {
+                        let _ = selected;
+                        sessions.launch(target.clone(), uid)
+                    };
+                    launched.map_err(ServiceError::Debug)
                 })?;
                 to_value(handle)
             }
@@ -523,6 +624,56 @@ mod tests {
     use super::*;
     use compatforge_domain::CoreConfig;
     use std::fs;
+
+    #[test]
+    fn debugger_runtime_config_requires_pinned_absolute_tools_and_bounded_sources() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let file = |path: &str| json!({"path":path,"sha256":digest});
+        let root = if cfg!(windows) {
+            "C:/compatforge-service"
+        } else {
+            "/tmp/compatforge-service"
+        };
+        let valid = json!({"schemaVersion":"1","serviceRoot":root,
+            "debuggerRuntime":{"schemaVersion":1,"runtimePackDigest":digest,
+                "worker":file("/usr/lib/compatforge/compatforge-debug-worker.py"),
+                "wine":file("/usr/bin/winedbg"),
+                "winedbgModule":file("/usr/lib/wine/x86_64-windows/winedbg.exe"),
+                "gdb":file("/opt/compatforge/debugger/usr/bin/gdb"),
+                "gdbRoot":"/opt/compatforge/debugger","sourceMap":{"/workspace/probe.c":"/managed/probe.c"}}});
+        let config: ServiceConfig = serde_json::from_value(valid.clone()).unwrap();
+        assert!(config.validate().is_ok());
+        let mut invalid = valid.clone();
+        invalid["debuggerRuntime"]["gdb"]["path"] = json!("relative/gdb");
+        assert!(serde_json::from_value::<ServiceConfig>(invalid)
+            .unwrap()
+            .validate()
+            .is_err());
+        let mut invalid = valid;
+        invalid["debuggerRuntime"]["sourceMap"] = json!({"/workspace/../private":"/managed/probe.c"});
+        assert!(serde_json::from_value::<ServiceConfig>(invalid)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn debug_dap_dispatch_rejects_arbitrary_gdb_commands_before_session_lookup() {
+        let service = service();
+        let request = |message| ServiceRequest {
+            schema_version: "1".into(),
+            request_id: "dap-probe".into(),
+            operation: "debug.dap".into(),
+            payload: json!({"schemaVersion":"1","handle":{"sessionId":"debug-missing","capability":"fake"},"message":message}),
+        };
+        let unsafe_command = json!({"seq":1,"type":"request","command":"evaluate","arguments":{"expression":"shell id","context":"repl"}});
+        assert_eq!(
+            service.call(request(unsafe_command)).unwrap_err().code(),
+            "invalid-request"
+        );
+        let safe_command = json!({"seq":1,"type":"request","command":"threads","arguments":{}});
+        assert_ne!(service.call(request(safe_command)).unwrap_err().code(), "not-found");
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -538,6 +689,7 @@ mod tests {
             ServiceConfig {
                 schema_version: SCHEMA_VERSION_V1.into(),
                 service_root: root.join("service").to_string_lossy().into_owned(),
+                debugger_runtime: None,
             },
         )
         .unwrap()

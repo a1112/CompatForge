@@ -94,7 +94,8 @@ def write_new(path, value):
 
 
 def validate_template(value):
-    require(type(value) is dict and set(value) == {"schemaVersion", "cliSha256", "runtimePackDigest", "runtime", "bottleFont"},
+    keys = {"schemaVersion", "cliSha256", "runtimePackDigest", "runtime", "bottleFont"}
+    require(type(value) is dict and set(value) in (keys, keys | {"debuggerRuntime"}),
             "unknown desktop template fields")
     require(type(value["schemaVersion"]) is int and value["schemaVersion"] == 1
             and digest(value["cliSha256"]) and type(value["runtimePackDigest"]) is str
@@ -112,6 +113,35 @@ def validate_template(value):
             and font["path"] == FONT and font["family"] == "Noto Sans CJK SC"
             and type(font["digest"]) is str and font["digest"].startswith("sha256:")
             and digest(font["digest"][7:]), "unsupported or unpinned desktop font")
+    if "debuggerRuntime" in value:
+        debugger = value["debuggerRuntime"]
+        require(type(debugger) is dict and set(debugger) in (
+                {"schemaVersion", "runtimePackDigest", "worker", "wine", "winedbgModule", "gdb", "gdbRoot", "sourceMap"},
+                {"schemaVersion", "runtimePackDigest", "worker", "wine", "winedbgModule", "gdb", "gdbRoot", "sourceMap", "sourceSubstitution"})
+                and type(debugger["schemaVersion"]) is int and debugger["schemaVersion"] == 1
+                and debugger["runtimePackDigest"] == value["runtimePackDigest"]
+                and debugger["gdbRoot"] == "/opt/compatforge/debugger",
+                "invalid debugger runtime binding")
+        for key, path in [("worker", "/usr/lib/compatforge/compatforge-debug-worker.py"),
+                          ("wine", "/usr/bin/winedbg"),
+                          ("winedbgModule", "/usr/lib/wine/x86_64-windows/winedbg.exe"),
+                          ("gdb", "/opt/compatforge/debugger/usr/bin/gdb")]:
+            item = debugger[key]
+            require(type(item) is dict and set(item) == {"path", "sha256"} and item["path"] == path
+                    and type(item["sha256"]) is str and item["sha256"].startswith("sha256:")
+                    and digest(item["sha256"][7:]), "invalid pinned debugger file")
+        sources = debugger["sourceMap"]
+        require(type(sources) is dict and len(sources) <= 128 and all(
+                type(source) is str and type(mapped) is str and source.startswith("/") and mapped.startswith("/")
+                and ".." not in Path(source).parts and ".." not in Path(mapped).parts
+                and len(source) <= 4096 and len(mapped) <= 4096
+                for source, mapped in sources.items()), "invalid debugger source map")
+        if "sourceSubstitution" in debugger:
+            mapping = debugger["sourceSubstitution"]
+            require(type(mapping) is dict and set(mapping) == {"compiled", "installed"}
+                    and all(type(part) is str and part.startswith("/") and len(part) <= 4096
+                            and ".." not in Path(part).parts and not any(char in part for char in "\n\r;\"")
+                            for part in mapping.values()), "invalid debugger source substitution")
     return value
 
 
@@ -124,6 +154,21 @@ def verify_system(template):
             require(metadata.st_uid == 0 and metadata.st_mode & 0o022 == 0, "system asset ancestor is writable")
         require(sha(read_regular(path, 0, 512 * 1024 * 1024)) == pin,
                 "system asset changed; install a matching verified CompatForge image: " + path)
+    if "debuggerRuntime" in template:
+        debugger = template["debuggerRuntime"]
+        for key in ("worker", "winedbgModule", "gdb"):
+            item = debugger[key]
+            for ancestor in Path(item["path"]).parents:
+                metadata = ancestor.stat()
+                require(metadata.st_uid == 0 and metadata.st_mode & 0o022 == 0, "debugger system asset ancestor is writable")
+            require(sha(read_regular(item["path"], 0, 512 * 1024 * 1024)) == item["sha256"][7:],
+                    "debugger system asset changed: " + key)
+        wine = Path(debugger["wine"]["path"])
+        metadata = wine.lstat()
+        require(wine.is_symlink() and metadata.st_uid == 0
+                and wine.resolve() == Path("/usr/bin/wine")
+                and sha(read_regular(wine.resolve(), 0, 512 * 1024 * 1024)) == debugger["wine"]["sha256"][7:],
+                "WineDbg loader link changed")
 
 
 def command(argv):
@@ -139,7 +184,7 @@ def command(argv):
         return json.loads(output.read(MAX_JSON + 1), object_pairs_hook=unique_pairs)
 
 
-def initialize(home, template, run=command):
+def initialize(home, template, run=command, refresh_debugger=False):
     """Caller holds the initialization lock; no live daemon may own this config."""
     validate_template(template)
     home = Path(home).absolute()
@@ -158,11 +203,65 @@ def initialize(home, template, run=command):
         private_directory(config)
         receipt = read_json(config / "init-v1.json", owner)
         require(type(receipt) is dict and set(receipt) == {"schemaVersion", "templateSha256", "configurationSha256", "contextSha256", "serviceSha256"}
-                and type(receipt["schemaVersion"]) is int and receipt["schemaVersion"] == 1
-                and receipt["configurationSha256"] == configuration_pin,
-                "existing context differs from image template; preserve it and migrate explicitly")
-        for name, key in [("context.json", "contextSha256"), ("service.json", "serviceSha256")]:
-            require(sha(read_regular(config / name, owner)) == receipt[key], "existing context was modified; refusing overwrite")
+                and type(receipt["schemaVersion"]) is int and receipt["schemaVersion"] == 1,
+                "existing context receipt is invalid")
+        require(sha(read_regular(config / "context.json", owner)) == receipt["contextSha256"],
+                "existing context was modified; refusing overwrite")
+        service_raw = read_regular(config / "service.json", owner)
+        if sha(service_raw) != receipt["serviceSha256"]:
+            # The service file was atomically installed before a crash, but
+            # the receipt was not. Finish only this recognized transaction.
+            require(refresh_debugger and "debuggerRuntime" in template,
+                    "interrupted debugger refresh requires explicit retry")
+            legacy = {key: value for key, value in template.items() if key not in ("cliSha256", "debuggerRuntime")}
+            require(receipt["configurationSha256"] == sha(canonical(legacy)),
+                    "existing context is not a recognized pre-debugger image")
+            service = json.loads(service_raw, object_pairs_hook=unique_pairs)
+            require(type(service) is dict and set(service) == {"schemaVersion", "serviceRoot", "debuggerRuntime"}
+                    and service["debuggerRuntime"] == template["debuggerRuntime"],
+                    "interrupted debugger service differs from image template")
+            old_service = {key: value for key, value in service.items() if key != "debuggerRuntime"}
+            require(sha(canonical(old_service)) == receipt["serviceSha256"],
+                    "interrupted debugger service differs from prior receipt")
+            next_receipt = dict(receipt, templateSha256=template_pin, configurationSha256=configuration_pin,
+                                serviceSha256=sha(service_raw))
+            receipt_next = config / ".init.debugger.next"
+            require(not os.path.lexists(config / ".service.debugger.next"),
+                    "unexpected debugger service staging file")
+            if os.path.lexists(receipt_next):
+                require(read_regular(receipt_next, owner) == canonical(next_receipt),
+                        "interrupted debugger receipt differs from expected")
+            else:
+                write_new(receipt_next, next_receipt)
+            os.replace(receipt_next, config / "init-v1.json")
+            sync_directory(config)
+            return {"initialized": True, "reused": True, "refreshedDebugger": True}
+        if receipt["configurationSha256"] != configuration_pin:
+            require(refresh_debugger and "debuggerRuntime" in template, "existing context differs from image template; preserve it and migrate explicitly")
+            legacy = {key: value for key, value in template.items() if key not in ("cliSha256", "debuggerRuntime")}
+            require(receipt["configurationSha256"] == sha(canonical(legacy)), "existing context is not a recognized pre-debugger image")
+            service = read_json(config / "service.json", owner)
+            require(type(service) is dict and set(service) == {"schemaVersion", "serviceRoot"}
+                    and service["schemaVersion"] == "1", "existing service configuration is not a recognized legacy file")
+            service["debuggerRuntime"] = template["debuggerRuntime"]
+            next_receipt = dict(receipt, templateSha256=template_pin, configurationSha256=configuration_pin,
+                                serviceSha256=sha(canonical(service)))
+            service_next = config / ".service.debugger.next"
+            receipt_next = config / ".init.debugger.next"
+            if os.path.lexists(service_next):
+                require(read_regular(service_next, owner) == canonical(service),
+                        "interrupted debugger service staging differs from expected")
+            else:
+                write_new(service_next, service)
+            if os.path.lexists(receipt_next):
+                require(read_regular(receipt_next, owner) == canonical(next_receipt),
+                        "interrupted debugger receipt staging differs from expected")
+            else:
+                write_new(receipt_next, next_receipt)
+            os.replace(service_next, config / "service.json")
+            os.replace(receipt_next, config / "init-v1.json")
+            sync_directory(config)
+            return {"initialized": True, "reused": True, "refreshedDebugger": True}
         if receipt["templateSha256"] != template_pin:
             receipt["templateSha256"] = template_pin
             # A CLI-only update has no configuration semantic change. Preserve
@@ -201,7 +300,9 @@ def initialize(home, template, run=command):
     write_new(stage / "bootstrap.json", request)
     receipt = run([CLI, "local", "linux", "context", str(stage / "bootstrap.json"), str(stage / "context.json")])
     require(receipt.get("packDigest") == template["runtimePackDigest"], "bootstrapped runtime differs from image pin")
-    write_new(stage / "service.json", {"schemaVersion": "1", "serviceRoot": str(root / "service")})
+    service = {"schemaVersion": "1", "serviceRoot": str(root / "service")}
+    if "debuggerRuntime" in template: service["debuggerRuntime"] = template["debuggerRuntime"]
+    write_new(stage / "service.json", service)
     write_new(stage / "seed.json", {"schemaVersion": "1", "requestId": "first-login", "operation": "applications.seed-defaults", "payload": {}})
     response = run([CLI, "api", str(stage / "context.json"), str(stage / "service.json"), str(stage / "seed.json")])
     require(response.get("operation") == "applications.seed-defaults" and response.get("result") == {"seeded": True}, "application registry initialization failed")
@@ -219,7 +320,13 @@ def initialize(home, template, run=command):
 
 
 def main():
-    require(sys.platform == "linux" and len(sys.argv) == 1, "user-init takes no arguments and requires Linux")
+    require(sys.platform == "linux" and sys.argv[1:] in ([], ["--refresh-debugger"]),
+            "user-init accepts only --refresh-debugger on Linux")
+    refresh_debugger = sys.argv[1:] == ["--refresh-debugger"]
+    if refresh_debugger:
+        active = subprocess.run(["/usr/bin/systemctl", "--user", "is-active", "--quiet", "compatforge.service"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        require(active.returncode != 0, "stop the CompatForge user service before debugger refresh")
     import fcntl
     import pwd
     require(os.getuid() != 0 and os.getuid() == os.geteuid(), "run as the ordinary desktop user")
@@ -240,7 +347,7 @@ def main():
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         template = validate_template(read_json(TEMPLATE, 0))
         verify_system(template)
-        print(json.dumps(initialize(home, template), sort_keys=True))
+        print(json.dumps(initialize(home, template, refresh_debugger=refresh_debugger), sort_keys=True))
     finally: os.close(descriptor)
 
 
