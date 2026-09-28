@@ -97,3 +97,17 @@ and all personal files. Retain the archived JSON for diagnostics, then reopen th
 service and retry. If an older service already exceeded the limit, use the same
 offline procedure before reopening; this version does not silently remove those
 older records.
+
+`bottles.list`, `bottles.get`, `bottles.create`, and `bottles.restore` summaries
+include the additive boolean `managed`. When true, the Bottle is retained by the
+application lifecycle and cannot be manually archived. Desktop clients disable
+that action. This includes reserved `gen-` names without a current generation
+record. Managed summaries bind the physical Bottle ID to its retained definition,
+so changing or removing the current recipe does not erase its application or
+launcher inventory. `installedLauncherCount` counts existing declared launcher
+files; consult `applications.generations` for installation and recovery evidence.
+A false `managed` value does not bypass the existing active-job archive checks.
+
+The 4 MiB metadata limit includes pretty-JSON whitespace and the final newline.
+An update that exceeds this on-disk size is rejected before replacing the previous
+record, retaining the selected generation and readable job history.

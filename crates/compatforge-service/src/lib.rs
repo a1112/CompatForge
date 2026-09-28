@@ -463,6 +463,59 @@ mod tests {
     }
 
     #[test]
+    fn managed_bottle_summary_uses_retained_definition_and_disables_archive() {
+        let service = service();
+        service.seed_default_applications().unwrap();
+        let app = service.registry.get_application("7zip").unwrap().application;
+        let generation = service.registry.lifecycle.stage(&app, "job-summary").unwrap();
+        let config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        let binding = &config.runtime_bindings[0];
+        let runtime = lifecycle::InstalledRuntime::from_config(
+            &config,
+            &compatforge_domain::RuntimeSelection {
+                provider: compatforge_domain::RuntimeKind::Wine,
+                pack_id: binding.pack_id.clone(),
+                pack_digest: binding.pack_digest.clone(),
+            },
+        )
+        .unwrap();
+        service
+            .registry
+            .lifecycle
+            .bind_runtime(&app.id, "job-summary", runtime)
+            .unwrap();
+        let path = service
+            .registry
+            .lifecycle
+            .launcher_path(&generation, &app.launchers[0].executable);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
+        let job: JobRecord = serde_json::from_value(json!({"schemaVersion":"1", "id":"job-summary", "applicationId":app.id,
+            "generationId":generation.id, "kind":"install", "status":"succeeded", "createdAtMilliseconds":1, "updatedAtMilliseconds":1})).unwrap();
+        service.registry.lifecycle.finish(&job).unwrap();
+        let mut replacement = app.clone();
+        replacement.bottle_id = "another-logical-bottle".into();
+        replacement.launchers[0].executable = "missing-new-launcher.exe".into();
+        service.registry.upsert_application(replacement).unwrap();
+        let summary = service.get_bottle(&generation.bottle_id).unwrap();
+        assert_eq!(summary.application_ids, std::slice::from_ref(&app.id));
+        assert_eq!(summary.installed_launcher_count, 1);
+        assert_eq!(summary.status, BottleStatus::Ready);
+        assert_eq!(serde_json::to_value(&summary).unwrap()["managed"], true);
+        assert_eq!(
+            service.archive_bottle(&generation.bottle_id).unwrap_err().code(),
+            "conflict"
+        );
+        // Retained generations keep their identity even after recipe removal.
+        service.registry.remove_application(&app.id).unwrap();
+        assert_eq!(service.list_bottles().unwrap(), [summary]);
+        let legacy = service.create_bottle("manual-bottle").unwrap();
+        assert_eq!(serde_json::to_value(legacy).unwrap()["managed"], false);
+        assert!(service.archive_bottle("manual-bottle").is_ok());
+    }
+
+    #[test]
     fn generic_dispatcher_covers_applications_settings_and_bottles() {
         let service = service();
         service

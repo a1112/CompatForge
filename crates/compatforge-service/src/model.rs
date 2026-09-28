@@ -230,6 +230,8 @@ pub enum BottleStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BottleSummary {
     pub id: String,
+    #[serde(default)]
+    pub managed: bool,
     pub status: BottleStatus,
     pub application_ids: Vec<String>,
     pub installed_launcher_count: usize,

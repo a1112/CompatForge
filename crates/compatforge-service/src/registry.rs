@@ -1,4 +1,7 @@
-use crate::lifecycle::{acquire_root_lock, check_path, ensure_directory, read_record, LifecycleStore};
+use crate::lifecycle::{
+    acquire_root_lock, check_path, ensure_directory, read_record, stored_record_size, ApplicationGeneration,
+    GenerationStatus, LifecycleStore,
+};
 use crate::model::{
     ApplicationDefinition, ApplicationRecord, ApplicationStatus, ApplicationSummary, BottleArchive, BottleStatus,
     BottleSummary, CompatibilityRating, InstallerDefinition, JobKind, JobRecord, JobStatus, LauncherDefinition,
@@ -66,7 +69,7 @@ impl Registry {
 
     fn write_record<T: serde::Serialize>(&self, path: impl AsRef<Path>, value: &T) -> Result<(), RegistryError> {
         check_path(&self.service_root.join(path.as_ref()), true)?;
-        if serde_json::to_vec(value).map_err(RegistryError::Json)?.len() as u64 > MAX_RECORD_BYTES {
+        if stored_record_size(value)? > MAX_RECORD_BYTES {
             return Err(RegistryError::Invalid("registry record exceeds 4 MiB"));
         }
         self.store
@@ -203,10 +206,6 @@ impl Registry {
             .is_ok_and(|generation| self.lifecycle.verify_launchers(&generation).is_ok())
     }
 
-    pub(crate) fn launcher_path(&self, application: &ApplicationDefinition, launcher: &LauncherDefinition) -> PathBuf {
-        self.bottle_drive_c(&application.bottle_id).join(&launcher.executable)
-    }
-
     pub(crate) fn bottle_drive_c(&self, bottle_id: &str) -> PathBuf {
         self.storage_root
             .join("bottles")
@@ -236,12 +235,8 @@ impl Registry {
     }
 
     pub(crate) fn list_bottles(&self) -> Result<Vec<BottleSummary>, RegistryError> {
-        let records = self.list_application_records()?;
-        let mut summaries = Vec::new();
-        for id in list_directories(&self.storage_root.join("bottles"))? {
-            validate_registry_id(&id)?;
-            summaries.push(self.bottle_summary(&id, &records));
-        }
+        let ids = list_directories(&self.storage_root.join("bottles"))?;
+        let mut summaries = self.bottle_summaries(&ids)?;
         summaries.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(summaries)
     }
@@ -256,29 +251,63 @@ impl Registry {
         if !is_directory(&root) {
             return Err(RegistryError::NotFound("bottle"));
         }
-        let records = self.list_application_records_unlocked()?;
-        Ok(self.bottle_summary(id, &records))
+        self.bottle_summaries(&[id.into()])?
+            .pop()
+            .ok_or(RegistryError::NotFound("bottle"))
     }
 
-    fn bottle_summary(&self, id: &str, records: &[ApplicationRecord]) -> BottleSummary {
-        let applications: Vec<&ApplicationDefinition> = records
+    fn bottle_summaries(&self, ids: &[String]) -> Result<Vec<BottleSummary>, RegistryError> {
+        // Load and index each registry once per request, including retained
+        // definitions whose current application recipe was changed or removed.
+        let records = self.list_application_records_unlocked()?;
+        let states = self.lifecycle.all_states()?;
+        let mut definitions: BTreeMap<&str, Vec<&ApplicationDefinition>> = BTreeMap::new();
+        for record in &records {
+            definitions
+                .entry(&record.application.bottle_id)
+                .or_default()
+                .push(&record.application);
+        }
+        let generations: BTreeMap<&str, &ApplicationGeneration> = states
             .iter()
-            .filter(|record| record.application.bottle_id == id)
-            .map(|record| &record.application)
+            .flat_map(|state| state.generations.iter())
+            .map(|generation| (generation.bottle_id.as_str(), generation))
             .collect();
+        ids.iter()
+            .map(|id| {
+                validate_registry_id(id)?;
+                let generation = generations.get(id.as_str()).copied();
+                let applications = match generation {
+                    Some(generation) => vec![&generation.definition],
+                    None => definitions.get(id.as_str()).cloned().unwrap_or_default(),
+                };
+                Ok(self.bottle_summary(id, &applications, generation))
+            })
+            .collect()
+    }
+
+    fn bottle_summary(
+        &self,
+        id: &str,
+        applications: &[&ApplicationDefinition],
+        generation: Option<&ApplicationGeneration>,
+    ) -> BottleSummary {
         let installed_launcher_count = applications
             .iter()
-            .flat_map(|application| {
-                application
-                    .launchers
-                    .iter()
-                    .map(move |launcher| (*application, launcher))
+            .flat_map(|application| application.launchers.iter())
+            .filter(|launcher| {
+                let path = self.bottle_drive_c(id).join(&launcher.executable);
+                check_path(&path, false).is_ok() && is_regular_file(&path)
             })
-            .filter(|(application, launcher)| is_regular_file(&self.launcher_path(application, launcher)))
             .count();
+        let incomplete_generation = generation.is_some_and(|generation| {
+            generation.status != GenerationStatus::Ready
+                || installed_launcher_count != generation.definition.launchers.len()
+        });
         BottleSummary {
             id: id.into(),
-            status: if installed_launcher_count == 0 {
+            managed: generation.is_some() || id.starts_with("gen-"),
+            status: if installed_launcher_count == 0 || incomplete_generation {
                 BottleStatus::Empty
             } else {
                 BottleStatus::Ready
@@ -726,7 +755,9 @@ mod tests {
         let (service_root, storage_root) = roots("legacy");
         let registry = Registry::new(service_root, storage_root).unwrap();
         let app = baseline_applications()[0].clone();
-        let path = registry.launcher_path(&app, &app.launchers[0]);
+        let path = registry
+            .bottle_drive_c(&app.bottle_id)
+            .join(&app.launchers[0].executable);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"legacy executable").unwrap();
         assert!(!registry.application_installed(&app));
@@ -788,6 +819,58 @@ mod tests {
         registry.recover_interrupted_jobs().unwrap();
         assert!(registry.lifecycle.state("7zip").unwrap().operation.unwrap().quarantined);
         assert!(registry.lifecycle.selected("7zip").is_err());
+    }
+
+    #[test]
+    fn oversized_pretty_job_preserves_the_previous_readable_record() {
+        let (service_root, storage_root) = roots("pretty-job-bound");
+        let registry = Registry::new(service_root.clone(), storage_root.clone()).unwrap();
+        let previous: JobRecord = serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1", "id":"job-bound", "applicationId":"7zip", "kind":"launch",
+            "status":"succeeded", "createdAtMilliseconds":1, "updatedAtMilliseconds":1
+        }))
+        .unwrap();
+        registry.write_job(&previous).unwrap();
+        let path = service_root.join("jobs/job-bound.json");
+        let original = fs::read(&path).unwrap();
+
+        let mut oversized = previous.clone();
+        let event: compatforge_domain::RuntimeEvent = serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1", "sequence":1, "kind":"started", "requestId":"job-bound",
+            "elapsedMilliseconds":0, "message":""
+        }))
+        .unwrap();
+        oversized.events = vec![event; crate::model::MAX_JOB_EVENTS];
+        for (index, event) in oversized.events.iter_mut().enumerate() {
+            event.sequence = index as u64 + 1;
+        }
+        let padding =
+            (MAX_RECORD_BYTES as usize - serde_json::to_vec(&oversized).unwrap().len()) / oversized.events.len();
+        for event in &mut oversized.events {
+            event.message = Some("x".repeat(padding));
+        }
+        oversized.validate().unwrap();
+        assert!(serde_json::to_vec(&oversized).unwrap().len() as u64 <= MAX_RECORD_BYTES);
+        assert!(serde_json::to_vec_pretty(&oversized).unwrap().len() as u64 + 1 > MAX_RECORD_BYTES);
+        assert!(registry.write_job(&oversized).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(registry.read_job(&previous.id).unwrap(), previous);
+
+        // The final newline is part of the persisted file limit too.
+        let mut newline_overflow = previous.clone();
+        newline_overflow.inspection = Some(serde_json::Value::String(String::new()));
+        let padding = MAX_RECORD_BYTES as usize - serde_json::to_vec_pretty(&newline_overflow).unwrap().len();
+        newline_overflow.inspection = Some(serde_json::Value::String("x".repeat(padding)));
+        assert_eq!(
+            serde_json::to_vec_pretty(&newline_overflow).unwrap().len() as u64,
+            MAX_RECORD_BYTES
+        );
+        assert!(registry.write_job(&newline_overflow).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(registry);
+        let reopened = Registry::new(service_root, storage_root).unwrap();
+        reopened.recover_interrupted_jobs().unwrap();
+        assert_eq!(reopened.read_job(&previous.id).unwrap(), previous);
     }
 
     #[test]

@@ -77,7 +77,8 @@ terminal status, cleanup, and restart recovery cannot be blocked by the limit.
 The service does not prune history automatically. Operators can stop it and move
 completed, unreferenced job records into a separate offline archive to free slots;
 see the lifecycle guide for the preservation requirements. Service metadata is bounded
-to 4 MiB per record with bounded collections and IDs. Roots, metadata, launcher
+to 4 MiB per record, measured using the actual pretty-JSON encoding plus its
+trailing newline before replacement, with bounded collections and IDs. Roots, metadata, launcher
 paths, and lock paths reject symbolic links and Windows reparse points.
 
 The dependency is `fs4 = 0.8.4` with only `sync`, MIT OR Apache-2.0, from
@@ -122,3 +123,8 @@ linked launcher paths on Unix, active/uncleared handle conflicts, duplicate root
 ownership, normal shutdown reopening, and the generic API. Supervisor and real
 Linux installer/GUI acceptance are separate gates. Synthetic boot UUID tests are
 state-machine tests, not evidence of a real host reboot.
+
+Bottle summaries expose additive `managed` metadata so consumers disable manual
+archive for retained generations. Listing reads definitions and generation states
+once and indexes physical Bottle IDs; each summary uses its frozen definition
+even after the current recipe changes or is removed.

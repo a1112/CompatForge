@@ -255,7 +255,7 @@ impl LifecycleStore {
         let relative = format!("{}.json", state.application_id);
         let path = self.root.join(&relative);
         check_path(&path, true)?;
-        if serde_json::to_vec(state).map_err(RegistryError::Json)?.len() as u64 > MAX_STATE_BYTES {
+        if stored_record_size(state)? > MAX_STATE_BYTES {
             return Err(RegistryError::Invalid("generation state exceeds 4 MiB"));
         }
         let previous = self.state(&state.application_id)?;
@@ -636,6 +636,12 @@ pub(crate) fn bounded_error(message: &str) -> String {
     message.chars().take(1000).collect()
 }
 
+pub(crate) fn stored_record_size<T: Serialize>(value: &T) -> Result<u64, RegistryError> {
+    // JsonStore persists pretty JSON followed by one newline. Admission must
+    // measure that exact encoding so every successful write stays readable.
+    Ok(serde_json::to_vec_pretty(value).map_err(RegistryError::Json)?.len() as u64 + 1)
+}
+
 pub(crate) fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, RegistryError> {
     check_path(path, false)?;
     let metadata = fs::symlink_metadata(path).map_err(RegistryError::Io)?;
@@ -815,6 +821,39 @@ mod tests {
         launchers(store, &generation, 2);
         store.finish(&job(app, id, JobStatus::Succeeded)).unwrap();
         store.selected(&app.id).unwrap()
+    }
+
+    #[test]
+    fn oversized_pretty_generation_preserves_previous_selection_and_metadata() {
+        let (store, mut app, runtime) = fixture();
+        app.launchers.truncate(1);
+        app.launchers[0].arguments = vec!["x".repeat(500); crate::model::MAX_ARGUMENTS];
+        app.validate().unwrap();
+        let selected = installed(&store, &app, &runtime, "job-old");
+        let mut previous = store.state(&app.id).unwrap();
+        for index in 1..MAX_GENERATIONS - 1 {
+            let mut generation = selected.clone();
+            generation.id = format!("gen-job-retained-{index}");
+            generation.bottle_id = generation.id.clone();
+            previous.generations.push(generation);
+        }
+        store.write(&previous).unwrap();
+        let path = store.root.join(format!("{}.json", app.id));
+        let original = fs::read(&path).unwrap();
+        let mut oversized = previous.clone();
+        let mut generation = selected.clone();
+        generation.id = "gen-job-next".into();
+        generation.bottle_id = generation.id.clone();
+        oversized.generations.push(generation);
+        store.validate(&oversized, &app.id).unwrap();
+        assert!(serde_json::to_vec(&oversized).unwrap().len() as u64 <= MAX_STATE_BYTES);
+        assert!(serde_json::to_vec_pretty(&oversized).unwrap().len() as u64 + 1 > MAX_STATE_BYTES);
+        assert!(store.stage(&app, "job-next").is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
+        assert_eq!(store.selected(&app.id).unwrap(), selected);
+        let reopened = LifecycleStore::new(store.root.clone(), store.storage_root.clone()).unwrap();
+        assert_eq!(reopened.state(&app.id).unwrap(), previous);
+        assert_eq!(reopened.all_states().unwrap(), vec![previous]);
     }
 
     #[test]

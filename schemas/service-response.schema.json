@@ -65,6 +65,90 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "enum": [
+              "bottles.get",
+              "bottles.create",
+              "bottles.restore"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "$ref": "#/$defs/bottleSummary"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "bottles.list"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/bottleSummary"
+            }
+          }
+        }
+      }
     }
-  ]
+  ],
+  "$defs": {
+    "bottleSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "managed",
+        "status",
+        "applicationIds",
+        "installedLauncherCount"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "managed": {
+          "type": "boolean",
+          "description": "Managed or reserved generation Bottle. Manual archive is prohibited; use application lifecycle operations."
+        },
+        "status": {
+          "enum": [
+            "ready",
+            "empty",
+            "archived"
+          ]
+        },
+        "applicationIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "installedLauncherCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 262144
+        }
+      }
+    }
+  }
 }
