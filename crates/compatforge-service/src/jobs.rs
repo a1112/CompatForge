@@ -678,11 +678,14 @@ fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
                 state.record.error = event.message.clone().or_else(|| Some("runtime failed".into()));
             }
         }
+        RuntimeEventKind::TimedOut | RuntimeEventKind::GracePeriodExpired => {
+            if !state.cancel_requested && state.record.error.is_none() {
+                state.record.error = Some("runtime exceeded its completion deadline".into());
+            }
+        }
         RuntimeEventKind::Started
         | RuntimeEventKind::Output
         | RuntimeEventKind::TerminateRequested
-        | RuntimeEventKind::TimedOut
-        | RuntimeEventKind::GracePeriodExpired
         | RuntimeEventKind::WineServerStopRequested => {}
     }
 }
@@ -899,6 +902,18 @@ mod shutdown_tests {
         assert_eq!(manager.registry.list_jobs().unwrap()[0].status, JobStatus::Failed);
         assert!(manager.registry.lifecycle.selected(&app.id).is_err());
         manager.active.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn timed_out_installer_with_zero_exit_cannot_activate() {
+        let (manager, handle, _, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        handle.events.lock().unwrap().push_front(serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1", "sequence":1, "kind":"timed-out", "requestId":"job-managed", "elapsedMilliseconds":1,
+            "message":"runtime exceeded deadline"
+        })).unwrap());
+        assert_eq!(manager.poll("job-managed", 0).unwrap().job.status, JobStatus::Failed);
+        assert!(manager.registry.lifecycle.selected(&app.id).is_err());
     }
 
     #[test]
