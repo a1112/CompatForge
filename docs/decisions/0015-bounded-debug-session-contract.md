@@ -22,6 +22,10 @@ the service socket alone does not transfer ownership or terminate a session.
 The v1 commands are `launch`, `status`, `terminate` and `disconnect`. The
 supervisor checks state transitions and invokes a backend once for each terminal
 operation; a cleanup failure retains the owned session and surfaces an error.
+At most eight live sessions are admitted. Successful terminal sessions release
+admission immediately; only the most recent 32 terminal handles are retained
+for idempotent replies. An evicted handle receives `unauthorized`, and an active
+session is never evicted to reclaim terminal history.
 Its explicit `shutdown` retries all owned sessions and reports failure. Task 6
 must wire that cleanup into the service shutdown gate when replacing the
 unavailable backend with a real process provider. An unexpected owner-process

@@ -1,6 +1,6 @@
 use compatforge_debug::{
     decode_request, Backend, DebugError, DebugEvent, DebugRequest, DebugSupervisor, DebugTarget, DebuggerBinary,
-    DebuggerPackageBinding, PinnedDebugger, SessionState,
+    DebuggerPackageBinding, PinnedDebugger, SessionState, MAX_ACTIVE_SESSIONS, MAX_TERMINAL_HISTORY,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -142,6 +142,44 @@ fn disconnect_is_idempotent() {
     sessions.disconnect(&handle, 1000).unwrap();
     assert_eq!(sessions.backend().disconnects.load(Ordering::SeqCst), 1);
     assert_eq!(sessions.state(&handle, 1000).unwrap(), SessionState::Disconnected);
+}
+
+#[test]
+fn completed_sessions_release_admission_and_keep_only_recent_idempotent_handles() {
+    let mut sessions = DebugSupervisor::new(BackendCounter::default());
+    let mut handles = Vec::new();
+    for _ in 0..(MAX_TERMINAL_HISTORY + MAX_ACTIVE_SESSIONS + 1) {
+        let handle = sessions.launch(target(), 1000).unwrap();
+        sessions.terminate(&handle, 1000).unwrap();
+        handles.push(handle);
+    }
+    assert!(sessions.count() <= MAX_TERMINAL_HISTORY);
+    assert_eq!(sessions.terminate(&handles[0], 1000), Err(DebugError::Unauthorized));
+    let recent = handles.last().unwrap();
+    assert_eq!(sessions.state(recent, 1000), Ok(SessionState::Terminated));
+    assert_eq!(sessions.terminate(recent, 1000), Ok(()));
+    assert_eq!(sessions.backend().terminations.load(Ordering::SeqCst), handles.len());
+}
+
+#[test]
+fn active_capacity_remains_eight_and_tombstone_reclamation_never_evicts_active_sessions() {
+    let mut sessions = DebugSupervisor::new(BackendCounter::default());
+    let active = (0..MAX_ACTIVE_SESSIONS)
+        .map(|_| sessions.launch(target(), 1000).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(sessions.launch(target(), 1000), Err(DebugError::Capacity));
+    sessions.disconnect(&active[0], 1000).unwrap();
+    for _ in 0..(MAX_TERMINAL_HISTORY + 9) {
+        let temporary = sessions.launch(target(), 1000).unwrap();
+        sessions.disconnect(&temporary, 1000).unwrap();
+    }
+    assert!(sessions.count() <= MAX_ACTIVE_SESSIONS - 1 + MAX_TERMINAL_HISTORY);
+    for handle in &active[1..] {
+        assert_eq!(sessions.state(handle, 1000), Ok(SessionState::Active));
+    }
+    assert_eq!(sessions.state(&active[0], 1000), Err(DebugError::Unauthorized));
+    assert!(sessions.launch(target(), 1000).is_ok());
+    assert_eq!(sessions.launch(target(), 1000), Err(DebugError::Capacity));
 }
 
 #[test]

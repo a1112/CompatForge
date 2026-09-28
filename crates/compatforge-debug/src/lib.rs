@@ -4,11 +4,12 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 pub const MAX_DEBUG_REQUEST_BYTES: usize = 64 * 1024;
-const MAX_SESSIONS: usize = 8;
+pub const MAX_ACTIVE_SESSIONS: usize = 8;
+pub const MAX_TERMINAL_HISTORY: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DebugError {
@@ -237,6 +238,7 @@ struct Session<O> {
 pub struct DebugSupervisor<B: Backend> {
     backend: B,
     sessions: BTreeMap<String, Session<B::Owned>>,
+    terminal_order: VecDeque<String>,
 }
 
 impl<B: Backend> DebugSupervisor<B> {
@@ -244,6 +246,7 @@ impl<B: Backend> DebugSupervisor<B> {
         Self {
             backend,
             sessions: BTreeMap::new(),
+            terminal_order: VecDeque::new(),
         }
     }
     pub fn backend(&self) -> &B {
@@ -255,7 +258,7 @@ impl<B: Backend> DebugSupervisor<B> {
 
     pub fn launch(&mut self, target: DebugTarget, owner_uid: u32) -> Result<DebugSessionHandle, DebugError> {
         target.validate()?;
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.sessions.values().filter(|session| session.owned.is_some()).count() >= MAX_ACTIVE_SESSIONS {
             return Err(DebugError::Capacity);
         }
         let mut random = [0_u8; 48];
@@ -325,6 +328,7 @@ impl<B: Backend> DebugSupervisor<B> {
         }
         session.owned = None;
         session.state = SessionState::Terminated;
+        self.remember_terminal(&handle.session_id);
         Ok(())
     }
 
@@ -345,17 +349,20 @@ impl<B: Backend> DebugSupervisor<B> {
         }
         session.owned = None;
         session.state = SessionState::Disconnected;
+        self.remember_terminal(&handle.session_id);
         Ok(())
     }
 
     pub fn shutdown(&mut self) -> Result<(), DebugError> {
         let mut first_error = None;
-        for session in self.sessions.values_mut() {
+        let mut completed = Vec::new();
+        for (id, session) in &mut self.sessions {
             if let Some(owned) = session.owned.as_mut() {
                 match self.backend.terminate(owned) {
                     Ok(()) => {
                         session.owned = None;
                         session.state = SessionState::Terminated;
+                        completed.push(id.clone());
                     }
                     Err(error) => {
                         first_error.get_or_insert(error);
@@ -363,7 +370,19 @@ impl<B: Backend> DebugSupervisor<B> {
                 }
             }
         }
+        for id in completed {
+            self.remember_terminal(&id);
+        }
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn remember_terminal(&mut self, id: &str) {
+        self.terminal_order.push_back(id.to_owned());
+        while self.terminal_order.len() > MAX_TERMINAL_HISTORY {
+            if let Some(oldest) = self.terminal_order.pop_front() {
+                self.sessions.remove(&oldest);
+            }
+        }
     }
 }
 
