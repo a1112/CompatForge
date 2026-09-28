@@ -1,0 +1,125 @@
+{
+  "schemaVersion": "1",
+  "date": "2026-09-29",
+  "scope": "Task 3 Linux shared service and desktop consumer; actual Plasma integration belongs to Task 4",
+  "environment": {
+    "userspace": "Pinned Arch chroot, Wine 11.14 x86_64",
+    "display": "Private Xvfb 1280x800x24",
+    "isolation": "Mount, PID and network namespaces; tini PID 1; ordinary UID 1000",
+    "userVmModified": false
+  },
+  "earlyDaemonAcceptance": {
+    "rawEvidenceDirectory": "/srv/forge-apps-build/evidence/task3-daemon-early",
+    "provenance": {
+      "scope": "Uncommitted early Task3 source snapshot; not final desktop acceptance",
+      "sourceArchiveSha256": "8d43583a0f0fbfbc67e1af3ae1f7738b6ec667b37f7ab0979dd175a31c6fe4fe",
+      "binarySha256": "072d66930c4d173361fecabf17082e2e42b9d108a23ab0551060d56d957e5740"
+    },
+    "cases": [
+      {
+        "case": "private-endpoint-and-three-selected-launchers",
+        "result": "passed"
+      },
+      {
+        "case": "real-Wine-application-survives-desktop-client-exit",
+        "result": "passed"
+      },
+      {
+        "case": "rejected-request-does-not-stop-service-or-application",
+        "result": "passed"
+      },
+      {
+        "case": "background-poll-persists-cancellation-without-jobs-poll",
+        "result": "passed"
+      },
+      {
+        "case": "lost-response-retains-owned-job-and-client-can-reconnect",
+        "result": "passed"
+      },
+      {
+        "case": "real-install-activates-with-no-connected-client",
+        "result": "passed"
+      },
+      {
+        "case": "explicit-service-stop-joins-running-app-and-restarts-cleanly",
+        "result": "passed"
+      }
+    ],
+    "rawEvidenceSha256": {
+      "api.jsonl": "71f26ebd5b3b5ae5803ebff751031d62c76d044346eb3ceb88272f007542705a",
+      "observations.json": "a45e1fe487aaa70d343bfc4ec2a310c1f0cc7ce2c4ac7ffd471f732cef47d7e8",
+      "provenance.json": "600e2812eddffd0fa8c90b85195c10d21d252a77a4ef5c91f3e1a2a3121702b0",
+      "processes-after-cleanup.txt": "f1a22e2c59dd1ae45c3ee4592ecf2ab0f2e7ea7ff5e6fd0c93993d9e79509093"
+    }
+  },
+  "finalDesktopDelta": {
+    "rawEvidenceDirectory": "/srv/forge-apps-build/evidence/task3-desktop-final-b",
+    "provenance": {
+      "scope": "Task3 actual shared-service and consumer delta; Plasma timer/window grouping/reboot still pending",
+      "compatforgeArchiveSha256": "6a3e0614ecb30cef299e4eb14dbaa525ef84b642128c75ca6dd154914b01d7d4",
+      "forgeDesktopArchiveSha256": "546907235d26a815688f3618ccfd8def444d32ff82905dd4eb4f320669130ab4",
+      "binarySha256": "89bd186b3ab633673409fc7ecfac2cd6598a8eb6156d29e7d9f5d620d9d6dc2e"
+    },
+    "cases": [
+      {
+        "case": "actual-consumer-writes-three-valid-desktop-entries-and-retains-MIME-default",
+        "result": "passed"
+      },
+      {
+        "case": "uninstall-removes-owned-entry-rollback-restores-it-and-user-edit-survives",
+        "result": "passed"
+      },
+      {
+        "case": "stop-client-acknowledges-only-after-real-Wine-process-cleanup",
+        "result": "passed"
+      }
+    ],
+    "rawEvidenceSha256": {
+      "api.jsonl": "7fa7626a342cd77baf333063765eaaf5b62f48860427fde765340a9d7c7e73eb",
+      "observations.json": "a4bbad216bd0376594315606a78c7c891f813a6298b92cab75973c9cf1150f93",
+      "provenance.json": "a0b1f7348e2ce0cb12c2d44ea65b478f34e1e569b8776bbdb6aa0629d5e7eaf7",
+      "processes-after-cleanup.txt": "e89c421e5ce01c9be4dc95040144a613d83110f3502655be437ca7163422640b",
+      "processes-at-stop-ack.txt": "7cf35aa1e34529e59e6ed13445e216312080b97f00daa30d47718ac581b6c7bd"
+    }
+  },
+  "sourceComparison": {
+    "compatforgeCommit": "a52dcb7824bca3c1be8a4c997ba68f4b8eb1d641",
+    "forgeDesktopCommit": "fc5012f",
+    "method": "Compare exported archive last-member bytes against committed changed paths, normalizing CRLF to LF",
+    "result": "All executable, source, schema and tool bytes match; ForgeDesktop has no differences",
+    "compatforgeDocumentationAddedAfterSnapshot": [
+      "docs/architecture/application-service-api.md",
+      "docs/evidence/linux-applications/2026-09-28-desktop-integration-unit.json"
+    ]
+  },
+  "finalLinuxChecks": {
+    "cliTestsPassed": 74,
+    "serviceTestsPassed": 72,
+    "serviceHelperTestsIgnored": 2,
+    "desktopBackendTestsPassed": 13,
+    "forgeDesktopPythonTestsPassed": 56,
+    "clippyAllTargetsWarningsDenied": "passed",
+    "repositoryValidator": "passed after exporting the updated schema allowlist",
+    "cliBuild": "passed",
+    "logs": [
+      "/srv/forge-apps-build/evidence/task3-final-build.log",
+      "/srv/forge-apps-build/evidence/task3-final-finish-build.log"
+    ]
+  },
+  "stopAcknowledgement": "At stopped:true, no Wine processes remained. The already exited daemon was a zombie pending its Python parent wait; after wait and Xvfb cleanup only tini, Python and ps remained.",
+  "remaining": [
+    "Per-user initialization and user service/timer activation in the actual image",
+    "Plasma menu/Dock icon and task grouping acceptance",
+    "Opening a selected Chinese filename and saving through the actual application UI",
+    "Reboot persistence and recovery after a different kernel boot identity",
+    "Pinned CJK fallback in Wine GDI labels",
+    "A Wine Bottle is not a security sandbox; test namespace isolation is not product sandbox evidence"
+  ],
+  "reviewDelta": {
+    "forgeDesktopCommit": "30778034c4747523e46b171825902a834dd0e3a2",
+    "change": "Nonblocking open rejects FIFO before it can stall all desktop reconciliation",
+    "regression": "Real Linux subprocess reproduced 2-second blocking before fix; all 9 consumer tests passed after fix, preserving FIFO and installing another entry",
+    "reviews": "Independent specification and quality reviews passed",
+    "windowsChecks": "56 Python tests passed; the POSIX regression was skipped on Windows"
+  }
+}
