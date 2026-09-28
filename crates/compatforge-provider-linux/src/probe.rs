@@ -970,6 +970,7 @@ mod tests {
                     schema_version: "1".into(),
                     runtime_store_root: "/runtime-store".into(),
                     dxvk_graphics: None,
+                    bottle_font: None,
                     wine_runtime: WineRuntimeConfig {
                         provider_id: "linux-wine".into(),
                         pack_id: "wine-linux-x86_64".into(),

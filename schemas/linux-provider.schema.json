@@ -4,11 +4,21 @@
   "title": "CompatForge Linux Provider Configuration",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "runtimeStoreRoot", "wineRuntime"],
+  "required": [
+    "schemaVersion",
+    "runtimeStoreRoot",
+    "wineRuntime"
+  ],
   "properties": {
-    "schemaVersion": {"const": "1"},
-    "runtimeStoreRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
-    "dxvkGraphics": {"$ref": "#/$defs/dxvkGraphics"},
+    "schemaVersion": {
+      "const": "1"
+    },
+    "runtimeStoreRoot": {
+      "$ref": "#/$defs/absoluteLinuxPath"
+    },
+    "dxvkGraphics": {
+      "$ref": "#/$defs/dxvkGraphics"
+    },
     "wineRuntime": {
       "type": "object",
       "additionalProperties": false,
@@ -25,39 +35,110 @@
         "wined3dCapabilities"
       ],
       "properties": {
-        "providerId": {"$ref": "#/$defs/id"},
-        "packId": {"$ref": "#/$defs/id"},
-        "packDigest": {"$ref": "#/$defs/digest"},
-        "version": {"$ref": "#/$defs/version"},
-        "architecture": {"const": "x86_64"},
-        "materializedRoot": {"$ref": "#/$defs/absoluteLinuxPath"},
-        "wine": {"$ref": "#/$defs/entrypoint"},
-        "wineserver": {"$ref": "#/$defs/entrypoint"},
-        "capabilities": {"const": ["guest-x86_64"]},
-        "wined3dCapabilities": {"const": ["opengl"]}
+        "providerId": {
+          "$ref": "#/$defs/id"
+        },
+        "packId": {
+          "$ref": "#/$defs/id"
+        },
+        "packDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "architecture": {
+          "const": "x86_64"
+        },
+        "materializedRoot": {
+          "$ref": "#/$defs/absoluteLinuxPath"
+        },
+        "wine": {
+          "$ref": "#/$defs/entrypoint"
+        },
+        "wineserver": {
+          "$ref": "#/$defs/entrypoint"
+        },
+        "capabilities": {
+          "const": [
+            "guest-x86_64"
+          ]
+        },
+        "wined3dCapabilities": {
+          "const": [
+            "opengl"
+          ]
+        }
+      }
+    },
+    "bottleFont": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "digest",
+        "family"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^/"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "family": {
+          "const": "Noto Sans CJK SC"
+        }
       }
     }
   },
   "$defs": {
     "dxvkGraphics": {
-      "type": "object", "additionalProperties": false,
-      "required": ["dxvk", "vulkan"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dxvk",
+        "vulkan"
+      ],
       "properties": {
         "dxvk": {
-          "type": "object", "additionalProperties": false,
-          "required": ["version", "d3d11", "dxgi"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "d3d11",
+            "dxgi"
+          ],
           "properties": {
-            "version": {"$ref": "#/$defs/version"},
-            "d3d11": {"$ref": "#/$defs/entrypoint"},
-            "dxgi": {"$ref": "#/$defs/entrypoint"}
+            "version": {
+              "$ref": "#/$defs/version"
+            },
+            "d3d11": {
+              "$ref": "#/$defs/entrypoint"
+            },
+            "dxgi": {
+              "$ref": "#/$defs/entrypoint"
+            }
           }
         },
         "vulkan": {
-          "type": "object", "additionalProperties": false,
-          "required": ["probe", "icdManifest"],
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "probe",
+            "icdManifest"
+          ],
           "properties": {
-            "probe": {"$ref": "#/$defs/entrypoint"},
-            "icdManifest": {"$ref": "#/$defs/entrypoint"}
+            "probe": {
+              "$ref": "#/$defs/entrypoint"
+            },
+            "icdManifest": {
+              "$ref": "#/$defs/entrypoint"
+            }
           }
         }
       }
@@ -93,10 +174,17 @@
     "entrypoint": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "digest"],
+      "required": [
+        "path",
+        "digest"
+      ],
       "properties": {
-        "path": {"$ref": "#/$defs/relativePath"},
-        "digest": {"$ref": "#/$defs/digest"}
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
       }
     }
   }

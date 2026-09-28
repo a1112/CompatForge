@@ -209,7 +209,11 @@ class LinuxProviderSchemaTests(unittest.TestCase):
         self.assertFalse(runtime["additionalProperties"])
         root_fields = {"schemaVersion", "runtimeStoreRoot", "wineRuntime"}
         self.assertEqual(set(schema["required"]), root_fields)
-        self.assertEqual(set(schema["properties"]), root_fields | {"dxvkGraphics"})
+        self.assertEqual(set(schema["properties"]), root_fields | {"dxvkGraphics", "bottleFont"})
+        font = schema["properties"]["bottleFont"]
+        self.assertFalse(font["additionalProperties"])
+        self.assertEqual(set(font["required"]), {"path", "digest", "family"})
+        self.assertEqual(font["properties"]["family"]["const"], "Noto Sans CJK SC")
         self.assertEqual(
             schema["properties"]["dxvkGraphics"]["$ref"],
             "#/$defs/dxvkGraphics",
@@ -286,7 +290,7 @@ class LinuxProviderSchemaTests(unittest.TestCase):
             "version",
         }
         self.assertEqual(set(schema["required"]), fields)
-        self.assertEqual(set(schema["properties"]), fields | {"dxvkGraphics"})
+        self.assertEqual(set(schema["properties"]), fields | {"dxvkGraphics", "bottleFont"})
         self.assertEqual(schema["properties"]["dxvkGraphics"]["$ref"], "#/$defs/dxvkGraphics")
         graphics = schema["$defs"]["dxvkGraphics"]
         self.assertFalse(graphics["additionalProperties"])

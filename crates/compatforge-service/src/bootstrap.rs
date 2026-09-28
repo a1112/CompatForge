@@ -180,6 +180,7 @@ mod tests {
                 wined3d_capabilities: vec!["opengl".into()],
             },
             dxvk_graphics: None,
+            bottle_font: None,
         }
     }
 

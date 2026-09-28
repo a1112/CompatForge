@@ -566,6 +566,13 @@ impl PolicyEngine {
         let bottle_directory = join_host_path(&config.storage_root, &["bottles", &request.bottle_id]);
 
         let mut environment = request.environment.clone();
+        for name in [
+            "COMPATFORGE_BOTTLE_FONT_FILE",
+            "COMPATFORGE_BOTTLE_FONT_SHA256",
+            "COMPATFORGE_BOTTLE_FONT_FAMILY",
+        ] {
+            environment.remove(name);
+        }
         for name in DXVK_EVIDENCE_NAMES {
             environment.remove(name);
         }
@@ -732,6 +739,15 @@ impl PolicyEngine {
         for (key, value) in protected_graphics_environment(&binding.environment, plan.graphics.backend) {
             if plan.process.environment.get(&key) != Some(&value) {
                 return Err(PlanError::PlanMismatch("protected runtime environment"));
+            }
+        }
+        for key in [
+            "COMPATFORGE_BOTTLE_FONT_FILE",
+            "COMPATFORGE_BOTTLE_FONT_SHA256",
+            "COMPATFORGE_BOTTLE_FONT_FAMILY",
+        ] {
+            if plan.process.environment.get(key) != binding.environment.get(key) {
+                return Err(PlanError::PlanMismatch("protected Bottle font environment"));
             }
         }
         if plan.graphics.backend != GraphicsBackendKind::Dxvk
@@ -1871,6 +1887,28 @@ mod tests {
         let plan = PolicyEngine::compile(&config, &request).unwrap();
         assert_eq!(plan.process.environment["COMPATFORGE_RUNTIME_PACK"], "trusted");
         PolicyEngine::authorize(&config, &plan).unwrap();
+    }
+
+    #[test]
+    fn request_cannot_introduce_unbound_bottle_font_evidence() {
+        let config = config(CpuArchitecture::X86_64);
+        let mut request = request();
+        for name in [
+            "COMPATFORGE_BOTTLE_FONT_FILE",
+            "COMPATFORGE_BOTTLE_FONT_SHA256",
+            "COMPATFORGE_BOTTLE_FONT_FAMILY",
+        ] {
+            request.environment.insert(name.into(), "untrusted".into());
+        }
+        let plan = PolicyEngine::compile(&config, &request).unwrap();
+        assert!(!plan.process.environment.contains_key("COMPATFORGE_BOTTLE_FONT_FAMILY"));
+        assert!(!plan.process.environment.contains_key("COMPATFORGE_BOTTLE_FONT_FILE"));
+        let mut altered = plan;
+        altered
+            .process
+            .environment
+            .insert("COMPATFORGE_BOTTLE_FONT_FAMILY".into(), "Heiti SC".into());
+        assert!(PolicyEngine::authorize(&config, &altered).is_err());
     }
 
     #[test]

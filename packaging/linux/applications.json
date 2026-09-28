@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Pinned Linux acceptance inputs; downloaded separately, never executed by the image builder",
+  "applications": [
+    {
+      "id": "7zip", "version": "26.01", "file": "7z2601-x64.exe",
+      "sha256": "d64a0468f5b5b0b0fc5b2188450bcd655b70809d97b1c4535f2884635094377d",
+      "url": "https://www.7-zip.org/a/7z2601-x64.exe",
+      "license": "LGPL-2.1-or-later AND BSD-3-Clause AND BSD-2-Clause AND LicenseRef-unRAR-restriction",
+      "licenseSource": "https://www.7-zip.org/license.txt"
+    },
+    {
+      "id": "notepad-plus-plus", "version": "8.9.6.2", "file": "npp.8.9.6.2.Installer.x64.exe",
+      "sha256": "7c243203265ce8fdac76c839bf744ae35dcf620760eb97c2ea279af498560e45",
+      "url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.6.2/npp.8.9.6.2.Installer.x64.exe",
+      "license": "GPL-3.0-only; see upstream clarifications and bundled component notices",
+      "licenseSource": "https://github.com/notepad-plus-plus/notepad-plus-plus/blob/v8.9.6.2/LICENSE"
+    },
+    {
+      "id": "sumatrapdf", "version": "3.6.1", "file": "SumatraPDF-3.6.1-64-install.exe",
+      "sha256": "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381",
+      "url": "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64-install.exe",
+      "license": "GPL-3.0-or-later; bundled component notices apply",
+      "licenseSource": "https://github.com/sumatrapdfreader/sumatrapdf/blob/3.6.1/COPYING"
+    }
+  ]
+}

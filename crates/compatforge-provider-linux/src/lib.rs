@@ -128,7 +128,41 @@ pub struct LinuxProviderConfig {
     pub runtime_store_root: String,
     pub wine_runtime: WineRuntimeConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottle_font: Option<LinuxBottleFont>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dxvk_graphics: Option<DxvkGraphicsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinuxBottleFont {
+    pub path: String,
+    pub digest: String,
+    pub family: String,
+}
+
+impl LinuxBottleFont {
+    fn validate(&self) -> Result<(), LinuxProviderError> {
+        if !serialized_linux_absolute_path(&self.path) || self.family != "Noto Sans CJK SC" {
+            return Err(LinuxProviderError::InvalidConfig("bottleFont"));
+        }
+        validate_linux_digest("bottleFont.digest", &self.digest)?;
+        Ok(())
+    }
+
+    fn verify(&self) -> Result<(), LinuxProviderError> {
+        self.validate()?;
+        let path = Path::new(&self.path);
+        let metadata = fs::symlink_metadata(path).map_err(|_| LinuxProviderError::Evidence(EvidenceFailure::Digest))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || fs::canonicalize(path).ok().as_deref() != Some(path)
+            || sha256_file(path).map_err(LinuxProviderError::Evidence)? != self.digest
+        {
+            return Err(LinuxProviderError::Evidence(EvidenceFailure::Digest));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -179,6 +213,8 @@ pub struct LinuxLocalContextRequest {
     pub wineserver: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottle_font: Option<LinuxBottleFont>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dxvk_graphics: Option<DxvkGraphicsConfig>,
 }
 
@@ -207,6 +243,9 @@ impl LinuxProviderConfig {
             return Err(LinuxProviderError::InvalidConfig("runtimeStoreRoot"));
         }
         self.wine_runtime.validate()?;
+        if let Some(font) = &self.bottle_font {
+            font.validate()?;
+        }
         if let Some(graphics) = &self.dxvk_graphics {
             graphics.validate()?;
         }
@@ -255,6 +294,9 @@ impl VerifiedEntrypoint {
 impl LinuxLocalContextRequest {
     pub fn validate(&self) -> Result<(), LinuxProviderError> {
         validate_schema_version(&self.schema_version)?;
+        if let Some(font) = &self.bottle_font {
+            font.validate()?;
+        }
         for (field, value) in [
             ("runtimeStoreRoot", self.runtime_store_root.as_str()),
             ("storageRoot", self.storage_root.as_str()),
@@ -707,7 +749,7 @@ fn build_provider_snapshot(
         return unavailable_provider_snapshot(host_report, config, EvidenceFailure::Entrypoint);
     };
     let report = provider_report(host_report, runtime, None)?;
-    let runtime_binding = RuntimeBinding {
+    let mut runtime_binding = RuntimeBinding {
         provider_id: runtime.provider_id.clone(),
         pack_id: runtime.pack_id.clone(),
         pack_digest: runtime.pack_digest.clone(),
@@ -735,6 +777,14 @@ fn build_provider_snapshot(
         ]),
         working_directory: None,
     };
+    if let Some(font) = &config.bottle_font {
+        font.verify()?;
+        runtime_binding.environment.extend([
+            ("COMPATFORGE_BOTTLE_FONT_FILE".into(), font.path.clone()),
+            ("COMPATFORGE_BOTTLE_FONT_SHA256".into(), font.digest.clone()),
+            ("COMPATFORGE_BOTTLE_FONT_FAMILY".into(), font.family.clone()),
+        ]);
+    }
     runtime_binding.validate()?;
     Ok(LinuxProviderSnapshot {
         capabilities: report,
@@ -1249,6 +1299,9 @@ fn prepare_bootstrap(
     owner: OwnerIdentity,
 ) -> Result<PreparedBootstrap, LinuxBootstrapError> {
     request.validate().map_err(map_bootstrap_request_error)?;
+    if let Some(font) = &request.bottle_font {
+        font.verify().map_err(LinuxBootstrapError::Provider)?;
+    }
     host_report.validate().map_err(LinuxBootstrapError::Contract)?;
     if !cfg!(target_os = "linux")
         || host_report.host.os != HostOs::Linux
@@ -1337,6 +1390,7 @@ fn prepare_bootstrap(
         schema_version: SCHEMA_VERSION_V1.into(),
         runtime_store_root: store_text,
         dxvk_graphics: request.dxvk_graphics.clone(),
+        bottle_font: request.bottle_font.clone(),
         wine_runtime: WineRuntimeConfig {
             provider_id: LOCAL_PREVIEW_PROVIDER_ID.into(),
             pack_id: LOCAL_PREVIEW_PACK_ID.into(),
@@ -2591,6 +2645,25 @@ mod tests {
 
     fn valid_config() -> LinuxProviderConfig {
         serde_json::from_value(valid_config_json()).expect("valid Linux Provider configuration")
+    }
+
+    #[test]
+    fn linux_bottle_font_is_optional_but_has_closed_family_and_pinned_bytes() {
+        let mut value = valid_config_json();
+        value["bottleFont"] = serde_json::json!({"path":"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc","digest":format!("sha256:{}", "b".repeat(64)),"family":"Noto Sans CJK SC"});
+        let config: LinuxProviderConfig = serde_json::from_value(value.clone()).expect("reviewed Linux font");
+        config.validate().unwrap();
+        value["bottleFont"]["family"] = "unreviewed".into();
+        assert!(serde_json::from_value::<LinuxProviderConfig>(value.clone())
+            .unwrap()
+            .validate()
+            .is_err());
+        value["bottleFont"]["family"] = "Noto Sans CJK SC".into();
+        value["bottleFont"]["digest"] = "bad".into();
+        assert!(serde_json::from_value::<LinuxProviderConfig>(value)
+            .unwrap()
+            .validate()
+            .is_err());
     }
 
     fn linux_host_report() -> CapabilityReport {
@@ -4658,6 +4731,7 @@ int main(void) {
             wineserver: "bin/wineserver".into(),
             version: "9.0".into(),
             dxvk_graphics: None,
+            bottle_font: None,
         }
     }
 
@@ -4888,6 +4962,7 @@ int main(void) {
             wineserver: fixture.config.wine_runtime.wineserver.path.clone(),
             version: fixture.config.wine_runtime.version.clone(),
             dxvk_graphics: None,
+            bottle_font: None,
         }
     }
 
@@ -6308,6 +6383,7 @@ int main(void) {
                 wineserver: "bin/wineserver".into(),
                 version: "9.0".into(),
                 dxvk_graphics: None,
+                bottle_font: None,
             };
             let before = snapshot_tree(&case.root);
             assert!(
@@ -6333,6 +6409,7 @@ int main(void) {
                 wineserver: "bin/wineserver".into(),
                 version: "9.0".into(),
                 dxvk_graphics: None,
+                bottle_font: None,
             };
             let before = snapshot_tree(&case.root);
             assert!(
@@ -6365,6 +6442,7 @@ int main(void) {
                 wineserver: "bin/wineserver".into(),
                 version: "9.0".into(),
                 dxvk_graphics: None,
+                bottle_font: None,
             };
             let before = snapshot_tree(&case.root);
             assert!(create_local_context_with(&linux_host_report(), &request, &PanicProbeCommand).is_err());

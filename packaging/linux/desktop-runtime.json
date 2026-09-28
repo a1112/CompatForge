@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "runtimePackDigest": "sha256:6b2a66327849bd5da3933011afdd5db6129f6cf2e246b8082daeb601f0b3afba",
+  "runtime": {
+    "materializedRoot": "/usr",
+    "wine": "bin/wine",
+    "wineserver": "bin/wineserver",
+    "version": "11.14",
+    "wineSha256": "2d7731d7532318e06f47bb2b9d6cd7f8a934856f6d4711314c047dc8660b97e9",
+    "wineserverSha256": "e078d038b21543bd7cb4adf75b25c14a8490b38c5d098b20ad4750d89aaaec39"
+  },
+  "bottleFont": {
+    "path": "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "digest": "sha256:b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a",
+    "family": "Noto Sans CJK SC"
+  }
+}

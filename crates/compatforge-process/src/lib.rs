@@ -45,6 +45,7 @@ const FONT_CONFIG_FILE_ENV: &str = "FONTCONFIG_FILE";
 const FONT_CONFIG_DIGEST_ENV: &str = "COMPATFORGE_FONT_CONFIG_SHA256";
 const BOTTLE_FONT_FILE_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FILE";
 const BOTTLE_FONT_DIGEST_ENV: &str = "COMPATFORGE_BOTTLE_FONT_SHA256";
+const BOTTLE_FONT_FAMILY_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FAMILY";
 const BOTTLE_FONT_FILE_NAME: &str = "compatforge-cjk.ttc";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1118,6 +1119,7 @@ fn verify_pinned_font_config(plan: &LaunchPlan) -> Result<(), ProcessError> {
 }
 
 fn verify_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    bottle_font_family(plan)?;
     let path = plan.process.environment.get(BOTTLE_FONT_FILE_ENV);
     let digest = plan.process.environment.get(BOTTLE_FONT_DIGEST_ENV);
     match (path, digest) {
@@ -1126,6 +1128,14 @@ fn verify_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
             Err(ProcessError::InvalidRuntimeEvidence("incomplete Bottle font evidence"))
         }
         (Some(path), Some(digest)) => verify_pinned_regular_file(Path::new(path), digest, "Bottle font"),
+    }
+}
+
+fn bottle_font_family(plan: &LaunchPlan) -> Result<&'static str, ProcessError> {
+    match plan.process.environment.get(BOTTLE_FONT_FAMILY_ENV).map(String::as_str) {
+        None | Some("Heiti SC") => Ok("Heiti SC"),
+        Some("Noto Sans CJK SC") => Ok("Noto Sans CJK SC"),
+        _ => Err(ProcessError::InvalidRuntimeEvidence("Bottle font family")),
     }
 }
 
@@ -1170,6 +1180,8 @@ fn prepare_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
     }
     verify_pinned_bottle_font(plan)?;
 
+    let family = bottle_font_family(plan)?;
+
     const REGISTRY_KEYS: &[&str] = &[
         r"HKCU\Software\Wine\Fonts\Replacements",
         r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",
@@ -1187,7 +1199,7 @@ fn prepare_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
     ];
     for key in REGISTRY_KEYS {
         for name in REGISTRY_NAMES {
-            run_bounded_wine_command(plan, &["reg", "add", key, "/v", name, "/d", "Heiti SC", "/f"])?;
+            run_bounded_wine_command(plan, &["reg", "add", key, "/v", name, "/d", family, "/f"])?;
         }
     }
     run_bounded_wine_command(
@@ -1197,7 +1209,7 @@ fn prepare_pinned_bottle_font(plan: &LaunchPlan) -> Result<(), ProcessError> {
             "add",
             r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Fonts",
             "/v",
-            "Heiti SC (TrueType)",
+            &format!("{family} (TrueType)"),
             "/d",
             BOTTLE_FONT_FILE_NAME,
             "/f",
@@ -5610,6 +5622,17 @@ mod tests {
         plan.process
             .environment
             .insert(BOTTLE_FONT_DIGEST_ENV.into(), sha256_file(&font).unwrap());
+        verify_pinned_bottle_font(&plan).unwrap();
+        plan.process
+            .environment
+            .insert("COMPATFORGE_BOTTLE_FONT_FAMILY".into(), "arbitrary font".into());
+        assert!(
+            verify_pinned_bottle_font(&plan).is_err(),
+            "unreviewed registry family must be rejected"
+        );
+        plan.process
+            .environment
+            .insert("COMPATFORGE_BOTTLE_FONT_FAMILY".into(), "Noto Sans CJK SC".into());
         verify_pinned_bottle_font(&plan).unwrap();
         std::fs::write(&font, b"tampered").unwrap();
         assert!(matches!(

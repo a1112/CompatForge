@@ -5,9 +5,11 @@ After=graphical-session-pre.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/libexec/compatforge/user-init
 ExecStart=/usr/bin/compatforge-cli service-daemon %h/.config/compatforge/context.json %h/.config/compatforge/service.json
 ExecStop=/usr/bin/compatforge-cli service-stop
 TimeoutStopSec=120
+TimeoutStartSec=120
 KillMode=control-group
 UMask=0077
 Restart=on-failure
