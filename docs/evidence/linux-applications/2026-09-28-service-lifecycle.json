@@ -1,15 +1,17 @@
 {
   "schemaVersion": "1",
   "date": "2026-09-28",
-  "candidateRevision": "7e36ff2c33fd3d204e95dcb295ce1558e01fba5f",
+  "candidateRevision": "17d74174f70b536cb5b8f35e2c8d772a3653735c",
   "baselineRevision": "3e0522e",
   "environment": "Pinned Arch Linux chroot with Wine 11.14, private Xvfb, ordinary UID 1000, separate mount/PID/network namespaces and tini PID 1",
   "linuxGates": {
     "cliTestsPassed": 71,
-    "serviceTestsPassed": 23,
+    "serviceTestsPassed": 27,
     "serviceHelperTestsIntentionallyIgnored": 1,
     "tauriLibraryTestsPassed": 13,
-    "repositoryValidator": "passed"
+    "repositoryValidator": "passed",
+    "independentSpecReview": "passed",
+    "independentCodeQualityReview": "passed"
   },
   "realEofComparison": {
     "procedure": [
