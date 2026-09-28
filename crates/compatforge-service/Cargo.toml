@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 compatforge-bottle = { path = "../compatforge-bottle" }
+compatforge-debug = { path = "../compatforge-debug" }
 fs4 = { version = "=0.8.4", default-features = false, features = ["sync"] }
 sha2.workspace = true
 compatforge-domain = { path = "../compatforge-domain" }

@@ -6,6 +6,7 @@ use std::io;
 enum Command<'a> {
     Daemon(&'a str, &'a str),
     Call(&'a str),
+    Debug(&'a str),
     Stop,
     Export,
     Launch(&'a str, &'a str, &'a [String]),
@@ -15,6 +16,7 @@ fn parse(arguments: &[String]) -> io::Result<Option<Command<'_>>> {
     Ok(Some(match arguments {
         [command, config, service] if command == "service-daemon" => Command::Daemon(config, service),
         [command, file] if command == "service-call" => Command::Call(file),
+        [command, file] if command == "debug-session" => Command::Debug(file),
         [command] if command == "service-stop" => Command::Stop,
         [command] if command == "desktop-export" => Command::Export,
         [command, app, launcher, separator, files @ ..] if command == "desktop-launch" && separator == "--" => {
@@ -25,6 +27,7 @@ fn parse(arguments: &[String]) -> io::Result<Option<Command<'_>>> {
             if [
                 "service-daemon",
                 "service-call",
+                "debug-session",
                 "service-stop",
                 "desktop-export",
                 "desktop-launch",
@@ -93,6 +96,12 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
             let request: ServiceRequest =
                 read_shared_json(Path::new(path), compatforge_service::transport::MAX_REQUEST_BYTES)?;
             return print_reply(daemon::request(&directory, &request)?, false);
+        }
+        Command::Debug(path) => {
+            let payload: serde_json::Value =
+                read_shared_json(Path::new(path), compatforge_debug::MAX_DEBUG_REQUEST_BYTES)?;
+            compatforge_debug::decode_request(&serde_json::to_vec(&payload)?)?;
+            ("debug.session", payload)
         }
         Command::Daemon(_, _) => unreachable!(),
     };
@@ -192,6 +201,12 @@ mod tests {
         assert_eq!(parse(&args(&["desktop-export"])).unwrap(), Some(Command::Export));
         assert!(parse(&args(&["service-daemon", "config"])).is_err());
         assert_eq!(parse(&args(&["api-session", "config", "service"])).unwrap(), None);
+        assert!(parse(&args(&["debug-session"])).is_err());
+        assert!(parse(&args(&["debug-session", "request.json", "--attach", "123"])).is_err());
+        assert_eq!(
+            parse(&args(&["debug-session", "request.json"])).unwrap(),
+            Some(Command::Debug("request.json"))
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod model;
 mod registry;
 pub mod transport;
 
+use compatforge_debug::{DebugRequest, DebugSupervisor, UnavailableBackend};
 use jobs::{JobError, JobManager};
 pub use jobs::{ShutdownError, ShutdownFailure, ShutdownPhase};
 use model::{ApplicationPayload, ArchivePayload, AssessmentPayload, IdPayload, PollPayload};
@@ -25,7 +26,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use model::{
     ApplicationDefinition, ApplicationRecord, ApplicationStatus, ApplicationSummary, AssessmentCheck,
@@ -39,6 +40,7 @@ use compatforge_domain::{CoreConfig, SCHEMA_VERSION_V1};
 pub struct AutomationService {
     registry: Arc<Registry>,
     jobs: JobManager,
+    debug: Mutex<DebugSupervisor<UnavailableBackend>>,
 }
 
 impl AutomationService {
@@ -62,7 +64,11 @@ impl AutomationService {
         );
         registry.recover_interrupted_jobs().map_err(ServiceError::Registry)?;
         let jobs = JobManager::new(Arc::clone(&registry), core_config);
-        Ok(Self { registry, jobs })
+        Ok(Self {
+            registry,
+            jobs,
+            debug: Mutex::new(DebugSupervisor::new(UnavailableBackend)),
+        })
     }
 
     pub fn seed_default_applications(&self) -> Result<(), ServiceError> {
@@ -260,6 +266,11 @@ impl AutomationService {
     pub fn call(&self, request: ServiceRequest) -> Result<ServiceResponse, ServiceError> {
         request.validate().map_err(ServiceError::Model)?;
         let result = match request.operation.as_str() {
+            "debug.session" => {
+                let bytes = serde_json::to_vec(&request.payload).map_err(ServiceError::Json)?;
+                let command = compatforge_debug::decode_request(&bytes).map_err(ServiceError::Debug)?;
+                to_value(self.debug_session(command)?)?
+            }
             "applications.seed-defaults" => {
                 self.seed_default_applications()?;
                 json!({ "seeded": true })
@@ -356,6 +367,51 @@ impl AutomationService {
     }
 }
 
+impl AutomationService {
+    fn debug_session(&self, command: DebugRequest) -> Result<Value, ServiceError> {
+        let uid = debug_owner_uid();
+        let mut sessions = self
+            .debug
+            .lock()
+            .map_err(|_| ServiceError::Conflict("debug supervisor lock is poisoned"))?;
+        match command {
+            DebugRequest::Launch { target } => {
+                // Reuse the desktop launch trust chain: only a selected Ready
+                // generation whose frozen runtime and launcher digests still
+                // match can become a debug target.
+                let eligible = self.desktop_launchers()?.iter().any(|entry| {
+                    entry.application_id == target.application_id
+                        && entry.generation_id == target.generation_id
+                        && entry.launcher_id == target.launcher_id
+                });
+                if !eligible {
+                    return Err(ServiceError::Debug(compatforge_debug::DebugError::Unauthorized));
+                }
+                let handle = sessions.launch(target, uid).map_err(ServiceError::Debug)?;
+                to_value(handle)
+            }
+            DebugRequest::Status { handle } => to_value(sessions.state(&handle, uid).map_err(ServiceError::Debug)?),
+            DebugRequest::Terminate { handle } => {
+                sessions.terminate(&handle, uid).map_err(ServiceError::Debug)?;
+                Ok(json!({"terminated":true}))
+            }
+            DebugRequest::Disconnect { handle } => {
+                sessions.disconnect(&handle, uid).map_err(ServiceError::Debug)?;
+                Ok(json!({"disconnected":true}))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn debug_owner_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+#[cfg(not(target_os = "linux"))]
+fn debug_owner_uid() -> u32 {
+    0
+}
+
 fn parse_payload<T: DeserializeOwned>(payload: Value) -> Result<T, ServiceError> {
     serde_json::from_value(payload).map_err(ServiceError::Json)
 }
@@ -373,6 +429,7 @@ pub enum ServiceError {
     Registry(RegistryError),
     Job(JobError),
     Json(serde_json::Error),
+    Debug(compatforge_debug::DebugError),
 }
 
 impl ServiceError {
@@ -380,6 +437,17 @@ impl ServiceError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Invalid(_) | Self::Model(_) | Self::Json(_) => "invalid-request",
+            Self::Debug(
+                compatforge_debug::DebugError::InvalidRequest | compatforge_debug::DebugError::InvalidTarget,
+            ) => "invalid-request",
+            Self::Debug(compatforge_debug::DebugError::Unauthorized) => "unauthorized",
+            Self::Debug(compatforge_debug::DebugError::Unavailable) => "unavailable",
+            Self::Debug(
+                compatforge_debug::DebugError::DigestMismatch | compatforge_debug::DebugError::BackendFailed,
+            ) => "service-failed",
+            Self::Debug(compatforge_debug::DebugError::Capacity | compatforge_debug::DebugError::InvalidTransition) => {
+                "conflict"
+            }
             Self::NotFound(_) => "not-found",
             Self::Conflict(_) => "conflict",
             Self::Registry(RegistryError::NotFound(_)) | Self::Job(JobError::NotFound(_)) => "not-found",
@@ -400,6 +468,7 @@ impl fmt::Display for ServiceError {
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Job(error) => write!(formatter, "{error}"),
             Self::Json(error) => write!(formatter, "invalid service payload: {error}"),
+            Self::Debug(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -473,6 +542,59 @@ mod tests {
         assert!(service.desktop_launchers().is_err());
         service.uninstall_application("7zip").unwrap();
         assert!(service.desktop_launchers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn debug_session_refuses_unmanaged_or_tampered_target_and_unavailable_provider() {
+        let service = service();
+        service.seed_default_applications().unwrap();
+        let request = |generation: &str| ServiceRequest {
+            schema_version: "1".into(),
+            request_id: "debug-contract".into(),
+            operation: "debug.session".into(),
+            payload: json!({"schemaVersion":"1","command":"launch","target":{"applicationId":"7zip","generationId":generation,"launcherId":"main"}}),
+        };
+        assert!(service.call(request("gen-foreign")).is_err());
+        let app = service.get_application("7zip").unwrap().application;
+        let staged = service.registry.lifecycle.stage(&app, "job-debug-1").unwrap();
+        let config: CoreConfig =
+            serde_json::from_str(include_str!("../../../examples/context-config.linux-arm64.json")).unwrap();
+        let binding = &config.runtime_bindings[0];
+        let runtime = InstalledRuntime::from_config(
+            &config,
+            &compatforge_domain::RuntimeSelection {
+                provider: compatforge_domain::RuntimeKind::Wine,
+                pack_id: binding.pack_id.clone(),
+                pack_digest: binding.pack_digest.clone(),
+            },
+        )
+        .unwrap();
+        service
+            .registry
+            .lifecycle
+            .bind_runtime(&app.id, "job-debug-1", runtime)
+            .unwrap();
+        let path = service
+            .registry
+            .lifecycle
+            .launcher_path(&staged, &app.launchers[0].executable);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, include_bytes!("../../../tests/fixtures/hello-x86_64.exe")).unwrap();
+        let job: JobRecord = serde_json::from_value(json!({"schemaVersion":"1","id":"job-debug-1","applicationId":"7zip","generationId":staged.id,"kind":"install","status":"succeeded","createdAtMilliseconds":1,"updatedAtMilliseconds":1})).unwrap();
+        service.registry.lifecycle.finish(&job).unwrap();
+        let error = service.call(request(&staged.id)).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "unavailable",
+            "Task 5 must not claim an uninstalled debugger can launch"
+        );
+        fs::write(&path, b"tampered").unwrap();
+        assert_ne!(service.call(request(&staged.id)).unwrap_err().code(), "unavailable");
+        let invalid = ServiceRequest {
+            payload: json!({"schemaVersion":"1","command":"attachPid","pid":7}),
+            ..request(&staged.id)
+        };
+        assert_eq!(service.call(invalid).unwrap_err().code(), "invalid-request");
     }
 
     #[test]

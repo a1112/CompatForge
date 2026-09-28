@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "providerId": "winedbg-gdb",
+  "runtimePackDigest": "sha256:6b2a66327849bd5da3933011afdd5db6129f6cf2e246b8082daeb601f0b3afba",
+  "available": false,
+  "winedbgSha256": null,
+  "gdbSha256": null
+}

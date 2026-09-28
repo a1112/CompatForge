@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/debug-session-request.schema.json",
+  "title": "CompatForge Debug Session Request",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "command", "target"],
+      "properties": {
+        "schemaVersion": { "const": "1" },
+        "command": { "const": "launch" },
+        "target": { "$ref": "#/$defs/target" }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "command", "handle"],
+      "properties": {
+        "schemaVersion": { "const": "1" },
+        "command": { "enum": ["status", "terminate", "disconnect"] },
+        "handle": { "$ref": "#/$defs/handle" }
+      }
+    }
+  ],
+  "$defs": {
+    "token": { "type": "string", "pattern": "^[a-z0-9-]{1,96}$" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicationId", "generationId", "launcherId"],
+      "properties": {
+        "applicationId": { "$ref": "#/$defs/token" },
+        "generationId": { "type": "string", "pattern": "^gen-[a-z0-9-]{1,92}$" },
+        "launcherId": { "$ref": "#/$defs/token" }
+      }
+    },
+    "handle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "capability"],
+      "properties": {
+        "sessionId": { "type": "string", "pattern": "^debug-[0-9a-f]{32}$" },
+        "capability": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

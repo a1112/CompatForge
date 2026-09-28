@@ -138,6 +138,7 @@ BOTTLE_MIGRATION_SCHEMA_NAMES = frozenset(
         "daemon-request.schema.json",
         "daemon-reply.schema.json",
         "desktop-launcher.schema.json",
+        "debug-session-request.schema.json",
         "executable-inspection.schema.json",
         "guest-artifact.schema.json",
         "install-request.schema.json",

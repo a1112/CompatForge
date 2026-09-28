@@ -44,12 +44,17 @@
         "applications.rollback",
         "applications.uninstall",
         "applications.recover",
-        "desktop.launchers"
+        "desktop.launchers",
+        "debug.session"
       ]
     },
     "payload": {}
   },
   "allOf": [
+    {
+      "if": { "properties": { "operation": { "const": "debug.session" } } },
+      "then": { "properties": { "payload": { "$ref": "debug-session-request.schema.json" } } }
+    },
     {
       "if": {
         "properties": {

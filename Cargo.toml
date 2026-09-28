@@ -4,6 +4,7 @@ members = [
   "apps/cli",
   "crates/compatforge-bottle",
   "crates/compatforge-domain",
+  "crates/compatforge-debug",
   "crates/compatforge-inspect",
   "crates/compatforge-guest-artifact",
   "crates/compatforge-capability",
