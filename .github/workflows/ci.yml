@@ -49,6 +49,16 @@ jobs:
       - name: Test dual-Runtime macOS acceptance contracts
         run: python -S -B -m unittest tests.test_macos_dual_runtime_acceptance -v
 
+  android-core-cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Check Android ARM64 Core compilation
+        run: cargo check --workspace --target aarch64-linux-android --locked
+
   rust:
     strategy:
       fail-fast: false

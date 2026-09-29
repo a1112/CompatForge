@@ -1,4 +1,4 @@
-#![cfg_attr(target_os = "macos", allow(dead_code, unused_imports))]
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code, unused_imports))]
 
 // Strict macOS mode rejects snapshot creation before source/store access. The
 // verifier and its shared data model remain available on that target, so the
@@ -48,8 +48,8 @@ thread_local! {
     static SOURCE_PREFLIGHT_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod macos_tests {
+#[cfg(all(test, not(any(target_os = "linux", windows))))]
+mod strict_platform_tests {
     use super::BottleStore;
     use crate::DiagnosticCode;
     use std::fs;
@@ -878,18 +878,18 @@ impl BottleStore {
     }
 
     pub fn snapshot(&self, source: &Path) -> Result<SnapshotReceipt, BottleMigrationError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = source;
             Err(unsupported_platform())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(target_os = "linux", windows))]
         {
             self.snapshot_supported(source)
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", windows))]
     fn snapshot_supported(&self, source: &Path) -> Result<SnapshotReceipt, BottleMigrationError> {
         let selected_source = SelectedSource::bind(source)?;
         let pending_store = PendingStoreRoot::bind(&self.root)?;
@@ -2192,7 +2192,7 @@ const fn source_changed() -> BottleMigrationError {
     BottleMigrationError::new(DiagnosticCode::SourceChanged)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(any(target_os = "linux", windows)))]
 const fn unsupported_platform() -> BottleMigrationError {
     BottleMigrationError::new(DiagnosticCode::UnsupportedPlatform)
 }
@@ -2205,7 +2205,7 @@ const fn transaction_failed() -> BottleMigrationError {
     BottleMigrationError::new(DiagnosticCode::TransactionFailed)
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
     use super::{
         checked_regular_file_size, BottleSnapshot, BottleStore, SnapshotEntry, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES,

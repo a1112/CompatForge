@@ -1,4 +1,5 @@
-#![cfg_attr(target_os = "macos", allow(dead_code))]
+// Non-Linux/Windows targets expose the read-only verifier, but not migration.
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 
 // Strict macOS mode retains the held-handle verifier primitives while snapshot
 // creation is rejected before access, leaving creation-only helpers unused.

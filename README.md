@@ -48,6 +48,12 @@ flowchart TD
 
 完整边界见 [平台支持矩阵](docs/platform-support.md)。
 
+Android ARM64 目前有[实验性 APK 宿主](apps/android/README.md)：Rust Core 能在
+Android 模拟器的普通应用 UID 中加载，APK 内原生入口可启动，并能检查固定哈希的
+Windows 版 7-Zip 安装程序。Box64/Wine 与显示运行时尚未接入，因此 APK 目前不能
+运行 Windows 应用；[G0 报告](docs/reports/2026-09-29-android-runtime-spike.md)记录了
+已通过的检查与未完成的验收。
+
 ## 仓库结构
 
 ```text
