@@ -1,6 +1,6 @@
 # PeaZip classic-theme compatibility profile
 
-Status: approved by the user on 2026-09-30; implementation and publication pending.
+Status: approved by the user on 2026-09-30; implemented, validated in the isolated rolling VM and locally published on 2026-10-01. See the retained deployed-service adapters and ForgeStore publication evidence. The primary checkout's earlier design checkpoint is preserved separately.
 
 ## Verified problem and scope
 

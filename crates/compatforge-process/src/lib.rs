@@ -79,6 +79,7 @@ pub enum CleanupStage {
 
 #[derive(Debug)]
 pub enum ProcessError {
+    Cancelled,
     InvalidPlan(ContractError),
     InvalidGuestArtifact(GuestArtifactError),
     InvalidRuntimeEvidence(&'static str),
@@ -97,6 +98,7 @@ pub enum ProcessError {
 impl fmt::Display for ProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(formatter, "launch cancelled during preparation"),
             Self::InvalidPlan(error) => write!(formatter, "invalid launch plan: {error}"),
             Self::InvalidGuestArtifact(error) => write!(formatter, "invalid guest artifact: {error}"),
             Self::InvalidRuntimeEvidence(field) => write!(formatter, "invalid pinned Runtime evidence: {field}"),
@@ -119,7 +121,8 @@ impl std::error::Error for ProcessError {
             Self::InvalidPlan(error) => Some(error),
             Self::InvalidGuestArtifact(error) => Some(error),
             Self::Isolation(error) | Self::Spawn(error) | Self::Terminate(error) => Some(error),
-            Self::InvalidRuntimeEvidence(_)
+            Self::Cancelled
+            | Self::InvalidRuntimeEvidence(_)
             | Self::UnsafeDirectory(_)
             | Self::WinePrefixBusy(_)
             | Self::Startup(_)
@@ -143,10 +146,16 @@ impl ProcessSupervisor {
         Self::start_with_operations(plan, &SystemStartupOperations)
     }
 
+    /// Construct a launch owner before starting runtime configuration.
+    pub fn prepare(plan: &LaunchPlan) -> Result<PreparingLaunch, ProcessError> {
+        PreparingLaunch::new(plan.clone())
+    }
+
     fn start_with_operations(
         plan: &LaunchPlan,
         operations: &impl StartupOperations,
     ) -> Result<LaunchHandle, ProcessError> {
+        operations.check_cancelled()?;
         plan.validate().map_err(ProcessError::InvalidPlan)?;
         verify_guest_inputs(plan)?;
         verify_pinned_runtime(plan)?;
@@ -159,7 +168,7 @@ impl ProcessSupervisor {
         startup_step(
             &mut startup_guard,
             StartupStage::AppearancePreparation,
-            prepare_wine_appearance(plan),
+            operations.appearance(plan),
         )?;
         startup_step(
             &mut startup_guard,
@@ -235,7 +244,17 @@ impl ProcessSupervisor {
     }
 }
 
+mod preparing;
+pub use preparing::PreparingLaunch;
+
 trait StartupOperations {
+    fn check_cancelled(&self) -> Result<(), ProcessError> {
+        Ok(())
+    }
+    fn appearance(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+        prepare_wine_appearance(plan)
+    }
+
     fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
         initialize_wine_prefix(plan)
     }
@@ -327,8 +346,22 @@ fn wait_bounded<C: BoundedChild>(
     clock: &impl PollClock,
     timeout: Duration,
 ) -> Result<bool, AuxiliaryFailure> {
+    wait_bounded_with_cancel(child, clock, timeout, None)
+}
+
+fn wait_bounded_with_cancel<C: BoundedChild>(
+    child: &mut C,
+    clock: &impl PollClock,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+) -> Result<bool, AuxiliaryFailure> {
     let deadline = clock.now() + timeout;
     loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(AuxiliaryFailure {
+                cleanup: reap_bounded(child, clock, WINE_SERVER_COMMAND_TIMEOUT).err(),
+            });
+        }
         match child.poll() {
             Ok(Some(success)) => {
                 child
@@ -446,11 +479,21 @@ fn finish_auxiliary_capture(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn capture_auxiliary_typed(
     command: &mut Command,
     timeout: Duration,
     limit: usize,
+) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
+    capture_auxiliary_with_cancel(command, timeout, limit, None)
+}
+
+#[cfg(unix)]
+fn capture_auxiliary_with_cancel(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
     use std::os::fd::AsRawFd;
     command
@@ -476,6 +519,9 @@ fn capture_auxiliary_typed(
         let mut output = Vec::with_capacity(limit);
         let mut eof = false;
         loop {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(io::Error::other("auxiliary capture cancelled"));
+            }
             if !eof {
                 eof = read_auxiliary_chunk(&mut stdout, &mut output, limit)?;
             }
@@ -887,6 +933,15 @@ fn initialize_wine_prefix_with_spawn(
     timeout: Duration,
     spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
 ) -> Result<(), ProcessError> {
+    initialize_wine_prefix_with_cancel(plan, timeout, spawn, None)
+}
+
+fn initialize_wine_prefix_with_cancel(
+    plan: &LaunchPlan,
+    timeout: Duration,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ProcessError> {
     if plan.runtime.provider != RuntimeKind::Wine {
         return Ok(());
     }
@@ -920,7 +975,7 @@ fn initialize_wine_prefix_with_spawn(
         .stderr(Stdio::null());
     let mut child =
         spawn_auxiliary_with(&mut command, spawn).map_err(|error| error.into_process_error(StartupStage::Wineboot))?;
-    match wait_bounded(&mut child, &SystemPollClock, timeout) {
+    match wait_bounded_with_cancel(&mut child, &SystemPollClock, timeout, cancellation) {
         Ok(true) => {
             let metadata =
                 std::fs::symlink_metadata(&marker).map_err(|_| ProcessError::UnsafeDirectory("Wine prefix marker"))?;
@@ -1257,6 +1312,13 @@ fn run_bounded_wine_command(plan: &LaunchPlan, arguments: &[&str]) -> Result<(),
 /// Apply only the closed, authorized appearance profile within the prefix lease.
 /// The helper accepts no caller-supplied commands, registry paths or values.
 fn prepare_wine_appearance(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    prepare_wine_appearance_with_cancel(plan, None)
+}
+
+fn prepare_wine_appearance_with_cancel(
+    plan: &LaunchPlan,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ProcessError> {
     if plan.wine_appearance.is_none() {
         return Ok(());
     }
@@ -1284,11 +1346,12 @@ fn prepare_wine_appearance(plan: &LaunchPlan) -> Result<(), ProcessError> {
         "0",
         "/f",
     ];
-    appearance_registry_command(plan, &add, false)?;
+    appearance_registry_command(plan, &add, false, cancellation)?;
     let output = appearance_registry_command(
         plan,
         &[tool.as_str(), "query", THEME_MANAGER_KEY, "/v", "ThemeActive"],
         true,
+        cancellation,
     )?;
     let output =
         std::str::from_utf8(&output).map_err(|_| ProcessError::Startup(StartupStage::AppearancePreparation))?;
@@ -1303,7 +1366,12 @@ fn prepare_wine_appearance(plan: &LaunchPlan) -> Result<(), ProcessError> {
     Ok(())
 }
 
-fn appearance_registry_command(plan: &LaunchPlan, arguments: &[&str], _capture: bool) -> Result<Vec<u8>, ProcessError> {
+fn appearance_registry_command(
+    plan: &LaunchPlan,
+    arguments: &[&str],
+    _capture: bool,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<u8>, ProcessError> {
     verify_pinned_runtime(plan)?;
     materialize_launch_directories(plan)?;
     let tool = Path::new(arguments[0]);
@@ -1329,10 +1397,11 @@ fn appearance_registry_command(plan: &LaunchPlan, arguments: &[&str], _capture: 
         .stderr(Stdio::null());
     #[cfg(unix)]
     {
-        let (status, bytes) = capture_auxiliary_typed(
+        let (status, bytes) = capture_auxiliary_with_cancel(
             &mut command,
             WINE_APPEARANCE_TIMEOUT,
             MAX_APPEARANCE_QUERY_BYTES as usize,
+            cancellation,
         )
         .map_err(|error| error.into_process_error(StartupStage::AppearancePreparation))?;
         if !status.success() {
@@ -1342,6 +1411,7 @@ fn appearance_registry_command(plan: &LaunchPlan, arguments: &[&str], _capture: 
     }
     #[cfg(not(unix))]
     {
+        let _ = cancellation;
         Err(ProcessError::Startup(StartupStage::AppearancePreparation))
     }
 }
@@ -2278,8 +2348,13 @@ fn startup_step<T>(
                 if let ProcessError::StartupCleanup { cleanup, .. } = error {
                     let _ = guard.session.prior_cleanup_failure.set(cleanup);
                 }
-                guard.abort(stage)?;
-                unreachable!("aborting startup always returns an error");
+                let cancelled = matches!(error, ProcessError::Cancelled);
+                let outcome = guard.abort(stage);
+                return match outcome {
+                    Err(ProcessError::Startup(_)) if cancelled => Err(ProcessError::Cancelled),
+                    Err(error) => Err(error),
+                    Ok(()) => unreachable!("aborting startup always returns an error"),
+                };
             }
             Err(error)
         }
@@ -4780,6 +4855,53 @@ mod tests {
         )
         .unwrap();
         assert!(ProcessSupervisor::start(&fixture.plan).is_err());
+        assert!(!fixture.guest_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_cancel_during_registry_query_cleans_up_without_guest_spawn() {
+        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        let path = Path::new(&fixture.plan.process.executable);
+        let source = std::fs::read_to_string(path).unwrap().replace(
+            "printf '%s\\n' 'ThemeActive REG_SZ 0'",
+            "/bin/sleep 30\n printf '%s\\n' 'ThemeActive REG_SZ 0'",
+        );
+        assert!(source.contains("/bin/sleep 30"));
+        std::fs::write(path, source).unwrap();
+        fixture
+            .plan
+            .process
+            .environment
+            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), sha256_file(path).unwrap());
+        let handle = ProcessSupervisor::prepare(&fixture.plan).unwrap();
+        handle.activate();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if std::fs::read_to_string(&fixture.wine_log)
+                .unwrap_or_default()
+                .contains("reg.exe query")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "registry barrier was not reached");
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        assert!(!fixture.guest_log.exists());
+        assert!(WineSession::acquire(&fixture.plan).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_owner_precedes_runtime_configuration_and_can_cancel_before_activation() {
+        let fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        let handle = ProcessSupervisor::prepare(&fixture.plan).unwrap();
+        assert!(
+            !fixture.wine_log.exists(),
+            "configuration began before job ownership activation"
+        );
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
         assert!(!fixture.guest_log.exists());
     }
 

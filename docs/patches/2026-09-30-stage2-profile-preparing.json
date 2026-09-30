@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "baseDirectory": "/srv/forge-apps-build/rolling-1000-compatforge-stage2",
+  "targetDirectory": "/srv/forge-apps-build/rolling-1000-compatforge-stage2-peazip-classic",
+  "sourcePins": [
+    {
+      "path": "crates/compatforge-service/src/registry.rs",
+      "baseSha256": "1d5c507d126fc810f1bc2ed425e37cf5967751b5d13c8f7c489bfff41b2f0a4d",
+      "targetSha256": "b86641d2ae6e827a9a1de64f957dff0b115af03284bced879a5253dfaaff955a"
+    },
+    {
+      "path": "crates/compatforge-service/src/desktop.rs",
+      "baseSha256": "2e81e891fa4430ff4821e59d0802995e6411d1ed57e9a15de701e64873b8c9a3",
+      "targetSha256": "d0a26e8f7962990bf324407ece85ebe0f66a523fd81d37b95457862fcd135492"
+    },
+    {
+      "path": "crates/compatforge-service/src/model.rs",
+      "baseSha256": "5ee7bda22c3b5616c55f90dd204e5086eb1a89f6d585519a090e7725fefa46e9",
+      "targetSha256": "7251dc073df58a2e06a77e9950982719505c7c5c8078198102ea0b415d384ba7"
+    },
+    {
+      "path": "crates/compatforge-service/src/jobs.rs",
+      "baseSha256": "788dc75e83e8edfaf6b0d9192db4499f9dbb3aa0fa93a8961ccaf61fa809b3eb",
+      "targetSha256": "1c383d403c5e949e2a311e3bfc75ce4aeb6e7293b0b016ce40bb6fe7cd380be6"
+    },
+    {
+      "path": "crates/compatforge-ffi/src/lib.rs",
+      "baseSha256": "f00cf47ea9006d1be89fcbbd39891b232da36d2dafe4884ab60135953af5452f",
+      "targetSha256": "e035792fa37cb6b727c03302a38f866195401700781e527c6092a541074d1dbd"
+    },
+    {
+      "path": "crates/compatforge-provider-linux/src/lib.rs",
+      "baseSha256": "5e222fddbf8186af70c8e911ba885d87e172f528744c2bf66fc9c321989c4cb6",
+      "targetSha256": "9dcd40c1379037ec9ca9f51d91bbc2f0fef4a0d1fe13f6e417e98837b6254a21"
+    },
+    {
+      "path": "crates/compatforge-domain/src/lib.rs",
+      "baseSha256": "5f9fe668222c80d3bf01449ea3c9312f83b9c09fc1eeefa210eadefe9507940c",
+      "targetSha256": "0bc33633a9ca26fd127fddf7669ad406fb14fdc578b5596b011acfc76d9456f8"
+    },
+    {
+      "path": "crates/compatforge-provider-macos/src/lib.rs",
+      "baseSha256": "d73504e3b4585a232b6179a6494fb1af74d30be0b91a1b57b3a2b5da30c2d040",
+      "targetSha256": "727a16cc7b0f4a531858d04076fbdb272ec48befd0226dfdf238447c176d34ab"
+    },
+    {
+      "path": "crates/compatforge-process/src/preparing.rs",
+      "baseSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "targetSha256": "d09efe3558db366c4a482b1bc9c047b92162b89345a74b714319580dfcd4d9d2"
+    },
+    {
+      "path": "crates/compatforge-process/src/lib.rs",
+      "baseSha256": "6d2b97e49406d435b2ce2bae69b3b7201efc0bfd286dbc64b647479114a5e81a",
+      "targetSha256": "d68d137f365e397359d1b2b0362ebde120837fd356ab1c7c43adac9d537dda4e"
+    },
+    {
+      "path": "crates/compatforge-orchestrator/src/lib.rs",
+      "baseSha256": "51cfc81244ca5136eb69e132d884c49e7bc39219de7cb1b6dab88b1608cc21d9",
+      "targetSha256": "d8c6146a764c9c019f551630921d82e58963f5ff8b9d8bb183af052480933877"
+    }
+  ]
+}

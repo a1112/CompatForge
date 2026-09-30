@@ -8,11 +8,11 @@ use compatforge_domain::{
 };
 use compatforge_inspect::{inspect_path, PeArchitecture};
 use compatforge_orchestrator::PreparedLaunch;
-use compatforge_process::{EventPoll, LaunchHandle, ProcessSupervisor};
+use compatforge_process::{EventPoll, LaunchHandle, PreparingLaunch, ProcessSupervisor};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -22,12 +22,45 @@ pub(crate) struct JobManager {
     registry: Arc<Registry>,
     config: CoreConfig,
     active: Mutex<HashMap<String, ActiveJob>>,
+    operation: Mutex<()>,
+    closing: AtomicBool,
 }
 
 struct ActiveJob {
-    handle: Arc<LaunchHandle>,
+    handle: Arc<JobHandle>,
     record: JobRecord,
     cancel_requested: bool,
+}
+
+enum JobHandle {
+    Running(LaunchHandle),
+    Preparing(PreparingLaunch),
+}
+impl JobHandle {
+    fn start(plan: &compatforge_domain::LaunchPlan) -> Result<Self, compatforge_process::ProcessError> {
+        if plan.wine_appearance.is_some() {
+            ProcessSupervisor::prepare(plan).map(Self::Preparing)
+        } else {
+            ProcessSupervisor::start(plan).map(Self::Running)
+        }
+    }
+    fn activate(&self) {
+        if let Self::Preparing(handle) = self {
+            handle.activate();
+        }
+    }
+    fn next_event(&self, timeout: Duration) -> EventPoll {
+        match self {
+            Self::Running(handle) => handle.next_event(timeout),
+            Self::Preparing(handle) => handle.next_event(timeout),
+        }
+    }
+    fn terminate(&self) -> Result<(), compatforge_process::ProcessError> {
+        match self {
+            Self::Running(handle) => handle.terminate(),
+            Self::Preparing(handle) => handle.terminate(),
+        }
+    }
 }
 
 impl JobManager {
@@ -36,11 +69,20 @@ impl JobManager {
             registry,
             config,
             active: Mutex::new(HashMap::new()),
+            operation: Mutex::new(()),
+            closing: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn submit(&self, request: JobRequest) -> Result<JobRecord, JobError> {
         request.validate().map_err(JobError::Model)?;
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| JobError::Conflict("service operation lock is poisoned"))?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(JobError::Conflict("service is shutting down"));
+        }
         let settings = self.registry.read_settings().map_err(JobError::Registry)?;
         let active_count = self
             .lock_active()?
@@ -131,22 +173,43 @@ impl JobManager {
             let plan = prepared
                 .authorize(&self.config)
                 .map_err(|error| JobError::Preparation(error.to_string()))?;
-            ProcessSupervisor::start(plan).map_err(|error| JobError::Process(error.to_string()))
+            JobHandle::start(plan).map_err(|error| JobError::Process(error.to_string()))
         })();
 
         match start_result {
             Ok(handle) => {
-                record.status = JobStatus::Running;
+                record.status = if matches!(handle, JobHandle::Preparing(_)) {
+                    JobStatus::Preparing
+                } else {
+                    JobStatus::Running
+                };
                 record.updated_at_milliseconds = now_milliseconds();
-                self.registry.write_job(&record).map_err(JobError::Registry)?;
+                let handle = Arc::new(handle);
                 self.lock_active()?.insert(
                     job_id,
                     ActiveJob {
-                        handle: Arc::new(handle),
+                        handle: Arc::clone(&handle),
                         record: record.clone(),
                         cancel_requested: false,
                     },
                 );
+                if let Err(error) = self.registry.write_job(&record) {
+                    if matches!(handle.as_ref(), JobHandle::Preparing(_)) {
+                        if let Some(state) = self
+                            .active
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get_mut(&record.id)
+                        {
+                            state.cancel_requested = true;
+                            state.record.status = JobStatus::Cancelling;
+                            state.record.error = Some("preparing job persistence failed before activation".into());
+                        }
+                        let _ = handle.terminate();
+                    }
+                    return Err(JobError::Registry(error));
+                }
+                handle.activate();
                 Ok(record)
             }
             Err(error) => {
@@ -256,6 +319,8 @@ impl JobManager {
     }
 
     pub(crate) fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
+        let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
         let handles = self
             .lock_active()
             .map(|active| active.values().map(|job| Arc::clone(&job.handle)).collect::<Vec<_>>())
@@ -354,7 +419,9 @@ fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
     match event.kind {
         RuntimeEventKind::Exited => {
             let success = event.exit.as_ref().is_some_and(|exit| exit.success);
-            state.record.status = if state.cancel_requested {
+            state.record.status = if state.record.error.is_some() {
+                JobStatus::Failed
+            } else if state.cancel_requested {
                 JobStatus::Cancelled
             } else if success {
                 JobStatus::Succeeded
@@ -370,8 +437,12 @@ fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
                 state.record.error = event.message.clone().or_else(|| Some("runtime failed".into()));
             }
         }
-        RuntimeEventKind::Started
-        | RuntimeEventKind::Output
+        RuntimeEventKind::Started => {
+            if state.record.status == JobStatus::Preparing {
+                state.record.status = JobStatus::Running;
+            }
+        }
+        RuntimeEventKind::Output
         | RuntimeEventKind::TerminateRequested
         | RuntimeEventKind::TimedOut
         | RuntimeEventKind::GracePeriodExpired

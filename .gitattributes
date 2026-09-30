@@ -17,3 +17,6 @@ tests/fixtures/*.exe binary
 /examples/macos-dual-runtime-interactions.json text eol=lf
 /docs/migration/macwin-portable-assets.md text eol=lf
 /docs/migration/macwin-patch-provenance.md text eol=lf
+
+# Preserve exact deployed unified-diff bytes and required context spaces.
+docs/patches/*.patch -text -whitespace

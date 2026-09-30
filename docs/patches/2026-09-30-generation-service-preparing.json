@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "base": "generation service with reviewed profile expectation, preserved from actual isolated builder",
+  "baseSourceSha256": "98d48213dfaf52ba6b76ac6e9bedc646abeaee7c5de875a5577593f3a277d83a",
+  "targetSourceSha256": "d53bcca7053174fbe1c193c9627f6a4c9031137ff41262dfc3d255c6f2659f69",
+  "canonicalRepositoryService": "older baseline; separate adapter committed in crates/compatforge-service/src/jobs.rs",
+  "application": "Only apply against matching base digest; preserve generation/GUI-idle/lifecycle source"
+}

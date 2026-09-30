@@ -1,0 +1,1620 @@
+--- a/crates/compatforge-service/src/registry.rs
++++ b/crates/compatforge-service/src/registry.rs
+@@ -594,6 +594,7 @@
+         }],
+         compatibility_rating: CompatibilityRating::Unknown,
+         tags: vec!["gui-baseline".into()],
++        wine_appearance: None,
+     }
+ }
+ 
+--- a/crates/compatforge-service/src/desktop.rs
++++ b/crates/compatforge-service/src/desktop.rs
+@@ -59,6 +59,7 @@
+         }
+     }
+     let request = JobRequest {
++        expected_wine_appearance: None,
+         schema_version: "1".into(),
+         application_id: application.into(),
+         kind: JobKind::Launch,
+--- a/crates/compatforge-service/src/model.rs
++++ b/crates/compatforge-service/src/model.rs
+@@ -158,6 +158,8 @@
+     pub compatibility_rating: CompatibilityRating,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub tags: Vec<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub wine_appearance: Option<compatforge_domain::WineAppearance>,
+ }
+ 
+ impl ApplicationDefinition {
+@@ -375,12 +377,24 @@
+     pub argument_overrides: Vec<String>,
+     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+     pub environment_overrides: BTreeMap<String, String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub expected_wine_appearance: Option<WineAppearanceExpectation>,
++}
++
++#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "lowercase")]
++pub enum WineAppearanceExpectation {
++    Default,
++    Classic,
+ }
+ 
+ impl JobRequest {
+     pub fn validate(&self) -> Result<(), ModelError> {
+         validate_schema(&self.schema_version)?;
+         validate_domain_id("job.applicationId", &self.application_id)?;
++        if self.expected_wine_appearance.is_some() && self.kind != JobKind::Install {
++            return Err(ModelError::Invalid("only install jobs accept expectedWineAppearance"));
++        }
+         if let Some(launcher_id) = &self.launcher_id {
+             validate_domain_id("job.launcherId", launcher_id)?;
+         }
+@@ -720,3 +734,41 @@
+         Err(ModelError::Invalid("installer sha256 must contain 64 hex characters"))
+     }
+ }
++
++#[cfg(test)]
++mod appearance_tests {
++    use super::*;
++
++    #[test]
++    fn classic_install_expectation_is_closed_and_survives_submission() {
++        let mut value = serde_json::json!({"schemaVersion":"1", "applicationId":"peazip", "kind":"install",
++            "executablePath":std::env::temp_dir().join("installer.exe"),"expectedWineAppearance":"classic"});
++        let request: JobRequest = serde_json::from_value(value.clone()).expect("signed appearance expectation");
++        request.validate().unwrap();
++        assert_eq!(
++            serde_json::to_value(request).unwrap()["expectedWineAppearance"],
++            "classic"
++        );
++        value["expectedWineAppearance"] = serde_json::json!("default");
++        assert!(serde_json::from_value::<JobRequest>(value.clone()).is_ok());
++        value["expectedWineAppearance"] = serde_json::json!("script");
++        assert!(serde_json::from_value::<JobRequest>(value).is_err());
++    }
++
++    #[test]
++    fn classic_application_profile_is_explicit_and_default_is_omitted() {
++        let legacy = serde_json::json!({"schemaVersion":"1", "id":"peazip", "name":"PeaZip",
++            "version":"11.3.0", "publisher":"Giorgio Tani", "category":"utilities",
++            "bottleId":"gui-peazip", "launchers":[{"id":"main","name":"PeaZip",
++            "executable":"Program Files/PeaZip/peazip.exe"}], "compatibilityRating":"unknown"});
++        let decoded: ApplicationDefinition = serde_json::from_value(legacy.clone()).unwrap();
++        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
++        let mut classic = legacy.clone();
++        classic["wineAppearance"] = serde_json::json!("classic");
++        let decoded: ApplicationDefinition = serde_json::from_value(classic.clone()).expect("reviewed classic profile");
++        decoded.validate().unwrap();
++        assert_eq!(serde_json::to_value(decoded).unwrap(), classic);
++        classic["wineAppearance"] = serde_json::json!("script");
++        assert!(serde_json::from_value::<ApplicationDefinition>(classic).is_err());
++    }
++}
+--- a/crates/compatforge-service/src/jobs.rs
++++ b/crates/compatforge-service/src/jobs.rs
+@@ -9,11 +9,11 @@
+ };
+ use compatforge_inspect::{inspect_path, PeArchitecture};
+ use compatforge_orchestrator::PreparedLaunch;
+-use compatforge_process::{EventPoll, LaunchHandle, ProcessSupervisor};
++use compatforge_process::{EventPoll, LaunchHandle, PreparingLaunch, ProcessSupervisor};
+ use std::collections::{BTreeMap, HashMap};
+ use std::fmt;
+ use std::path::PathBuf;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard};
+ use std::time::Duration;
+ 
+@@ -25,6 +25,7 @@
+     active: Mutex<HashMap<String, ActiveJob>>,
+     active_debug: Mutex<HashMap<String, DebugLease>>,
+     operation: Mutex<()>,
++    closing: AtomicBool,
+ }
+ 
+ pub(crate) struct SelectedDebugTarget {
+@@ -48,12 +49,36 @@
+ }
+ 
+ trait JobProcess: ShutdownTarget + Send + Sync {
++    fn activate(&self) {}
++    fn is_preparing(&self) -> bool {
++        false
++    }
+     fn next_event(&self, timeout: Duration) -> EventPoll;
+ }
+ 
+ impl JobProcess for LaunchHandle {
+     fn next_event(&self, timeout: Duration) -> EventPoll {
+         LaunchHandle::next_event(self, timeout)
++    }
++}
++
++impl JobProcess for PreparingLaunch {
++    fn next_event(&self, timeout: Duration) -> EventPoll {
++        PreparingLaunch::next_event(self, timeout)
++    }
++    fn activate(&self) {
++        PreparingLaunch::activate(self);
++    }
++    fn is_preparing(&self) -> bool {
++        true
++    }
++}
++impl ShutdownTarget for PreparingLaunch {
++    fn request_stop(&self) -> Result<(), String> {
++        self.terminate().map_err(|error| error.to_string())
++    }
++    fn wait_for_stop(&self, grace: Duration) -> Result<(), String> {
++        self.terminate_and_wait(grace).map_err(|error| error.to_string())
+     }
+ }
+ 
+@@ -147,6 +172,9 @@
+         launch: impl FnOnce(SelectedDebugTarget) -> Result<compatforge_debug::DebugSessionHandle, crate::ServiceError>,
+     ) -> Result<compatforge_debug::DebugSessionHandle, crate::ServiceError> {
+         let _operation = self.lock_operation().map_err(crate::ServiceError::Job)?;
++        if self.closing.load(Ordering::Acquire) {
++            return Err(crate::ServiceError::Conflict("service is shutting down"));
++        }
+         let mut active_debug = self
+             .active_debug
+             .lock()
+@@ -275,12 +303,16 @@
+             active: Mutex::new(HashMap::new()),
+             active_debug: Mutex::new(HashMap::new()),
+             operation: Mutex::new(()),
++            closing: AtomicBool::new(false),
+         }
+     }
+ 
+     pub(crate) fn submit(&self, request: JobRequest) -> Result<JobRecord, JobError> {
+         request.validate().map_err(JobError::Model)?;
+         let _operation = self.lock_operation()?;
++        if self.closing.load(Ordering::Acquire) {
++            return Err(JobError::Conflict("service is shutting down"));
++        }
+         let settings = self.registry.read_settings().map_err(JobError::Registry)?;
+         let active_count = self.lock_active()?.len();
+         if active_count >= usize::from(settings.maximum_parallel_jobs) {
+@@ -292,6 +324,19 @@
+             .get_application(&request.application_id)
+             .map_err(JobError::Registry)?
+             .application;
++        if let Some(expected) = request.expected_wine_appearance {
++            let matches = match expected {
++                crate::model::WineAppearanceExpectation::Default => application.wine_appearance.is_none(),
++                crate::model::WineAppearanceExpectation::Classic => {
++                    application.wine_appearance == Some(compatforge_domain::WineAppearance::Classic)
++                }
++            };
++            if !matches {
++                return Err(JobError::Conflict(
++                    "reviewed Wine appearance differs from install expectation",
++                ));
++            }
++        }
+         self.ensure_idle(&application.id, &application.bottle_id)?;
+ 
+         let job_id = next_job_id();
+@@ -337,6 +382,11 @@
+             let inspection = inspect_path(&resolved.source).map_err(|error| JobError::Inspection(error.to_string()))?;
+             let architecture = map_architecture(inspection.architecture)?;
+             let launch_request = LaunchRequest {
++                wine_appearance: if request.kind == JobKind::Install {
++                    application.wine_appearance
++                } else {
++                    None
++                },
+                 schema_version: SCHEMA_VERSION_V1.into(),
+                 request_id: job_id.clone(),
+                 bottle_id: generation.bottle_id.clone(),
+@@ -379,11 +429,19 @@
+             let plan = prepared
+                 .authorize(&self.config)
+                 .map_err(|error| JobError::Preparation(error.to_string()))?;
+-            ProcessSupervisor::start(plan).map_err(|error| JobError::Process(error.to_string()))
++            if plan.wine_appearance.is_some() {
++                ProcessSupervisor::prepare(plan)
++                    .map(|handle| Arc::new(handle) as Arc<dyn JobProcess>)
++                    .map_err(|error| JobError::Process(error.to_string()))
++            } else {
++                ProcessSupervisor::start(plan)
++                    .map(|handle| Arc::new(handle) as Arc<dyn JobProcess>)
++                    .map_err(|error| JobError::Process(error.to_string()))
++            }
+         })();
+ 
+         match start_result {
+-            Ok(handle) => self.adopt_started_job(record, Arc::new(handle)),
++            Ok(handle) => self.adopt_started_job(record, handle),
+             Err(error) => {
+                 record.status = JobStatus::Failed;
+                 record.error = Some(crate::lifecycle::bounded_error(&error.to_string()));
+@@ -408,7 +466,11 @@
+     }
+ 
+     fn adopt_started_job(&self, mut record: JobRecord, handle: Arc<dyn JobProcess>) -> Result<JobRecord, JobError> {
+-        record.status = JobStatus::Running;
++        record.status = if handle.is_preparing() {
++            JobStatus::Preparing
++        } else {
++            JobStatus::Running
++        };
+         record.updated_at_milliseconds = now_milliseconds();
+         // A started process must acquire a cleanup owner before any fallible
+         // post-start persistence. Recover solely to retain ownership if the map
+@@ -416,14 +478,41 @@
+         self.active.lock().unwrap_or_else(|error| error.into_inner()).insert(
+             record.id.clone(),
+             ActiveJob {
+-                handle,
++                handle: Arc::clone(&handle),
+                 record: record.clone(),
+                 cancel_requested: false,
+                 cleanup_join_failed: false,
+                 polling: Arc::new(Mutex::new(())),
+             },
+         );
+-        self.registry.write_job(&record).map_err(JobError::Registry)?;
++        if let Err(error) = self.registry.write_job(&record) {
++            if handle.is_preparing() {
++                if let Some(state) = self
++                    .active
++                    .lock()
++                    .unwrap_or_else(|error| error.into_inner())
++                    .get_mut(&record.id)
++                {
++                    state.cancel_requested = true;
++                    state.record.status = JobStatus::Cancelling;
++                    state.record.error = Some("preparing job persistence failed before activation".into());
++                }
++                if let Err(stop) = handle.request_stop() {
++                    if let Some(state) = self
++                        .active
++                        .lock()
++                        .unwrap_or_else(|error| error.into_inner())
++                        .get_mut(&record.id)
++                    {
++                        state.record.error = Some(crate::lifecycle::bounded_error(&format!(
++                            "preparing job persistence failed; cleanup request failed: {stop}"
++                        )));
++                    }
++                }
++            }
++            return Err(JobError::Registry(error));
++        }
++        handle.activate();
+         Ok(record)
+     }
+ 
+@@ -519,7 +608,9 @@
+                     Ok(()) => {
+                         // Shutdown may have requested cancellation while this
+                         // terminal poll was acknowledging supervisor completion.
+-                        if state.record.status == JobStatus::Cancelling {
++                        if state.record.status == JobStatus::Cancelling
++                            || (self.closing.load(Ordering::Acquire) && state.record.status == JobStatus::Succeeded)
++                        {
+                             state.record.status = JobStatus::Cancelled;
+                         }
+                         // Persist terminal evidence before the one atomic generation
+@@ -602,14 +693,21 @@
+     }
+ 
+     pub(crate) fn shutdown(&self) {
+-        for (_, handle) in self.owned_cleanup_handles() {
++        self.closing.store(true, Ordering::Release);
++        let handles = {
++            let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
++            self.owned_cleanup_handles()
++        };
++        for (_, handle) in handles {
+             let _ = handle.request_stop();
+         }
+     }
+ 
+     pub(crate) fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
+-        let handles = self.owned_cleanup_handles();
+-        {
++        self.closing.store(true, Ordering::Release);
++        let handles = {
++            let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
++            let handles = self.owned_cleanup_handles();
+             let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+             for (id, _) in &handles {
+                 if let Some(state) = active.get_mut(id) {
+@@ -621,7 +719,8 @@
+                     }
+                 }
+             }
+-        }
++            handles
++        };
+         shutdown_handles(
+             &handles,
+             Duration::from_millis(self.config.supervisor.termination_grace_milliseconds),
+@@ -899,10 +998,13 @@
+                 state.record.error = Some("runtime exceeded its completion deadline".into());
+             }
+         }
+-        RuntimeEventKind::Started
+-        | RuntimeEventKind::Output
+-        | RuntimeEventKind::TerminateRequested
+-        | RuntimeEventKind::WineServerStopRequested => {}
++        RuntimeEventKind::Started => {
++            if state.record.status == JobStatus::Preparing {
++                state.record.status = JobStatus::Running;
++            }
++        }
++        RuntimeEventKind::Output | RuntimeEventKind::TerminateRequested | RuntimeEventKind::WineServerStopRequested => {
++        }
+     }
+ }
+ 
+@@ -983,6 +1085,81 @@
+                 .pop_front()
+                 .map_or(EventPoll::Closed, EventPoll::Event)
+         }
++    }
++
++    #[test]
++    fn preparing_persistence_failure_can_drain_without_restart() {
++        let (manager, _, root) = terminal_poll_fixture(false);
++        let record = manager.active.lock().unwrap().remove("cleanup-job").unwrap().record;
++        manager.registry.write_job(&record).unwrap();
++        let job_path = root.join("service/jobs/cleanup-job.json");
++        std::fs::remove_file(&job_path).unwrap();
++        std::fs::create_dir(&job_path).unwrap();
++        let plan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
++        let handle = Arc::new(ProcessSupervisor::prepare(&plan).unwrap());
++        assert!(matches!(
++            manager.adopt_started_job(record, handle.clone()),
++            Err(JobError::Registry(_))
++        ));
++        assert!(manager.active.lock().unwrap().contains_key("cleanup-job"));
++        std::fs::remove_dir(&job_path).unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(1);
++        loop {
++            let result = manager.poll("cleanup-job", 10).unwrap();
++            if result.stream_ended {
++                assert_eq!(result.job.status, JobStatus::Failed);
++                break;
++            }
++            assert!(std::time::Instant::now() < deadline, "dormant owner was never stopped");
++        }
++        assert!(!manager.active.lock().unwrap().contains_key("cleanup-job"));
++        handle.terminate_and_wait(Duration::ZERO).unwrap();
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn preparing_shutdown_flag_prevents_terminal_generation_commit() {
++        let (manager, _, root, app) = managed_fixture(false);
++        write_managed_launcher(&manager, &app);
++        manager.closing.store(true, Ordering::Release);
++        let result = manager.poll("job-managed", 0).unwrap();
++        assert_eq!(result.job.status, JobStatus::Cancelled);
++        assert!(manager
++            .registry
++            .lifecycle
++            .state(&app.id)
++            .unwrap()
++            .selected_generation
++            .is_none());
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn preparing_shutdown_rejects_new_submission_before_adoption() {
++        let (manager, _, root) = terminal_poll_fixture(false);
++        manager.shutdown_and_wait().unwrap();
++        let request =
++            serde_json::from_value(serde_json::json!({"schemaVersion":"1","applicationId":"7zip","kind":"launch"}))
++                .unwrap();
++        assert!(matches!(
++            manager.submit(request),
++            Err(JobError::Conflict("service is shutting down"))
++        ));
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn preparing_job_has_persistent_owner_before_activation() {
++        let (manager, _, root) = terminal_poll_fixture(false);
++        let record = manager.active.lock().unwrap().remove("cleanup-job").unwrap().record;
++        let plan: compatforge_domain::LaunchPlan =
++            serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
++        let handle = Arc::new(ProcessSupervisor::prepare(&plan).unwrap());
++        let job = manager.adopt_started_job(record, handle).unwrap();
++        assert_eq!(job.status, JobStatus::Preparing);
++        manager.cancel(&job.id).unwrap();
++        manager.shutdown_and_wait().unwrap();
++        std::fs::remove_dir_all(root).unwrap();
+     }
+ 
+     fn terminal_poll_fixture(cleanup_failed: bool) -> (JobManager, Arc<CompletedProcess>, PathBuf) {
+--- a/crates/compatforge-ffi/src/lib.rs
++++ b/crates/compatforge-ffi/src/lib.rs
+@@ -1247,6 +1247,7 @@
+         config.runtime_bindings[0].wineserver_executable = None;
+ 
+         let plan = LaunchPlan {
++            wine_appearance: None,
+             schema_version: "1".into(),
+             request_id: "ffi-process-test".into(),
+             runtime: compatforge_domain::RuntimeSelection {
+--- a/crates/compatforge-provider-linux/src/lib.rs
++++ b/crates/compatforge-provider-linux/src/lib.rs
+@@ -642,6 +642,7 @@
+         let config = CoreConfig {
+             schema_version: compatforge_domain::SCHEMA_VERSION_V1.into(),
+             capabilities: self.capabilities.clone(),
++            wine_registry_tool: None,
+             runtime_bindings: vec![runtime_binding],
+             storage_root: canonical_storage_text.to_owned(),
+             sandbox_profile: compatforge_domain::SandboxProfile::Desktop,
+@@ -3242,12 +3243,14 @@
+         let core = CoreConfig {
+             schema_version: SCHEMA_VERSION_V1.into(),
+             capabilities: snapshot.capabilities,
++            wine_registry_tool: None,
+             runtime_bindings: vec![binding],
+             storage_root: "/private/storage".into(),
+             sandbox_profile: SandboxProfile::Desktop,
+             supervisor: SupervisorPolicy::default(),
+         };
+         let request = LaunchRequest {
++            wine_appearance: None,
+             schema_version: SCHEMA_VERSION_V1.into(),
+             request_id: "linux-provider-planner".into(),
+             bottle_id: "linux-preview".into(),
+--- a/crates/compatforge-domain/src/lib.rs
++++ b/crates/compatforge-domain/src/lib.rs
+@@ -438,6 +438,14 @@
+     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+     pub environment: BTreeMap<String, String>,
+     pub constraints: LaunchConstraints,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub wine_appearance: Option<WineAppearance>,
++}
++
++#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "lowercase")]
++pub enum WineAppearance {
++    Classic,
+ }
+ 
+ impl LaunchRequest {
+@@ -493,12 +501,22 @@
+     }
+ }
+ 
++/// Trusted service policy, kept separate from historical runtime snapshots.
++#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct WineRegistryTool {
++    pub path: String,
++    pub digest: String,
++}
++
+ #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+ #[serde(rename_all = "camelCase", deny_unknown_fields)]
+ pub struct CoreConfig {
+     pub schema_version: String,
+     pub capabilities: CapabilityReport,
+     pub runtime_bindings: Vec<RuntimeBinding>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub wine_registry_tool: Option<WineRegistryTool>,
+     pub storage_root: String,
+     #[serde(default)]
+     pub sandbox_profile: SandboxProfile,
+@@ -515,6 +533,12 @@
+         }
+         for binding in &self.runtime_bindings {
+             binding.validate()?;
++        }
++        if let Some(tool) = &self.wine_registry_tool {
++            if tool.path.is_empty() {
++                return Err(ContractError::MissingField("wineRegistryTool.path"));
++            }
++            validate_digest("wineRegistryTool.digest", &tool.digest)?;
+         }
+         self.supervisor.validate()?;
+         Ok(())
+@@ -737,6 +761,8 @@
+     pub lifecycle: ProcessLifecycle,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub decision_trace: Vec<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub wine_appearance: Option<WineAppearance>,
+ }
+ 
+ impl LaunchPlan {
+@@ -772,6 +798,11 @@
+             }
+         }
+         self.lifecycle.validate()?;
++        if self.wine_appearance.is_some()
++            && (self.runtime.provider != RuntimeKind::Wine || self.lifecycle.wineserver.is_none())
++        {
++            return Err(ContractError::UnsupportedValue("wineAppearance requires managed Wine"));
++        }
+         Ok(())
+     }
+ }
+@@ -1320,6 +1351,30 @@
+     use super::*;
+ 
+     #[test]
++    fn classic_appearance_survives_request_and_plan_serialization() {
++        let mut request: serde_json::Value =
++            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
++        request["wineAppearance"] = serde_json::json!("classic");
++        let decoded: LaunchRequest = serde_json::from_value(request).expect("classic appearance is a closed contract");
++        assert_eq!(serde_json::to_value(decoded).unwrap()["wineAppearance"], "classic");
++        let mut plan: serde_json::Value =
++            serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
++        plan["wineAppearance"] = serde_json::json!("classic");
++        let decoded: LaunchPlan = serde_json::from_value(plan).expect("classic appearance survives planning");
++        assert_eq!(serde_json::to_value(decoded).unwrap()["wineAppearance"], "classic");
++    }
++
++    #[test]
++    fn appearance_contract_rejects_arbitrary_registry_profiles() {
++        let mut request: serde_json::Value =
++            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
++        for unsupported in ["dark", "reg.exe", "classic;anything", ""] {
++            request["wineAppearance"] = serde_json::json!(unsupported);
++            assert!(serde_json::from_value::<LaunchRequest>(request.clone()).is_err());
++        }
++    }
++
++    #[test]
+     fn pinned_launch_request_serialization_stays_byte_compatible() {
+         let request: LaunchRequest =
+             serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+--- a/crates/compatforge-provider-macos/src/lib.rs
++++ b/crates/compatforge-provider-macos/src/lib.rs
+@@ -245,6 +245,7 @@
+         let config = CoreConfig {
+             schema_version: compatforge_domain::SCHEMA_VERSION_V1.into(),
+             capabilities: self.capabilities.clone(),
++            wine_registry_tool: None,
+             runtime_bindings: vec![runtime_binding],
+             storage_root,
+             sandbox_profile: SandboxProfile::Desktop,
+@@ -1520,6 +1521,7 @@
+             config.wine_runtime.wineserver.digest
+         );
+         let request = LaunchRequest {
++            wine_appearance: None,
+             schema_version: SCHEMA_VERSION_V1.into(),
+             request_id: "macos-provider-plan".into(),
+             bottle_id: "macos-smoke".into(),
+--- a/crates/compatforge-process/src/preparing.rs
++++ b/crates/compatforge-process/src/preparing.rs
+@@ -0,0 +1,290 @@
++//! A dormant startup owner registered by the service before activation.
++use super::*;
++use std::sync::Condvar;
++
++struct State {
++    ready: (Mutex<bool>, Condvar),
++    cancelled: AtomicBool,
++    spawn_gate: Mutex<()>,
++    result: Mutex<Option<Result<Arc<LaunchHandle>, ProcessError>>>,
++}
++
++pub struct PreparingLaunch {
++    state: Arc<State>,
++    receiver: Mutex<Receiver<RuntimeEvent>>,
++    worker: Mutex<Option<thread::JoinHandle<()>>>,
++}
++
++impl PreparingLaunch {
++    pub(super) fn new(plan: LaunchPlan) -> Result<Self, ProcessError> {
++        Self::new_with_start(plan, |plan, operations| {
++            ProcessSupervisor::start_with_operations(plan, operations)
++        })
++    }
++
++    fn new_with_start(
++        plan: LaunchPlan,
++        start: impl FnOnce(&LaunchPlan, &CancellableOperations) -> Result<LaunchHandle, ProcessError> + Send + 'static,
++    ) -> Result<Self, ProcessError> {
++        plan.validate().map_err(ProcessError::InvalidPlan)?;
++        let state = Arc::new(State {
++            ready: (Mutex::new(false), Condvar::new()),
++            cancelled: AtomicBool::new(false),
++            spawn_gate: Mutex::new(()),
++            result: Mutex::new(None),
++        });
++        let worker_state = Arc::clone(&state);
++        let (sender, receiver) = mpsc::channel();
++        let worker = thread::Builder::new()
++            .name("compatforge-preparing".into())
++            .spawn(move || {
++                let mut ready = lock_recover(&worker_state.ready.0);
++                while !*ready && !worker_state.cancelled.load(Ordering::Acquire) {
++                    ready = worker_state
++                        .ready
++                        .1
++                        .wait(ready)
++                        .unwrap_or_else(|error| error.into_inner());
++                }
++                drop(ready);
++                let operations = CancellableOperations(Arc::clone(&worker_state));
++                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(&plan, &operations)))
++                    .unwrap_or(Err(ProcessError::StartupCleanup {
++                        startup: StartupStage::AppearancePreparation,
++                        cleanup: CleanupStage::ClientCleanup,
++                    }));
++                let result = operations.map_cancel(result).map(Arc::new);
++                // Cancellation and guest spawn use the same gate. If spawn won the
++                // race, the newly owned handle must immediately receive the stop.
++                let _gate = lock_recover(&worker_state.spawn_gate);
++                if let Ok(handle) = &result {
++                    if worker_state.cancelled.load(Ordering::Acquire) {
++                        let _ = handle.terminate();
++                    }
++                }
++                let emitter = EventEmitter::new(plan.request_id, sender);
++                if let Err(error) = &result {
++                    if !matches!(error, ProcessError::Cancelled) {
++                        emitter.emit(RuntimeEventKind::Failed, None, None, None, Some(error.to_string()));
++                    }
++                    emitter.emit(
++                        RuntimeEventKind::Exited,
++                        None,
++                        None,
++                        Some(ProcessExit {
++                            code: None,
++                            success: false,
++                        }),
++                        None,
++                    );
++                }
++                *lock_recover(&worker_state.result) = Some(result);
++            })
++            .map_err(ProcessError::Spawn)?;
++        Ok(Self {
++            state,
++            receiver: Mutex::new(receiver),
++            worker: Mutex::new(Some(worker)),
++        })
++    }
++
++    /// Call only after persistent job registration and cleanup ownership.
++    pub fn activate(&self) {
++        *lock_recover(&self.state.ready.0) = true;
++        self.state.ready.1.notify_all();
++    }
++
++    pub fn next_event(&self, timeout: Duration) -> EventPoll {
++        let handle = lock_recover(&self.state.result)
++            .as_ref()
++            .and_then(|result| result.as_ref().ok())
++            .cloned();
++        if let Some(handle) = handle {
++            return handle.next_event(timeout);
++        }
++        let started = Instant::now();
++        let poll = match lock_recover(&self.receiver).recv_timeout(timeout) {
++            Ok(event) => EventPoll::Event(event),
++            Err(RecvTimeoutError::Timeout) => EventPoll::Timeout,
++            Err(RecvTimeoutError::Disconnected) => EventPoll::Closed,
++        };
++        // Publishing the running handle closes the preparation channel and
++        // wakes a reader already waiting for configuration to finish.
++        if matches!(poll, EventPoll::Closed) {
++            let handle = lock_recover(&self.state.result)
++                .as_ref()
++                .and_then(|result| result.as_ref().ok())
++                .cloned();
++            if let Some(handle) = handle {
++                return handle.next_event(timeout.saturating_sub(started.elapsed()));
++            }
++        }
++        poll
++    }
++
++    pub fn terminate(&self) -> Result<(), ProcessError> {
++        {
++            let _ready = lock_recover(&self.state.ready.0);
++            let _gate = lock_recover(&self.state.spawn_gate);
++            self.state.cancelled.store(true, Ordering::Release);
++        }
++        self.state.ready.1.notify_all();
++        let handle = lock_recover(&self.state.result)
++            .as_ref()
++            .and_then(|result| result.as_ref().ok())
++            .cloned();
++        match handle {
++            Some(handle) => handle.terminate(),
++            None => Ok(()),
++        }
++    }
++
++    pub fn terminate_and_wait(&self, grace: Duration) -> Result<(), ProcessError> {
++        self.terminate()?;
++        let deadline = Instant::now()
++            .checked_add(grace)
++            .and_then(|value| value.checked_add(SUPERVISOR_FORCE_COMPLETION_TIMEOUT))
++            .ok_or_else(|| ProcessError::Terminate(io::Error::other("invalid preparation completion deadline")))?;
++        let mut worker = lock_recover(&self.worker);
++        while worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
++            if Instant::now() >= deadline {
++                return Err(ProcessError::Terminate(io::Error::other(
++                    "preparation cleanup remains owned and incomplete",
++                )));
++            }
++            thread::sleep(PROCESS_POLL_INTERVAL);
++        }
++        if let Some(worker) = worker.take() {
++            worker
++                .join()
++                .map_err(|_| ProcessError::Terminate(io::Error::other("preparation worker panicked")))?;
++        }
++        drop(worker);
++        let result = lock_recover(&self.state.result);
++        match result.as_ref() {
++            Some(Ok(handle)) => {
++                let handle = Arc::clone(handle);
++                drop(result);
++                handle.terminate_and_wait_until(Duration::ZERO, deadline)
++            }
++            Some(Err(ProcessError::StartupCleanup { startup, cleanup })) => Err(ProcessError::StartupCleanup {
++                startup: *startup,
++                cleanup: *cleanup,
++            }),
++            Some(Err(_)) => Ok(()),
++            None => Err(ProcessError::Terminate(io::Error::other(
++                "preparation result unavailable",
++            ))),
++        }
++    }
++}
++
++impl Drop for PreparingLaunch {
++    fn drop(&mut self) {
++        let _ = self.terminate();
++    }
++}
++
++struct CancellableOperations(Arc<State>);
++impl CancellableOperations {
++    fn map_cancel<T>(&self, result: Result<T, ProcessError>) -> Result<T, ProcessError> {
++        match result {
++            Err(ProcessError::Startup(_) | ProcessError::Spawn(_)) if self.0.cancelled.load(Ordering::Acquire) => {
++                Err(ProcessError::Cancelled)
++            }
++            other => other,
++        }
++    }
++}
++impl StartupOperations for CancellableOperations {
++    fn check_cancelled(&self) -> Result<(), ProcessError> {
++        if self.0.cancelled.load(Ordering::Acquire) {
++            Err(ProcessError::Cancelled)
++        } else {
++            Ok(())
++        }
++    }
++    fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
++        self.check_cancelled()?;
++        self.map_cancel(initialize_wine_prefix_with_cancel(
++            plan,
++            WINE_PREFIX_BOOTSTRAP_TIMEOUT,
++            Command::spawn,
++            Some(&self.0.cancelled),
++        ))
++    }
++    fn appearance(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
++        self.check_cancelled()?;
++        self.map_cancel(prepare_wine_appearance_with_cancel(plan, Some(&self.0.cancelled)))
++    }
++    fn fonts(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
++        self.check_cancelled()?;
++        prepare_pinned_bottle_font(plan)
++    }
++    fn guest_alias(&self, plan: &LaunchPlan) -> Result<Option<PathBuf>, ProcessError> {
++        self.check_cancelled()?;
++        prepare_guest_execution_alias(plan)
++    }
++    fn spawn(&self, command: &mut Command) -> io::Result<Child> {
++        let _gate = lock_recover(&self.0.spawn_gate);
++        self.check_cancelled()
++            .map_err(|_| io::Error::other("guest spawn cancelled"))?;
++        command.spawn()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn preparing_worker_panic_emits_failure_and_never_confirms_cleanup() {
++        let plan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
++        let handle = PreparingLaunch::new_with_start(plan, |_, _| panic!("injected preparation panic")).unwrap();
++        handle.activate();
++        assert!(
++            matches!(handle.next_event(Duration::from_secs(3)), EventPoll::Event(event) if event.kind == RuntimeEventKind::Failed)
++        );
++        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
++        assert!(handle.terminate_and_wait(Duration::ZERO).is_err());
++    }
++    #[cfg(unix)]
++    #[test]
++    fn preparing_cancel_after_spawn_before_publication_stops_the_new_handle() {
++        let mut plan: LaunchPlan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
++        plan.process = compatforge_domain::NativeCommand {
++            executable: "/bin/sleep".into(),
++            arguments: vec!["30".into()],
++            environment: Default::default(),
++            working_directory: std::env::temp_dir().to_str().unwrap().into(),
++        };
++        plan.guest_artifact = None;
++        plan.bottle_executable = None;
++        plan.wine_appearance = None;
++        plan.lifecycle = compatforge_domain::ProcessLifecycle::default();
++        plan.graphics.backend = GraphicsBackendKind::WineD3d;
++        plan.graphics.version = None;
++        plan.translator.provider = compatforge_domain::TranslatorKind::Native;
++        plan.translator.version = None;
++        plan.mounts.clear();
++        let (spawned, observed) = mpsc::channel();
++        let (release, proceed) = mpsc::channel();
++        let handle = PreparingLaunch::new_with_start(plan, move |plan, ops| {
++            let inner = ProcessSupervisor::start_with_operations(plan, ops)?;
++            spawned.send(()).unwrap();
++            proceed.recv().unwrap();
++            Ok(inner)
++        })
++        .unwrap();
++        handle.activate();
++        observed.recv_timeout(Duration::from_secs(3)).unwrap();
++        handle.terminate().unwrap();
++        release.send(()).unwrap();
++        handle.terminate_and_wait(Duration::ZERO).unwrap();
++        assert!(lock_recover(&handle.state.result)
++            .as_ref()
++            .unwrap()
++            .as_ref()
++            .unwrap()
++            .is_finished());
++    }
++}
+--- a/crates/compatforge-process/src/lib.rs
++++ b/crates/compatforge-process/src/lib.rs
+@@ -47,10 +47,16 @@
+ const BOTTLE_FONT_DIGEST_ENV: &str = "COMPATFORGE_BOTTLE_FONT_SHA256";
+ const BOTTLE_FONT_FAMILY_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FAMILY";
+ const BOTTLE_FONT_FILE_NAME: &str = "compatforge-cjk.ttc";
++#[cfg(unix)]
++const WINE_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(15);
++#[cfg(unix)]
++const MAX_APPEARANCE_QUERY_BYTES: u64 = 4096;
++const THEME_MANAGER_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\ThemeManager";
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum StartupStage {
+     Wineboot,
++    AppearancePreparation,
+     FontPreparation,
+     GuestAlias,
+     GuestVerification,
+@@ -74,6 +80,7 @@
+ 
+ #[derive(Debug)]
+ pub enum ProcessError {
++    Cancelled,
+     InvalidPlan(ContractError),
+     InvalidGuestArtifact(GuestArtifactError),
+     InvalidRuntimeEvidence(&'static str),
+@@ -92,6 +99,7 @@
+ impl fmt::Display for ProcessError {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
++            Self::Cancelled => write!(formatter, "launch cancelled during preparation"),
+             Self::InvalidPlan(error) => write!(formatter, "invalid launch plan: {error}"),
+             Self::InvalidGuestArtifact(error) => write!(formatter, "invalid guest artifact: {error}"),
+             Self::InvalidRuntimeEvidence(field) => write!(formatter, "invalid pinned Runtime evidence: {field}"),
+@@ -114,7 +122,8 @@
+             Self::InvalidPlan(error) => Some(error),
+             Self::InvalidGuestArtifact(error) => Some(error),
+             Self::Isolation(error) | Self::Spawn(error) | Self::Terminate(error) => Some(error),
+-            Self::InvalidRuntimeEvidence(_)
++            Self::Cancelled
++            | Self::InvalidRuntimeEvidence(_)
+             | Self::UnsafeDirectory(_)
+             | Self::WinePrefixBusy(_)
+             | Self::Startup(_)
+@@ -138,10 +147,16 @@
+         Self::start_with_operations(plan, &SystemStartupOperations)
+     }
+ 
++    /// Construct a launch owner before starting runtime configuration.
++    pub fn prepare(plan: &LaunchPlan) -> Result<PreparingLaunch, ProcessError> {
++        PreparingLaunch::new(plan.clone())
++    }
++
+     fn start_with_operations(
+         plan: &LaunchPlan,
+         operations: &impl StartupOperations,
+     ) -> Result<LaunchHandle, ProcessError> {
++        operations.check_cancelled()?;
+         plan.validate().map_err(ProcessError::InvalidPlan)?;
+         verify_guest_inputs(plan)?;
+         verify_pinned_runtime(plan)?;
+@@ -151,6 +166,11 @@
+         let wine_session = WineSession::acquire(plan)?;
+         let mut startup_guard = wine_session.map(StartupWineSessionGuard::new);
+         startup_step(&mut startup_guard, StartupStage::Wineboot, operations.wineboot(plan))?;
++        startup_step(
++            &mut startup_guard,
++            StartupStage::AppearancePreparation,
++            operations.appearance(plan),
++        )?;
+         startup_step(
+             &mut startup_guard,
+             StartupStage::RuntimeVerification,
+@@ -225,7 +245,17 @@
+     }
+ }
+ 
++mod preparing;
++pub use preparing::PreparingLaunch;
++
+ trait StartupOperations {
++    fn check_cancelled(&self) -> Result<(), ProcessError> {
++        Ok(())
++    }
++    fn appearance(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
++        prepare_wine_appearance(plan)
++    }
++
+     fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+         initialize_wine_prefix(plan)
+     }
+@@ -317,8 +347,22 @@
+     clock: &impl PollClock,
+     timeout: Duration,
+ ) -> Result<bool, AuxiliaryFailure> {
++    wait_bounded_with_cancel(child, clock, timeout, None)
++}
++
++fn wait_bounded_with_cancel<C: BoundedChild>(
++    child: &mut C,
++    clock: &impl PollClock,
++    timeout: Duration,
++    cancellation: Option<&AtomicBool>,
++) -> Result<bool, AuxiliaryFailure> {
+     let deadline = clock.now() + timeout;
+     loop {
++        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
++            return Err(AuxiliaryFailure {
++                cleanup: reap_bounded(child, clock, WINE_SERVER_COMMAND_TIMEOUT).err(),
++            });
++        }
+         match child.poll() {
+             Ok(Some(success)) => {
+                 child
+@@ -402,7 +446,7 @@
+     }
+ }
+ 
+-#[cfg(any(test, target_os = "macos"))]
++#[cfg(any(test, unix))]
+ fn read_auxiliary_chunk(reader: &mut impl Read, output: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
+     let mut buffer = [0_u8; 4096];
+     let available = limit.saturating_sub(output.len());
+@@ -421,12 +465,43 @@
+ 
+ #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+ fn capture_auxiliary(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<(ExitStatus, Vec<u8>)> {
++    capture_auxiliary_typed(command, timeout, limit)
++        .map_err(|error| io::Error::other(format!("auxiliary capture failed: {error:?}")))
++}
++
++#[cfg(unix)]
++fn finish_auxiliary_capture(
++    result: io::Result<(ExitStatus, Vec<u8>)>,
++    cleanup: Result<(), CleanupStage>,
++) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
++    match cleanup {
++        Err(stage) => Err(AuxiliaryFailure { cleanup: Some(stage) }),
++        Ok(()) => result.map_err(|_| AuxiliaryFailure { cleanup: None }),
++    }
++}
++
++#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
++fn capture_auxiliary_typed(
++    command: &mut Command,
++    timeout: Duration,
++    limit: usize,
++) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
++    capture_auxiliary_with_cancel(command, timeout, limit, None)
++}
++
++#[cfg(unix)]
++fn capture_auxiliary_with_cancel(
++    command: &mut Command,
++    timeout: Duration,
++    limit: usize,
++    cancellation: Option<&AtomicBool>,
++) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
+     use std::os::fd::AsRawFd;
+     command
+         .stdout(Stdio::piped())
+         .stderr(Stdio::null())
+         .stdin(Stdio::null());
+-    let mut process = spawn_auxiliary(command).map_err(|_| io::Error::other("auxiliary spawn failed"))?;
++    let mut process = spawn_auxiliary(command)?;
+     let result = (|| {
+         let mut stdout = process
+             .child
+@@ -445,6 +520,9 @@
+         let mut output = Vec::with_capacity(limit);
+         let mut eof = false;
+         loop {
++            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
++                return Err(io::Error::other("auxiliary capture cancelled"));
++            }
+             if !eof {
+                 eof = read_auxiliary_chunk(&mut stdout, &mut output, limit)?;
+             }
+@@ -461,10 +539,7 @@
+         }
+     })();
+     let cleanup = reap_bounded(&mut process, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT);
+-    match cleanup {
+-        Err(stage) => Err(io::Error::other(format!("auxiliary cleanup failed: {stage:?}"))),
+-        Ok(()) => result,
+-    }
++    finish_auxiliary_capture(result, cleanup)
+ }
+ 
+ struct SystemStartupOperations;
+@@ -859,6 +934,15 @@
+     timeout: Duration,
+     spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+ ) -> Result<(), ProcessError> {
++    initialize_wine_prefix_with_cancel(plan, timeout, spawn, None)
++}
++
++fn initialize_wine_prefix_with_cancel(
++    plan: &LaunchPlan,
++    timeout: Duration,
++    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
++    cancellation: Option<&AtomicBool>,
++) -> Result<(), ProcessError> {
+     if plan.runtime.provider != RuntimeKind::Wine {
+         return Ok(());
+     }
+@@ -892,7 +976,7 @@
+         .stderr(Stdio::null());
+     let mut child =
+         spawn_auxiliary_with(&mut command, spawn).map_err(|error| error.into_process_error(StartupStage::Wineboot))?;
+-    match wait_bounded(&mut child, &SystemPollClock, timeout) {
++    match wait_bounded_with_cancel(&mut child, &SystemPollClock, timeout, cancellation) {
+         Ok(true) => {
+             let metadata =
+                 std::fs::symlink_metadata(&marker).map_err(|_| ProcessError::UnsafeDirectory("Wine prefix marker"))?;
+@@ -1234,6 +1318,113 @@
+         Ok(true) => Ok(()),
+         Ok(false) => Err(ProcessError::Startup(StartupStage::FontPreparation)),
+         Err(error) => Err(error.into_process_error(StartupStage::FontPreparation)),
++    }
++}
++
++/// Apply only the closed, authorized appearance profile within the prefix lease.
++/// The helper accepts no caller-supplied commands, registry paths or values.
++fn prepare_wine_appearance(plan: &LaunchPlan) -> Result<(), ProcessError> {
++    prepare_wine_appearance_with_cancel(plan, None)
++}
++
++fn prepare_wine_appearance_with_cancel(
++    plan: &LaunchPlan,
++    cancellation: Option<&AtomicBool>,
++) -> Result<(), ProcessError> {
++    if plan.wine_appearance.is_none() {
++        return Ok(());
++    }
++    plan.validate().map_err(ProcessError::InvalidPlan)?;
++    let tool = plan
++        .process
++        .environment
++        .get("COMPATFORGE_WINE_REGISTRY_TOOL")
++        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool"))?;
++    let digest = plan
++        .process
++        .environment
++        .get("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256")
++        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool digest"))?;
++    verify_pinned_regular_file(Path::new(tool), digest, "Wine registry tool")?;
++    let add = [
++        tool.as_str(),
++        "add",
++        THEME_MANAGER_KEY,
++        "/v",
++        "ThemeActive",
++        "/t",
++        "REG_SZ",
++        "/d",
++        "0",
++        "/f",
++    ];
++    appearance_registry_command(plan, &add, false, cancellation)?;
++    let output = appearance_registry_command(
++        plan,
++        &[tool.as_str(), "query", THEME_MANAGER_KEY, "/v", "ThemeActive"],
++        true,
++        cancellation,
++    )?;
++    let output =
++        std::str::from_utf8(&output).map_err(|_| ProcessError::Startup(StartupStage::AppearancePreparation))?;
++    let values: Vec<_> = output
++        .lines()
++        .map(|line| line.split_whitespace().collect::<Vec<_>>())
++        .filter(|parts| parts.first().copied() == Some("ThemeActive"))
++        .collect();
++    if values.as_slice() != [vec!["ThemeActive", "REG_SZ", "0"]] {
++        return Err(ProcessError::Startup(StartupStage::AppearancePreparation));
++    }
++    Ok(())
++}
++
++fn appearance_registry_command(
++    plan: &LaunchPlan,
++    arguments: &[&str],
++    _capture: bool,
++    cancellation: Option<&AtomicBool>,
++) -> Result<Vec<u8>, ProcessError> {
++    verify_pinned_runtime(plan)?;
++    materialize_launch_directories(plan)?;
++    let tool = Path::new(arguments[0]);
++    let digest = plan
++        .process
++        .environment
++        .get("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256")
++        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool digest"))?;
++    verify_pinned_regular_file(tool, digest, "Wine registry tool")?;
++    let directory = tool
++        .parent()
++        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool directory"))?;
++    let mut command = Command::new(&plan.process.executable);
++    command
++        .args(arguments)
++        .current_dir(directory)
++        .env_clear()
++        .envs(&plan.process.environment)
++        // Registry utility loads only runtime builtins, never native DLLs from
++        // the application's prefix or working directory.
++        .env("WINEDLLOVERRIDES", "*=b")
++        .stdin(Stdio::null())
++        .stderr(Stdio::null());
++    #[cfg(unix)]
++    {
++        let (status, bytes) = capture_auxiliary_with_cancel(
++            &mut command,
++            WINE_APPEARANCE_TIMEOUT,
++            MAX_APPEARANCE_QUERY_BYTES as usize,
++            cancellation,
++        )
++        .map_err(|error| error.into_process_error(StartupStage::AppearancePreparation))?;
++        if !status.success() {
++            return Err(ProcessError::Startup(StartupStage::AppearancePreparation));
++        }
++        Ok(bytes)
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = cancellation;
++        Err(ProcessError::Startup(StartupStage::AppearancePreparation))
+     }
+ }
+ 
+@@ -2169,8 +2360,13 @@
+                 if let ProcessError::StartupCleanup { cleanup, .. } = error {
+                     let _ = guard.session.prior_cleanup_failure.set(cleanup);
+                 }
+-                guard.abort(stage)?;
+-                unreachable!("aborting startup always returns an error");
++                let cancelled = matches!(error, ProcessError::Cancelled);
++                let outcome = guard.abort(stage);
++                return match outcome {
++                    Err(ProcessError::Startup(_)) if cancelled => Err(ProcessError::Cancelled),
++                    Err(error) => Err(error),
++                    Ok(()) => unreachable!("aborting startup always returns an error"),
++                };
+             }
+             Err(error)
+         }
+@@ -4084,6 +4280,7 @@
+ 
+     fn fixture_plan() -> LaunchPlan {
+         LaunchPlan {
++            wine_appearance: None,
+             schema_version: SCHEMA_VERSION_V1.into(),
+             request_id: "process-test".into(),
+             runtime: RuntimeSelection {
+@@ -4589,6 +4786,207 @@
+         assert!(WineSession::acquire(&fixture.plan).is_ok());
+     }
+ 
++    #[cfg(unix)]
++    fn classic_runtime_fixture(query: &str, add_exit: u8) -> RuntimeEvidenceFixture {
++        let mut fixture = RuntimeEvidenceFixture::new();
++        let source = format!(
++            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINE_LOG\"\n\
++             if [ \"$1\" = wineboot ]; then\n/bin/mkdir -p \"$WINEPREFIX/drive_c/windows/system32\"\nprintf marker > \"$WINEPREFIX/drive_c/windows/system32/ntdll.dll\"\n\
++             elif [ \"$1\" = \"$COMPATFORGE_WINE_REGISTRY_TOOL\" ]; then\n\
++             if [ \"$2\" = add ]; then exit {add_exit}; fi\n\
++             printf '%s\\n' '{query}'\n\
++             else exec \"$1\"; fi\n"
++        );
++        std::fs::write(&fixture.plan.process.executable, source).unwrap();
++        fixture.plan.process.environment.insert(
++            RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
++            sha256_file(Path::new(&fixture.plan.process.executable)).unwrap(),
++        );
++        let tool = fixture.root.join("reg.exe");
++        std::fs::write(&tool, b"trusted registry tool fixture").unwrap();
++        fixture
++            .plan
++            .process
++            .environment
++            .insert("COMPATFORGE_WINE_REGISTRY_TOOL".into(), tool.to_str().unwrap().into());
++        fixture.plan.process.environment.insert(
++            "COMPATFORGE_WINE_REGISTRY_TOOL_SHA256".into(),
++            sha256_file(&tool).unwrap(),
++        );
++        let mut value = serde_json::to_value(&fixture.plan).unwrap();
++        value["wineAppearance"] = serde_json::json!("classic");
++        fixture.plan = serde_json::from_value(value).unwrap();
++        fixture
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_requires_a_verified_registry_tool() {
++        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
++        fixture
++            .plan
++            .process
++            .environment
++            .remove("COMPATFORGE_WINE_REGISTRY_TOOL");
++        assert!(ProcessSupervisor::start(&fixture.plan).is_err());
++        assert!(!fixture.guest_log.exists());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_auxiliary_cleanup_error_preserves_cleanup_stage() {
++        let result = finish_auxiliary_capture(
++            Ok((std::process::Command::new("/bin/true").status().unwrap(), Vec::new())),
++            Err(CleanupStage::TreeTermination),
++        );
++        let error = result
++            .unwrap_err()
++            .into_process_error(StartupStage::AppearancePreparation);
++        assert!(matches!(
++            error,
++            ProcessError::StartupCleanup {
++                cleanup: CleanupStage::TreeTermination,
++                ..
++            }
++        ));
++        let fixture = RuntimeEvidenceFixture::new();
++        materialize_launch_directories(&fixture.plan).unwrap();
++        let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
++        let mut guard = Some(StartupWineSessionGuard::new(session));
++        assert!(startup_step::<()>(&mut guard, StartupStage::AppearancePreparation, Err(error)).is_err());
++        assert!(WineSession::acquire(&fixture.plan).is_err());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_rejects_changed_registry_tool_before_guest_spawn() {
++        let fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
++        std::fs::write(
++            &fixture.plan.process.environment["COMPATFORGE_WINE_REGISTRY_TOOL"],
++            b"substituted",
++        )
++        .unwrap();
++        assert!(ProcessSupervisor::start(&fixture.plan).is_err());
++        assert!(!fixture.guest_log.exists());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn preparing_cancel_during_registry_query_cleans_up_without_guest_spawn() {
++        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
++        let path = Path::new(&fixture.plan.process.executable);
++        let source = std::fs::read_to_string(path).unwrap().replace(
++            "printf '%s\\n' 'ThemeActive REG_SZ 0'",
++            "/bin/sleep 30\n printf '%s\\n' 'ThemeActive REG_SZ 0'",
++        );
++        assert!(source.contains("/bin/sleep 30"));
++        std::fs::write(path, source).unwrap();
++        fixture
++            .plan
++            .process
++            .environment
++            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), sha256_file(path).unwrap());
++        let handle = ProcessSupervisor::prepare(&fixture.plan).unwrap();
++        handle.activate();
++        let deadline = Instant::now() + Duration::from_secs(3);
++        loop {
++            if std::fs::read_to_string(&fixture.wine_log)
++                .unwrap_or_default()
++                .contains("reg.exe query")
++            {
++                break;
++            }
++            assert!(Instant::now() < deadline, "registry barrier was not reached");
++            thread::sleep(Duration::from_millis(5));
++        }
++        handle.terminate_and_wait(Duration::ZERO).unwrap();
++        assert!(!fixture.guest_log.exists());
++        assert!(WineSession::acquire(&fixture.plan).is_ok());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn preparing_owner_precedes_runtime_configuration_and_can_cancel_before_activation() {
++        let fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
++        let handle = ProcessSupervisor::prepare(&fixture.plan).unwrap();
++        assert!(
++            !fixture.wine_log.exists(),
++            "configuration began before job ownership activation"
++        );
++        handle.terminate_and_wait(Duration::ZERO).unwrap();
++        assert!(!fixture.guest_log.exists());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_configuration_is_verified_before_guest_spawn() {
++        let fixture = classic_runtime_fixture("    ThemeActive    REG_SZ    0", 0);
++        fixture.assert_valid_launch_runs_commands(&fixture.plan);
++        let log = std::fs::read_to_string(&fixture.wine_log).unwrap();
++        let add = log.find("reg.exe add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager /v ThemeActive /t REG_SZ /d 0 /f").expect("fixed registry add");
++        let query = log
++            .find("reg.exe query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager /v ThemeActive")
++            .expect("registry readback");
++        let guest = log.find(fixture.plan.process.arguments.first().unwrap()).unwrap();
++        assert!(add < query && query < guest);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_failed_configuration_never_spawns_guest_and_releases_prefix() {
++        for (query, exit) in [("ThemeActive REG_SZ 1", 0), ("ThemeActive REG_SZ 0", 23)] {
++            let fixture = classic_runtime_fixture(query, exit);
++            assert!(ProcessSupervisor::start(&fixture.plan).is_err());
++            assert!(!fixture.guest_log.exists());
++            assert!(std::fs::read_to_string(&fixture.wineserver_log).unwrap().contains("-k"));
++            assert!(WineSession::acquire(&fixture.plan).is_ok());
++        }
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_readback_rejects_duplicate_values_and_oversized_output() {
++        for query in [
++            "ThemeActive REG_SZ 0\nThemeActive REG_SZ 0".to_owned(),
++            "x".repeat(5000),
++        ] {
++            let fixture = classic_runtime_fixture(&query, 0);
++            assert!(ProcessSupervisor::start(&fixture.plan).is_err());
++            assert!(!fixture.guest_log.exists());
++            assert!(WineSession::acquire(&fixture.plan).is_ok());
++        }
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_absent_profile_does_not_change_registry() {
++        let fixture = RuntimeEvidenceFixture::new();
++        fixture.assert_valid_launch_runs_commands(&fixture.plan);
++        assert!(!std::fs::read_to_string(&fixture.wine_log).unwrap().contains("reg.exe"));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn classic_registry_timeout_cleans_up_without_spawning_guest() {
++        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
++        let source = std::fs::read_to_string(&fixture.plan.process.executable)
++            .unwrap()
++            .replace(
++                "if [ \"$2\" = add ]; then exit 0; fi",
++                "if [ \"$2\" = add ]; then /bin/sleep 30; exit 0; fi",
++            );
++        std::fs::write(&fixture.plan.process.executable, source).unwrap();
++        fixture.plan.process.environment.insert(
++            RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
++            sha256_file(Path::new(&fixture.plan.process.executable)).unwrap(),
++        );
++        let started = Instant::now();
++        assert!(ProcessSupervisor::start(&fixture.plan).is_err());
++        assert!(started.elapsed() < Duration::from_secs(25));
++        assert!(!fixture.guest_log.exists());
++        assert!(WineSession::acquire(&fixture.plan).is_ok());
++    }
++
+     #[test]
+     fn startup_transaction_guest_mutation_after_wineboot_stops_before_font_commands() {
+         struct MutateGuestBeforeFonts(std::cell::Cell<bool>);
+--- a/crates/compatforge-orchestrator/src/lib.rs
++++ b/crates/compatforge-orchestrator/src/lib.rs
+@@ -532,11 +532,21 @@
+         }
+ 
+         let (runtime_provider, runtime_kind) = Self::select_runtime(&config.capabilities, request)?;
++        if request.wine_appearance.is_some() && runtime_kind != RuntimeKind::Wine {
++            return Err(PlanError::InvalidRequest(ContractError::UnsupportedValue(
++                "wineAppearance requires Wine",
++            )));
++        }
+         let binding = config
+             .runtime_bindings
+             .iter()
+             .find(|candidate| candidate.provider_id == runtime_provider.id)
+             .ok_or_else(|| PlanError::MissingRuntimeBinding(runtime_provider.id.clone()))?;
++        if request.wine_appearance.is_some() && binding.wineserver_executable.is_none() {
++            return Err(PlanError::InvalidRequest(ContractError::UnsupportedValue(
++                "wineAppearance requires managed Wine",
++            )));
++        }
+         if !is_absolute_host_path(&binding.executable) {
+             return Err(PlanError::InvalidHostPath("runtimeBindings.executable"));
+         }
+@@ -583,6 +593,20 @@
+             environment.insert("WINEPREFIX".into(), prefix.clone());
+         }
+ 
++        environment.remove("COMPATFORGE_WINE_REGISTRY_TOOL");
++        environment.remove("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256");
++        if request.wine_appearance.is_some() {
++            let tool = config
++                .wine_registry_tool
++                .as_ref()
++                .ok_or(PlanError::InvalidHostPath("wineRegistryTool.path"))?;
++            if !is_absolute_host_path(&tool.path) {
++                return Err(PlanError::InvalidHostPath("wineRegistryTool.path"));
++            }
++            environment.insert("COMPATFORGE_WINE_REGISTRY_TOOL".into(), tool.path.clone());
++            environment.insert("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256".into(), tool.digest.clone());
++        }
++
+         let mut arguments = Vec::with_capacity(request.arguments.len() + 1);
+         arguments.push(request.executable.path.clone());
+         arguments.extend(request.arguments.clone());
+@@ -615,6 +639,7 @@
+         }
+ 
+         Ok(LaunchPlan {
++            wine_appearance: request.wine_appearance,
+             schema_version: SCHEMA_VERSION_V1.into(),
+             request_id: request.request_id.clone(),
+             runtime: RuntimeSelection {
+@@ -709,6 +734,20 @@
+             }
+         }
+ 
++        let path = plan.process.environment.get("COMPATFORGE_WINE_REGISTRY_TOOL");
++        let digest = plan.process.environment.get("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256");
++        if plan.wine_appearance.is_some() {
++            let tool = config
++                .wine_registry_tool
++                .as_ref()
++                .ok_or(PlanError::PlanMismatch("Wine registry tool"))?;
++            if !is_absolute_host_path(&tool.path) || path != Some(&tool.path) || digest != Some(&tool.digest) {
++                return Err(PlanError::PlanMismatch("Wine registry tool"));
++            }
++        } else if path.is_some() || digest.is_some() {
++            return Err(PlanError::PlanMismatch("unexpected Wine registry tool"));
++        }
++
+         let binding = config
+             .runtime_bindings
+             .iter()
+@@ -1040,6 +1079,7 @@
+                 observations: Vec::new(),
+                 features: BTreeMap::new(),
+             },
++            wine_registry_tool: None,
+             runtime_bindings: vec![
+                 RuntimeBinding {
+                     provider_id: "wine-local".into(),
+@@ -1068,6 +1108,7 @@
+ 
+     fn request() -> LaunchRequest {
+         LaunchRequest {
++            wine_appearance: None,
+             schema_version: SCHEMA_VERSION_V1.into(),
+             request_id: "018fe3cb-9d12-7b52-b334-1cce0e857fc9".into(),
+             bottle_id: "example-bottle".into(),
+@@ -1227,6 +1268,73 @@
+     }
+ 
+     #[test]
++    fn classic_profile_is_bound_to_prepared_authorization() {
++        let (mut config, root) = prepared_config("classic-authorization");
++        config.wine_registry_tool = Some(compatforge_domain::WineRegistryTool {
++            path: "/trusted/runtime/reg.exe".into(),
++            digest: format!("sha256:{}", "a".repeat(64)),
++        });
++        let mut value = serde_json::to_value(prepared_request()).unwrap();
++        value["wineAppearance"] = serde_json::json!("classic");
++        let request: LaunchRequest = serde_json::from_value(value).expect("classic request");
++        let mut prepared = PreparedLaunch::prepare(&config, &prepared_fixture(), &request).unwrap();
++        assert_eq!(
++            serde_json::to_value(prepared.plan()).unwrap()["wineAppearance"],
++            "classic"
++        );
++        prepared.authorize(&config).unwrap();
++        let mut changed = serde_json::to_value(prepared.plan()).unwrap();
++        changed.as_object_mut().unwrap().remove("wineAppearance");
++        prepared.plan = serde_json::from_value(changed).unwrap();
++        assert!(matches!(
++            prepared.authorize(&config),
++            Err(PreparationError::PreparedPlanMismatch)
++        ));
++        make_object_writable(&prepared);
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
++    #[test]
++    fn classic_direct_authorization_rejects_untrusted_tool_bindings() {
++        let mut config = config(CpuArchitecture::X86_64);
++        config.wine_registry_tool = Some(compatforge_domain::WineRegistryTool {
++            path: "/trusted/reg.exe".into(),
++            digest: format!("sha256:{}", "a".repeat(64)),
++        });
++        let mut request = request();
++        request.wine_appearance = Some(compatforge_domain::WineAppearance::Classic);
++        let plan = PolicyEngine::compile(&config, &request).unwrap();
++        PolicyEngine::authorize(&config, &plan).unwrap();
++        for key in [
++            "COMPATFORGE_WINE_REGISTRY_TOOL",
++            "COMPATFORGE_WINE_REGISTRY_TOOL_SHA256",
++        ] {
++            let mut changed = plan.clone();
++            changed
++                .process
++                .environment
++                .insert(key.into(), "/untrusted/reg.exe".into());
++            assert!(PolicyEngine::authorize(&config, &changed).is_err());
++        }
++        let mut missing = config.clone();
++        missing.wine_registry_tool = None;
++        assert!(PolicyEngine::authorize(&missing, &plan).is_err());
++        let mut default = plan.clone();
++        default.wine_appearance = None;
++        assert!(PolicyEngine::authorize(&config, &default).is_err());
++    }
++
++    #[test]
++    fn classic_profile_requires_managed_wine_runtime() {
++        let mut config = config(CpuArchitecture::X86_64);
++        config.runtime_bindings[0].wineserver_executable = None;
++        let mut value = serde_json::to_value(request()).unwrap();
++        value["wineAppearance"] = serde_json::json!("classic");
++        let request: LaunchRequest = serde_json::from_value(value).expect("classic request");
++        assert!(PolicyEngine::compile(&config, &request).is_err());
++    }
++
++    #[test]
+     fn prepares_an_inspection_bound_launch_plan() {
+         let (config, root) = prepared_config("prepared-plan");
+         let prepared = PreparedLaunch::prepare(&config, &prepared_fixture(), &prepared_request()).unwrap();
