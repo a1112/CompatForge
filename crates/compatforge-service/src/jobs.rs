@@ -56,6 +56,19 @@ impl JobManager {
             .get_application(&request.application_id)
             .map_err(JobError::Registry)?
             .application;
+        if let Some(expected) = request.expected_wine_appearance {
+            let matches = match expected {
+                crate::model::WineAppearanceExpectation::Default => application.wine_appearance.is_none(),
+                crate::model::WineAppearanceExpectation::Classic => {
+                    application.wine_appearance == Some(compatforge_domain::WineAppearance::Classic)
+                }
+            };
+            if !matches {
+                return Err(JobError::Conflict(
+                    "reviewed Wine appearance differs from install expectation",
+                ));
+            }
+        }
         self.registry
             .create_bottle(&application.bottle_id)
             .map_err(JobError::Registry)?;
@@ -83,6 +96,11 @@ impl JobManager {
             let inspection = inspect_path(&resolved.source).map_err(|error| JobError::Inspection(error.to_string()))?;
             let architecture = map_architecture(inspection.architecture)?;
             let launch_request = LaunchRequest {
+                wine_appearance: if request.kind == JobKind::Install {
+                    application.wine_appearance
+                } else {
+                    None
+                },
                 schema_version: SCHEMA_VERSION_V1.into(),
                 request_id: job_id.clone(),
                 bottle_id: application.bottle_id.clone(),

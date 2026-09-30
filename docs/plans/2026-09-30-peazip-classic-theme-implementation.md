@@ -47,3 +47,15 @@ Files: `ForgeStore/catalogue/candidate-v11/tuf`, `ForgeStore/docs/evidence`, `Fo
 4. Increment distinct accepted count only after all gates pass. Run evidence/ledger consistency checks, staged diff/credential checks, and commit reviewed implementation and evidence.
 
 Execution: continue in this chat under the user's approved design; no additional execution-choice prompt is needed. Existing worktree is `L:/project/FOS/.worktrees/compatforge-peazip-classic` on `fix/peazip-classic-theme`.
+
+
+## Review checkpoint: preparing cancellation is a deployment gate
+
+Closed profile propagation, trusted registry-tool binding, direct plan authorization, and typed auxiliary cleanup have passed regression and review. They are not deployed. Actual deployed source synchronously starts the process inside submission and registers its active owner afterward; Store awaits submission before it obtains the job ID. Do not activate the staged binary or sign candidate-v11 until the following is implemented and verified:
+
+- Register a preparing owner and return a job ID before Wine appearance commands run. Preserve the existing operation lock, generation lease and shutdown ownership rules.
+- Share cancellation between configuration waits, readback completion and the installer spawn boundary. Carry the cancellation marker through preparing-to-running transition.
+- Confirm auxiliary tree and wineserver cleanup before marking Cancelled and ending staging; cleanup failure must quarantine and retain evidence. Keep the old selected generation unchanged.
+- Test cancellation during configuration, at the spawn boundary, and during shutdown with deterministic barriers, followed by a fresh managed GUI install and market update/rollback.
+
+Review/source evidence is retained in ForgeStore/docs/evidence/2026-09-30-peazip-profile-review.json. Current catalogue remains candidate-v10, accepted count 10/1000, and the previous PeaZip generation remains selected.

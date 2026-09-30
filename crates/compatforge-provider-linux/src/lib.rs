@@ -600,6 +600,7 @@ impl LinuxProviderSnapshot {
         let config = CoreConfig {
             schema_version: compatforge_domain::SCHEMA_VERSION_V1.into(),
             capabilities: self.capabilities.clone(),
+            wine_registry_tool: None,
             runtime_bindings: vec![runtime_binding],
             storage_root: canonical_storage_text.to_owned(),
             sandbox_profile: compatforge_domain::SandboxProfile::Desktop,
@@ -3165,12 +3166,14 @@ mod tests {
         let core = CoreConfig {
             schema_version: SCHEMA_VERSION_V1.into(),
             capabilities: snapshot.capabilities,
+            wine_registry_tool: None,
             runtime_bindings: vec![binding],
             storage_root: "/private/storage".into(),
             sandbox_profile: SandboxProfile::Desktop,
             supervisor: SupervisorPolicy::default(),
         };
         let request = LaunchRequest {
+            wine_appearance: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             request_id: "linux-provider-planner".into(),
             bottle_id: "linux-preview".into(),

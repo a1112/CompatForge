@@ -70,6 +70,8 @@ pub struct ApplicationDefinition {
     pub compatibility_rating: CompatibilityRating,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_appearance: Option<compatforge_domain::WineAppearance>,
 }
 
 impl ApplicationDefinition {
@@ -281,12 +283,24 @@ pub struct JobRequest {
     pub argument_overrides: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment_overrides: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_wine_appearance: Option<WineAppearanceExpectation>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WineAppearanceExpectation {
+    Default,
+    Classic,
 }
 
 impl JobRequest {
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_schema(&self.schema_version)?;
         validate_domain_id("job.applicationId", &self.application_id)?;
+        if self.expected_wine_appearance.is_some() && self.kind != JobKind::Install {
+            return Err(ModelError::Invalid("only install jobs accept expectedWineAppearance"));
+        }
         if let Some(launcher_id) = &self.launcher_id {
             validate_domain_id("job.launcherId", launcher_id)?;
         }
@@ -560,5 +574,43 @@ fn validate_sha256(value: &str) -> Result<(), ModelError> {
         Ok(())
     } else {
         Err(ModelError::Invalid("installer sha256 must contain 64 hex characters"))
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    #[test]
+    fn classic_install_expectation_is_closed_and_survives_submission() {
+        let mut value = serde_json::json!({"schemaVersion":"1", "applicationId":"peazip", "kind":"install",
+            "executablePath":std::env::temp_dir().join("installer.exe"),"expectedWineAppearance":"classic"});
+        let request: JobRequest = serde_json::from_value(value.clone()).expect("signed appearance expectation");
+        request.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["expectedWineAppearance"],
+            "classic"
+        );
+        value["expectedWineAppearance"] = serde_json::json!("default");
+        assert!(serde_json::from_value::<JobRequest>(value.clone()).is_ok());
+        value["expectedWineAppearance"] = serde_json::json!("script");
+        assert!(serde_json::from_value::<JobRequest>(value).is_err());
+    }
+
+    #[test]
+    fn classic_application_profile_is_explicit_and_default_is_omitted() {
+        let legacy = serde_json::json!({"schemaVersion":"1", "id":"peazip", "name":"PeaZip",
+            "version":"11.3.0", "publisher":"Giorgio Tani", "category":"utilities",
+            "bottleId":"gui-peazip", "launchers":[{"id":"main","name":"PeaZip",
+            "executable":"Program Files/PeaZip/peazip.exe"}], "compatibilityRating":"unknown"});
+        let decoded: ApplicationDefinition = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        let mut classic = legacy.clone();
+        classic["wineAppearance"] = serde_json::json!("classic");
+        let decoded: ApplicationDefinition = serde_json::from_value(classic.clone()).expect("reviewed classic profile");
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), classic);
+        classic["wineAppearance"] = serde_json::json!("script");
+        assert!(serde_json::from_value::<ApplicationDefinition>(classic).is_err());
     }
 }

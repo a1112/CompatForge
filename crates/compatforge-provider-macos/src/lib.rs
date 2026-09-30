@@ -245,6 +245,7 @@ impl MacOsProviderSnapshot {
         let config = CoreConfig {
             schema_version: compatforge_domain::SCHEMA_VERSION_V1.into(),
             capabilities: self.capabilities.clone(),
+            wine_registry_tool: None,
             runtime_bindings: vec![runtime_binding],
             storage_root,
             sandbox_profile: SandboxProfile::Desktop,
@@ -1520,6 +1521,7 @@ mod tests {
             config.wine_runtime.wineserver.digest
         );
         let request = LaunchRequest {
+            wine_appearance: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             request_id: "macos-provider-plan".into(),
             bottle_id: "macos-smoke".into(),

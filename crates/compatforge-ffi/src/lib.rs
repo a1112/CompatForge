@@ -1247,6 +1247,7 @@ mod tests {
         config.runtime_bindings[0].wineserver_executable = None;
 
         let plan = LaunchPlan {
+            wine_appearance: None,
             schema_version: "1".into(),
             request_id: "ffi-process-test".into(),
             runtime: compatforge_domain::RuntimeSelection {
