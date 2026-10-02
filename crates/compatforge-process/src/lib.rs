@@ -47,10 +47,16 @@ const BOTTLE_FONT_FILE_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FILE";
 const BOTTLE_FONT_DIGEST_ENV: &str = "COMPATFORGE_BOTTLE_FONT_SHA256";
 const BOTTLE_FONT_FAMILY_ENV: &str = "COMPATFORGE_BOTTLE_FONT_FAMILY";
 const BOTTLE_FONT_FILE_NAME: &str = "compatforge-cjk.ttc";
+#[cfg(unix)]
+const WINE_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(unix)]
+const MAX_APPEARANCE_QUERY_BYTES: u64 = 4096;
+const THEME_MANAGER_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\ThemeManager";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupStage {
     Wineboot,
+    AppearancePreparation,
     FontPreparation,
     GuestAlias,
     GuestVerification,
@@ -74,6 +80,7 @@ pub enum CleanupStage {
 
 #[derive(Debug)]
 pub enum ProcessError {
+    Cancelled,
     InvalidPlan(ContractError),
     InvalidGuestArtifact(GuestArtifactError),
     InvalidRuntimeEvidence(&'static str),
@@ -92,6 +99,7 @@ pub enum ProcessError {
 impl fmt::Display for ProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(formatter, "launch cancelled during preparation"),
             Self::InvalidPlan(error) => write!(formatter, "invalid launch plan: {error}"),
             Self::InvalidGuestArtifact(error) => write!(formatter, "invalid guest artifact: {error}"),
             Self::InvalidRuntimeEvidence(field) => write!(formatter, "invalid pinned Runtime evidence: {field}"),
@@ -114,7 +122,8 @@ impl std::error::Error for ProcessError {
             Self::InvalidPlan(error) => Some(error),
             Self::InvalidGuestArtifact(error) => Some(error),
             Self::Isolation(error) | Self::Spawn(error) | Self::Terminate(error) => Some(error),
-            Self::InvalidRuntimeEvidence(_)
+            Self::Cancelled
+            | Self::InvalidRuntimeEvidence(_)
             | Self::UnsafeDirectory(_)
             | Self::WinePrefixBusy(_)
             | Self::Startup(_)
@@ -138,10 +147,16 @@ impl ProcessSupervisor {
         Self::start_with_operations(plan, &SystemStartupOperations)
     }
 
+    /// Construct a launch owner before starting runtime configuration.
+    pub fn prepare(plan: &LaunchPlan) -> Result<PreparingLaunch, ProcessError> {
+        PreparingLaunch::new(plan.clone())
+    }
+
     fn start_with_operations(
         plan: &LaunchPlan,
         operations: &impl StartupOperations,
     ) -> Result<LaunchHandle, ProcessError> {
+        operations.check_cancelled()?;
         plan.validate().map_err(ProcessError::InvalidPlan)?;
         verify_guest_inputs(plan)?;
         verify_pinned_runtime(plan)?;
@@ -151,6 +166,11 @@ impl ProcessSupervisor {
         let wine_session = WineSession::acquire(plan)?;
         let mut startup_guard = wine_session.map(StartupWineSessionGuard::new);
         startup_step(&mut startup_guard, StartupStage::Wineboot, operations.wineboot(plan))?;
+        startup_step(
+            &mut startup_guard,
+            StartupStage::AppearancePreparation,
+            operations.appearance(plan),
+        )?;
         startup_step(
             &mut startup_guard,
             StartupStage::RuntimeVerification,
@@ -225,7 +245,17 @@ impl ProcessSupervisor {
     }
 }
 
+mod preparing;
+pub use preparing::PreparingLaunch;
+
 trait StartupOperations {
+    fn check_cancelled(&self) -> Result<(), ProcessError> {
+        Ok(())
+    }
+    fn appearance(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
+        prepare_wine_appearance(plan)
+    }
+
     fn wineboot(&self, plan: &LaunchPlan) -> Result<(), ProcessError> {
         initialize_wine_prefix(plan)
     }
@@ -317,8 +347,22 @@ fn wait_bounded<C: BoundedChild>(
     clock: &impl PollClock,
     timeout: Duration,
 ) -> Result<bool, AuxiliaryFailure> {
+    wait_bounded_with_cancel(child, clock, timeout, None)
+}
+
+fn wait_bounded_with_cancel<C: BoundedChild>(
+    child: &mut C,
+    clock: &impl PollClock,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+) -> Result<bool, AuxiliaryFailure> {
     let deadline = clock.now() + timeout;
     loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(AuxiliaryFailure {
+                cleanup: reap_bounded(child, clock, WINE_SERVER_COMMAND_TIMEOUT).err(),
+            });
+        }
         match child.poll() {
             Ok(Some(success)) => {
                 child
@@ -402,7 +446,7 @@ fn attach_auxiliary(
     }
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, unix))]
 fn read_auxiliary_chunk(reader: &mut impl Read, output: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
     let mut buffer = [0_u8; 4096];
     let available = limit.saturating_sub(output.len());
@@ -421,12 +465,43 @@ fn read_auxiliary_chunk(reader: &mut impl Read, output: &mut Vec<u8>, limit: usi
 
 #[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 fn capture_auxiliary(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<(ExitStatus, Vec<u8>)> {
+    capture_auxiliary_typed(command, timeout, limit)
+        .map_err(|error| io::Error::other(format!("auxiliary capture failed: {error:?}")))
+}
+
+#[cfg(unix)]
+fn finish_auxiliary_capture(
+    result: io::Result<(ExitStatus, Vec<u8>)>,
+    cleanup: Result<(), CleanupStage>,
+) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
+    match cleanup {
+        Err(stage) => Err(AuxiliaryFailure { cleanup: Some(stage) }),
+        Ok(()) => result.map_err(|_| AuxiliaryFailure { cleanup: None }),
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn capture_auxiliary_typed(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
+    capture_auxiliary_with_cancel(command, timeout, limit, None)
+}
+
+#[cfg(unix)]
+fn capture_auxiliary_with_cancel(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(ExitStatus, Vec<u8>), AuxiliaryFailure> {
     use std::os::fd::AsRawFd;
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
-    let mut process = spawn_auxiliary(command).map_err(|_| io::Error::other("auxiliary spawn failed"))?;
+    let mut process = spawn_auxiliary(command)?;
     let result = (|| {
         let mut stdout = process
             .child
@@ -445,6 +520,9 @@ fn capture_auxiliary(command: &mut Command, timeout: Duration, limit: usize) -> 
         let mut output = Vec::with_capacity(limit);
         let mut eof = false;
         loop {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(io::Error::other("auxiliary capture cancelled"));
+            }
             if !eof {
                 eof = read_auxiliary_chunk(&mut stdout, &mut output, limit)?;
             }
@@ -461,10 +539,7 @@ fn capture_auxiliary(command: &mut Command, timeout: Duration, limit: usize) -> 
         }
     })();
     let cleanup = reap_bounded(&mut process, &SystemPollClock, WINE_SERVER_COMMAND_TIMEOUT);
-    match cleanup {
-        Err(stage) => Err(io::Error::other(format!("auxiliary cleanup failed: {stage:?}"))),
-        Ok(()) => result,
-    }
+    finish_auxiliary_capture(result, cleanup)
 }
 
 struct SystemStartupOperations;
@@ -859,6 +934,15 @@ fn initialize_wine_prefix_with_spawn(
     timeout: Duration,
     spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
 ) -> Result<(), ProcessError> {
+    initialize_wine_prefix_with_cancel(plan, timeout, spawn, None)
+}
+
+fn initialize_wine_prefix_with_cancel(
+    plan: &LaunchPlan,
+    timeout: Duration,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ProcessError> {
     if plan.runtime.provider != RuntimeKind::Wine {
         return Ok(());
     }
@@ -892,7 +976,7 @@ fn initialize_wine_prefix_with_spawn(
         .stderr(Stdio::null());
     let mut child =
         spawn_auxiliary_with(&mut command, spawn).map_err(|error| error.into_process_error(StartupStage::Wineboot))?;
-    match wait_bounded(&mut child, &SystemPollClock, timeout) {
+    match wait_bounded_with_cancel(&mut child, &SystemPollClock, timeout, cancellation) {
         Ok(true) => {
             let metadata =
                 std::fs::symlink_metadata(&marker).map_err(|_| ProcessError::UnsafeDirectory("Wine prefix marker"))?;
@@ -1234,6 +1318,113 @@ fn run_bounded_wine_command(plan: &LaunchPlan, arguments: &[&str]) -> Result<(),
         Ok(true) => Ok(()),
         Ok(false) => Err(ProcessError::Startup(StartupStage::FontPreparation)),
         Err(error) => Err(error.into_process_error(StartupStage::FontPreparation)),
+    }
+}
+
+/// Apply only the closed, authorized appearance profile within the prefix lease.
+/// The helper accepts no caller-supplied commands, registry paths or values.
+fn prepare_wine_appearance(plan: &LaunchPlan) -> Result<(), ProcessError> {
+    prepare_wine_appearance_with_cancel(plan, None)
+}
+
+fn prepare_wine_appearance_with_cancel(
+    plan: &LaunchPlan,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ProcessError> {
+    if plan.wine_appearance.is_none() {
+        return Ok(());
+    }
+    plan.validate().map_err(ProcessError::InvalidPlan)?;
+    let tool = plan
+        .process
+        .environment
+        .get("COMPATFORGE_WINE_REGISTRY_TOOL")
+        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool"))?;
+    let digest = plan
+        .process
+        .environment
+        .get("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256")
+        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool digest"))?;
+    verify_pinned_regular_file(Path::new(tool), digest, "Wine registry tool")?;
+    let add = [
+        tool.as_str(),
+        "add",
+        THEME_MANAGER_KEY,
+        "/v",
+        "ThemeActive",
+        "/t",
+        "REG_SZ",
+        "/d",
+        "0",
+        "/f",
+    ];
+    appearance_registry_command(plan, &add, false, cancellation)?;
+    let output = appearance_registry_command(
+        plan,
+        &[tool.as_str(), "query", THEME_MANAGER_KEY, "/v", "ThemeActive"],
+        true,
+        cancellation,
+    )?;
+    let output =
+        std::str::from_utf8(&output).map_err(|_| ProcessError::Startup(StartupStage::AppearancePreparation))?;
+    let values: Vec<_> = output
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|parts| parts.first().copied() == Some("ThemeActive"))
+        .collect();
+    if values.as_slice() != [vec!["ThemeActive", "REG_SZ", "0"]] {
+        return Err(ProcessError::Startup(StartupStage::AppearancePreparation));
+    }
+    Ok(())
+}
+
+fn appearance_registry_command(
+    plan: &LaunchPlan,
+    arguments: &[&str],
+    _capture: bool,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<u8>, ProcessError> {
+    verify_pinned_runtime(plan)?;
+    materialize_launch_directories(plan)?;
+    let tool = Path::new(arguments[0]);
+    let digest = plan
+        .process
+        .environment
+        .get("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256")
+        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool digest"))?;
+    verify_pinned_regular_file(tool, digest, "Wine registry tool")?;
+    let directory = tool
+        .parent()
+        .ok_or(ProcessError::InvalidRuntimeEvidence("Wine registry tool directory"))?;
+    let mut command = Command::new(&plan.process.executable);
+    command
+        .args(arguments)
+        .current_dir(directory)
+        .env_clear()
+        .envs(&plan.process.environment)
+        // Registry utility loads only runtime builtins, never native DLLs from
+        // the application's prefix or working directory.
+        .env("WINEDLLOVERRIDES", "*=b")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        let (status, bytes) = capture_auxiliary_with_cancel(
+            &mut command,
+            WINE_APPEARANCE_TIMEOUT,
+            MAX_APPEARANCE_QUERY_BYTES as usize,
+            cancellation,
+        )
+        .map_err(|error| error.into_process_error(StartupStage::AppearancePreparation))?;
+        if !status.success() {
+            return Err(ProcessError::Startup(StartupStage::AppearancePreparation));
+        }
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cancellation;
+        Err(ProcessError::Startup(StartupStage::AppearancePreparation))
     }
 }
 
@@ -2169,8 +2360,13 @@ fn startup_step<T>(
                 if let ProcessError::StartupCleanup { cleanup, .. } = error {
                     let _ = guard.session.prior_cleanup_failure.set(cleanup);
                 }
-                guard.abort(stage)?;
-                unreachable!("aborting startup always returns an error");
+                let cancelled = matches!(error, ProcessError::Cancelled);
+                let outcome = guard.abort(stage);
+                return match outcome {
+                    Err(ProcessError::Startup(_)) if cancelled => Err(ProcessError::Cancelled),
+                    Err(error) => Err(error),
+                    Ok(()) => unreachable!("aborting startup always returns an error"),
+                };
             }
             Err(error)
         }
@@ -4084,6 +4280,7 @@ mod tests {
 
     fn fixture_plan() -> LaunchPlan {
         LaunchPlan {
+            wine_appearance: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             request_id: "process-test".into(),
             runtime: RuntimeSelection {
@@ -4585,6 +4782,207 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["-k", "-w"]
         );
+        assert!(!fixture.guest_log.exists());
+        assert!(WineSession::acquire(&fixture.plan).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn classic_runtime_fixture(query: &str, add_exit: u8) -> RuntimeEvidenceFixture {
+        let mut fixture = RuntimeEvidenceFixture::new();
+        let source = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$COMPATFORGE_TEST_WINE_LOG\"\n\
+             if [ \"$1\" = wineboot ]; then\n/bin/mkdir -p \"$WINEPREFIX/drive_c/windows/system32\"\nprintf marker > \"$WINEPREFIX/drive_c/windows/system32/ntdll.dll\"\n\
+             elif [ \"$1\" = \"$COMPATFORGE_WINE_REGISTRY_TOOL\" ]; then\n\
+             if [ \"$2\" = add ]; then exit {add_exit}; fi\n\
+             printf '%s\\n' '{query}'\n\
+             else exec \"$1\"; fi\n"
+        );
+        std::fs::write(&fixture.plan.process.executable, source).unwrap();
+        fixture.plan.process.environment.insert(
+            RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(&fixture.plan.process.executable)).unwrap(),
+        );
+        let tool = fixture.root.join("reg.exe");
+        std::fs::write(&tool, b"trusted registry tool fixture").unwrap();
+        fixture
+            .plan
+            .process
+            .environment
+            .insert("COMPATFORGE_WINE_REGISTRY_TOOL".into(), tool.to_str().unwrap().into());
+        fixture.plan.process.environment.insert(
+            "COMPATFORGE_WINE_REGISTRY_TOOL_SHA256".into(),
+            sha256_file(&tool).unwrap(),
+        );
+        let mut value = serde_json::to_value(&fixture.plan).unwrap();
+        value["wineAppearance"] = serde_json::json!("classic");
+        fixture.plan = serde_json::from_value(value).unwrap();
+        fixture
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_requires_a_verified_registry_tool() {
+        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        fixture
+            .plan
+            .process
+            .environment
+            .remove("COMPATFORGE_WINE_REGISTRY_TOOL");
+        assert!(ProcessSupervisor::start(&fixture.plan).is_err());
+        assert!(!fixture.guest_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_auxiliary_cleanup_error_preserves_cleanup_stage() {
+        let result = finish_auxiliary_capture(
+            Ok((std::process::Command::new("/bin/true").status().unwrap(), Vec::new())),
+            Err(CleanupStage::TreeTermination),
+        );
+        let error = result
+            .unwrap_err()
+            .into_process_error(StartupStage::AppearancePreparation);
+        assert!(matches!(
+            error,
+            ProcessError::StartupCleanup {
+                cleanup: CleanupStage::TreeTermination,
+                ..
+            }
+        ));
+        let fixture = RuntimeEvidenceFixture::new();
+        materialize_launch_directories(&fixture.plan).unwrap();
+        let session = WineSession::acquire(&fixture.plan).unwrap().unwrap();
+        let mut guard = Some(StartupWineSessionGuard::new(session));
+        assert!(startup_step::<()>(&mut guard, StartupStage::AppearancePreparation, Err(error)).is_err());
+        assert!(WineSession::acquire(&fixture.plan).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_rejects_changed_registry_tool_before_guest_spawn() {
+        let fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        std::fs::write(
+            &fixture.plan.process.environment["COMPATFORGE_WINE_REGISTRY_TOOL"],
+            b"substituted",
+        )
+        .unwrap();
+        assert!(ProcessSupervisor::start(&fixture.plan).is_err());
+        assert!(!fixture.guest_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_cancel_during_registry_query_cleans_up_without_guest_spawn() {
+        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        let path = Path::new(&fixture.plan.process.executable);
+        let source = std::fs::read_to_string(path).unwrap().replace(
+            "printf '%s\\n' 'ThemeActive REG_SZ 0'",
+            "/bin/sleep 30\n printf '%s\\n' 'ThemeActive REG_SZ 0'",
+        );
+        assert!(source.contains("/bin/sleep 30"));
+        std::fs::write(path, source).unwrap();
+        fixture
+            .plan
+            .process
+            .environment
+            .insert(RUNTIME_EXECUTABLE_DIGEST_ENV.into(), sha256_file(path).unwrap());
+        let handle = ProcessSupervisor::prepare(&fixture.plan).unwrap();
+        handle.activate();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if std::fs::read_to_string(&fixture.wine_log)
+                .unwrap_or_default()
+                .contains("reg.exe query")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "registry barrier was not reached");
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        assert!(!fixture.guest_log.exists());
+        assert!(WineSession::acquire(&fixture.plan).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_owner_precedes_runtime_configuration_and_can_cancel_before_activation() {
+        let fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        let handle = ProcessSupervisor::prepare(&fixture.plan).unwrap();
+        assert!(
+            !fixture.wine_log.exists(),
+            "configuration began before job ownership activation"
+        );
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        assert!(!fixture.guest_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_configuration_is_verified_before_guest_spawn() {
+        let fixture = classic_runtime_fixture("    ThemeActive    REG_SZ    0", 0);
+        fixture.assert_valid_launch_runs_commands(&fixture.plan);
+        let log = std::fs::read_to_string(&fixture.wine_log).unwrap();
+        let add = log.find("reg.exe add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager /v ThemeActive /t REG_SZ /d 0 /f").expect("fixed registry add");
+        let query = log
+            .find("reg.exe query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager /v ThemeActive")
+            .expect("registry readback");
+        let guest = log.find(fixture.plan.process.arguments.first().unwrap()).unwrap();
+        assert!(add < query && query < guest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_failed_configuration_never_spawns_guest_and_releases_prefix() {
+        for (query, exit) in [("ThemeActive REG_SZ 1", 0), ("ThemeActive REG_SZ 0", 23)] {
+            let fixture = classic_runtime_fixture(query, exit);
+            assert!(ProcessSupervisor::start(&fixture.plan).is_err());
+            assert!(!fixture.guest_log.exists());
+            assert!(std::fs::read_to_string(&fixture.wineserver_log).unwrap().contains("-k"));
+            assert!(WineSession::acquire(&fixture.plan).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_readback_rejects_duplicate_values_and_oversized_output() {
+        for query in [
+            "ThemeActive REG_SZ 0\nThemeActive REG_SZ 0".to_owned(),
+            "x".repeat(5000),
+        ] {
+            let fixture = classic_runtime_fixture(&query, 0);
+            assert!(ProcessSupervisor::start(&fixture.plan).is_err());
+            assert!(!fixture.guest_log.exists());
+            assert!(WineSession::acquire(&fixture.plan).is_ok());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_absent_profile_does_not_change_registry() {
+        let fixture = RuntimeEvidenceFixture::new();
+        fixture.assert_valid_launch_runs_commands(&fixture.plan);
+        assert!(!std::fs::read_to_string(&fixture.wine_log).unwrap().contains("reg.exe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_registry_timeout_cleans_up_without_spawning_guest() {
+        let mut fixture = classic_runtime_fixture("ThemeActive REG_SZ 0", 0);
+        let source = std::fs::read_to_string(&fixture.plan.process.executable)
+            .unwrap()
+            .replace(
+                "if [ \"$2\" = add ]; then exit 0; fi",
+                "if [ \"$2\" = add ]; then /bin/sleep 30; exit 0; fi",
+            );
+        std::fs::write(&fixture.plan.process.executable, source).unwrap();
+        fixture.plan.process.environment.insert(
+            RUNTIME_EXECUTABLE_DIGEST_ENV.into(),
+            sha256_file(Path::new(&fixture.plan.process.executable)).unwrap(),
+        );
+        let started = Instant::now();
+        assert!(ProcessSupervisor::start(&fixture.plan).is_err());
+        assert!(started.elapsed() < Duration::from_secs(25));
         assert!(!fixture.guest_log.exists());
         assert!(WineSession::acquire(&fixture.plan).is_ok());
     }

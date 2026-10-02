@@ -9,11 +9,11 @@ use compatforge_domain::{
 };
 use compatforge_inspect::{inspect_path, PeArchitecture};
 use compatforge_orchestrator::PreparedLaunch;
-use compatforge_process::{EventPoll, LaunchHandle, ProcessSupervisor};
+use compatforge_process::{EventPoll, LaunchHandle, PreparingLaunch, ProcessSupervisor};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ pub(crate) struct JobManager {
     active: Mutex<HashMap<String, ActiveJob>>,
     active_debug: Mutex<HashMap<String, DebugLease>>,
     operation: Mutex<()>,
+    closing: AtomicBool,
 }
 
 pub(crate) struct SelectedDebugTarget {
@@ -48,12 +49,36 @@ struct DebugLease {
 }
 
 trait JobProcess: ShutdownTarget + Send + Sync {
+    fn activate(&self) {}
+    fn is_preparing(&self) -> bool {
+        false
+    }
     fn next_event(&self, timeout: Duration) -> EventPoll;
 }
 
 impl JobProcess for LaunchHandle {
     fn next_event(&self, timeout: Duration) -> EventPoll {
         LaunchHandle::next_event(self, timeout)
+    }
+}
+
+impl JobProcess for PreparingLaunch {
+    fn next_event(&self, timeout: Duration) -> EventPoll {
+        PreparingLaunch::next_event(self, timeout)
+    }
+    fn activate(&self) {
+        PreparingLaunch::activate(self);
+    }
+    fn is_preparing(&self) -> bool {
+        true
+    }
+}
+impl ShutdownTarget for PreparingLaunch {
+    fn request_stop(&self) -> Result<(), String> {
+        self.terminate().map_err(|error| error.to_string())
+    }
+    fn wait_for_stop(&self, grace: Duration) -> Result<(), String> {
+        self.terminate_and_wait(grace).map_err(|error| error.to_string())
     }
 }
 
@@ -147,6 +172,9 @@ impl JobManager {
         launch: impl FnOnce(SelectedDebugTarget) -> Result<compatforge_debug::DebugSessionHandle, crate::ServiceError>,
     ) -> Result<compatforge_debug::DebugSessionHandle, crate::ServiceError> {
         let _operation = self.lock_operation().map_err(crate::ServiceError::Job)?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(crate::ServiceError::Conflict("service is shutting down"));
+        }
         let mut active_debug = self
             .active_debug
             .lock()
@@ -275,12 +303,16 @@ impl JobManager {
             active: Mutex::new(HashMap::new()),
             active_debug: Mutex::new(HashMap::new()),
             operation: Mutex::new(()),
+            closing: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn submit(&self, request: JobRequest) -> Result<JobRecord, JobError> {
         request.validate().map_err(JobError::Model)?;
         let _operation = self.lock_operation()?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(JobError::Conflict("service is shutting down"));
+        }
         let settings = self.registry.read_settings().map_err(JobError::Registry)?;
         let active_count = self.lock_active()?.len();
         if active_count >= usize::from(settings.maximum_parallel_jobs) {
@@ -292,6 +324,19 @@ impl JobManager {
             .get_application(&request.application_id)
             .map_err(JobError::Registry)?
             .application;
+        if let Some(expected) = request.expected_wine_appearance {
+            let matches = match expected {
+                crate::model::WineAppearanceExpectation::Default => application.wine_appearance.is_none(),
+                crate::model::WineAppearanceExpectation::Classic => {
+                    application.wine_appearance == Some(compatforge_domain::WineAppearance::Classic)
+                }
+            };
+            if !matches {
+                return Err(JobError::Conflict(
+                    "reviewed Wine appearance differs from install expectation",
+                ));
+            }
+        }
         self.ensure_idle(&application.id, &application.bottle_id)?;
 
         let job_id = next_job_id();
@@ -337,6 +382,11 @@ impl JobManager {
             let inspection = inspect_path(&resolved.source).map_err(|error| JobError::Inspection(error.to_string()))?;
             let architecture = map_architecture(inspection.architecture)?;
             let launch_request = LaunchRequest {
+                wine_appearance: if request.kind == JobKind::Install {
+                    application.wine_appearance
+                } else {
+                    None
+                },
                 schema_version: SCHEMA_VERSION_V1.into(),
                 request_id: job_id.clone(),
                 bottle_id: generation.bottle_id.clone(),
@@ -379,11 +429,19 @@ impl JobManager {
             let plan = prepared
                 .authorize(&self.config)
                 .map_err(|error| JobError::Preparation(error.to_string()))?;
-            ProcessSupervisor::start(plan).map_err(|error| JobError::Process(error.to_string()))
+            if plan.wine_appearance.is_some() {
+                ProcessSupervisor::prepare(plan)
+                    .map(|handle| Arc::new(handle) as Arc<dyn JobProcess>)
+                    .map_err(|error| JobError::Process(error.to_string()))
+            } else {
+                ProcessSupervisor::start(plan)
+                    .map(|handle| Arc::new(handle) as Arc<dyn JobProcess>)
+                    .map_err(|error| JobError::Process(error.to_string()))
+            }
         })();
 
         match start_result {
-            Ok(handle) => self.adopt_started_job(record, Arc::new(handle)),
+            Ok(handle) => self.adopt_started_job(record, handle),
             Err(error) => {
                 record.status = JobStatus::Failed;
                 record.error = Some(crate::lifecycle::bounded_error(&error.to_string()));
@@ -408,7 +466,11 @@ impl JobManager {
     }
 
     fn adopt_started_job(&self, mut record: JobRecord, handle: Arc<dyn JobProcess>) -> Result<JobRecord, JobError> {
-        record.status = JobStatus::Running;
+        record.status = if handle.is_preparing() {
+            JobStatus::Preparing
+        } else {
+            JobStatus::Running
+        };
         record.updated_at_milliseconds = now_milliseconds();
         // A started process must acquire a cleanup owner before any fallible
         // post-start persistence. Recover solely to retain ownership if the map
@@ -416,14 +478,41 @@ impl JobManager {
         self.active.lock().unwrap_or_else(|error| error.into_inner()).insert(
             record.id.clone(),
             ActiveJob {
-                handle,
+                handle: Arc::clone(&handle),
                 record: record.clone(),
                 cancel_requested: false,
                 cleanup_join_failed: false,
                 polling: Arc::new(Mutex::new(())),
             },
         );
-        self.registry.write_job(&record).map_err(JobError::Registry)?;
+        if let Err(error) = self.registry.write_job(&record) {
+            if handle.is_preparing() {
+                if let Some(state) = self
+                    .active
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get_mut(&record.id)
+                {
+                    state.cancel_requested = true;
+                    state.record.status = JobStatus::Cancelling;
+                    state.record.error = Some("preparing job persistence failed before activation".into());
+                }
+                if let Err(stop) = handle.request_stop() {
+                    if let Some(state) = self
+                        .active
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get_mut(&record.id)
+                    {
+                        state.record.error = Some(crate::lifecycle::bounded_error(&format!(
+                            "preparing job persistence failed; cleanup request failed: {stop}"
+                        )));
+                    }
+                }
+            }
+            return Err(JobError::Registry(error));
+        }
+        handle.activate();
         Ok(record)
     }
 
@@ -519,7 +608,9 @@ impl JobManager {
                     Ok(()) => {
                         // Shutdown may have requested cancellation while this
                         // terminal poll was acknowledging supervisor completion.
-                        if state.record.status == JobStatus::Cancelling {
+                        if state.record.status == JobStatus::Cancelling
+                            || (self.closing.load(Ordering::Acquire) && state.record.status == JobStatus::Succeeded)
+                        {
                             state.record.status = JobStatus::Cancelled;
                         }
                         // Persist terminal evidence before the one atomic generation
@@ -602,14 +693,21 @@ impl JobManager {
     }
 
     pub(crate) fn shutdown(&self) {
-        for (_, handle) in self.owned_cleanup_handles() {
+        self.closing.store(true, Ordering::Release);
+        let handles = {
+            let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
+            self.owned_cleanup_handles()
+        };
+        for (_, handle) in handles {
             let _ = handle.request_stop();
         }
     }
 
     pub(crate) fn shutdown_and_wait(&self) -> Result<(), ShutdownError> {
-        let handles = self.owned_cleanup_handles();
-        {
+        self.closing.store(true, Ordering::Release);
+        let handles = {
+            let _operation = self.operation.lock().unwrap_or_else(|error| error.into_inner());
+            let handles = self.owned_cleanup_handles();
             let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
             for (id, _) in &handles {
                 if let Some(state) = active.get_mut(id) {
@@ -621,7 +719,8 @@ impl JobManager {
                     }
                 }
             }
-        }
+            handles
+        };
         shutdown_handles(
             &handles,
             Duration::from_millis(self.config.supervisor.termination_grace_milliseconds),
@@ -899,10 +998,13 @@ fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
                 state.record.error = Some("runtime exceeded its completion deadline".into());
             }
         }
-        RuntimeEventKind::Started
-        | RuntimeEventKind::Output
-        | RuntimeEventKind::TerminateRequested
-        | RuntimeEventKind::WineServerStopRequested => {}
+        RuntimeEventKind::Started => {
+            if state.record.status == JobStatus::Preparing {
+                state.record.status = JobStatus::Running;
+            }
+        }
+        RuntimeEventKind::Output | RuntimeEventKind::TerminateRequested | RuntimeEventKind::WineServerStopRequested => {
+        }
     }
 }
 
@@ -983,6 +1085,81 @@ mod shutdown_tests {
                 .pop_front()
                 .map_or(EventPoll::Closed, EventPoll::Event)
         }
+    }
+
+    #[test]
+    fn preparing_persistence_failure_can_drain_without_restart() {
+        let (manager, _, root) = terminal_poll_fixture(false);
+        let record = manager.active.lock().unwrap().remove("cleanup-job").unwrap().record;
+        manager.registry.write_job(&record).unwrap();
+        let job_path = root.join("service/jobs/cleanup-job.json");
+        std::fs::remove_file(&job_path).unwrap();
+        std::fs::create_dir(&job_path).unwrap();
+        let plan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        let handle = Arc::new(ProcessSupervisor::prepare(&plan).unwrap());
+        assert!(matches!(
+            manager.adopt_started_job(record, handle.clone()),
+            Err(JobError::Registry(_))
+        ));
+        assert!(manager.active.lock().unwrap().contains_key("cleanup-job"));
+        std::fs::remove_dir(&job_path).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let result = manager.poll("cleanup-job", 10).unwrap();
+            if result.stream_ended {
+                assert_eq!(result.job.status, JobStatus::Failed);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "dormant owner was never stopped");
+        }
+        assert!(!manager.active.lock().unwrap().contains_key("cleanup-job"));
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_shutdown_flag_prevents_terminal_generation_commit() {
+        let (manager, _, root, app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        manager.closing.store(true, Ordering::Release);
+        let result = manager.poll("job-managed", 0).unwrap();
+        assert_eq!(result.job.status, JobStatus::Cancelled);
+        assert!(manager
+            .registry
+            .lifecycle
+            .state(&app.id)
+            .unwrap()
+            .selected_generation
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_shutdown_rejects_new_submission_before_adoption() {
+        let (manager, _, root) = terminal_poll_fixture(false);
+        manager.shutdown_and_wait().unwrap();
+        let request =
+            serde_json::from_value(serde_json::json!({"schemaVersion":"1","applicationId":"7zip","kind":"launch"}))
+                .unwrap();
+        assert!(matches!(
+            manager.submit(request),
+            Err(JobError::Conflict("service is shutting down"))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparing_job_has_persistent_owner_before_activation() {
+        let (manager, _, root) = terminal_poll_fixture(false);
+        let record = manager.active.lock().unwrap().remove("cleanup-job").unwrap().record;
+        let plan: compatforge_domain::LaunchPlan =
+            serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        let handle = Arc::new(ProcessSupervisor::prepare(&plan).unwrap());
+        let job = manager.adopt_started_job(record, handle).unwrap();
+        assert_eq!(job.status, JobStatus::Preparing);
+        manager.cancel(&job.id).unwrap();
+        manager.shutdown_and_wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn terminal_poll_fixture(cleanup_failed: bool) -> (JobManager, Arc<CompletedProcess>, PathBuf) {

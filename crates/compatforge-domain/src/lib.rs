@@ -438,6 +438,14 @@ pub struct LaunchRequest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
     pub constraints: LaunchConstraints,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_appearance: Option<WineAppearance>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WineAppearance {
+    Classic,
 }
 
 impl LaunchRequest {
@@ -493,12 +501,22 @@ impl RuntimeBinding {
     }
 }
 
+/// Trusted service policy, kept separate from historical runtime snapshots.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WineRegistryTool {
+    pub path: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CoreConfig {
     pub schema_version: String,
     pub capabilities: CapabilityReport,
     pub runtime_bindings: Vec<RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_registry_tool: Option<WineRegistryTool>,
     pub storage_root: String,
     #[serde(default)]
     pub sandbox_profile: SandboxProfile,
@@ -515,6 +533,12 @@ impl CoreConfig {
         }
         for binding in &self.runtime_bindings {
             binding.validate()?;
+        }
+        if let Some(tool) = &self.wine_registry_tool {
+            if tool.path.is_empty() {
+                return Err(ContractError::MissingField("wineRegistryTool.path"));
+            }
+            validate_digest("wineRegistryTool.digest", &tool.digest)?;
         }
         self.supervisor.validate()?;
         Ok(())
@@ -737,6 +761,8 @@ pub struct LaunchPlan {
     pub lifecycle: ProcessLifecycle,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_trace: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_appearance: Option<WineAppearance>,
 }
 
 impl LaunchPlan {
@@ -772,6 +798,11 @@ impl LaunchPlan {
             }
         }
         self.lifecycle.validate()?;
+        if self.wine_appearance.is_some()
+            && (self.runtime.provider != RuntimeKind::Wine || self.lifecycle.wineserver.is_none())
+        {
+            return Err(ContractError::UnsupportedValue("wineAppearance requires managed Wine"));
+        }
         Ok(())
     }
 }
@@ -1318,6 +1349,30 @@ pub fn validate_portable_relative_path(field: &'static str, value: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classic_appearance_survives_request_and_plan_serialization() {
+        let mut request: serde_json::Value =
+            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+        request["wineAppearance"] = serde_json::json!("classic");
+        let decoded: LaunchRequest = serde_json::from_value(request).expect("classic appearance is a closed contract");
+        assert_eq!(serde_json::to_value(decoded).unwrap()["wineAppearance"], "classic");
+        let mut plan: serde_json::Value =
+            serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        plan["wineAppearance"] = serde_json::json!("classic");
+        let decoded: LaunchPlan = serde_json::from_value(plan).expect("classic appearance survives planning");
+        assert_eq!(serde_json::to_value(decoded).unwrap()["wineAppearance"], "classic");
+    }
+
+    #[test]
+    fn appearance_contract_rejects_arbitrary_registry_profiles() {
+        let mut request: serde_json::Value =
+            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+        for unsupported in ["dark", "reg.exe", "classic;anything", ""] {
+            request["wineAppearance"] = serde_json::json!(unsupported);
+            assert!(serde_json::from_value::<LaunchRequest>(request.clone()).is_err());
+        }
+    }
 
     #[test]
     fn pinned_launch_request_serialization_stays_byte_compatible() {

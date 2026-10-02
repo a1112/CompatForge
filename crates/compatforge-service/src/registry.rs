@@ -594,6 +594,7 @@ fn baseline_application(
         }],
         compatibility_rating: CompatibilityRating::Unknown,
         tags: vec!["gui-baseline".into()],
+        wine_appearance: None,
     }
 }
 

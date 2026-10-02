@@ -59,6 +59,7 @@ pub fn launch_request(application: &str, launcher: &str, files: &[String]) -> Re
         }
     }
     let request = JobRequest {
+        expected_wine_appearance: None,
         schema_version: "1".into(),
         application_id: application.into(),
         kind: JobKind::Launch,

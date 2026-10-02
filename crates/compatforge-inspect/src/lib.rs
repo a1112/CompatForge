@@ -481,7 +481,7 @@ fn parse_imports(
         let name = std::str::from_utf8(&name_bytes[..terminator]).map_err(|_| InspectionError::InvalidImportName)?;
         if !name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
         {
             return Err(InspectionError::InvalidImportName);
         }
@@ -899,6 +899,19 @@ mod tests {
             report.file_digest,
             "sha256:49c866f38f749fc92ded8749930b07eea51b1b8931492eff00c80c037ce46d02"
         );
+    }
+
+    #[test]
+    fn accepts_mingw_runtime_import_names_but_rejects_paths() {
+        let mut bytes = fixture();
+        let name = b"libstdc++-6.dll\0";
+        bytes[0x240..0x240 + name.len()].copy_from_slice(name);
+        assert_eq!(inspect_bytes(&bytes).unwrap().import_libraries, ["libstdc++-6.dll"]);
+
+        let mut bytes = fixture();
+        let name = b"../evil.dll\0";
+        bytes[0x240..0x240 + name.len()].copy_from_slice(name);
+        assert!(matches!(inspect_bytes(&bytes), Err(InspectionError::InvalidImportName)));
     }
 
     #[test]

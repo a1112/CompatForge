@@ -532,11 +532,21 @@ impl PolicyEngine {
         }
 
         let (runtime_provider, runtime_kind) = Self::select_runtime(&config.capabilities, request)?;
+        if request.wine_appearance.is_some() && runtime_kind != RuntimeKind::Wine {
+            return Err(PlanError::InvalidRequest(ContractError::UnsupportedValue(
+                "wineAppearance requires Wine",
+            )));
+        }
         let binding = config
             .runtime_bindings
             .iter()
             .find(|candidate| candidate.provider_id == runtime_provider.id)
             .ok_or_else(|| PlanError::MissingRuntimeBinding(runtime_provider.id.clone()))?;
+        if request.wine_appearance.is_some() && binding.wineserver_executable.is_none() {
+            return Err(PlanError::InvalidRequest(ContractError::UnsupportedValue(
+                "wineAppearance requires managed Wine",
+            )));
+        }
         if !is_absolute_host_path(&binding.executable) {
             return Err(PlanError::InvalidHostPath("runtimeBindings.executable"));
         }
@@ -583,6 +593,20 @@ impl PolicyEngine {
             environment.insert("WINEPREFIX".into(), prefix.clone());
         }
 
+        environment.remove("COMPATFORGE_WINE_REGISTRY_TOOL");
+        environment.remove("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256");
+        if request.wine_appearance.is_some() {
+            let tool = config
+                .wine_registry_tool
+                .as_ref()
+                .ok_or(PlanError::InvalidHostPath("wineRegistryTool.path"))?;
+            if !is_absolute_host_path(&tool.path) {
+                return Err(PlanError::InvalidHostPath("wineRegistryTool.path"));
+            }
+            environment.insert("COMPATFORGE_WINE_REGISTRY_TOOL".into(), tool.path.clone());
+            environment.insert("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256".into(), tool.digest.clone());
+        }
+
         let mut arguments = Vec::with_capacity(request.arguments.len() + 1);
         arguments.push(request.executable.path.clone());
         arguments.extend(request.arguments.clone());
@@ -615,6 +639,7 @@ impl PolicyEngine {
         }
 
         Ok(LaunchPlan {
+            wine_appearance: request.wine_appearance,
             schema_version: SCHEMA_VERSION_V1.into(),
             request_id: request.request_id.clone(),
             runtime: RuntimeSelection {
@@ -707,6 +732,20 @@ impl PolicyEngine {
             if !host_path_is_within(&config.storage_root, &plan.process.working_directory) {
                 return Err(PlanError::PlanMismatch("working directory"));
             }
+        }
+
+        let path = plan.process.environment.get("COMPATFORGE_WINE_REGISTRY_TOOL");
+        let digest = plan.process.environment.get("COMPATFORGE_WINE_REGISTRY_TOOL_SHA256");
+        if plan.wine_appearance.is_some() {
+            let tool = config
+                .wine_registry_tool
+                .as_ref()
+                .ok_or(PlanError::PlanMismatch("Wine registry tool"))?;
+            if !is_absolute_host_path(&tool.path) || path != Some(&tool.path) || digest != Some(&tool.digest) {
+                return Err(PlanError::PlanMismatch("Wine registry tool"));
+            }
+        } else if path.is_some() || digest.is_some() {
+            return Err(PlanError::PlanMismatch("unexpected Wine registry tool"));
         }
 
         let binding = config
@@ -1040,6 +1079,7 @@ mod tests {
                 observations: Vec::new(),
                 features: BTreeMap::new(),
             },
+            wine_registry_tool: None,
             runtime_bindings: vec![
                 RuntimeBinding {
                     provider_id: "wine-local".into(),
@@ -1068,6 +1108,7 @@ mod tests {
 
     fn request() -> LaunchRequest {
         LaunchRequest {
+            wine_appearance: None,
             schema_version: SCHEMA_VERSION_V1.into(),
             request_id: "018fe3cb-9d12-7b52-b334-1cce0e857fc9".into(),
             bottle_id: "example-bottle".into(),
@@ -1224,6 +1265,73 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[test]
+    fn classic_profile_is_bound_to_prepared_authorization() {
+        let (mut config, root) = prepared_config("classic-authorization");
+        config.wine_registry_tool = Some(compatforge_domain::WineRegistryTool {
+            path: "/trusted/runtime/reg.exe".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        });
+        let mut value = serde_json::to_value(prepared_request()).unwrap();
+        value["wineAppearance"] = serde_json::json!("classic");
+        let request: LaunchRequest = serde_json::from_value(value).expect("classic request");
+        let mut prepared = PreparedLaunch::prepare(&config, &prepared_fixture(), &request).unwrap();
+        assert_eq!(
+            serde_json::to_value(prepared.plan()).unwrap()["wineAppearance"],
+            "classic"
+        );
+        prepared.authorize(&config).unwrap();
+        let mut changed = serde_json::to_value(prepared.plan()).unwrap();
+        changed.as_object_mut().unwrap().remove("wineAppearance");
+        prepared.plan = serde_json::from_value(changed).unwrap();
+        assert!(matches!(
+            prepared.authorize(&config),
+            Err(PreparationError::PreparedPlanMismatch)
+        ));
+        make_object_writable(&prepared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn classic_direct_authorization_rejects_untrusted_tool_bindings() {
+        let mut config = config(CpuArchitecture::X86_64);
+        config.wine_registry_tool = Some(compatforge_domain::WineRegistryTool {
+            path: "/trusted/reg.exe".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        });
+        let mut request = request();
+        request.wine_appearance = Some(compatforge_domain::WineAppearance::Classic);
+        let plan = PolicyEngine::compile(&config, &request).unwrap();
+        PolicyEngine::authorize(&config, &plan).unwrap();
+        for key in [
+            "COMPATFORGE_WINE_REGISTRY_TOOL",
+            "COMPATFORGE_WINE_REGISTRY_TOOL_SHA256",
+        ] {
+            let mut changed = plan.clone();
+            changed
+                .process
+                .environment
+                .insert(key.into(), "/untrusted/reg.exe".into());
+            assert!(PolicyEngine::authorize(&config, &changed).is_err());
+        }
+        let mut missing = config.clone();
+        missing.wine_registry_tool = None;
+        assert!(PolicyEngine::authorize(&missing, &plan).is_err());
+        let mut default = plan.clone();
+        default.wine_appearance = None;
+        assert!(PolicyEngine::authorize(&config, &default).is_err());
+    }
+
+    #[test]
+    fn classic_profile_requires_managed_wine_runtime() {
+        let mut config = config(CpuArchitecture::X86_64);
+        config.runtime_bindings[0].wineserver_executable = None;
+        let mut value = serde_json::to_value(request()).unwrap();
+        value["wineAppearance"] = serde_json::json!("classic");
+        let request: LaunchRequest = serde_json::from_value(value).expect("classic request");
+        assert!(PolicyEngine::compile(&config, &request).is_err());
     }
 
     #[test]
