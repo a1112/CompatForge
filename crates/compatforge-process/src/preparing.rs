@@ -16,6 +16,17 @@ pub struct PreparingLaunch {
 }
 
 impl PreparingLaunch {
+    pub(super) fn new_with_validation(
+        plan: LaunchPlan,
+        validation: impl FnOnce(&AtomicBool) -> Result<(), ProcessError> + Send + 'static,
+    ) -> Result<Self, ProcessError> {
+        Self::new_with_start(plan, move |plan, operations| {
+            operations.check_cancelled()?;
+            validation(&operations.0.cancelled)?;
+            operations.check_cancelled()?;
+            ProcessSupervisor::start_with_operations(plan, operations)
+        })
+    }
     pub(super) fn new(plan: LaunchPlan) -> Result<Self, ProcessError> {
         Self::new_with_start(plan, |plan, operations| {
             ProcessSupervisor::start_with_operations(plan, operations)
@@ -197,6 +208,9 @@ impl CancellableOperations {
     }
 }
 impl StartupOperations for CancellableOperations {
+    fn cancellation(&self) -> Option<&AtomicBool> {
+        Some(&self.0.cancelled)
+    }
     fn check_cancelled(&self) -> Result<(), ProcessError> {
         if self.0.cancelled.load(Ordering::Acquire) {
             Err(ProcessError::Cancelled)
@@ -236,6 +250,39 @@ impl StartupOperations for CancellableOperations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validation_is_dormant_and_cancelled_before_activation_without_side_effects() {
+        let plan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let handle = PreparingLaunch::new_with_validation(plan, move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Err(ProcessError::Cancelled)
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn cancellation_interrupts_owned_validation_before_guest_spawn() {
+        let plan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();
+        let (started, observed) = mpsc::channel();
+        let handle = PreparingLaunch::new_with_validation(plan, move |cancelled| {
+            started.send(()).unwrap();
+            while !cancelled.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(ProcessError::Cancelled)
+        })
+        .unwrap();
+        handle.activate();
+        observed.recv_timeout(Duration::from_secs(3)).unwrap();
+        handle.terminate_and_wait(Duration::ZERO).unwrap();
+        assert!(
+            matches!(handle.next_event(Duration::from_secs(1)), EventPoll::Event(event) if event.kind==RuntimeEventKind::Exited && event.exit.as_ref().is_some_and(|exit| !exit.success))
+        );
+    }
     #[test]
     fn preparing_worker_panic_emits_failure_and_never_confirms_cleanup() {
         let plan = serde_json::from_str(include_str!("../../../examples/launch-plan.json")).unwrap();

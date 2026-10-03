@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -113,7 +114,7 @@ class Phase23ContractTests(unittest.TestCase):
             "bottleId": "msi-smoke-x64",
             "recipeId": "probe.msi-install-smoke",
             "package": {
-                "path": "/external/fixtures/msi-install-smoke.msi",
+                "path": str(ROOT / "tests" / "fixtures" / "msi-install-smoke.msi"),
                 "fileName": "msi-install-smoke.msi",
                 "sha256": "f" * 64,
                 "sizeBytes": 16384,
@@ -141,6 +142,58 @@ class Phase23ContractTests(unittest.TestCase):
             self.assertFalse(value["additionalProperties"])
             identifiers.append(value["$id"])
         self.assertEqual(len(identifiers), len(set(identifiers)))
+
+    def test_install_accepts_actual_jasp_and_exact_two_gib_bound(self) -> None:
+        schema = json.loads((ROOT / 'schemas' / 'install-request.schema.json').read_text())
+        self.assertEqual(schema['properties']['package']['properties']['sizeBytes']['maximum'], 2**31)
+        for size in (1299197952, 2**31):
+            request = self.install_request()
+            request['package']['sizeBytes'] = size
+            self.install.validate_install_request(request)
+        request['package']['sizeBytes'] = 2**31 + 1
+        with self.assertRaises(self.probe.ContractError):
+            self.install.validate_install_request(request)
+
+    def test_install_rejects_boolean_size_and_unsafe_property_commands(self) -> None:
+        request = self.install_request()
+        self.install.validate_install_request(request)
+        request['package']['sizeBytes'] = True
+        with self.assertRaises(self.probe.ContractError):
+            self.install.validate_install_request(request)
+        for properties in ({'TRANSFORMS': 'evil.mst'}, {'REBOOT': 'Force'},
+                           {'INSTALLFOLDER': 'https://example.com/setup'},
+                           {'INSTALLFOLDER': 'C:\\Good" /forcerestart'},
+                           {'INSTALLFOLDER': 'C:\\Good\nBAD=1'}, {'CUSTOM_ACTION': 'cmd.exe'}):
+            request = self.install_request()
+            request['handler']['properties'] = properties
+            with self.subTest(properties=properties), self.assertRaises(self.probe.ContractError):
+                self.install.validate_install_request(request)
+
+    def test_install_shared_filename_and_directory_schema_boundaries(self) -> None:
+        vectors=json.loads((ROOT/'tests/fixtures/msi-validation-vectors.json').read_text(encoding='utf8'))
+        schema=json.loads((ROOT/'schemas/install-request.schema.json').read_text())
+        filename_schema=schema['properties']['package']['properties']['fileName']
+        directory_schema=schema['$defs']['installDirectory']
+        path_schema=schema['properties']['package']['properties']['path']
+        for group in ('fileNames','installDirectories','pathAncestors'):
+            for case in vectors[group]:
+                value=case['value'];request=self.install_request()
+                if group=='fileNames':
+                    request['package']['fileName']=value;request['package']['path']=str(ROOT/value)
+                    structural=bool(re.search(filename_schema['pattern'],value)) and len(value)<=filename_schema['maxLength']
+                elif group=='pathAncestors':
+                    request['package']['path']=str(ROOT/value/request['package']['fileName'])
+                    structural=not re.search(path_schema.get('not',{}).get('pattern',r'(?!x)x'),request['package']['path'])
+                else:
+                    request['handler']['properties']={'INSTALLDIR':value}
+                    structural=(bool(re.search(directory_schema['pattern'],value))
+                                and not re.search(directory_schema['not']['pattern'],value)
+                                and directory_schema['minLength']<=len(value)<=directory_schema['maxLength'])
+                with self.subTest(group=group,value=value):
+                    self.assertEqual(structural,case['valid'])
+                    if case['valid']:self.install.validate_install_request(request)
+                    else:
+                        with self.assertRaises(self.probe.ContractError):self.install.validate_install_request(request)
 
     def test_probe_manifest_and_result_are_cross_bound(self) -> None:
         manifest = self.probe.validate_manifest(self.manifest())

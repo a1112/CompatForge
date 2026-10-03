@@ -1275,6 +1275,7 @@ mod tests {
             },
             guest_artifact: None,
             bottle_executable: None,
+            msi_install: None,
             mounts: Vec::new(),
             sandbox: compatforge_domain::SandboxPolicy {
                 profile: config.sandbox_profile,

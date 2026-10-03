@@ -127,6 +127,17 @@ pub struct InstallerDefinition {
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msi: Option<MsiInstallerDefinition>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MsiInstallerDefinition {
+    pub size_bytes: u64,
+    pub architecture: compatforge_domain::CpuArchitecture,
+    pub handler: compatforge_domain::InstallHandler,
+    pub maximum_runtime_milliseconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -164,6 +175,12 @@ pub struct ApplicationDefinition {
 
 impl ApplicationDefinition {
     pub fn validate(&self) -> Result<(), ModelError> {
+        self.validate_metadata(false)
+    }
+    pub(crate) fn validate_retained_failure_metadata(&self) -> Result<(), ModelError> {
+        self.validate_metadata(true)
+    }
+    fn validate_metadata(&self, retained_failure: bool) -> Result<(), ModelError> {
         validate_schema(&self.schema_version)?;
         validate_domain_id("application.id", &self.id)?;
         validate_domain_id("application.bottleId", &self.bottle_id)?;
@@ -179,6 +196,39 @@ impl ApplicationDefinition {
             validate_arguments(&installer.arguments)?;
             if let Some(digest) = &installer.sha256 {
                 validate_sha256(digest)?;
+            }
+            if let Some(msi) = &installer.msi {
+                let digest = installer
+                    .sha256
+                    .as_deref()
+                    .ok_or(ModelError::Invalid("MSI requires a reviewed SHA-256"))?;
+                let package = compatforge_domain::InstallPackage {
+                    path: std::env::temp_dir().join(&installer.file_name).to_string_lossy().into(),
+                    file_name: installer.file_name.clone(),
+                    sha256: digest.into(),
+                    size_bytes: msi.size_bytes,
+                    media_type: "application/x-msi".into(),
+                };
+                package
+                    .validate()
+                    .map_err(|_| ModelError::Invalid("invalid MSI package definition"))?;
+                if retained_failure {
+                    msi.handler.validate_retained_failure_metadata()
+                } else {
+                    msi.handler.validate()
+                }
+                .map_err(|_| ModelError::Invalid("invalid MSI handler definition"))?;
+                if !installer.arguments.is_empty()
+                    || !matches!(
+                        msi.architecture,
+                        compatforge_domain::CpuArchitecture::I386 | compatforge_domain::CpuArchitecture::X86_64
+                    )
+                    || !(1000..=3_600_000).contains(&msi.maximum_runtime_milliseconds)
+                {
+                    return Err(ModelError::Invalid(
+                        "invalid MSI architecture, arguments or runtime bound",
+                    ));
+                }
             }
         }
         let mut launcher_ids = BTreeSet::new();

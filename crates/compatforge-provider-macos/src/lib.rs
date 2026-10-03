@@ -246,6 +246,7 @@ impl MacOsProviderSnapshot {
             schema_version: compatforge_domain::SCHEMA_VERSION_V1.into(),
             capabilities: self.capabilities.clone(),
             wine_registry_tool: None,
+            wine_installer_tools: Vec::new(),
             runtime_bindings: vec![runtime_binding],
             storage_root,
             sandbox_profile: SandboxProfile::Desktop,

@@ -1,0 +1,27 @@
+{
+  "fileNames": [
+    {"value":"qalculate-5.12.0-x64.msi","valid":true},
+    {"value":"_canary.MSI","valid":true},
+    {"value":"bad:stream.msi","valid":false},
+    {"value":"bad\u0000.msi","valid":false},
+    {"value":".msi","valid":false},
+    {"value":"测试.msi","valid":false}
+  ],
+  "pathAncestors": [
+    {"value":"source","valid":true},
+    {"value":"bad\u0000directory","valid":false},
+    {"value":"bad\ndirectory","valid":false},
+    {"value":"bad\u0085directory","valid":false},
+    {"value":"bad\u007fdirectory","valid":false}
+  ],
+  "installDirectories": [
+    {"value":"C:\\CompatForgeProbe","valid":true},
+    {"value":"C:\\Program Files\\Qalculate","valid":false},
+    {"value":"C:\\Qalculate Canary","valid":false},
+    {"value":"C:\\Bad\u0085Name","valid":false},
+    {"value":"C:\\Bad\\..\\outside","valid":false},
+    {"value":"C:\\Bad\\","valid":false},
+    {"value":"C:\\Bad \\Name","valid":false},
+    {"value":"C:\\Bad\" /forcerestart","valid":false}
+  ]
+}

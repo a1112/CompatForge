@@ -30,6 +30,7 @@
         }
       }
     },
+    "wineInstallerTools": {"type": "array", "items": {"$ref": "runtime-installer-tool.schema.json"}},
     "storageRoot": { "type": "string", "minLength": 1 },
     "sandboxProfile": {
       "enum": ["strict", "desktop", "game", "developer", "unconfined"]

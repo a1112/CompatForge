@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/runtime-installer-tool.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["packId", "packDigest", "path", "digest", "architecture"],
+  "properties": {
+    "packId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$"},
+    "packDigest": {"type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$"},
+    "path": {"type": "string", "minLength": 1, "not": {"pattern": "[\u0000-\u001f\u007f-\u009f]"}},
+    "digest": {"type": "string", "pattern": "^sha256:[a-fA-F0-9]{64}$"},
+    "architecture": {"enum": ["i386", "x86_64"]}
+  }
+}

@@ -517,6 +517,8 @@ pub struct CoreConfig {
     pub runtime_bindings: Vec<RuntimeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wine_registry_tool: Option<WineRegistryTool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wine_installer_tools: Vec<RuntimeInstallerTool>,
     pub storage_root: String,
     #[serde(default)]
     pub sandbox_profile: SandboxProfile,
@@ -541,6 +543,23 @@ impl CoreConfig {
             validate_digest("wineRegistryTool.digest", &tool.digest)?;
         }
         self.supervisor.validate()?;
+        for (index, tool) in self.wine_installer_tools.iter().enumerate() {
+            tool.validate()?;
+            if !self
+                .runtime_bindings
+                .iter()
+                .any(|binding| binding.pack_id == tool.pack_id && binding.pack_digest == tool.pack_digest)
+                || self.wine_installer_tools[..index].iter().any(|other| {
+                    other.pack_id == tool.pack_id
+                        && other.pack_digest == tool.pack_digest
+                        && other.architecture == tool.architecture
+                })
+            {
+                return Err(ContractError::UnsupportedValue(
+                    "wineInstallerTools runtime or duplicate binding",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -763,6 +782,8 @@ pub struct LaunchPlan {
     pub decision_trace: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wine_appearance: Option<WineAppearance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msi_install: Option<MsiInstallBinding>,
 }
 
 impl LaunchPlan {
@@ -798,6 +819,20 @@ impl LaunchPlan {
             }
         }
         self.lifecycle.validate()?;
+        if let Some(install) = &self.msi_install {
+            install.validate()?;
+            if self.runtime.provider != RuntimeKind::Wine
+                || self.lifecycle.wineserver.is_none()
+                || self.guest_artifact.is_some()
+                || self.bottle_executable.is_some()
+                || self.runtime.pack_id != install.tool.pack_id
+                || self.runtime.pack_digest != install.tool.pack_digest
+                || self.process.arguments != install.arguments()?
+                || self.lifecycle.maximum_runtime_milliseconds != Some(install.maximum_runtime_milliseconds)
+            {
+                return Err(ContractError::UnsupportedValue("msiInstall launch plan"));
+            }
+        }
         if self.wine_appearance.is_some()
             && (self.runtime.provider != RuntimeKind::Wine || self.lifecycle.wineserver.is_none())
         {
@@ -1680,3 +1715,5 @@ mod tests {
         assert!(serde_json::from_value::<CapabilityReport>(null_observation).is_err());
     }
 }
+mod install;
+pub use install::*;

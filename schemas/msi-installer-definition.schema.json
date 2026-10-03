@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://compatforge.dev/schemas/msi-installer-definition.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sizeBytes", "architecture", "handler", "maximumRuntimeMilliseconds"],
+  "properties": {
+    "sizeBytes": {"type": "integer", "minimum": 1, "maximum": 2147483648},
+    "architecture": {"enum": ["i386", "x86_64"]},
+    "handler": {"$ref": "install-request.schema.json#/properties/handler"},
+    "maximumRuntimeMilliseconds": {"type": "integer", "minimum": 1000, "maximum": 3600000}
+  }
+}

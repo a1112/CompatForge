@@ -190,7 +190,17 @@ impl LifecycleStore {
             {
                 return Err(RegistryError::Invalid("invalid generation identity"));
             }
-            generation.definition.validate().map_err(RegistryError::Model)?;
+            // Preserve older terminal failure evidence without permitting that
+            // definition to be registered, staged, selected or executed again.
+            if matches!(
+                generation.status,
+                GenerationStatus::Failed | GenerationStatus::Cancelled
+            ) {
+                generation.definition.validate_retained_failure_metadata()
+            } else {
+                generation.definition.validate()
+            }
+            .map_err(RegistryError::Model)?;
             if definition_digest(&generation.definition)? != generation.definition_digest {
                 return Err(RegistryError::Invalid("generation definition digest mismatch"));
             }
@@ -854,6 +864,48 @@ mod tests {
         let reopened = LifecycleStore::new(store.root.clone(), store.storage_root.clone()).unwrap();
         assert_eq!(reopened.state(&app.id).unwrap(), previous);
         assert_eq!(reopened.all_states().unwrap(), vec![previous]);
+    }
+
+    #[test]
+    fn retained_failed_msi_space_override_remains_readable_but_cannot_execute() {
+        let (store, app, runtime) = fixture();
+        let old = installed(&store, &app, &runtime, "job-old");
+        let mut state = store.state(&app.id).unwrap();
+        let mut failed = old.clone();
+        failed.id = "gen-job-space-failure".into();
+        failed.bottle_id = failed.id.clone();
+        failed.status = GenerationStatus::Failed;
+        failed.launcher_digests.clear();
+        failed.definition.installer = Some(
+            serde_json::from_value(serde_json::json!({
+                "fileName":"canary.msi", "sha256":"a".repeat(64),
+                "msi":{"architecture":"x86_64", "sizeBytes":100, "maximumRuntimeMilliseconds":120000,
+                    "handler":{"kind":"msiexec", "action":"install", "ui":"none", "reboot":"suppress",
+                        "properties":{"TARGETDIR":"C:\\Qalculate Canary"}}}
+            }))
+            .unwrap(),
+        );
+        failed.definition_digest = definition_digest(&failed.definition).unwrap();
+        state.generations.push(failed.clone());
+        let path = store.root.join(format!("{}.json", app.id));
+        fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let reopened = LifecycleStore::new(store.root.clone(), store.storage_root.clone()).unwrap();
+        assert_eq!(reopened.state(&app.id).unwrap().generations, state.generations);
+        assert_eq!(reopened.selected(&app.id).unwrap(), old);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(failed.definition.validate().is_err());
+        assert!(reopened.stage(&failed.definition, "job-new").is_err());
+        assert!(reopened
+            .rollback(&RollbackRequest {
+                application_id: app.id.clone(),
+                generation_id: failed.id.clone()
+            })
+            .is_err());
+        failed.status = GenerationStatus::Ready;
+        state.generations[1] = failed;
+        assert!(reopened.write(&state).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]

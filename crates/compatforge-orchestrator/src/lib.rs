@@ -73,6 +73,7 @@ pub enum PreparationError {
     },
     DigestMismatch,
     GuestArtifact(GuestArtifactError),
+    Installer(std::io::Error),
     Planning(PlanError),
     ContextSerialization(serde_json::Error),
     ContextMismatch,
@@ -94,6 +95,7 @@ impl fmt::Display for PreparationError {
             ),
             Self::DigestMismatch => formatter.write_str("requested executable digest does not match inspected content"),
             Self::GuestArtifact(error) => write!(formatter, "guest artifact preparation failed: {error}"),
+            Self::Installer(error) => write!(formatter, "managed MSI preparation failed: {error}"),
             Self::Planning(error) => write!(formatter, "prepared launch planning failed: {error}"),
             Self::ContextSerialization(error) => write!(formatter, "trusted context serialization failed: {error}"),
             Self::ContextMismatch => formatter.write_str("prepared launch context fingerprint mismatch"),
@@ -113,6 +115,7 @@ impl std::error::Error for PreparationError {
         match self {
             Self::InvalidRequest(error) => Some(error),
             Self::GuestArtifact(error) => Some(error),
+            Self::Installer(error) => Some(error),
             Self::Planning(error) => Some(error),
             Self::ContextSerialization(error) => Some(error),
             _ => None,
@@ -520,6 +523,9 @@ impl std::error::Error for PlanError {
 
 pub struct PolicyEngine;
 
+mod install;
+pub use install::{InstallIntent, InstallLaunchOptions, PreparedInstall};
+
 impl PolicyEngine {
     /// Compile a request to a fully serializable plan without launching a process.
     pub fn compile(config: &CoreConfig, request: &LaunchRequest) -> Result<LaunchPlan, PlanError> {
@@ -657,6 +663,7 @@ impl PolicyEngine {
             },
             guest_artifact: None,
             bottle_executable: None,
+            msi_install: None,
             mounts: Vec::new(),
             sandbox: SandboxPolicy {
                 profile: config.sandbox_profile,
@@ -687,6 +694,22 @@ impl PolicyEngine {
     pub fn authorize(config: &CoreConfig, plan: &LaunchPlan) -> Result<(), PlanError> {
         config.validate().map_err(PlanError::InvalidConfig)?;
         plan.validate().map_err(PlanError::InvalidPlan)?;
+
+        if let Some(install) = &plan.msi_install {
+            let expected = Path::new(&config.storage_root)
+                .join("installer-packages/objects/sha256")
+                .join(&install.package.package.sha256)
+                .join("package.msi");
+            if Path::new(&install.package.stored_path) != expected
+                || !config.wine_installer_tools.contains(&install.tool)
+                || config
+                    .supervisor
+                    .maximum_runtime_milliseconds
+                    .is_some_and(|bound| install.maximum_runtime_milliseconds > bound)
+            {
+                return Err(PlanError::PlanMismatch("MSI storage, runtime tool or maximum runtime"));
+            }
+        }
 
         if !is_absolute_host_path(&config.storage_root) {
             return Err(PlanError::InvalidHostPath("storageRoot"));
@@ -768,7 +791,8 @@ impl PolicyEngine {
             return Err(PlanError::PlanMismatch("sandbox profile"));
         }
         if plan.lifecycle.termination_grace_milliseconds != config.supervisor.termination_grace_milliseconds
-            || plan.lifecycle.maximum_runtime_milliseconds != config.supervisor.maximum_runtime_milliseconds
+            || (plan.msi_install.is_none()
+                && plan.lifecycle.maximum_runtime_milliseconds != config.supervisor.maximum_runtime_milliseconds)
         {
             return Err(PlanError::PlanMismatch("supervisor policy"));
         }
@@ -1080,6 +1104,7 @@ mod tests {
                 features: BTreeMap::new(),
             },
             wine_registry_tool: None,
+            wine_installer_tools: Vec::new(),
             runtime_bindings: vec![
                 RuntimeBinding {
                     provider_id: "wine-local".into(),

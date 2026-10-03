@@ -8,7 +8,7 @@ use compatforge_domain::{
     RuntimeEvent, RuntimeEventKind, SCHEMA_VERSION_V1,
 };
 use compatforge_inspect::{inspect_path, PeArchitecture};
-use compatforge_orchestrator::PreparedLaunch;
+use compatforge_orchestrator::{InstallIntent, InstallLaunchOptions, PreparedLaunch};
 use compatforge_process::{EventPoll, LaunchHandle, PreparingLaunch, ProcessSupervisor};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -379,6 +379,14 @@ impl JobManager {
                 runtime.check_config(&self.config).map_err(JobError::Registry)?;
             }
             let resolved = self.resolve_launch(&generation, &request)?;
+            if request.kind == JobKind::Install
+                && application
+                    .installer
+                    .as_ref()
+                    .is_some_and(|installer| installer.msi.is_some())
+            {
+                return self.prepare_msi_install(&application, &generation, &request, &mut record, resolved);
+            }
             let inspection = inspect_path(&resolved.source).map_err(|error| JobError::Inspection(error.to_string()))?;
             let architecture = map_architecture(inspection.architecture)?;
             let launch_request = LaunchRequest {
@@ -514,6 +522,89 @@ impl JobManager {
         }
         handle.activate();
         Ok(record)
+    }
+
+    fn prepare_msi_install(
+        &self,
+        application: &crate::model::ApplicationDefinition,
+        generation: &crate::lifecycle::ApplicationGeneration,
+        request: &JobRequest,
+        record: &mut JobRecord,
+        resolved: ResolvedLaunch,
+    ) -> Result<Arc<dyn JobProcess>, JobError> {
+        use compatforge_domain::{InstallConstraints, InstallPackage, InstallRequest};
+        if !request.argument_overrides.is_empty() {
+            return Err(JobError::Invalid("MSI jobs do not accept raw argument overrides"));
+        }
+        let installer = application
+            .installer
+            .as_ref()
+            .ok_or(JobError::Invalid("missing MSI definition"))?;
+        let msi = installer.msi.as_ref().ok_or(JobError::Invalid("missing MSI handler"))?;
+        let install = InstallRequest {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            request_id: installation_request_id(&record.id),
+            bottle_id: generation.bottle_id.clone(),
+            recipe_id: Some(application.id.clone()),
+            package: InstallPackage {
+                path: resolved.source.to_string_lossy().into(),
+                file_name: installer.file_name.clone(),
+                sha256: installer
+                    .sha256
+                    .clone()
+                    .ok_or(JobError::Invalid("missing MSI digest"))?,
+                size_bytes: msi.size_bytes,
+                media_type: "application/x-msi".into(),
+            },
+            handler: msi.handler.clone(),
+            constraints: InstallConstraints {
+                allow_virtual_machine: false,
+                allow_remote: false,
+                network_policy: "deny".into(),
+                maximum_runtime_milliseconds: msi.maximum_runtime_milliseconds,
+            },
+        };
+        let intent = InstallIntent::compile(
+            &self.config,
+            &install,
+            msi.architecture,
+            InstallLaunchOptions {
+                environment: resolved.environment,
+                wine_appearance: application.wine_appearance,
+            },
+        )
+        .map_err(|error| JobError::Preparation(error.to_string()))?;
+        let runtime =
+            InstalledRuntime::from_config(&self.config, &intent.plan().runtime).map_err(JobError::Registry)?;
+        self.registry
+            .lifecycle
+            .bind_runtime(&application.id, &record.id, runtime)
+            .map_err(JobError::Registry)?;
+        record.inspection = Some(
+            serde_json::json!({"kind":"msi", "expectedPackage":intent.plan().msi_install.as_ref().map(|binding| &binding.package), "verifiedBeforeSpawn":false,
+                "exitCodeSemantics":"Unix Wine process status; full Win32 MSI exit code is not captured; nonzero fails closed; reboot is suppressed"}),
+        );
+        record.launch_plan = Some(serde_json::to_value(intent.plan()).map_err(JobError::Serialization)?);
+        record.updated_at_milliseconds = now_milliseconds();
+        self.registry.write_job(record).map_err(JobError::Registry)?;
+        let config = self.config.clone();
+        let expected_plan = intent.plan().clone();
+        ProcessSupervisor::prepare_with_validation(&expected_plan, move |cancellation| {
+            let verify = (|| {
+                let prepared = intent.prepare(&config, Some(cancellation))?;
+                prepared.authorize_cancellable(&config, Some(cancellation))?;
+                Ok::<_, compatforge_orchestrator::PreparationError>(())
+            })();
+            verify.map_err(|error| {
+                if cancellation.load(Ordering::Acquire) {
+                    compatforge_process::ProcessError::Cancelled
+                } else {
+                    compatforge_process::ProcessError::InstallerPreparation(error.to_string())
+                }
+            })
+        })
+        .map(|handle| Arc::new(handle) as Arc<dyn JobProcess>)
+        .map_err(|error| JobError::Process(error.to_string()))
     }
 
     pub(crate) fn poll(&self, id: &str, timeout_milliseconds: u64) -> Result<JobPollResult, JobError> {
@@ -999,6 +1090,11 @@ fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
             }
         }
         RuntimeEventKind::Started => {
+            if let Some(inspection) = state.record.inspection.as_mut() {
+                if inspection.get("kind").and_then(serde_json::Value::as_str) == Some("msi") {
+                    inspection["verifiedBeforeSpawn"] = serde_json::Value::Bool(true);
+                }
+            }
             if state.record.status == JobStatus::Preparing {
                 state.record.status = JobStatus::Running;
             }
@@ -1020,6 +1116,19 @@ fn next_job_id() -> String {
     let now = now_milliseconds();
     let counter = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("job-{now}-{counter}")
+}
+
+fn installation_request_id(job_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = format!("{:x}", Sha256::digest(job_id.as_bytes()));
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hash[..8],
+        &hash[8..12],
+        &hash[12..16],
+        &hash[16..20],
+        &hash[20..32]
+    )
 }
 
 #[derive(Debug)]
@@ -1669,6 +1778,60 @@ mod shutdown_tests {
             manager.registry.lifecycle.state(&app.id).unwrap().generations[1].status,
             crate::GenerationStatus::Failed
         );
+    }
+
+    #[test]
+    fn invalid_msi_fails_in_owned_preparation_and_preserves_previous_selection() {
+        use sha2::{Digest, Sha256};
+        let (mut manager, _, root, mut app) = managed_fixture(false);
+        write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        let old = manager.registry.lifecycle.selected(&app.id).unwrap();
+        let bytes = b"not an MSI compound installer";
+        let installer = root.join("canary.msi");
+        std::fs::write(&installer, bytes).unwrap();
+        let binding = &manager.config.runtime_bindings[0];
+        manager.config.wine_installer_tools = vec![serde_json::from_value(
+            serde_json::json!({"packId":binding.pack_id, "packDigest":binding.pack_digest,
+            "path":root.join("msiexec.exe"), "digest":format!("sha256:{}", "a".repeat(64)), "architecture":"x86_64"}),
+        )
+        .unwrap()];
+        app.version = "msi-test".into();
+        app.installer = Some(serde_json::from_value(serde_json::json!({"fileName":"canary.msi", "sha256":format!("{:x}", Sha256::digest(bytes)),
+            "msi":{"sizeBytes":bytes.len(), "architecture":"x86_64", "handler":{"kind":"msiexec","action":"install","ui":"none","reboot":"suppress","properties":{}},"maximumRuntimeMilliseconds":120000}})).unwrap());
+        manager.registry.upsert_application(app.clone()).unwrap();
+        let request = serde_json::from_value(
+            serde_json::json!({"schemaVersion":"1","applicationId":app.id,"kind":"install","executablePath":installer}),
+        )
+        .unwrap();
+        let job = manager.submit(request).unwrap();
+        assert_eq!(job.status, JobStatus::Preparing);
+        assert!(job.launch_plan.as_ref().unwrap().get("msiInstall").is_some());
+        assert!(job.launch_plan.as_ref().unwrap().get("guestArtifact").is_none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let result = manager.poll(&job.id, 20).unwrap();
+            if result.stream_ended {
+                assert_eq!(result.job.status, JobStatus::Failed);
+                assert_eq!(result.job.inspection.as_ref().unwrap()["verifiedBeforeSpawn"], false);
+                assert!(!result
+                    .job
+                    .events
+                    .iter()
+                    .any(|event| event.kind == RuntimeEventKind::Started));
+                assert!(result.job.error.is_some());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        assert_eq!(manager.registry.lifecycle.selected(&app.id).unwrap(), old);
+        assert_eq!(
+            manager.registry.lifecycle.state(&app.id).unwrap().generations[1].status,
+            crate::GenerationStatus::Failed
+        );
+        assert!(manager.active.lock().unwrap().is_empty());
+        manager.shutdown_and_wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

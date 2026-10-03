@@ -10,6 +10,7 @@ use compatforge_domain::{
 };
 use compatforge_guest_artifact::{
     verify_binding_contents, verify_in_place_binding_contents, GuestArtifactError, PinnedBottleExecutable,
+    PinnedMsiInputs,
 };
 use sha2::{Digest, Sha256};
 #[cfg(any(test, target_os = "macos"))]
@@ -84,6 +85,7 @@ pub enum ProcessError {
     InvalidPlan(ContractError),
     InvalidGuestArtifact(GuestArtifactError),
     InvalidRuntimeEvidence(&'static str),
+    InstallerPreparation(String),
     UnsafeDirectory(&'static str),
     Isolation(io::Error),
     Spawn(io::Error),
@@ -103,6 +105,7 @@ impl fmt::Display for ProcessError {
             Self::InvalidPlan(error) => write!(formatter, "invalid launch plan: {error}"),
             Self::InvalidGuestArtifact(error) => write!(formatter, "invalid guest artifact: {error}"),
             Self::InvalidRuntimeEvidence(field) => write!(formatter, "invalid pinned Runtime evidence: {field}"),
+            Self::InstallerPreparation(message) => write!(formatter, "managed MSI preparation failed: {message}"),
             Self::UnsafeDirectory(field) => write!(formatter, "unsafe launch directory: {field}"),
             Self::Isolation(error) => write!(formatter, "process-tree isolation failed: {error}"),
             Self::Spawn(error) => write!(formatter, "process spawn failed: {error}"),
@@ -124,6 +127,7 @@ impl std::error::Error for ProcessError {
             Self::Isolation(error) | Self::Spawn(error) | Self::Terminate(error) => Some(error),
             Self::Cancelled
             | Self::InvalidRuntimeEvidence(_)
+            | Self::InstallerPreparation(_)
             | Self::UnsafeDirectory(_)
             | Self::WinePrefixBusy(_)
             | Self::Startup(_)
@@ -151,6 +155,14 @@ impl ProcessSupervisor {
     pub fn prepare(plan: &LaunchPlan) -> Result<PreparingLaunch, ProcessError> {
         PreparingLaunch::new(plan.clone())
     }
+    /// Register this dormant owner before activation. Validation runs in its
+    /// cancellable worker before Wine configuration or guest process creation.
+    pub fn prepare_with_validation(
+        plan: &LaunchPlan,
+        validation: impl FnOnce(&AtomicBool) -> Result<(), ProcessError> + Send + 'static,
+    ) -> Result<PreparingLaunch, ProcessError> {
+        PreparingLaunch::new_with_validation(plan.clone(), validation)
+    }
 
     fn start_with_operations(
         plan: &LaunchPlan,
@@ -158,6 +170,18 @@ impl ProcessSupervisor {
     ) -> Result<LaunchHandle, ProcessError> {
         operations.check_cancelled()?;
         plan.validate().map_err(ProcessError::InvalidPlan)?;
+        let pinned_msi = plan
+            .msi_install
+            .as_ref()
+            .map(|binding| PinnedMsiInputs::pin(binding, operations.cancellation()))
+            .transpose()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    ProcessError::Cancelled
+                } else {
+                    ProcessError::InvalidRuntimeEvidence("MSI package or runtime tool")
+                }
+            })?;
         verify_guest_inputs(plan)?;
         verify_pinned_runtime(plan)?;
         verify_pinned_font_config(plan)?;
@@ -197,26 +221,38 @@ impl ProcessSupervisor {
             operations.guest_alias(plan),
         )?;
         let keep_alive_after_root_exit = managed_wine_gui_requires_idle_wait(plan);
+        // Installers retain bounded diagnostic output even while waiting for
+        // Wine idle. The owned tree is stopped before readers are drained.
+        let discard_output = keep_alive_after_root_exit && plan.msi_install.is_none();
 
         let mut command = Command::new(&plan.process.executable);
+        let arguments = match &pinned_msi {
+            Some(inputs) => inputs
+                .execution_arguments()
+                .map_err(|_| ProcessError::InvalidRuntimeEvidence("pinned MSI command"))?,
+            None => execution_arguments(plan, guest_execution_alias.as_deref()),
+        };
         command
-            .args(execution_arguments(plan, guest_execution_alias.as_deref()))
+            .args(arguments)
             .current_dir(&plan.process.working_directory)
             .env_clear()
             .envs(&plan.process.environment)
             .stdin(Stdio::null())
-            .stdout(if keep_alive_after_root_exit {
-                Stdio::null()
-            } else {
-                Stdio::piped()
-            })
-            .stderr(if keep_alive_after_root_exit {
-                Stdio::null()
-            } else {
-                Stdio::piped()
-            });
+            .stdout(if discard_output { Stdio::null() } else { Stdio::piped() })
+            .stderr(if discard_output { Stdio::null() } else { Stdio::piped() });
 
-        supervise_command_with_operations(plan, command, startup_guard, (), operations, || {
+        let retained_inputs = pinned_msi.as_ref().map_or_else(Vec::new, PinnedMsiInputs::files);
+        supervise_command_with_operations(plan, command, startup_guard, (), retained_inputs, operations, || {
+            operations.check_cancelled()?;
+            if let Some(inputs) = &pinned_msi {
+                inputs.revalidate(operations.cancellation()).map_err(|error| {
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        ProcessError::Cancelled
+                    } else {
+                        ProcessError::InvalidRuntimeEvidence("held MSI package or runtime tool")
+                    }
+                })?;
+            }
             verify_guest_inputs(plan)?;
             // Recheck the actual alias too; the binding source alone cannot
             // prove that a replaced alias still names the approved bytes.
@@ -249,6 +285,9 @@ mod preparing;
 pub use preparing::PreparingLaunch;
 
 trait StartupOperations {
+    fn cancellation(&self) -> Option<&AtomicBool> {
+        None
+    }
     fn check_cancelled(&self) -> Result<(), ProcessError> {
         Ok(())
     }
@@ -669,6 +708,7 @@ fn start_pinned_bottle_macos(plan: &LaunchPlan, pinned: &PinnedBottleExecutable)
         command,
         startup_guard,
         execution,
+        Vec::new(),
         &SystemStartupOperations,
         || {
             pinned.revalidate().map_err(|_| pinned_launch_failed())?;
@@ -699,7 +739,8 @@ fn validate_existing_pinned_directory(path: &Path) -> Result<(), ProcessError> {
 }
 
 fn managed_wine_gui_requires_idle_wait(plan: &LaunchPlan) -> bool {
-    plan.bottle_executable.is_some()
+    plan.msi_install.is_some()
+        || plan.bottle_executable.is_some()
         || plan
             .guest_artifact
             .as_ref()
@@ -738,6 +779,7 @@ fn supervise_command_with_operations<G>(
     mut command: Command,
     mut startup_guard: Option<StartupWineSessionGuard>,
     parent_execution_guard: G,
+    retained_execution_inputs: Vec<Arc<std::fs::File>>,
     operations: &impl StartupOperations,
     before_spawn: impl FnOnce() -> Result<(), ProcessError>,
 ) -> Result<LaunchHandle, ProcessError> {
@@ -802,6 +844,7 @@ fn supervise_command_with_operations<G>(
         completion_lock: Mutex::new(()),
         active_operations: Mutex::new(0),
         workers: Mutex::new(Vec::new()),
+        _retained_execution_inputs: retained_execution_inputs,
     });
 
     emitter.emit(RuntimeEventKind::Started, Some(process_id), None, None, None);
@@ -1599,6 +1642,7 @@ enum TerminationReason {
 }
 
 struct TerminationController {
+    _retained_execution_inputs: Vec<Arc<std::fs::File>>,
     child: Arc<Mutex<Child>>,
     process_tree: Arc<platform::ProcessTree>,
     emitter: Arc<EventEmitter>,
@@ -4305,6 +4349,7 @@ mod tests {
             },
             guest_artifact: None,
             bottle_executable: None,
+            msi_install: None,
             mounts: Vec::new(),
             sandbox: SandboxPolicy {
                 profile: SandboxProfile::Desktop,
@@ -6276,6 +6321,96 @@ mod tests {
             }
         }
         events
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn msi_root_success_waits_for_active_wine_work_and_keeps_cancel_and_timeout_live() {
+        // Exercise the supervisor after the verified-input boundary. These shell
+        // fixtures model a successful root with outstanding Wine work, not MSI installation.
+        for completion in ["idle", "cancel", "timeout"] {
+            let fixture = RuntimeEvidenceFixture::new();
+            let mut plan = fixture.plan.clone();
+            let started = fixture.root.join("idle-wait-started");
+            let release = fixture.root.join("release");
+            let server = &plan.lifecycle.wineserver.as_ref().unwrap().executable;
+            std::fs::write(server, b"#!/bin/sh\nif [ \"$1\" = -k ]; then\n : > \"$COMPATFORGE_MSI_TEST_RELEASE\"\nelif [ \"$1\" = -w ] && [ ! -e \"$COMPATFORGE_MSI_TEST_RELEASE\" ]; then\n : > \"$COMPATFORGE_MSI_TEST_STARTED\"\n while [ ! -e \"$COMPATFORGE_MSI_TEST_RELEASE\" ]; do /bin/sleep 0.01; done\nfi\n").unwrap();
+            plan.process.environment.insert(
+                WINESERVER_EXECUTABLE_DIGEST_ENV.into(),
+                sha256_file(Path::new(server)).unwrap(),
+            );
+            plan.process.environment.insert(
+                "COMPATFORGE_MSI_TEST_STARTED".into(),
+                started.to_string_lossy().into_owned(),
+            );
+            plan.process.environment.insert(
+                "COMPATFORGE_MSI_TEST_RELEASE".into(),
+                release.to_string_lossy().into_owned(),
+            );
+            plan.lifecycle.maximum_runtime_milliseconds = Some(1000);
+            plan.guest_artifact = None;
+            let tool = fixture.root.join("msiexec.exe");
+            let stored = fixture.root.join("package.msi");
+            plan.msi_install = Some(serde_json::from_value(serde_json::json!({
+                "package":{"package":{"path":stored,"fileName":"package.msi","sha256":"a".repeat(64),"sizeBytes":16384,"mediaType":"application/x-msi"},"storedPath":stored,"architecture":"x86_64"},
+                "handler":{"kind":"msiexec","action":"install","ui":"none","reboot":"suppress","properties":{}},
+                "tool":{"packId":plan.runtime.pack_id,"packDigest":plan.runtime.pack_digest,"path":tool,"digest":format!("sha256:{}", "b".repeat(64)),"architecture":"x86_64"},
+                "maximumRuntimeMilliseconds":1000
+            })).unwrap());
+            plan.process.arguments = plan.msi_install.as_ref().unwrap().arguments().unwrap();
+            plan.validate().unwrap();
+            materialize_launch_directories(&plan).unwrap();
+            let guard = WineSession::acquire(&plan).unwrap().map(StartupWineSessionGuard::new);
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "exit 0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let handle = supervise_command_with_operations(
+                &plan,
+                command,
+                guard,
+                (),
+                Vec::new(),
+                &SystemStartupOperations,
+                || Ok(()),
+            )
+            .unwrap();
+            let mut events = Vec::new();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !started.exists() && Instant::now() < deadline {
+                if let EventPoll::Event(event) = handle.next_event(PROCESS_POLL_INTERVAL) {
+                    events.push(event);
+                }
+            }
+            // Save the assertion until cleanup so the red test cannot leak workers.
+            let outstanding_work_was_waited_for = started.exists() && !handle.is_finished();
+            match completion {
+                "idle" => std::fs::write(&release, b"idle").unwrap(),
+                "cancel" => handle.terminate().unwrap(),
+                _ => (),
+            }
+            events.extend(collect_until_exit(&handle, Instant::now() + Duration::from_secs(8)));
+            let cleanup = handle.terminate_and_wait(Duration::from_secs(2));
+            assert!(cleanup.is_ok(), "{completion}: {cleanup:?}; events: {events:?}");
+            assert!(
+                outstanding_work_was_waited_for,
+                "root success prematurely completed {completion}"
+            );
+            assert_eq!(events.last().map(|e| e.kind), Some(RuntimeEventKind::Exited));
+            assert_eq!(handle.controller.worker_count(), 0);
+            let terminated = events.iter().any(|e| {
+                matches!(
+                    e.kind,
+                    RuntimeEventKind::TerminateRequested | RuntimeEventKind::TimedOut
+                )
+            });
+            assert_eq!(terminated, completion != "idle", "{completion}");
+            if completion == "timeout" {
+                assert!(events.iter().any(|e| e.kind == RuntimeEventKind::TimedOut));
+            }
+        }
     }
 
     #[test]

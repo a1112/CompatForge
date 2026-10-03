@@ -39,7 +39,8 @@ pub use model::{
     ApplicationDefinition, ApplicationRecord, ApplicationStatus, ApplicationSummary, AssessmentCheck,
     AssessmentOutcome, BottleArchive, BottleStatus, BottleSummary, CheckOutcome, CompatibilityRating,
     GuestArchitecture, InstallerDefinition, JobAssessment, JobKind, JobPollResult, JobRecord, JobRequest, JobStatus,
-    LauncherDefinition, ModelError, ServiceConfig, ServiceRequest, ServiceResponse, ServiceSettings, WindowsVersion,
+    LauncherDefinition, ModelError, MsiInstallerDefinition, ServiceConfig, ServiceRequest, ServiceResponse,
+    ServiceSettings, WindowsVersion,
 };
 
 use compatforge_domain::{CoreConfig, SCHEMA_VERSION_V1};

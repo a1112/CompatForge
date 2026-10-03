@@ -2,7 +2,11 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod msi_package;
 mod pinned_platform;
+pub use msi_package::{
+    inspect_msi_installer_tool, inspect_msi_package, verify_msi_package_contents, MsiPackageStore, PinnedMsiInputs,
+};
 
 use compatforge_domain::{
     BottleExecutableBinding, ContractError, CpuArchitecture, GuestArtifactBinding, SCHEMA_VERSION_V1,

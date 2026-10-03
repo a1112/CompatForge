@@ -37,17 +37,18 @@ def validate_install_request(value: dict[str, object]) -> dict[str, object]:
     if (
         not isinstance(package_path, str)
         or len(package_path.encode("utf-8")) > 4096
+        or any(ord(c) <= 31 or 127 <= ord(c) <= 159 for c in package_path)
         or not Path(package_path).is_absolute()
         or ".." in Path(package_path).parts
     ):
         raise ContractError("package.path must be absolute and non-traversing")
     file_name = portable_component(package["fileName"], "package.fileName")
-    if not file_name.casefold().endswith(".msi"):
+    if re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9 ._()+-]{0,250}\.[mM][sS][iI]', file_name) is None:
         raise ContractError("package.fileName must use the .msi extension")
     if Path(package_path).name != file_name:
         raise ContractError("package.fileName does not match package.path")
     digest(package["sha256"], "package.sha256")
-    if not isinstance(package["sizeBytes"], int) or not 1 <= package["sizeBytes"] <= 1024 * 1024 * 1024:
+    if type(package["sizeBytes"]) is not int or not 1 <= package["sizeBytes"] <= 2 * 1024 * 1024 * 1024:
         raise ContractError("package size is outside the fixed bound")
     if package["mediaType"] != "application/x-msi":
         raise ContractError("package mediaType is unsupported")
@@ -61,13 +62,26 @@ def validate_install_request(value: dict[str, object]) -> dict[str, object]:
     if handler["ui"] not in {"none", "basic"} or handler["reboot"] != "suppress":
         raise ContractError("handler UI/reboot policy is unsupported")
     properties = handler["properties"]
-    if not isinstance(properties, dict) or len(properties) > 64:
+    if not isinstance(properties, dict) or len(properties) > 5:
         raise ContractError("handler properties exceed the fixed bound")
     for key, item in properties.items():
         if PROPERTY.fullmatch(key) is None:
             raise ContractError("handler property name is not canonical")
         if not isinstance(item, str) or len(item.encode("utf-8")) > 4096:
             raise ContractError("handler property value exceeds the fixed bound")
+        if key == 'ALLUSERS':
+            valid = item in {'1', '2'}
+        elif key == 'MSIINSTALLPERUSER':
+            valid = item == '1'
+        elif key in {'INSTALLDIR', 'INSTALLFOLDER', 'TARGETDIR'}:
+            valid = (item.startswith('C:\\') and len(item) > 3
+                     and not any(not 33 <= ord(c) <= 126 or c in '\"<>|?*/=' for c in item)
+                     and ':' not in item[3:]
+                     and not any(part in {'', '.', '..'} or part.endswith(('.', ' ')) for part in item[3:].split('\\')))
+        else:
+            valid = False
+        if not valid:
+            raise ContractError('unauthorized msiexec property')
 
     constraints = value["constraints"]
     if not isinstance(constraints, dict):
@@ -81,7 +95,7 @@ def validate_install_request(value: dict[str, object]) -> dict[str, object]:
     if constraints["networkPolicy"] not in {"deny", "installer-only"}:
         raise ContractError("install network policy is unsupported")
     maximum = constraints["maximumRuntimeMilliseconds"]
-    if not isinstance(maximum, int) or not 1000 <= maximum <= 3_600_000:
+    if type(maximum) is not int or not 1000 <= maximum <= 3_600_000:
         raise ContractError("install maximum runtime is outside the fixed bound")
     return value
 

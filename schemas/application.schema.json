@@ -55,6 +55,9 @@
         },
         "arguments": {
           "$ref": "#/$defs/arguments"
+        },
+        "msi": {
+          "$ref": "msi-installer-definition.schema.json"
         }
       },
       "description": "Managed installation requires sha256. Legacy definitions may omit it but cannot be executed by jobs.submit."

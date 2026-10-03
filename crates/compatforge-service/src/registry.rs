@@ -572,6 +572,7 @@ fn baseline_application(
         category: "utilities".into(),
         bottle_id: bottle_id.into(),
         installer: Some(InstallerDefinition {
+            msi: None,
             file_name: installer_name.into(),
             sha256: Some(installer_sha256.into()),
             arguments: if id == "sumatrapdf" {
