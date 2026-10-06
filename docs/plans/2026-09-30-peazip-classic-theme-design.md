@@ -1,6 +1,6 @@
 # PeaZip classic-theme compatibility profile
 
-Status: proposed for review; no runtime implementation or publication yet.
+Status: approved by the user on 2026-09-30; implementation and publication pending.
 
 ## Verified problem and scope
 
