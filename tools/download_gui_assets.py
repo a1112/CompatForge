@@ -221,6 +221,7 @@ ALLOWED_HOSTS = {
     "7-zip.org",
     "www.sumatrapdfreader.org",
     "sumatrapdfreader.org",
+    "files.sumatrapdfreader.org",
     "files2.sumatrapdfreader.org",
     "github.com",
     "objects.githubusercontent.com",

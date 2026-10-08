@@ -10,6 +10,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{AppHandle, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -311,6 +313,61 @@ fn open_settings(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn ensure_tray(app: &AppHandle) -> Result<(), String> {
+    if app.tray_by_id("compatforge").is_some() {
+        return Ok(());
+    }
+    let icon = app.default_window_icon().ok_or("缺少托盘图标")?;
+    let show = MenuItem::with_id(app, "show-main", "显示 CompatForge", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let quit =
+        MenuItem::with_id(app, "quit", "退出 CompatForge", true, None::<&str>).map_err(|error| error.to_string())?;
+    let menu = Menu::with_items(app, &[&show, &quit]).map_err(|error| error.to_string())?;
+    TrayIconBuilder::with_id("compatforge")
+        .icon(icon.clone())
+        .tooltip("CompatForge")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show-main" => show_main_window(app),
+            "quit" => {
+                app.state::<AppState>().shutdown();
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn close_to_background_enabled(state: &AppState) -> bool {
+    let service = state.runtime.lock().ok().and_then(|runtime| runtime.service.clone());
+    service
+        .and_then(|service| service.get_settings().ok())
+        .is_some_and(|settings| settings.close_to_background)
+}
+
 fn bootstrap_core(
     runtime_store_root: &Path,
     storage_root: &Path,
@@ -462,22 +519,38 @@ where
         .build(tauri::generate_context!())
         .map_err(|_| DESKTOP_LAUNCH_FAILED)?;
 
-    application.run(|app_handle, event| {
-        if matches!(event, RunEvent::Exit)
-            || matches!(
-                event,
-                RunEvent::WindowEvent {
-                    ref label,
-                    event: WindowEvent::CloseRequested { .. },
-                    ..
-                } if label == "main"
-            )
-        {
-            app_handle.state::<AppState>().shutdown();
+    application.run(|app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_main_window(app_handle),
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            let state = app_handle.state::<AppState>();
+            if close_to_background_enabled(&state)
+                && ensure_tray(app_handle).is_ok()
+                && app_handle
+                    .get_webview_window("main")
+                    .is_some_and(|window| window.hide().is_ok())
+            {
+                if let Some(settings) = app_handle.get_webview_window("settings") {
+                    let _ = settings.hide();
+                }
+                api.prevent_close();
+            } else {
+                state.shutdown();
+                app_handle.exit(0);
+            }
         }
+        RunEvent::Exit => app_handle.state::<AppState>().shutdown(),
+        _ => {}
     });
     Ok(())
 }
+
+#[cfg(test)]
+mod window_tests;
 
 #[cfg(test)]
 mod tests {

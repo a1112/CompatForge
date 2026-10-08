@@ -3991,6 +3991,9 @@ class MacWinPatchProvenanceTests(unittest.TestCase):
 
             def wrap_ordinary_binding(*arguments, **options):
                 errors, binding = original_scan(*arguments, **options)
+                # The recovery scan after rejecting the mutation is unbound.
+                if len(arguments) < 3 or arguments[2] is None:
+                    return errors, binding
                 return errors, PostOrdinaryMutation(binding)
 
             with mock.patch.object(
@@ -8798,14 +8801,16 @@ class MacWinMigrationTransactionTests(unittest.TestCase):
             )
 
     def test_scan_rejects_casefold_colliding_current_paths_on_case_sensitive_filesystem(self) -> None:
-        if os.path.normcase("A") == os.path.normcase("a"):
-            self.skipTest("case-colliding names cannot coexist on this filesystem")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             generated = root / "migration/macwin/generated"
             generated.mkdir(parents=True)
             (generated / "A.json").write_bytes(b"{}\n")
-            (generated / "a.json").write_bytes(b"{}\n")
+            try:
+                with (generated / "a.json").open("xb") as lowercase:
+                    lowercase.write(b"{}\n")
+            except FileExistsError:
+                self.skipTest("case-colliding names cannot coexist on this filesystem")
             with self.assertRaises(self.converter.ConversionError):
                 self.converter.read_generated_documents(root)
 
@@ -8913,14 +8918,15 @@ class MacWinMigrationTransactionTests(unittest.TestCase):
                 parent_descriptor,
             )
             try:
-                before = len(os.listdir("/proc/self/fd"))
+                fd_directory = "/dev/fd" if sys.platform == "darwin" else "/proc/self/fd"
+                before = len(os.listdir(fd_directory))
                 with mock.patch.object(
                     self.converter.os,
                     "fstat",
                     side_effect=OSError("injected post-open failure"),
                 ), self.assertRaises(self.converter.ConversionError):
                     self.converter._open_bound_child(parent, "child")
-                self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+                self.assertEqual(len(os.listdir(fd_directory)), before)
             finally:
                 os.close(parent_descriptor)
 
@@ -8943,7 +8949,8 @@ class MacWinMigrationTransactionTests(unittest.TestCase):
                     raise OSError("injected destination parent open failure")
                 return original_open(path, *args, **kwargs)
 
-            before = len(os.listdir("/proc/self/fd"))
+            fd_directory = "/dev/fd" if sys.platform == "darwin" else "/proc/self/fd"
+            before = len(os.listdir(fd_directory))
             with mock.patch.object(
                 self.converter.os, "open", side_effect=fail_destination
             ), self.assertRaises(OSError):
@@ -8952,7 +8959,7 @@ class MacWinMigrationTransactionTests(unittest.TestCase):
                     destination_parent / "value",
                     exchange=False,
                 )
-            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+            self.assertEqual(len(os.listdir(fd_directory)), before)
 
     def test_every_install_failure_restores_the_exact_mixed_tree(self) -> None:
         initial = {
@@ -13300,8 +13307,10 @@ class MacWinMigrationSideEffectTests(unittest.TestCase):
             try:
                 metadata = os.fstat(descriptor)
                 opened = resolved_path(path, dir_fd=dir_fd)
-                if self._path_is_within(opened, approved_root) and (
-                    flags & write_flags or stat.S_ISDIR(metadata.st_mode)
+                # Read-only ancestor handles are needed to resolve openat paths;
+                # audit_path still rejects every write outside approved_root.
+                if stat.S_ISDIR(metadata.st_mode) or (
+                    self._path_is_within(opened, approved_root) and flags & write_flags
                 ):
                     descriptor_paths[descriptor] = opened
                     descriptor_identities[descriptor] = self._snapshot_identity(metadata)

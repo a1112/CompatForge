@@ -85,6 +85,22 @@ def write_text(path: Path, text: str, mode: int = 0o644) -> None:
     path.chmod(mode)
 
 
+def crossover_ntdll(runtime_root: Path, wine: Path) -> Path:
+    for candidate in (
+        wine.parent / "ntdll.so",
+        runtime_root / "lib" / "wine" / "x86_64-unix" / "ntdll.so",
+    ):
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        if runtime_root not in resolved.parents:
+            raise PreparationError("CrossOver ntdll.so escapes materialized root")
+        if resolved.is_file():
+            return resolved
+    raise PreparationError("CrossOver ntdll.so is unavailable")
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     value.add_argument("--runtime-id", required=True, choices=RUNTIME_IDS)
@@ -583,10 +599,11 @@ def prepare(arguments: argparse.Namespace) -> dict[str, str]:
         app_executable.parent.mkdir(parents=True, exist_ok=True)
         if runtime_id == "crossover":
             shutil.copy2(wine, app_executable)
-            ntdll = wine.parent / "ntdll.so"
-            if not ntdll.is_file():
-                raise PreparationError("CrossOver ntdll.so is unavailable")
+            ntdll = crossover_ntdll(runtime_root, wine)
             os.symlink(ntdll, app_executable.parent / "ntdll.so")
+            if ntdll == runtime_root / "lib/wine/x86_64-unix/ntdll.so":
+                # New loaders locate their Unix modules relative to Contents/MacOS.
+                os.symlink(runtime_root / "lib", app_executable.parent.parent / "lib")
         else:
             observer_c = output_root / "provenance" / "observer-launcher.c"
             write_text(observer_c, observer_launcher_source(wine, wineserver))
