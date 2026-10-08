@@ -1803,12 +1803,20 @@ fn pump_output<R: Read>(
                 return Err(error);
             }
         };
-        let available = budget
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                Some(remaining.saturating_sub(count))
-            })
-            .expect("reservation always succeeds");
+        // CAS retains the declared MSRV without using the deprecated fetch_update
+        // or the newer try_update API, while sharing one exact stdout/stderr budget.
+        let mut available = budget.remaining.load(Ordering::Acquire);
+        loop {
+            match budget.remaining.compare_exchange_weak(
+                available,
+                available.saturating_sub(count),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => available = actual,
+            }
+        }
         let reserved = available.min(count);
         filled += reserved;
         if filled == buffer.len() || reserved != count {
