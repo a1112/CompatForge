@@ -346,6 +346,7 @@ dependencies = [
  "compatforge-capability",
  "compatforge-domain",
  "compatforge-inspect",
+ "compatforge-native-window-corners",
  "compatforge-orchestrator",
  "compatforge-process",
  "compatforge-provider-macos",
@@ -383,6 +384,13 @@ dependencies = [
  "libc",
  "serde",
  "sha2",
+]
+
+[[package]]
+name = "compatforge-native-window-corners"
+version = "0.1.0"
+dependencies = [
+ "tauri",
 ]
 
 [[package]]

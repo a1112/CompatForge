@@ -47,3 +47,5 @@ clipped by its native CALayer at 10 points (zero when maximized/fullscreen), on
 the AppKit main thread. Linux outer geometry remains compositor-owned.
 Frameless web content uses matching 8px (Windows/Linux) / 10px (macOS) clipping,
 with --project-window-radius available to application styles. Mobile unchanged.
+
+The native corner ABI bridge is isolated in `native-window-corners`; the desktop application retains `forbid(unsafe_code)`. Its public API only accepts a live Tauri Window, retains macOS window ownership until the main-thread callback, checks native handles, and contains all raw pointer/ABI calls.

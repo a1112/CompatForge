@@ -1,0 +1,13 @@
+[package]
+name = "compatforge-native-window-corners"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tauri = { version = "=2.11.5", features = ["macos-private-api"] }
+
+[workspace]
+
+[lints.clippy]
+all = "deny"

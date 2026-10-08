@@ -3600,11 +3600,18 @@ mod tests {
                 if self.denied {
                     return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                 }
-                return Ok(self
-                    .alive_probes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
-                    .unwrap()
-                    > 0);
+                let mut remaining = self.alive_probes.load(Ordering::Relaxed);
+                loop {
+                    match self.alive_probes.compare_exchange_weak(
+                        remaining,
+                        remaining.saturating_sub(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Ok(remaining > 0),
+                        Err(actual) => remaining = actual,
+                    }
+                }
             }
             Ok(true)
         }
