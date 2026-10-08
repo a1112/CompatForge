@@ -5344,7 +5344,10 @@ mod tests {
         // Parallel tests may reuse a closed descriptor number for another file.
         if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } == 0 {
             let metadata = unsafe { metadata.assume_init() };
-            assert_ne!((metadata.st_dev as u64, metadata.st_ino), (original.dev(), original.ino()));
+            assert_ne!(
+                (metadata.st_dev as u64, metadata.st_ino),
+                (original.dev(), original.ino())
+            );
         } else {
             assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }

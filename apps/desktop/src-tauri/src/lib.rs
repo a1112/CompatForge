@@ -487,7 +487,8 @@ where
     S: Into<OsString>,
 {
     let options = DesktopLaunchOptions::parse(arguments)?;
-    let application = tauri::Builder::default().plugin(project_window_chrome::init())
+    let application = tauri::Builder::default()
+        .plugin(project_window_chrome::init())
         .plugin(project_resource_monitor::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {

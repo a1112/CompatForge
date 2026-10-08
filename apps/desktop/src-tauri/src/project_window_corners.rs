@@ -9,15 +9,9 @@ pub fn apply<R: tauri::Runtime>(window: &tauri::Window<R>) {
     use std::ffi::c_void;
     #[link(name = "dwmapi")]
     unsafe extern "system" {
-        fn DwmSetWindowAttribute(
-            hwnd: *mut c_void,
-            attribute: u32,
-            value: *const c_void,
-            size: u32,
-        ) -> i32;
+        fn DwmSetWindowAttribute(hwnd: *mut c_void, attribute: u32, value: *const c_void, size: u32) -> i32;
     }
-    let (Ok(hwnd), Ok(maximized), Ok(fullscreen)) =
-        (window.hwnd(), window.is_maximized(), window.is_fullscreen())
+    let (Ok(hwnd), Ok(maximized), Ok(fullscreen)) = (window.hwnd(), window.is_maximized(), window.is_fullscreen())
     else {
         return;
     };
@@ -25,14 +19,7 @@ pub fn apply<R: tauri::Runtime>(window: &tauri::Window<R>) {
     // snapping policy. No SetWindowRgn: regions disable DWM's antialiased corners.
     let preference: u32 = if square(maximized, fullscreen) { 1 } else { 2 };
     // SAFETY: Tauri owns a live HWND; the DWORD pointer remains valid for this call.
-    let result = unsafe {
-        DwmSetWindowAttribute(
-            hwnd.0 as *mut c_void,
-            33,
-            (&preference as *const u32).cast(),
-            4,
-        )
-    };
+    let result = unsafe { DwmSetWindowAttribute(hwnd.0 as *mut c_void, 33, (&preference as *const u32).cast(), 4) };
     // Pre-Windows-11/compositor restrictions are a supported graceful fallback.
     // Never fail startup or replace the user's window with a region-shaped one.
     let _ = result;
@@ -46,11 +33,7 @@ pub fn apply<R: tauri::Runtime>(window: &tauri::Window<R>) {
     let (Ok(maximized), Ok(fullscreen)) = (window.is_maximized(), window.is_fullscreen()) else {
         return;
     };
-    let radius = if square(maximized, fullscreen) {
-        0.0
-    } else {
-        10.0
-    };
+    let radius = if square(maximized, fullscreen) { 0.0 } else { 10.0 };
     let owned = window.clone();
     let _ = window.run_on_main_thread(move || {
         use std::ffi::{c_char, c_void};
@@ -95,16 +78,8 @@ pub fn apply<R: tauri::Runtime>(window: &tauri::Window<R>) {
                 return;
             }
             set_bool(handle, sel_registerName(c"setOpaque:".as_ptr()), false);
-            set_object(
-                handle,
-                sel_registerName(c"setBackgroundColor:".as_ptr()),
-                clear,
-            );
-            set_double(
-                layer,
-                sel_registerName(c"setCornerRadius:".as_ptr()),
-                radius,
-            );
+            set_object(handle, sel_registerName(c"setBackgroundColor:".as_ptr()), clear);
+            set_double(layer, sel_registerName(c"setCornerRadius:".as_ptr()), radius);
             set_bool(layer, sel_registerName(c"setMasksToBounds:".as_ptr()), true);
             send_void(handle, sel_registerName(c"invalidateShadow".as_ptr()));
         }
