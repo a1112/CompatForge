@@ -1803,12 +1803,20 @@ fn pump_output<R: Read>(
                 return Err(error);
             }
         };
-        let available = budget
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                Some(remaining.saturating_sub(count))
-            })
-            .expect("reservation always succeeds");
+        // CAS retains the declared MSRV without using the deprecated fetch_update
+        // or the newer try_update API, while sharing one exact stdout/stderr budget.
+        let mut available = budget.remaining.load(Ordering::Acquire);
+        loop {
+            match budget.remaining.compare_exchange_weak(
+                available,
+                available.saturating_sub(count),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => available = actual,
+            }
+        }
         let reserved = available.min(count);
         filled += reserved;
         if filled == buffer.len() || reserved != count {
@@ -3592,11 +3600,18 @@ mod tests {
                 if self.denied {
                     return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                 }
-                return Ok(self
-                    .alive_probes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
-                    .unwrap()
-                    > 0);
+                let mut remaining = self.alive_probes.load(Ordering::Relaxed);
+                loop {
+                    match self.alive_probes.compare_exchange_weak(
+                        remaining,
+                        remaining.saturating_sub(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Ok(remaining > 0),
+                        Err(actual) => remaining = actual,
+                    }
+                }
             }
             Ok(true)
         }
@@ -5337,12 +5352,30 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn assert_descriptor_no_longer_references(descriptor: i32, original: &std::fs::Metadata) {
+        use std::os::unix::fs::MetadataExt;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat borrows the number and initializes the buffer only on success.
+        // Parallel tests may reuse a closed descriptor number for another file.
+        if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } == 0 {
+            let metadata = unsafe { metadata.assume_init() };
+            assert_ne!(
+                (metadata.st_dev as u64, metadata.st_ino),
+                (original.dev(), original.ino())
+            );
+        } else {
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn pinned_process_owned_duplicate_is_rewound_inheritable_and_caller_lease_stays_valid() {
         use std::os::fd::AsRawFd;
 
         let (root, pinned, _plan, _bytes, _output, _arguments, _gate) = macos_pinned_fixture("owned-duplicate");
         let execution = ProcessOwnedPinnedExecution::duplicate(&pinned).unwrap();
+        let original_metadata = execution.file.metadata().unwrap();
         let descriptor = execution.file.as_raw_fd();
         // SAFETY: `descriptor` belongs to the live `execution` file and lseek
         // only reads its current kernel-maintained offset.
@@ -5352,9 +5385,7 @@ mod tests {
         assert!(flags >= 0);
         assert_eq!(flags & libc::FD_CLOEXEC, 0);
         drop(execution);
-        // SAFETY: querying the former number proves this owner closed it; no
-        // ownership is reconstructed from the raw integer.
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        assert_descriptor_no_longer_references(descriptor, &original_metadata);
         pinned.revalidate().unwrap();
         drop(pinned);
         std::fs::remove_dir_all(root).unwrap();
@@ -5364,6 +5395,7 @@ mod tests {
     #[test]
     fn pinned_start_inherits_only_the_process_duplicate_and_closes_the_parent_copy() {
         let (root, pinned, plan, bytes, output, arguments, gate) = macos_pinned_fixture("start");
+        let original_metadata = std::fs::metadata(&pinned.binding().path).unwrap();
         let handle = ProcessSupervisor::start_pinned_bottle(&plan, &pinned).unwrap();
         pinned.revalidate().unwrap();
         std::fs::write(gate, b"revalidation-complete").unwrap();
@@ -5379,9 +5411,7 @@ mod tests {
         let lines = child_arguments.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 1);
         let descriptor = lines[0].strip_prefix("/dev/fd/").unwrap().parse::<i32>().unwrap();
-        // SAFETY: F_GETFD does not take ownership. The process-owned parent
-        // descriptor must already be closed once spawn returned.
-        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1);
+        assert_descriptor_no_longer_references(descriptor, &original_metadata);
 
         handle.terminate().unwrap();
         let events = collect_until_exit(&handle, Instant::now() + Duration::from_secs(5));

@@ -174,15 +174,22 @@ python3 -S -B tools/discover_macos_wine.py --all
 
 ## GUI certification soak
 
-长期 GUI 测试是 Apple Silicon macOS 上的显式门禁，不进入默认 CI：
+长期 GUI 测试是 Apple Silicon macOS 上的显式门禁，不进入默认 CI。先以固定 Runtime 选择运行一个独立 canary：
 
 ```text
 python3 -S -B tools/run_gui_soak.py \
-  --compatforge-cli /absolute/path/to/compatforge-cli \
+  --compatforge-cli /absolute/external/build/compatforge-cli \
   --cache-root /absolute/external/cache \
-  --output-root /absolute/external/soak-60 \
-  --cycles 60
+  --output-root /absolute/external/soak-canary \
+  --cycles 1 \
+  --runtime-id crossover \
+  --wine-root /absolute/external/runtime-root \
+  --wine Contents/SharedSupport/CrossOver/bin/wine \
+  --wineserver Contents/SharedSupport/CrossOver/bin/wineserver \
+  --version fixed-discovered-version
 ```
+
+正式运行使用新的空输出根，并且相对 canary 只修改 `--output-root` 和 `--cycles 60`；完整 Runtime 选择与应用闭集保持不变。canary 和正式运行都必须离线执行，不得传入 `--allow-network`，五个固定摘要资产必须在第 1 轮之前完成缓存复验。正式门禁要求精确的 `60/60` 已完成轮次和 `300/300` 已完成且已验证应用生命周期，`hardFailures`、`infrastructureBlocked`、`cleanupFailures` 与 `residualProcessFailures` 均为 0，并且 60 轮共享一个稳定、无路径的 Runtime 投影；在真实 Apple Silicon 证据满足这些条件前，不得声明 M0 通过。
 
 每轮必须使用新 Bottle，并保留固定包摘要、PE inspection、目标窗口、非空截图、退出事件、Bottle 清理和空残留进程证据。`policy-blocked` 的人工交互项不构成 soak 硬失败，但 soak 通过也不能替代 schemaVersion 2 的人工签署。锁屏或桌面观察基础设施不可用必须保持 `unverified`。
 

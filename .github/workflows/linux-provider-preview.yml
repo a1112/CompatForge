@@ -34,7 +34,10 @@ jobs:
         with:
           components: clippy,rustfmt
       - name: Run Linux schema and native contracts
-        run: python3 -S -B -m unittest tests.test_linux_provider_contracts -v
+        # A dedicated PID namespace gives the native observer a complete proc view.
+        # The hosted runner contains same-UID services with unreadable environments;
+        # production intentionally fails closed when such visibility is incomplete.
+        run: sudo unshare --mount --pid --fork --mount-proc -- env "PATH=$PATH" python3 -S -B -m unittest tests.test_linux_provider_contracts -v
       - name: Validate repository contracts
         run: python3 -B scripts/validate_repository.py
       - name: Check formatting

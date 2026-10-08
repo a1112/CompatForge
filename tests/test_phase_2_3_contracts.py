@@ -107,13 +107,18 @@ class Phase23ContractTests(unittest.TestCase):
         }
 
     def install_request(self) -> dict[str, object]:
+        package_path = (
+            Path(tempfile.gettempdir()).resolve()
+            / "compatforge-external-fixtures"
+            / "msi-install-smoke.msi"
+        )
         return {
             "schemaVersion": "1",
             "requestId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "bottleId": "msi-smoke-x64",
             "recipeId": "probe.msi-install-smoke",
             "package": {
-                "path": "/external/fixtures/msi-install-smoke.msi",
+                "path": str(package_path),
                 "fileName": "msi-install-smoke.msi",
                 "sha256": "f" * 64,
                 "sizeBytes": 16384,

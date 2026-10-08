@@ -11,11 +11,7 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
             .on_window_ready(|window| project_window_corners::apply(&window))
             .js_init_script(include_str!("project-window-chrome.js").replace(
                 "__PROJECT_CHROME_MACOS__",
-                if cfg!(target_os = "macos") {
-                    "true"
-                } else {
-                    "false"
-                },
+                if cfg!(target_os = "macos") { "true" } else { "false" },
             ))
             .on_event(|app, event| {
                 if let tauri::RunEvent::WindowEvent { label, event, .. } = event {
@@ -27,9 +23,7 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
                     ) {
                         if let Some(window) = app.get_webview_window(label) {
                             project_window_corners::apply(&window.as_ref().window());
-                            let _ = window.eval(
-                                "window.dispatchEvent(new Event('project-native-window-state'))",
-                            );
+                            let _ = window.eval("window.dispatchEvent(new Event('project-native-window-state'))");
                         }
                     }
                 }

@@ -40,17 +40,11 @@ fn descendants(root: u32, parents: &[(u32, Option<u32>)]) -> HashSet<u32> {
 
 impl Sampler {
     fn sample(&mut self) -> Result<Snapshot, String> {
-        if !cfg!(any(
-            target_os = "windows",
-            target_os = "linux",
-            target_os = "macos"
-        )) {
+        if !cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos")) {
             return Err("Resource sampling is unavailable on this platform".into());
         }
         let now = Instant::now();
-        let elapsed = self
-            .sampled_at
-            .map(|at| now.duration_since(at).as_secs_f64());
+        let elapsed = self.sampled_at.map(|at| now.duration_since(at).as_secs_f64());
         if elapsed.is_some_and(|seconds| seconds < 1.0) {
             if let Some(snapshot) = &self.snapshot {
                 return Ok(snapshot.clone());
@@ -59,10 +53,7 @@ impl Sampler {
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_memory()
-                .with_disk_usage(),
+            ProcessRefreshKind::nothing().with_cpu().with_memory().with_disk_usage(),
         );
         let root = get_current_pid().map_err(|e| e.to_string())?;
         if self.system.process(root).is_none() {
@@ -76,8 +67,7 @@ impl Sampler {
             .collect();
         let included = descendants(root.as_u32(), &parents);
         let mut current = HashMap::new();
-        let (mut cpu, mut memory, mut reads, mut writes, mut count) =
-            (0.0_f64, 0_u64, 0_u64, 0_u64, 0_usize);
+        let (mut cpu, mut memory, mut reads, mut writes, mut count) = (0.0_f64, 0_u64, 0_u64, 0_u64, 0_usize);
         for (pid, process) in self.system.processes() {
             if !included.contains(&pid.as_u32()) {
                 continue;
@@ -93,9 +83,7 @@ impl Sampler {
             }
             current.insert(identity, (disk.total_read_bytes, disk.total_written_bytes));
         }
-        let processors = std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(1) as f64;
+        let processors = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1) as f64;
         let snapshot = Snapshot {
             cpu_percent: elapsed.map(|_| (cpu / processors).clamp(0.0, 100.0)),
             memory_bytes: memory,
