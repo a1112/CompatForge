@@ -18,6 +18,7 @@ use std::sync::Mutex;
 
 const MAX_ACTIVATION_HISTORY: usize = 32;
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static STORE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -80,7 +81,7 @@ impl RuntimePackStore {
         validate_portable_relative_path("runtimePack.manifestPath", manifest_relative_path)?;
         let bundle_root = canonical_directory(bundle_root.as_ref())?;
         let manifest_path = resolve_bundle_file(&bundle_root, manifest_relative_path)?;
-        let manifest_bytes = fs::read(manifest_path).map_err(RuntimePackError::Io)?;
+        let manifest_bytes = read_bounded_manifest(&manifest_path)?;
         let manifest: RuntimePackManifest = serde_json::from_slice(&manifest_bytes).map_err(RuntimePackError::Json)?;
         self.install(&bundle_root, &manifest, verifier)
     }
@@ -227,11 +228,7 @@ impl RuntimePackStore {
         let temporary = temporary_path(&target)?;
         let result = (|| {
             let mut input = File::open(source).map_err(RuntimePackError::Io)?;
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(RuntimePackError::Io)?;
+            let mut output = create_private_temporary(&temporary)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0_u8; COPY_BUFFER_SIZE];
             loop {
@@ -265,8 +262,7 @@ impl RuntimePackStore {
         let target = self.root.join(manifest_relative_path(&manifest.digest)?);
         if target.is_file() {
             let existing: RuntimePackManifest =
-                serde_json::from_slice(&fs::read(target).map_err(RuntimePackError::Io)?)
-                    .map_err(RuntimePackError::Json)?;
+                serde_json::from_slice(&read_bounded_manifest(&target)?).map_err(RuntimePackError::Json)?;
             existing.validate()?;
             if existing.canonical_unsigned_bytes().map_err(RuntimePackError::Json)? == canonical {
                 return Ok(());
@@ -279,17 +275,19 @@ impl RuntimePackStore {
         normalized.capabilities.sort();
         let mut bytes = serde_json::to_vec_pretty(&normalized).map_err(RuntimePackError::Json)?;
         bytes.push(b'\n');
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(RuntimePackError::ManifestTooLarge);
+        }
         publish_bytes(&target, &bytes)
     }
 
     fn load_manifest(&self, digest: &str) -> Result<RuntimePackManifest, RuntimePackError> {
         let path = self.root.join(manifest_relative_path(digest)?);
-        let bytes = fs::read(path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
+        let bytes = read_bounded_manifest(&path).map_err(|error| match error {
+            RuntimePackError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
                 RuntimePackError::PackNotInstalled(normalized_digest(digest))
-            } else {
-                RuntimePackError::Io(error)
             }
+            error => error,
         })?;
         serde_json::from_slice(&bytes).map_err(RuntimePackError::Json)
     }
@@ -381,6 +379,19 @@ fn sha256_digest_file(path: &Path) -> Result<String, RuntimePackError> {
         hasher.update(&buffer[..read]);
     }
     Ok(format_digest(hasher.finalize()))
+}
+
+fn read_bounded_manifest(path: &Path) -> Result<Vec<u8>, RuntimePackError> {
+    let file = File::open(path).map_err(RuntimePackError::Io)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(RuntimePackError::Io)?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        Err(RuntimePackError::ManifestTooLarge)
+    } else {
+        Ok(bytes)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
@@ -482,11 +493,7 @@ fn publish_bytes(target: &Path, bytes: &[u8]) -> Result<(), RuntimePackError> {
     fs::create_dir_all(parent).map_err(RuntimePackError::Io)?;
     let temporary = temporary_path(target)?;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(RuntimePackError::Io)?;
+        let mut file = create_private_temporary(&temporary)?;
         file.write_all(bytes).map_err(RuntimePackError::Io)?;
         file.sync_all().map_err(RuntimePackError::Io)?;
         fs::rename(&temporary, target).map_err(RuntimePackError::Io)?;
@@ -496,6 +503,29 @@ fn publish_bytes(target: &Path, bytes: &[u8]) -> Result<(), RuntimePackError> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn create_private_temporary(path: &Path) -> Result<File, RuntimePackError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(RuntimePackError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(RuntimePackError::Io(error));
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -527,6 +557,7 @@ pub enum RuntimePackError {
     Store(StoreError),
     Io(io::Error),
     BundlePath(&'static str),
+    ManifestTooLarge,
     ManifestDigestMismatch {
         expected: String,
         actual: String,
@@ -549,6 +580,15 @@ pub enum RuntimePackError {
     Internal(&'static str),
 }
 
+impl RuntimePackError {
+    /// Whether an active-ref replacement became visible without confirmed directory durability.
+    /// Immutable object and manifest publication failures do not switch the active ref.
+    #[must_use]
+    pub fn is_commit_uncertain(&self) -> bool {
+        matches!(self, Self::Store(StoreError::DurabilityUncertain(_)))
+    }
+}
+
 impl fmt::Display for RuntimePackError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -557,6 +597,7 @@ impl fmt::Display for RuntimePackError {
             Self::Store(error) => write!(formatter, "Runtime Pack state failed: {error}"),
             Self::Io(error) => write!(formatter, "Runtime Pack I/O failed: {error}"),
             Self::BundlePath(message) => write!(formatter, "invalid Runtime Pack bundle path: {message}"),
+            Self::ManifestTooLarge => formatter.write_str("Runtime Pack manifest exceeds 1 MiB"),
             Self::ManifestDigestMismatch { expected, actual } => {
                 write!(formatter, "manifest digest mismatch: expected {expected}, got {actual}")
             }
@@ -607,6 +648,8 @@ impl From<ContractError> for RuntimePackError {
 mod tests {
     use super::*;
     use compatforge_domain::{CpuArchitecture, HostOs, RuntimeComponent, RuntimeHost};
+    #[cfg(unix)]
+    use compatforge_storage::JsonStore;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -629,6 +672,10 @@ mod tests {
     fn write_bundle(root: &Path, artifact: &[u8], version: &str, channel: RuntimeChannel) -> RuntimePackManifest {
         fs::create_dir_all(root.join("components")).unwrap();
         fs::write(root.join("components/runtime.blob"), artifact).unwrap();
+        bundle_manifest(artifact, version, channel)
+    }
+
+    fn bundle_manifest(artifact: &[u8], version: &str, channel: RuntimeChannel) -> RuntimePackManifest {
         let mut manifest = RuntimePackManifest {
             schema_version: SCHEMA_VERSION_V1.into(),
             id: "test-runtime".into(),
@@ -697,6 +744,97 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_store_private_modes_are_independent_of_umask() {
+        use std::process::Command;
+
+        use std::os::unix::fs::PermissionsExt;
+
+        for mask in ["0000", "0002", "0777"] {
+            let root = temporary_directory(&format!("umask-{mask}"));
+            for directory in [
+                root.join("bundle/components"),
+                root.join("store/objects/sha256"),
+                root.join("store/manifests/sha256"),
+                root.join("store/refs/test-runtime"),
+                root.join("json"),
+            ] {
+                fs::create_dir_all(&directory).unwrap();
+            }
+            fn make_accessible(path: &Path, root: &Path) {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                if path != root {
+                    make_accessible(path.parent().unwrap(), root);
+                }
+            }
+            for directory in [
+                root.join("bundle/components"),
+                root.join("store/objects/sha256"),
+                root.join("store/manifests/sha256"),
+                root.join("store/refs/test-runtime"),
+                root.join("json"),
+            ] {
+                make_accessible(&directory, &root);
+            }
+            fs::write(root.join("bundle/components/runtime.blob"), b"private-runtime").unwrap();
+            fs::set_permissions(
+                root.join("bundle/components/runtime.blob"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("umask \"$1\"; export COMPATFORGE_RUNTIME_UMASK_ROOT=\"$2\"; exec \"$3\" --ignored --exact tests::runtime_store_private_mode_child --nocapture")
+                .arg("compatforge-runtime-umask")
+                .arg(mask)
+                .arg(&root)
+                .arg(std::env::current_exe().unwrap())
+                .status()
+                .expect("run isolated umask child");
+            assert!(status.success(), "umask {mask}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn runtime_store_private_mode_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from(std::env::var_os("COMPATFORGE_RUNTIME_UMASK_ROOT").expect("child root"));
+        let bundle = root.join("bundle");
+        let store_root = root.join("store");
+        let store = RuntimePackStore::new(&store_root);
+        let manifest = bundle_manifest(b"private-runtime", "1.0.0", RuntimeChannel::Preview);
+        store.install(&bundle, &manifest, &RejectAllSignatures).unwrap();
+        store.verified_manifest(&manifest.digest).unwrap();
+        let digest_hex = manifest.components[0].digest.trim_start_matches("sha256:");
+        let manifest_hex = manifest.digest.trim_start_matches("sha256:");
+        for path in [
+            store_root.join("objects/sha256").join(digest_hex),
+            store_root.join("manifests/sha256").join(format!("{manifest_hex}.json")),
+            store_root.join("refs/test-runtime/current.json"),
+        ] {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let json = JsonStore::new(root.join("json"));
+        json.write("state.json", &manifest).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("json/state.json")).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fn no_temps(path: &Path) -> bool {
+            fs::read_dir(path).unwrap().all(|entry| {
+                let entry = entry.unwrap();
+                !entry.file_name().to_string_lossy().contains(".tmp-")
+                    && (!entry.path().is_dir() || no_temps(&entry.path()))
+            })
+        }
+        assert!(no_temps(&root));
+    }
+
     #[test]
     fn rejects_digest_mismatch_without_activating_the_pack() {
         let root = temporary_directory("mismatch");
@@ -733,6 +871,71 @@ mod tests {
         ));
         assert_eq!(store.active_digest("test-runtime").unwrap(), None);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_reads_are_bounded_at_every_runtime_store_entrypoint() {
+        let root = temporary_directory("bounded-manifests");
+        let bundle = root.join("bundle");
+        let store_root = root.join("store");
+        let store = RuntimePackStore::new(&store_root);
+        let manifest = write_bundle(&bundle, b"runtime", "1.0.0", RuntimeChannel::Preview);
+        let mut exact = serde_json::to_vec(&manifest).unwrap();
+        exact.resize(MAX_MANIFEST_BYTES, b' ');
+        fs::write(bundle.join("manifest.json"), &exact).unwrap();
+        assert!(store
+            .install_bundle(&bundle, "manifest.json", &RejectAllSignatures)
+            .is_ok());
+        let manifest_path = store_root.join(manifest_relative_path(&manifest.digest).unwrap());
+        fs::write(&manifest_path, &exact).unwrap();
+        assert!(store.install(&bundle, &manifest, &RejectAllSignatures).is_ok());
+        assert!(store.verified_manifest(&manifest.digest).is_ok());
+        let oversized = vec![b' '; MAX_MANIFEST_BYTES + 1];
+
+        fs::write(bundle.join("manifest.json"), &oversized).unwrap();
+        assert!(matches!(
+            store.install_bundle(&bundle, "manifest.json", &RejectAllSignatures),
+            Err(RuntimePackError::ManifestTooLarge)
+        ));
+
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        fs::write(&manifest_path, &oversized).unwrap();
+        let error = store.install(&bundle, &manifest, &RejectAllSignatures).unwrap_err();
+        assert!(matches!(error, RuntimePackError::ManifestTooLarge), "{error:?}");
+        assert!(matches!(
+            store.verified_manifest(&manifest.digest),
+            Err(RuntimePackError::ManifestTooLarge)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_manifest_is_not_published_or_activated() {
+        let root = temporary_directory("oversized-publish");
+        let bundle = root.join("bundle");
+        let store = RuntimePackStore::new(root.join("store"));
+        let mut manifest = write_bundle(&bundle, b"runtime", "1.0.0", RuntimeChannel::Preview);
+        manifest.version = "v".repeat(MAX_MANIFEST_BYTES);
+        manifest.components[0].version = manifest.version.clone();
+        manifest.digest = sha256_digest_bytes(&manifest.canonical_unsigned_bytes().unwrap());
+
+        assert!(matches!(
+            store.install(&bundle, &manifest, &RejectAllSignatures),
+            Err(RuntimePackError::ManifestTooLarge)
+        ));
+        assert_eq!(store.active_digest("test-runtime").unwrap(), None);
+        assert!(!root
+            .join("store")
+            .join(manifest_relative_path(&manifest.digest).unwrap())
+            .exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_error_reports_post_commit_uncertainty_without_erasing_its_type() {
+        let state = RuntimePackError::Store(StoreError::DurabilityUncertain(io::Error::other("directory sync")));
+        assert!(state.is_commit_uncertain());
+        assert!(!RuntimePackError::Io(io::Error::other("write")).is_commit_uncertain());
     }
 
     #[test]

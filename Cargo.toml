@@ -11,6 +11,7 @@ members = [
   "crates/compatforge-runtime",
   "crates/compatforge-orchestrator",
   "crates/compatforge-process",
+  "crates/compatforge-provider-linux",
   "crates/compatforge-provider-macos",
   "crates/compatforge-service",
   "crates/compatforge-ffi",

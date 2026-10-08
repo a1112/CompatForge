@@ -36,6 +36,38 @@ def sha256(path: Path) -> str:
 
 
 class MacOsInteractiveRuntimePreparationTests(unittest.TestCase):
+    def test_crossover_ntdll_supports_both_runtime_layouts(self) -> None:
+        prepare = load_module("interactive_runtime_ntdll", PREPARE_INTERACTIVE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            wine = root / "hosted" / "wineloader"
+            legacy = wine.parent / "ntdll.so"
+            modern = root / "lib/wine/x86_64-unix/ntdll.so"
+            modern.parent.mkdir(parents=True)
+            modern.write_bytes(b"modern")
+            self.assertEqual(prepare.crossover_ntdll(root, wine), modern)
+            legacy.parent.mkdir()
+            legacy.write_bytes(b"legacy")
+            self.assertEqual(prepare.crossover_ntdll(root, wine), legacy)
+
+    def test_crossover_ntdll_rejects_escape_and_missing_library(self) -> None:
+        prepare = load_module("interactive_runtime_ntdll_boundary", PREPARE_INTERACTIVE)
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "runtime"
+            wine = root / "hosted/wineloader"
+            wine.parent.mkdir(parents=True)
+            with self.assertRaises(prepare.PreparationError):
+                prepare.crossover_ntdll(root, wine)
+            outside = parent / "ntdll.so"
+            outside.write_bytes(b"outside")
+            try:
+                (wine.parent / "ntdll.so").symlink_to(outside)
+            except OSError as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            with self.assertRaises(prepare.PreparationError):
+                prepare.crossover_ntdll(root, wine)
+
     def test_whisky_launcher_preserves_closed_pinned_descriptor_guests(self) -> None:
         prepare = load_module("interactive_runtime_preparation", PREPARE_INTERACTIVE)
         source = prepare.launcher_source(

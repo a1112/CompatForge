@@ -141,6 +141,8 @@ BOTTLE_MIGRATION_SCHEMA_NAMES = frozenset(
         "launch-plan.schema.json",
         "launch-request.schema.json",
         "job.schema.json",
+        "linux-bootstrap-request.schema.json",
+        "linux-provider.schema.json",
         "macos-provider.schema.json",
         "macos-bootstrap-request.schema.json",
         "macwin-patch-review.schema.json",
@@ -4670,6 +4672,7 @@ def _validate_macos_acceptance_report(source: str) -> None:
             raise ValueError(
                 f"macOS acceptance report marker drifted: {required_line}"
             )
+    # Preserve the report's observed historical ports, not today's Desktop config.
     for marker in (
         "cjkTextReadable: true",
         "127.0.0.1:1421",

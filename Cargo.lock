@@ -49,6 +49,7 @@ dependencies = [
  "compatforge-inspect",
  "compatforge-orchestrator",
  "compatforge-process",
+ "compatforge-provider-linux",
  "compatforge-provider-macos",
  "compatforge-runtime",
  "compatforge-service",
@@ -117,6 +118,19 @@ dependencies = [
  "compatforge-guest-artifact",
  "compatforge-orchestrator",
  "libc",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "compatforge-provider-linux"
+version = "0.12.0"
+dependencies = [
+ "compatforge-domain",
+ "compatforge-orchestrator",
+ "compatforge-runtime",
+ "libc",
+ "serde",
  "serde_json",
  "sha2",
 ]

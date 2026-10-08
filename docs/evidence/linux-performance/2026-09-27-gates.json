@@ -1,0 +1,68 @@
+{
+  "date": "2026-09-27",
+  "gates": [
+    {
+      "exitCode": 0,
+      "name": "repository-contracts",
+      "scope": "11a56d1 source export plus all added files; no Cargo target tree"
+    },
+    {
+      "exitCode": 0,
+      "name": "cargo-fmt-all-check"
+    },
+    {
+      "exitCode": 0,
+      "ignored": 3,
+      "name": "cargo-test-workspace-locked-offline",
+      "note": "umask077; recursively invoked filtered tests not double counted",
+      "passed": 502
+    },
+    {
+      "exitCode": 0,
+      "name": "cargo-clippy-workspace-all-targets-locked-offline-deny-warnings"
+    },
+    {
+      "exitCode": 0,
+      "name": "performance-unit-tests-linux",
+      "passed": 9
+    },
+    {
+      "errors": 1,
+      "exitCode": 1,
+      "failed": 3,
+      "name": "full-python-discovery-corrected-environment",
+      "note": "Three existing MacWin failures reproduced on baseline. One missing test-fixture HEAD error passed focused recheck.",
+      "ran": 810,
+      "skipped": 10
+    },
+    {
+      "exitCode": 1,
+      "failed": 3,
+      "name": "baseline-reproduction-without-feature",
+      "ran": 3
+    },
+    {
+      "exitCode": 0,
+      "name": "test-fixture-head-focused-recheck",
+      "passed": 1
+    },
+    {
+      "commands": 74,
+      "excludedInitialization": 2,
+      "excludedWarmups": 4,
+      "exitCode": 0,
+      "name": "real-matched-benchmark",
+      "warmSamples": 28
+    }
+  ],
+  "privateLogSha256": {
+    "cf-performance-baseline-failures.log": "dd8d222970676be875d6261fa9250306d632b0f4bb85868d6c48c0e135413e8c",
+    "cf-performance-focused-gate.log": "a42aec96f81986697b8864feb788ac2933414ba49ef26aa38e8de119c12cbf26",
+    "cf-performance-gates.log": "9ae9b340a70ee430a9c5c2ee070fa33b60083665fcfcadb095bf03ccc27f55df",
+    "cf-performance-head-gate.log": "60f6037186273590d5b6287bbdb0991efe03351f48d330ff4fa3ab7f93014223",
+    "cf-performance-python-corrected.log": "8de750410d04ed473c88ad71217938c42ced1d1da7070e83087c65fce3b94e50",
+    "cf-performance-python-gates.log": "135cc90c495e256f5baa78a13dc4cc1b68d06af7751c326b69d8c8a20d464d4f",
+    "cf-performance-rust-gates.log": "a0106d2cc963644d18f5d6569e8b37be8d03bd3f1e6c1f7f4baef07ac4b7e811"
+  },
+  "schemaVersion": "1"
+}

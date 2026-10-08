@@ -13,6 +13,7 @@ compatforge-guest-artifact = { path = "../../crates/compatforge-guest-artifact" 
 compatforge-inspect = { path = "../../crates/compatforge-inspect" }
 compatforge-orchestrator = { path = "../../crates/compatforge-orchestrator" }
 compatforge-process = { path = "../../crates/compatforge-process" }
+compatforge-provider-linux = { path = "../../crates/compatforge-provider-linux" }
 compatforge-provider-macos = { path = "../../crates/compatforge-provider-macos" }
 compatforge-runtime = { path = "../../crates/compatforge-runtime" }
 compatforge-service = { path = "../../crates/compatforge-service" }

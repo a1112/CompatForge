@@ -995,7 +995,15 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
         capability = json.loads((TAURI / "capabilities" / "default.json").read_text(encoding="utf-8"))
         self.assertEqual(
             capability["permissions"],
-            ["core:default", "core:window:allow-start-dragging", "dialog:allow-open"],
+            [
+                "core:default",
+                "core:window:allow-start-dragging",
+                "core:window:allow-minimize",
+                "core:window:allow-toggle-maximize",
+                "core:window:allow-is-maximized",
+                "core:window:allow-close",
+                "dialog:allow-open",
+            ],
         )
 
     def test_tauri_uses_the_shared_application_service(self) -> None:
@@ -1965,6 +1973,20 @@ const BYTES: &[u8] = b"{root_check}"; {root_check}
             ):
                 with self.assertRaises(self.baseline.AssetFetchError):
                     self.baseline.fetch_asset(arguments, "7zip")
+
+    def test_sumatra_official_file_redirect_remains_host_and_https_scoped(self) -> None:
+        source = "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.exe"
+        target = "https://files.sumatrapdfreader.org/software/sumatrapdf/rel/3.6.1/SumatraPDF-3.6.1-64.exe"
+        handler = self.assets.AllowlistedRedirect()
+        request = self.assets.urllib.request.Request(source)
+        redirected = handler.redirect_request(request, None, 307, "redirect", {}, target)
+        self.assertEqual(redirected.full_url, target)
+        for rejected in (
+            target.replace("https:", "http:"),
+            target.replace("files.sumatrapdfreader.org", "files.sumatrapdfreader.org.example.com"),
+        ):
+            with self.subTest(url=rejected), self.assertRaises(self.assets.AssetError):
+                handler.redirect_request(request, None, 307, "redirect", {}, rejected)
 
     def test_downloader_typed_network_boundary_preserves_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory(prefix="compatforge-gui-downloader-") as temporary:
