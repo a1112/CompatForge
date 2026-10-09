@@ -3,9 +3,9 @@
 use crate::ServiceResponse;
 #[cfg(any(target_os = "linux", test))]
 use crate::{AutomationService, ServiceRequest};
+use forge_provider_contract::binding::DaemonIdentity;
 #[cfg(any(target_os = "linux", test))]
-use forge_provider_contract::binding::{admit, BoundDaemonRequest, ClientHello};
-use forge_provider_contract::binding::{DaemonIdentity, WIRE_VERSION};
+use forge_provider_contract::binding::{admit, BoundDaemonRequest, ClientHello, WIRE_VERSION};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 #[cfg(any(target_os = "linux", test))]
