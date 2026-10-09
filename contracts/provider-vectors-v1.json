@@ -28,7 +28,7 @@
       "code": "unsupported-version",
       "field": "contractVersion",
       "name": "contract-version",
-      "value": "2.0.0"
+      "value": "1.0.0"
     },
     {
       "code": "source-mismatch",
@@ -99,15 +99,16 @@
       "desktop-launchers-v1",
       "generation-lifecycle-v1",
       "managed-applications-v1",
+      "provider-binding-v2",
       "shared-service-v1"
     ],
     "commands": {
-      "desktop-export": "1",
-      "desktop-launch": "1",
-      "service-call": "1",
-      "service-daemon": "1"
+      "desktop-export": "2",
+      "desktop-launch": "2",
+      "service-call": "2",
+      "service-daemon": "2"
     },
-    "contractVersion": "1.0.0",
+    "contractVersion": "2.0.0",
     "operations": [
       "applications.generations",
       "applications.get",
@@ -125,6 +126,10 @@
     "providerVersion": "0.12.0",
     "schemaVersion": "1",
     "schemas": {
+      "bound-request": "2",
+      "bound-response": "2",
+      "daemon-handshake": "2",
+      "daemon-reply": "2",
       "desktop-export": "1",
       "desktop-launcher": "1",
       "job": "1",
@@ -140,12 +145,13 @@
     "capabilities": [
       "generation-lifecycle-v1",
       "managed-applications-v1",
+      "provider-binding-v2",
       "shared-service-v1"
     ],
     "commands": {
-      "service-call": "1"
+      "service-call": "2"
     },
-    "contractVersion": "1.0.0",
+    "contractVersion": "2.0.0",
     "operations": [
       "applications.generations",
       "applications.get",
@@ -162,6 +168,10 @@
     "providerVersion": "0.12.0",
     "schemaVersion": "1",
     "schemas": {
+      "bound-request": "2",
+      "bound-response": "2",
+      "daemon-handshake": "2",
+      "daemon-reply": "2",
       "job": "1",
       "service-request": "1",
       "service-response": "1"

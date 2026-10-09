@@ -3,6 +3,9 @@
 use crate::ServiceResponse;
 #[cfg(any(target_os = "linux", test))]
 use crate::{AutomationService, ServiceRequest};
+#[cfg(any(target_os = "linux", test))]
+use forge_provider_contract::binding::{admit, BoundDaemonRequest, ClientHello};
+use forge_provider_contract::binding::{DaemonIdentity, WIRE_VERSION};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 #[cfg(any(target_os = "linux", test))]
@@ -17,6 +20,7 @@ pub const SOCKET_NAME: &str = "service.sock";
 pub struct DaemonReply {
     pub schema_version: String,
     pub request_id: String,
+    pub daemon: DaemonIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<ServiceResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,7 +56,31 @@ pub fn read_frame(reader: &mut impl Read, maximum: usize) -> io::Result<Vec<u8>>
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn dispatch(service: &AutomationService, request: ServiceRequest, stop: &AtomicBool) -> DaemonReply {
+fn dispatch_bound(
+    service: &AutomationService,
+    bound: BoundDaemonRequest<ServiceRequest>,
+    hello: &ClientHello,
+    stop: &AtomicBool,
+    daemon: &DaemonIdentity,
+) -> io::Result<DaemonReply> {
+    admit(
+        &bound.schema_version,
+        &bound.daemon_instance_id,
+        &bound.request.request_id,
+        hello,
+        daemon,
+    )
+    .map_err(io::Error::other)?;
+    Ok(dispatch(service, bound.request, stop, daemon))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn dispatch(
+    service: &AutomationService,
+    request: ServiceRequest,
+    stop: &AtomicBool,
+    daemon: &DaemonIdentity,
+) -> DaemonReply {
     let id = request.request_id.clone();
     let result = if stop.load(Ordering::Acquire) {
         Err(("closing", "service is closing".into()))
@@ -75,14 +103,16 @@ fn dispatch(service: &AutomationService, request: ServiceRequest, stop: &AtomicB
     };
     match result {
         Ok(response) => DaemonReply {
-            schema_version: "1".into(),
+            schema_version: WIRE_VERSION.into(),
             request_id: id,
+            daemon: daemon.clone(),
             response: Some(response),
             error: None,
         },
         Err((code, message)) => DaemonReply {
-            schema_version: "1".into(),
+            schema_version: WIRE_VERSION.into(),
             request_id: id,
+            daemon: daemon.clone(),
             response: None,
             error: Some(DaemonError {
                 code: code.into(),
@@ -130,6 +160,15 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(1);
+    pub(super) fn identity() -> DaemonIdentity {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contracts/provider-vectors-v1.json")).unwrap();
+        DaemonIdentity {
+            schema_version: WIRE_VERSION.into(),
+            instance_id: "synthetic-daemon-1".into(),
+            provider: forge_provider_contract::decode_info(&serde_json::to_vec(&vectors["report"]).unwrap()).unwrap(),
+        }
+    }
 
     #[test]
     fn length_prefix_rejects_large_frames_before_reading_payload() {
@@ -160,8 +199,9 @@ mod tests {
     #[test]
     fn stop_acknowledgement_reports_cleanup_failure_and_only_then_success() {
         let reply = || DaemonReply {
-            schema_version: "1".into(),
+            schema_version: WIRE_VERSION.into(),
             request_id: "stop".into(),
+            daemon: identity(),
             response: Some(ServiceResponse {
                 schema_version: "1".into(),
                 request_id: "stop".into(),
@@ -205,33 +245,79 @@ mod tests {
             operation: operation.into(),
             payload,
         };
+        // Execute the production admission+dispatch path against an in-memory
+        // fixture service. A stale daemon/version/capability or restart must not
+        // execute even daemon.stop (which changes admission state).
+        let daemon = identity();
+        let hello = ClientHello {
+            schema_version: WIRE_VERSION.into(),
+            request_id: "desktop-1".into(),
+            required_provider: daemon.provider.identity(),
+        };
+        for field in ["source", "version", "capability", "instance"] {
+            let mut wrong = daemon.clone();
+            match field {
+                "source" => wrong.provider.source_commit = "f".repeat(40),
+                "version" => wrong.provider.contract_version = "1.0.0".into(),
+                "capability" => wrong.provider.capabilities.clear(),
+                _ => wrong.instance_id = "restarted-instance".into(),
+            }
+            let bound = BoundDaemonRequest {
+                schema_version: WIRE_VERSION.into(),
+                daemon_instance_id: daemon.instance_id.clone(),
+                request: call("daemon.stop", serde_json::json!({})),
+            };
+            assert!(
+                dispatch_bound(&service, bound, &hello, &stop, &wrong).is_err(),
+                "{field}"
+            );
+            assert!(!stop.load(Ordering::Acquire), "rejected request executed daemon.stop");
+        }
         assert_eq!(
-            dispatch(&service, call("missing.operation", serde_json::json!({})), &stop)
-                .error
-                .unwrap()
-                .code,
+            dispatch(
+                &service,
+                call("missing.operation", serde_json::json!({})),
+                &stop,
+                &identity()
+            )
+            .error
+            .unwrap()
+            .code,
             "not-found"
         );
+        assert!(dispatch(
+            &service,
+            call("applications.list", serde_json::json!({})),
+            &stop,
+            &identity()
+        )
+        .response
+        .is_some());
+        assert!(dispatch(
+            &service,
+            call("daemon.stop", serde_json::json!({"extra":true})),
+            &stop,
+            &identity()
+        )
+        .error
+        .is_some());
+        assert!(!stop.load(Ordering::Acquire));
         assert!(
-            dispatch(&service, call("applications.list", serde_json::json!({})), &stop)
+            dispatch(&service, call("daemon.stop", serde_json::json!({})), &stop, &identity())
                 .response
                 .is_some()
         );
-        assert!(
-            dispatch(&service, call("daemon.stop", serde_json::json!({"extra":true})), &stop)
-                .error
-                .is_some()
-        );
-        assert!(!stop.load(Ordering::Acquire));
-        assert!(dispatch(&service, call("daemon.stop", serde_json::json!({})), &stop)
-            .response
-            .is_some());
         assert!(stop.load(Ordering::Acquire));
         assert_eq!(
-            dispatch(&service, call("applications.list", serde_json::json!({})), &stop)
-                .error
-                .unwrap()
-                .code,
+            dispatch(
+                &service,
+                call("applications.list", serde_json::json!({})),
+                &stop,
+                &identity()
+            )
+            .error
+            .unwrap()
+            .code,
             "closing"
         );
         service.shutdown_and_wait().unwrap();

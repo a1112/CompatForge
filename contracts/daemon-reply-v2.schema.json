@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "not": {
+        "required": [
+          "error"
+        ]
+      },
+      "required": [
+        "response"
+      ]
+    },
+    {
+      "not": {
+        "required": [
+          "response"
+        ]
+      },
+      "required": [
+        "error"
+      ]
+    }
+  ],
+  "properties": {
+    "daemon": {
+      "additionalProperties": false,
+      "properties": {
+        "instanceId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "provider-info-v1.schema.json"
+        },
+        "schemaVersion": {
+          "const": "2"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "instanceId",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "error": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 80,
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "requestId": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "type": "string"
+    },
+    "response": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "maxLength": 80,
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "result": {},
+        "schemaVersion": {
+          "const": "1"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "operation",
+        "result"
+      ],
+      "type": "object"
+    },
+    "schemaVersion": {
+      "const": "2"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "requestId",
+    "daemon"
+  ],
+  "type": "object"
+}

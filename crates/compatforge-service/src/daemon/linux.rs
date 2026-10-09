@@ -1,5 +1,7 @@
 use super::*;
 use crate::{CoreConfig, ServiceConfig};
+use forge_provider_contract::binding::{validate_identity, validate_response_identity, ServerHello};
+use forge_provider_contract::{ProviderInfo, ProviderRequirements, MAX_CONTRACT_BYTES};
 use fs4::FileExt;
 use rustix::net::sockopt::get_socket_peercred;
 use rustix::process::{geteuid, getuid};
@@ -190,20 +192,56 @@ impl Drop for Endpoint {
 }
 
 /// One request per connection. Disconnect affects only its response delivery.
-pub fn request(directory: &Path, request: &ServiceRequest) -> io::Result<DaemonReply> {
+pub fn request(directory: &Path, request: &ServiceRequest, required: &ProviderRequirements) -> io::Result<DaemonReply> {
     private_directory(directory)?;
     request.validate().map_err(io::Error::other)?;
     let path = directory.join(SOCKET_NAME);
     check_socket(&path)?;
     let mut stream = connect(&path)?;
     authenticate(&stream)?;
+    let hello = ClientHello {
+        schema_version: WIRE_VERSION.into(),
+        request_id: request.request_id.clone(),
+        required_provider: required.clone(),
+    };
+    hello.validate().map_err(io::Error::other)?;
     write_frame(
         &mut DeadlineStream {
             stream: &mut stream,
             deadline: Instant::now() + IO_TIMEOUT,
         },
-        &serde_json::to_vec(request)?,
-        crate::transport::MAX_REQUEST_BYTES,
+        &serde_json::to_vec(&hello)?,
+        MAX_CONTRACT_BYTES,
+    )?;
+    let server_bytes = read_frame(
+        &mut DeadlineStream {
+            stream: &mut stream,
+            deadline: Instant::now() + IO_TIMEOUT,
+        },
+        MAX_CONTRACT_BYTES,
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("forge.provider.provider-unavailable: daemon handshake v2 unavailable: {error}"),
+        )
+    })?;
+    let server: ServerHello = serde_json::from_slice(&server_bytes)
+        .map_err(|_| io::Error::other("forge.provider.schema-mismatch: daemon must implement identity handshake v2"))?;
+    server.validate(&hello).map_err(io::Error::other)?;
+    // No business operation is sent until the actual peer's immutable identity matches.
+    let bound = BoundDaemonRequest {
+        schema_version: WIRE_VERSION.into(),
+        daemon_instance_id: server.daemon.instance_id.clone(),
+        request,
+    };
+    write_frame(
+        &mut DeadlineStream {
+            stream: &mut stream,
+            deadline: Instant::now() + IO_TIMEOUT,
+        },
+        &serde_json::to_vec(&bound)?,
+        crate::transport::MAX_REQUEST_BYTES + MAX_CONTRACT_BYTES,
     )?;
     let reply: DaemonReply = serde_json::from_slice(&read_frame(
         &mut DeadlineStream {
@@ -216,8 +254,10 @@ pub fn request(directory: &Path, request: &ServiceRequest) -> io::Result<DaemonR
                 },
         },
         MAX_RESPONSE_BYTES,
-    )?)?;
-    if reply.schema_version != "1"
+    )?)
+    .map_err(|_| io::Error::other("forge.provider.schema-mismatch: daemon reply must carry wire v2 identity"))?;
+    validate_response_identity(&reply.daemon, &server.daemon, required).map_err(io::Error::other)?;
+    if reply.schema_version != WIRE_VERSION
         || reply.request_id != request.request_id
         || reply.response.is_some() == reply.error.is_some()
         || reply.response.as_ref().is_some_and(|r| {
@@ -239,16 +279,40 @@ fn connection(
     service: &AutomationService,
     stop: &AtomicBool,
     stops: &StopReplies,
+    daemon: &DaemonIdentity,
 ) -> io::Result<()> {
     authenticate(&stream)?;
-    let request = serde_json::from_slice(&read_frame(
+    let hello: ClientHello = serde_json::from_slice(&read_frame(
         &mut DeadlineStream {
             stream: &mut stream,
             deadline: Instant::now() + IO_TIMEOUT,
         },
-        crate::transport::MAX_REQUEST_BYTES,
+        MAX_CONTRACT_BYTES,
     )?)?;
-    let reply = dispatch(service, request, stop);
+    hello.validate().map_err(io::Error::other)?;
+    let server = ServerHello {
+        schema_version: WIRE_VERSION.into(),
+        request_id: hello.request_id.clone(),
+        daemon: daemon.clone(),
+    };
+    write_frame(
+        &mut DeadlineStream {
+            stream: &mut stream,
+            deadline: Instant::now() + IO_TIMEOUT,
+        },
+        &serde_json::to_vec(&server)?,
+        MAX_CONTRACT_BYTES,
+    )?;
+    // The daemon validates its own frozen identity, never echoes caller metadata as identity.
+    validate_identity(daemon, &hello.required_provider).map_err(io::Error::other)?;
+    let bound: BoundDaemonRequest<ServiceRequest> = serde_json::from_slice(&read_frame(
+        &mut DeadlineStream {
+            stream: &mut stream,
+            deadline: Instant::now() + IO_TIMEOUT,
+        },
+        crate::transport::MAX_REQUEST_BYTES + MAX_CONTRACT_BYTES,
+    )?)?;
+    let reply = dispatch_bound(service, bound, &hello, stop, daemon)?;
     if reply
         .response
         .as_ref()
@@ -269,8 +333,9 @@ fn send_reply(mut stream: UnixStream, reply: DaemonReply) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(&reply)?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         bytes = serde_json::to_vec(&DaemonReply {
-            schema_version: "1".into(),
+            schema_version: WIRE_VERSION.into(),
             request_id: reply.request_id,
+            daemon: reply.daemon,
             response: None,
             error: Some(DaemonError {
                 code: "response-too-large".into(),
@@ -290,7 +355,25 @@ fn send_reply(mut stream: UnixStream, reply: DaemonReply) -> io::Result<()> {
 
 /// The owning process stops admission, joins clients, then drains every job.
 /// systemd ExecStop uses daemon.stop. SIGKILL remains crash/quarantine recovery.
-pub fn run(directory: &Path, config: CoreConfig, service_config: ServiceConfig) -> io::Result<()> {
+pub fn run(
+    directory: &Path,
+    config: CoreConfig,
+    service_config: ServiceConfig,
+    provider: ProviderInfo,
+) -> io::Result<()> {
+    let daemon = Arc::new(DaemonIdentity {
+        schema_version: WIRE_VERSION.into(),
+        provider,
+        instance_id: format!(
+            "daemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos()
+        ),
+    });
+    validate_identity(&daemon, &daemon.provider.identity()).map_err(io::Error::other)?;
     let endpoint = Endpoint::bind(directory)?;
     let service = Arc::new(AutomationService::new(config, service_config).map_err(io::Error::other)?);
     let stop = Arc::new(AtomicBool::new(false));
@@ -319,13 +402,14 @@ pub fn run(directory: &Path, config: CoreConfig, service_config: ServiceConfig) 
                     let service = Arc::clone(&service);
                     let stop = Arc::clone(&stop);
                     let stops = Arc::clone(&stops);
+                    let daemon = Arc::clone(&daemon);
                     clients.push(
                         thread::Builder::new()
                             .name("compatforge-client".into())
                             .spawn(move || {
                                 // A malformed frame, failed write, or disconnected UI is
                                 // local to this connection and never owns service jobs.
-                                let _ = connection(stream, &service, &stop, &stops);
+                                let _ = connection(stream, &service, &stop, &stops, &daemon);
                             })?,
                     );
                 }
@@ -410,7 +494,8 @@ mod tests {
                 request_id: "id".into(),
                 operation: "applications.list".into(),
                 payload: serde_json::json!({})
-            }
+            },
+            &super::super::tests::identity().provider.identity(),
         )
         .is_err());
         drop(owner);

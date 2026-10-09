@@ -2,7 +2,7 @@
 use forge_provider_contract::{ProviderInfo, CONTRACT_VERSION};
 use std::collections::BTreeMap;
 
-fn info() -> ProviderInfo {
+pub(crate) fn info() -> ProviderInfo {
     let linux = cfg!(target_os = "linux");
     let map = |names: &[&str]| -> BTreeMap<String, String> {
         if linux {
@@ -33,19 +33,35 @@ fn info() -> ProviderInfo {
         } else {
             String::new()
         },
-        commands: map(&["service-call", "service-daemon", "desktop-export", "desktop-launch"]),
-        schemas: map(&[
-            "service-request",
-            "service-response",
-            "job",
-            "desktop-export",
-            "desktop-launcher",
-        ]),
+        commands: if linux {
+            ["service-call", "service-daemon", "desktop-export", "desktop-launch"]
+                .iter()
+                .map(|name| ((*name).into(), "2".into()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        },
+        schemas: {
+            let mut schemas = map(&[
+                "service-request",
+                "service-response",
+                "job",
+                "desktop-export",
+                "desktop-launcher",
+            ]);
+            if linux {
+                for name in ["daemon-handshake", "daemon-reply", "bound-request", "bound-response"] {
+                    schemas.insert(name.into(), "2".into());
+                }
+            }
+            schemas
+        },
         capabilities: list(&[
             "shared-service-v1",
             "managed-applications-v1",
             "generation-lifecycle-v1",
             "desktop-launchers-v1",
+            "provider-binding-v2",
         ]),
         operations: list(&[
             "applications.list",

@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const CONTRACT_VERSION: &str = "1.0.0";
+pub const CONTRACT_VERSION: &str = "2.0.0";
 pub const MAX_CONTRACT_BYTES: usize = 64 * 1024;
+pub mod binding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -84,7 +85,7 @@ where
     deserializer.deserialize_map(Visitor)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderInfo {
     pub schema_version: String,
@@ -103,7 +104,7 @@ pub struct ProviderInfo {
     pub operations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderRequirements {
     pub schema_version: String,
@@ -122,7 +123,7 @@ pub struct ProviderRequirements {
 }
 
 impl ProviderInfo {
-    fn identity(&self) -> ProviderRequirements {
+    pub fn identity(&self) -> ProviderRequirements {
         ProviderRequirements {
             schema_version: self.schema_version.clone(),
             contract_version: self.contract_version.clone(),
@@ -284,6 +285,23 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     #[test]
+    fn raw_wire_vectors_have_identical_utf8_only_semantics() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../../contracts/provider-raw-vectors-v1.json")).unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let hex = case["rawHex"].as_str().unwrap().as_bytes();
+            let raw: Vec<u8> = hex
+                .chunks_exact(2)
+                .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+                .collect();
+            let result = decode_info(&raw);
+            assert_eq!(result.is_ok(), case["accepted"].as_bool().unwrap(), "{}", case["name"]);
+            if let Err(error) = result {
+                assert_eq!(error.code, ErrorCode::SchemaMismatch);
+            }
+        }
+    }
+    #[test]
     fn public_adapter_preserves_independent_interop_v1_error_semantics() {
         for (domain, public) in [
             (ErrorCode::ProviderUnavailable, "CAPABILITY_UNAVAILABLE"),
@@ -318,8 +336,8 @@ mod tests {
     fn rejects_duplicate_nested_keys_and_oversized_reports() {
         let vectors: Value = serde_json::from_str(include_str!("../../../contracts/provider-vectors-v1.json")).unwrap();
         let raw = serde_json::to_string(&vectors["report"]).unwrap().replace(
-            "\"service-call\":\"1\"",
-            "\"service-call\":\"1\",\"service-call\":\"1\"",
+            "\"service-call\":\"2\"",
+            "\"service-call\":\"2\",\"service-call\":\"2\"",
         );
         assert!(decode_info(raw.as_bytes()).is_err());
         assert!(decode_info(&vec![b' '; MAX_CONTRACT_BYTES + 1]).is_err());

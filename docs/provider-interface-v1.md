@@ -1,5 +1,9 @@
 # Forge provider protocol v1
 
+The CLI-only v1 candidate is superseded by [binding v2](provider-binding-v2.md)
+after independent review. Current consumers require 2.0.0 and reject unbound v1
+results; this file records the original metadata shape, not runtime acceptance.
+
 `compatforge-cli provider-info` emits a bounded JSON report without opening a
 context, runtime directory, daemon, Wine process or network connection. It
 accepts no arguments. The report describes the protocols implemented in this

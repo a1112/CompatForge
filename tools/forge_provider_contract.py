@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import stat
 import subprocess
 import time
 
@@ -73,25 +74,73 @@ def validate(value, *, report=False):
     return value
 
 
-def decode(raw, *, report=False):
-    if len(raw) > MAX_CONTRACT_BYTES:
-        reject("schema-mismatch", "provider contract exceeds 64 KiB")
+def decode_json(raw, maximum=MAX_CONTRACT_BYTES):
+    if type(raw) not in (bytes, bytearray) or len(raw) > maximum:
+        reject("schema-mismatch", "JSON exceeds its byte limit or is not bytes")
     try:
-        value = json.loads(raw, object_pairs_hook=unique,
+        # Wire/locks are UTF-8 without a BOM, identical to serde_json::from_slice.
+        value = json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=unique,
                            parse_constant=lambda _: reject("schema-mismatch", "non-finite JSON value"))
     except (ValueError, UnicodeError, RecursionError) as error:
         if isinstance(error, ContractError):
             raise
         reject("schema-mismatch", "provider contract is malformed or has wrong types")
-    return validate(value, report=report)
+    return value
+
+
+def decode(raw, *, report=False):
+    return validate(decode_json(raw), report=report)
+
+
+def read_regular_bytes(path, maximum):
+    """Pin no-follow directory/leaf descriptors; reject before reading special files.
+
+    Nonblocking open prevents FIFO hangs. No allocation/read exceeds maximum+1,
+    even if the file grows after fstat. Final fd/path identity catches replacement.
+    Root-owned installed files and caller-owned temporary review files are allowed.
+    """
+    parent = leaf = None
+    try:
+        path = Path(path).absolute()
+        if ".." in path.parts or len(path.parts) < 2:
+            reject("provider-unavailable", "contract input has an invalid path")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent = os.open(path.anchor, directory_flags)
+        for component in path.parts[1:-1]:
+            next_parent = os.open(component, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = next_parent
+        leaf = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        before = os.fstat(leaf)
+        def identity(metadata):
+            return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+                    metadata.st_ctime_ns, metadata.st_mode, metadata.st_nlink, metadata.st_uid)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_uid not in (0, os.getuid()) or before.st_mode & 0o022
+                or before.st_size > maximum):
+            reject("provider-unavailable", "contract input must be a bounded singly linked owned regular file")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(leaf, min(8192, maximum + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (len(raw) > maximum or len(raw) != before.st_size
+                or identity(os.fstat(leaf)) != identity(before) or identity(current) != identity(before)):
+            reject("provider-unavailable", "contract input changed or exceeded its byte limit")
+        return bytes(raw)
+    except OSError:
+        reject("provider-unavailable", "contract input is missing, linked or not safely readable")
+    finally:
+        if leaf is not None:
+            os.close(leaf)
+        if parent is not None:
+            os.close(parent)
 
 
 def load_lock(path):
-    try:
-        with Path(path).open("rb") as stream:
-            return decode(stream.read(MAX_CONTRACT_BYTES + 1))
-    except OSError:
-        reject("provider-unavailable", "versioned provider composition lock is unavailable")
+    return decode(read_regular_bytes(path, MAX_CONTRACT_BYTES))
 
 
 def negotiate(info, required):
@@ -113,6 +162,25 @@ def negotiate(info, required):
         for name in required[field]:
             if name not in info[field]:
                 reject("capability-missing", f"required capability/operation {name} is unavailable")
+
+
+def decode_execution(raw, required, request_id, operation, maximum):
+    value = decode_json(raw, maximum)
+    if (type(value) is not dict or set(value) != {"schemaVersion", "requestId", "operation", "executor", "daemon", "result"}
+            or value["schemaVersion"] != "2" or value["requestId"] != request_id or value["operation"] != operation):
+        reject("schema-mismatch", "missing, malformed or legacy unbound execution reply; expected wire v2")
+    validate(required)
+    validate(value["executor"], report=True)
+    if required["contractVersion"] != "2.0.0" or value["executor"]["contractVersion"] != "2.0.0":
+        reject("unsupported-version", "bound execution requires provider contract 2.0.0")
+    negotiate(value["executor"], required)
+    daemon = value["daemon"]
+    if (type(daemon) is not dict or set(daemon) != {"schemaVersion", "instanceId", "provider"}
+            or daemon["schemaVersion"] != "2" or type(daemon["instanceId"]) is not str
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", daemon["instanceId"])):
+        reject("schema-mismatch", "daemon identity requires wire v2 and bounded instance ID")
+    negotiate(daemon["provider"], required)
+    return value["result"]
 
 
 def query_info(client):
