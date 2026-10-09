@@ -805,7 +805,7 @@ enum PrefixEntry {
 impl PrefixEntry {
     fn from_snapshot(entry: &SnapshotEntry) -> Self {
         match entry {
-            SnapshotEntry::File { path, size, digest } if path == "manifest.json" => Self::Bytes { bytes: Vec::new() },
+            SnapshotEntry::File { path, .. } if path == "manifest.json" => Self::Bytes { bytes: Vec::new() },
             SnapshotEntry::File { size, digest, .. } => Self::File {
                 size: *size,
                 digest: digest.clone(),

@@ -28,6 +28,9 @@ pub(crate) struct JobManager {
     closing: AtomicBool,
 }
 
+// Validate the same selected generation on every platform. Only the Linux
+// worker consumes these launch pins after validation.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct SelectedDebugTarget {
     pub executable: PathBuf,
     pub prefix: PathBuf,

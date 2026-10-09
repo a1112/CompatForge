@@ -30,6 +30,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod provider;
 mod shared;
 
 const PINNED_SUMATRAPDF_FAILURE: &str = "pinned SumatraPDF launch failed";
@@ -256,6 +257,9 @@ fn main() {
 }
 
 fn run_arguments(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    if let Some(result) = provider::run(arguments) {
+        return result;
+    }
     if let Some(result) = shared::run(arguments) {
         return result;
     }
@@ -1995,6 +1999,7 @@ fn print_help() {
     println!("  compatforge-cli api <context-config.json> <service-config.json> <service-request.json>");
     println!("  compatforge-cli api-session <context-config.json> <service-config.json>  # JSON Lines on stdin/stdout");
     println!("  compatforge-cli service-daemon <context-config.json> <service-config.json>  # Linux shared user owner");
+    println!("  compatforge-cli provider-info");
     println!("  compatforge-cli service-call <request.json> | service-stop | desktop-export");
     println!("  compatforge-cli debug-session <debug-request.json>  # private user service; provider availability is checked");
     println!("  compatforge-cli debug-adapter <managed-debug-launch.json>  # private DAP stdio adapter");

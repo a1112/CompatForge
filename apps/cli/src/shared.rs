@@ -12,6 +12,7 @@ enum Command<'a> {
     DebugAdapter(&'a str),
     Stop,
     Export,
+    BoundExport(&'a str, &'a str),
     Launch(&'a str, &'a str, &'a [String]),
 }
 
@@ -23,6 +24,11 @@ fn parse(arguments: &[String]) -> io::Result<Option<Command<'_>>> {
         [command, file] if command == "debug-adapter" => Command::DebugAdapter(file),
         [command] if command == "service-stop" => Command::Stop,
         [command] if command == "desktop-export" => Command::Export,
+        [command, lock_flag, lock, id_flag, id]
+            if command == "desktop-export" && lock_flag == "--provider-contract" && id_flag == "--request-id" =>
+        {
+            Command::BoundExport(lock, id)
+        }
         [command, app, launcher, separator, files @ ..] if command == "desktop-launch" && separator == "--" => {
             compatforge_service::desktop::launch_request(app, launcher, files).map_err(io::Error::other)?;
             Command::Launch(app, launcher, files)
@@ -65,14 +71,42 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
 #[cfg(target_os = "linux")]
 fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
     use compatforge_service::{daemon, ServiceRequest};
+    use forge_provider_contract::binding::{correlation, BoundInvocation};
+    use forge_provider_contract::{decode_requirements, negotiate, ContractError, ErrorCode};
     use serde_json::json;
     use std::path::Path;
+    let executor = crate::provider::info();
+    let mut required = executor.identity();
+    let mut call = None;
+    let mut export_id = None;
+    // Recheck the actual executing binary, not the binary used by an earlier probe.
+    match command {
+        Command::Call(path) => {
+            let invocation: BoundInvocation<ServiceRequest> = read_shared_json(
+                Path::new(path),
+                compatforge_service::transport::MAX_REQUEST_BYTES + forge_provider_contract::MAX_CONTRACT_BYTES,
+            )?;
+            invocation.validate_executor(&executor)?;
+            required = invocation.required_provider;
+            call = Some(invocation.request);
+        }
+        Command::BoundExport(lock, id) => {
+            required = decode_requirements(lock.as_bytes())?;
+            if !correlation(id) {
+                return Err(ContractError::new(ErrorCode::SchemaMismatch, "invalid bound desktop request ID").into());
+            }
+            export_id = Some(id);
+        }
+        _ => {}
+    }
+    negotiate(&executor, &required)?;
     let directory = daemon::runtime_directory()?;
     if let Command::Daemon(config, service) = command {
         return daemon::run(
             &directory,
             read_shared_json(Path::new(config), 4 * 1024 * 1024).map_err(|error| io::Error::other(format!("shared context configuration {config} is unavailable or invalid: {error}; provision it using CompatForge local context bootstrap")))?,
             read_shared_json(Path::new(service), 4 * 1024 * 1024).map_err(|error| io::Error::other(format!("shared service configuration {service} is unavailable or invalid: {error}")))?,
+            executor,
         )
         .map_err(Into::into);
     }
@@ -81,7 +115,7 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
     }
     let (operation, payload) = match command {
         Command::Stop => ("daemon.stop", json!({})),
-        Command::Export => ("desktop.launchers", json!({})),
+        Command::Export | Command::BoundExport(_, _) => ("desktop.launchers", json!({})),
         Command::Launch(app, launcher, files) => {
             let mut request = compatforge_service::desktop::launch_request(app, launcher, files)?;
             request.argument_overrides = windows_files(files);
@@ -100,10 +134,9 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
             checked.validate()?;
             ("jobs.submit", serde_json::to_value(request)?)
         }
-        Command::Call(path) => {
-            let request: ServiceRequest =
-                read_shared_json(Path::new(path), compatforge_service::transport::MAX_REQUEST_BYTES)?;
-            return print_reply(daemon::request(&directory, &request)?, false);
+        Command::Call(_) => {
+            let request = call.expect("decoded bound request");
+            return print_reply(daemon::request(&directory, &request, &required)?, false, executor);
         }
         Command::Debug(path) => {
             let payload: serde_json::Value =
@@ -116,13 +149,16 @@ fn execute(command: Command<'_>) -> Result<(), Box<dyn Error>> {
     };
     let request = ServiceRequest {
         schema_version: "1".into(),
-        request_id: format!("desktop-{}", std::process::id()),
+        request_id: export_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("desktop-{}", std::process::id())),
         operation: operation.into(),
         payload,
     };
     print_reply(
-        daemon::request(&directory, &request)?,
-        matches!(command, Command::Export),
+        daemon::request(&directory, &request, &required)?,
+        matches!(command, Command::Export | Command::BoundExport(_, _)),
+        executor,
     )
 }
 
@@ -193,6 +229,7 @@ fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn
             operation: "debug.session".into(),
             payload,
         },
+        &crate::provider::info().identity(),
     )?;
     let handle: DebugSessionHandle = serde_json::from_value(debug_reply_result(launched)?)?;
     let (sender, receiver) = mpsc::sync_channel::<Result<Option<Value>, String>>(8);
@@ -268,6 +305,7 @@ fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn
                     operation: "debug.dap".into(),
                     payload: json!({"schemaVersion":"1","handle":handle,"message":message}),
                 },
+                &crate::provider::info().identity(),
             )?;
             let result = debug_reply_result(reply)?;
             let messages = result
@@ -294,6 +332,7 @@ fn run_debug_adapter(directory: &Path, launch_path: &Path) -> Result<(), Box<dyn
                 operation: "debug.session".into(),
                 payload: json!({"schemaVersion":"1","command":"disconnect","handle":handle}),
             },
+            &crate::provider::info().identity(),
         );
     }
     result
@@ -341,23 +380,36 @@ fn read_shared_json<T: serde::de::DeserializeOwned>(path: &std::path::Path, maxi
 }
 
 #[cfg(target_os = "linux")]
-fn print_reply(reply: compatforge_service::daemon::DaemonReply, export: bool) -> Result<(), Box<dyn Error>> {
+fn print_reply(
+    reply: compatforge_service::daemon::DaemonReply,
+    export: bool,
+    executor: forge_provider_contract::ProviderInfo,
+) -> Result<(), Box<dyn Error>> {
     if let Some(error) = reply.error {
         return Err(io::Error::other(format!("{}: {}", error.code, error.message)).into());
     }
     let response = reply
         .response
         .ok_or_else(|| io::Error::other("service returned no response"))?;
-    if export {
+    let result = if export {
         let launchers: Vec<compatforge_service::desktop::DesktopLauncher> = serde_json::from_value(response.result)?;
         let entries = launchers.into_iter().map(|metadata| {
             let content = metadata.desktop_entry()?;
             Ok(serde_json::json!({"entryId":metadata.entry_id, "applicationId":metadata.application_id, "generationId":metadata.generation_id, "desktopEntry":content}))
         }).collect::<Result<Vec<_>, compatforge_service::ServiceError>>()?;
-        println!("{}", serde_json::json!({"schemaVersion":"1", "entries":entries}));
+        serde_json::json!({"schemaVersion":"1", "entries":entries})
     } else {
-        println!("{}", serde_json::to_string(&response)?);
-    }
+        response.result
+    };
+    let bound = forge_provider_contract::binding::ExecutionReply {
+        schema_version: forge_provider_contract::binding::WIRE_VERSION.into(),
+        request_id: response.request_id,
+        operation: response.operation,
+        executor,
+        daemon: reply.daemon,
+        result,
+    };
+    println!("{}", serde_json::to_string(&bound)?);
     Ok(())
 }
 

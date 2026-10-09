@@ -83,6 +83,7 @@ dependencies = [
  "compatforge-provider-macos",
  "compatforge-runtime",
  "compatforge-service",
+ "forge-provider-contract",
  "serde",
  "serde_json",
 ]
@@ -216,6 +217,7 @@ dependencies = [
  "compatforge-provider-linux",
  "compatforge-provider-macos",
  "compatforge-storage",
+ "forge-provider-contract",
  "fs4",
  "libc",
  "rustix",
@@ -296,6 +298,14 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "forge-provider-contract"
+version = "2.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fs4"

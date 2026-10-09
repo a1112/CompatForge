@@ -4881,7 +4881,10 @@ mod tests {
     #[test]
     fn classic_auxiliary_cleanup_error_preserves_cleanup_stage() {
         let result = finish_auxiliary_capture(
-            Ok((std::process::Command::new("/bin/true").status().unwrap(), Vec::new())),
+            Ok((
+                <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(0),
+                Vec::new(),
+            )),
             Err(CleanupStage::TreeTermination),
         );
         let error = result

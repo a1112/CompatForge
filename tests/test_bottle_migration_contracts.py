@@ -2313,8 +2313,8 @@ class BottleMigrationRepositoryTests(unittest.TestCase):
             cargo = root / "Cargo.toml"
             cargo.write_text(
                 cargo.read_text(encoding="utf-8").replace(
-                    '  "apps/cli",\n  "crates/compatforge-bottle",',
-                    '  # "apps/cli",\n  # "crates/compatforge-bottle",',
+                    '  "crates/compatforge-bottle",\n',
+                    '  # "crates/compatforge-bottle",\n',
                 ),
                 encoding="utf-8",
             )

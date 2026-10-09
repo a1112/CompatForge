@@ -1,0 +1,183 @@
+{
+  "cases": [
+    {
+      "code": "capability-missing",
+      "field": "commands",
+      "name": "missing-command",
+      "value": {}
+    },
+    {
+      "code": "schema-mismatch",
+      "field": "schemas",
+      "name": "schema-major",
+      "value": {
+        "desktop-export": "1",
+        "desktop-launcher": "1",
+        "job": "1",
+        "service-request": "1",
+        "service-response": "2"
+      }
+    },
+    {
+      "code": "unsupported-version",
+      "field": "providerVersion",
+      "name": "provider-version",
+      "value": "0.13.0"
+    },
+    {
+      "code": "unsupported-version",
+      "field": "contractVersion",
+      "name": "contract-version",
+      "value": "1.0.0"
+    },
+    {
+      "code": "source-mismatch",
+      "field": "sourceCommit",
+      "name": "source-revision",
+      "value": "ffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "code": "source-mismatch",
+      "field": "sourceDirty",
+      "name": "dirty-source",
+      "value": true
+    },
+    {
+      "code": "capability-missing",
+      "field": "target",
+      "name": "target",
+      "value": "aarch64-unknown-linux-gnu"
+    },
+    {
+      "code": "capability-missing",
+      "field": "serviceName",
+      "name": "service",
+      "value": "foreign.service"
+    },
+    {
+      "code": "capability-missing",
+      "field": "capabilities",
+      "name": "missing-capability",
+      "value": []
+    },
+    {
+      "code": "capability-missing",
+      "field": "operations",
+      "name": "missing-operation",
+      "value": []
+    },
+    {
+      "code": "schema-mismatch",
+      "field": "schemaVersion",
+      "name": "report-schema",
+      "value": "2"
+    },
+    {
+      "code": "schema-mismatch",
+      "field": "schemaVersion",
+      "name": "schema-type",
+      "value": 1
+    },
+    {
+      "code": "schema-mismatch",
+      "field": "capabilities",
+      "name": "duplicate-capability",
+      "value": [
+        "shared-service-v1",
+        "shared-service-v1"
+      ]
+    },
+    {
+      "code": "schema-mismatch",
+      "field": "providerVersion",
+      "name": "invalid-version",
+      "value": "0.12"
+    }
+  ],
+  "report": {
+    "capabilities": [
+      "desktop-launchers-v1",
+      "generation-lifecycle-v1",
+      "managed-applications-v1",
+      "provider-binding-v2",
+      "shared-service-v1"
+    ],
+    "commands": {
+      "desktop-export": "2",
+      "desktop-launch": "2",
+      "service-call": "2",
+      "service-daemon": "2"
+    },
+    "contractVersion": "2.0.0",
+    "operations": [
+      "applications.generations",
+      "applications.get",
+      "applications.list",
+      "applications.rollback",
+      "applications.uninstall",
+      "applications.upsert",
+      "desktop.launchers",
+      "jobs.cancel",
+      "jobs.get",
+      "jobs.poll",
+      "jobs.submit"
+    ],
+    "providerId": "compatforge",
+    "providerVersion": "0.12.0",
+    "schemaVersion": "1",
+    "schemas": {
+      "bound-request": "2",
+      "bound-response": "2",
+      "daemon-handshake": "2",
+      "daemon-reply": "2",
+      "desktop-export": "1",
+      "desktop-launcher": "1",
+      "job": "1",
+      "service-request": "1",
+      "service-response": "1"
+    },
+    "serviceName": "compatforge.service",
+    "sourceCommit": "cfc9b6cb9498844f4098cbe786694515568a3bc7",
+    "sourceDirty": false,
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "requirements": {
+    "capabilities": [
+      "generation-lifecycle-v1",
+      "managed-applications-v1",
+      "provider-binding-v2",
+      "shared-service-v1"
+    ],
+    "commands": {
+      "service-call": "2"
+    },
+    "contractVersion": "2.0.0",
+    "operations": [
+      "applications.generations",
+      "applications.get",
+      "applications.list",
+      "applications.rollback",
+      "applications.uninstall",
+      "applications.upsert",
+      "jobs.cancel",
+      "jobs.get",
+      "jobs.poll",
+      "jobs.submit"
+    ],
+    "providerId": "compatforge",
+    "providerVersion": "0.12.0",
+    "schemaVersion": "1",
+    "schemas": {
+      "bound-request": "2",
+      "bound-response": "2",
+      "daemon-handshake": "2",
+      "daemon-reply": "2",
+      "job": "1",
+      "service-request": "1",
+      "service-response": "1"
+    },
+    "serviceName": "compatforge.service",
+    "sourceCommit": "cfc9b6cb9498844f4098cbe786694515568a3bc7",
+    "target": "x86_64-unknown-linux-gnu"
+  }
+}

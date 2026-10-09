@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "daemon": {
+      "additionalProperties": false,
+      "properties": {
+        "instanceId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "provider-info-v1.schema.json"
+        },
+        "schemaVersion": {
+          "const": "2"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "instanceId",
+        "provider"
+      ],
+      "type": "object"
+    },
+    "executor": {
+      "$ref": "provider-info-v1.schema.json"
+    },
+    "operation": {
+      "maxLength": 80,
+      "type": "string"
+    },
+    "requestId": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "type": "string"
+    },
+    "result": {},
+    "schemaVersion": {
+      "const": "2"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "requestId",
+    "operation",
+    "executor",
+    "daemon",
+    "result"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "requiredProvider": {
+          "$ref": "provider-lock-v1.schema.json"
+        },
+        "schemaVersion": {
+          "const": "2"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "requiredProvider"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "daemon": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.-]+$",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "provider-info-v1.schema.json"
+            },
+            "schemaVersion": {
+              "const": "2"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "instanceId",
+            "provider"
+          ],
+          "type": "object"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        },
+        "schemaVersion": {
+          "const": "2"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "daemon"
+      ],
+      "type": "object"
+    }
+  ]
+}
