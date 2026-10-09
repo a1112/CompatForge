@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "description": "Lexicographically sorted; adapters enforce canonical order.",
+      "items": {
+        "maxLength": 80,
+        "minLength": 1,
+        "pattern": "^[a-z0-9_.-]+$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "commands": {
+      "additionalProperties": {
+        "pattern": "^[1-9][0-9]{0,3}$",
+        "type": "string"
+      },
+      "maxProperties": 64,
+      "propertyNames": {
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^[a-z0-9_.-]+$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "contractVersion": {
+      "pattern": "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$",
+      "type": "string"
+    },
+    "operations": {
+      "description": "Lexicographically sorted; adapters enforce canonical order.",
+      "items": {
+        "maxLength": 80,
+        "minLength": 1,
+        "pattern": "^[a-z0-9_.-]+$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "providerId": {
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9_.-]+$",
+      "type": "string"
+    },
+    "providerVersion": {
+      "pattern": "^(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$",
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": "1"
+    },
+    "schemas": {
+      "additionalProperties": {
+        "pattern": "^[1-9][0-9]{0,3}$",
+        "type": "string"
+      },
+      "maxProperties": 64,
+      "propertyNames": {
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^[a-z0-9_.-]+$",
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "serviceName": {
+      "maxLength": 80,
+      "pattern": "^[a-z0-9_.-]*$",
+      "type": "string"
+    },
+    "sourceCommit": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "target": {
+      "maxLength": 80,
+      "minLength": 1,
+      "pattern": "^[a-z0-9_.-]+$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "capabilities",
+    "commands",
+    "contractVersion",
+    "operations",
+    "providerId",
+    "providerVersion",
+    "schemaVersion",
+    "schemas",
+    "serviceName",
+    "sourceCommit",
+    "target"
+  ],
+  "title": "Forge provider composition requirements v1",
+  "type": "object"
+}
