@@ -34,7 +34,12 @@ fn main() {
         .unwrap_or_else(|| "0000000000000000000000000000000000000000".into());
     let dirty = git(&root, &["status", "--porcelain", "--untracked-files=normal"])
         .map(|value| !value.is_empty())
-        .unwrap_or(true);
+        .unwrap_or(true)
+        || git(&root, &["ls-files", "-v"])
+            .map(|value| value.lines().any(|line| !line.starts_with("H ")))
+            .unwrap_or(true);
+    // Hidden/sparse index entries cannot prove a clean build source; never let
+    // assume-unchanged or skip-worktree turn altered code into a pinned report.
     println!("cargo:rustc-env=FORGE_PROVIDER_SOURCE={source}");
     println!("cargo:rustc-env=FORGE_PROVIDER_DIRTY={dirty}");
     println!(
