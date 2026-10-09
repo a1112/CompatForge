@@ -30,8 +30,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-mod shared;
 mod provider;
+mod shared;
 
 const PINNED_SUMATRAPDF_FAILURE: &str = "pinned SumatraPDF launch failed";
 
