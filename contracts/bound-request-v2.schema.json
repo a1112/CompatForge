@@ -1,44 +1,94 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "additionalProperties": false,
-  "properties": {
-    "request": {
+  "oneOf": [
+    {
       "additionalProperties": false,
       "properties": {
-        "operation": {
-          "maxLength": 80,
-          "type": "string"
+        "request": {
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "maxLength": 80,
+              "type": "string"
+            },
+            "payload": {},
+            "requestId": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.-]+$",
+              "type": "string"
+            },
+            "schemaVersion": {
+              "const": "1"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "operation",
+            "payload"
+          ],
+          "type": "object"
         },
-        "payload": {},
-        "requestId": {
+        "requiredProvider": {
+          "$ref": "provider-lock-v1.schema.json"
+        },
+        "schemaVersion": {
+          "const": "2"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "requiredProvider",
+        "request"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "daemonInstanceId": {
           "maxLength": 128,
           "minLength": 1,
           "pattern": "^[A-Za-z0-9_.-]+$",
           "type": "string"
         },
+        "request": {
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "maxLength": 80,
+              "type": "string"
+            },
+            "payload": {},
+            "requestId": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.-]+$",
+              "type": "string"
+            },
+            "schemaVersion": {
+              "const": "1"
+            }
+          },
+          "required": [
+            "schemaVersion",
+            "requestId",
+            "operation",
+            "payload"
+          ],
+          "type": "object"
+        },
         "schemaVersion": {
-          "const": "1"
+          "const": "2"
         }
       },
       "required": [
         "schemaVersion",
-        "requestId",
-        "operation",
-        "payload"
+        "daemonInstanceId",
+        "request"
       ],
       "type": "object"
-    },
-    "requiredProvider": {
-      "$ref": "provider-lock-v1.schema.json"
-    },
-    "schemaVersion": {
-      "const": "2"
     }
-  },
-  "required": [
-    "schemaVersion",
-    "requiredProvider",
-    "request"
-  ],
-  "type": "object"
+  ]
 }
