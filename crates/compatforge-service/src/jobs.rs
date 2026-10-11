@@ -416,7 +416,8 @@ impl JobManager {
                     required_capabilities: Vec::new(),
                 },
             };
-            let prepared = PreparedLaunch::prepare(&self.config, &resolved.source, &launch_request)
+            let launch_config = self.launch_context(&generation, resolved.working_directory.as_deref())?;
+            let prepared = PreparedLaunch::prepare(&launch_config, &resolved.source, &launch_request)
                 .map_err(|error| JobError::Preparation(error.to_string()))?;
             let runtime =
                 InstalledRuntime::from_config(&self.config, &prepared.plan().runtime).map_err(JobError::Registry)?;
@@ -434,8 +435,11 @@ impl JobManager {
             record.launch_plan = Some(serde_json::to_value(prepared.plan()).map_err(JobError::Serialization)?);
             record.updated_at_milliseconds = now_milliseconds();
             self.registry.write_job(&record).map_err(JobError::Registry)?;
+            // Persistence and preparation can touch the filesystem. Recheck
+            // before authorization; the process supervisor checks again at start.
+            self.launch_context(&generation, resolved.working_directory.as_deref())?;
             let plan = prepared
-                .authorize(&self.config)
+                .authorize(&launch_config)
                 .map_err(|error| JobError::Preparation(error.to_string()))?;
             if plan.wine_appearance.is_some() {
                 ProcessSupervisor::prepare(plan)
@@ -1001,6 +1005,7 @@ impl JobManager {
                     },
                     arguments,
                     environment: request.environment_overrides.clone(),
+                    working_directory: None,
                 })
             }
             JobKind::Launch | JobKind::CompatibilityTest | JobKind::AdaptationTrial => {
@@ -1010,6 +1015,11 @@ impl JobManager {
                 }
                 .ok_or(JobError::NotFound("launcher"))?;
                 let source = self.registry.lifecycle.launcher_path(generation, &launcher.executable);
+                let working_directory = self
+                    .registry
+                    .lifecycle
+                    .launcher_working_directory(generation, launcher)
+                    .map_err(JobError::Registry)?;
                 // Carry the installed digest through prepare/authorize/start.
                 // A prior filesystem check alone must not authorize a replacement
                 // read by PreparedLaunch after that check.
@@ -1031,9 +1041,43 @@ impl JobManager {
                     },
                     arguments,
                     environment,
+                    working_directory,
                 })
             }
         }
+    }
+
+    fn launch_context(
+        &self,
+        generation: &crate::lifecycle::ApplicationGeneration,
+        directory: Option<&std::path::Path>,
+    ) -> Result<CoreConfig, JobError> {
+        let mut config = self.config.clone();
+        if let Some(directory) = directory {
+            let drive = self.registry.lifecycle.launcher_path(generation, "");
+            if !directory.starts_with(&drive) {
+                return Err(JobError::Invalid(
+                    "launcher working directory escapes selected generation",
+                ));
+            }
+            crate::lifecycle::check_path(directory, false).map_err(JobError::Registry)?;
+            if !directory.is_dir() {
+                return Err(JobError::Invalid("launcher working directory is not a directory"));
+            }
+            let runtime = generation
+                .runtime
+                .as_ref()
+                .ok_or(JobError::Conflict("generation has no installed runtime"))?;
+            let binding = config
+                .runtime_bindings
+                .iter_mut()
+                .find(|binding| {
+                    binding.pack_id == runtime.selection.pack_id && binding.pack_digest == runtime.selection.pack_digest
+                })
+                .ok_or(JobError::Conflict("installed runtime binding is unavailable"))?;
+            binding.working_directory = Some(directory.to_string_lossy().into_owned());
+        }
+        Ok(config)
     }
 
     fn lock_active(&self) -> Result<MutexGuard<'_, HashMap<String, ActiveJob>>, JobError> {
@@ -1059,6 +1103,7 @@ struct ResolvedLaunch {
     executable: ResolvedExecutable,
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    working_directory: Option<PathBuf>,
 }
 
 fn apply_event(state: &mut ActiveJob, event: &RuntimeEvent) {
@@ -1333,9 +1378,18 @@ mod shutdown_tests {
     fn managed_fixture(
         cleanup_failed: bool,
     ) -> (JobManager, Arc<CompletedProcess>, PathBuf, crate::ApplicationDefinition) {
+        managed_fixture_with_directory(cleanup_failed, None)
+    }
+
+    fn managed_fixture_with_directory(
+        cleanup_failed: bool,
+        directory: Option<&str>,
+    ) -> (JobManager, Arc<CompletedProcess>, PathBuf, crate::ApplicationDefinition) {
         let (manager, handle, root) = terminal_poll_fixture(cleanup_failed);
         manager.registry.seed_defaults().unwrap();
-        let app = manager.registry.get_application("7zip").unwrap().application;
+        let mut app = manager.registry.get_application("7zip").unwrap().application;
+        app.launchers[0].working_directory = directory.map(str::to_owned);
+        manager.registry.upsert_application(app.clone()).unwrap();
         let mut active = manager.active.lock().unwrap().remove("cleanup-job").unwrap();
         active.record.id = "job-managed".into();
         active.record.application_id = app.id.clone();
@@ -1570,6 +1624,112 @@ mod shutdown_tests {
             JobStatus::Cancelled
         );
         assert!(manager.registry.lifecycle.selected(&app.id).is_err());
+    }
+
+    #[test]
+    fn launcher_working_directory_is_scoped_to_frozen_generation_and_keeps_pins() {
+        let (manager, _, root, app) = managed_fixture_with_directory(false, Some("Program Files/7-Zip"));
+        let launcher_path = write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        let generation = manager.registry.lifecycle.selected(&app.id).unwrap();
+        let request: JobRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1","applicationId":app.id,"kind":"launch"}))
+        .unwrap();
+        let baseline = serde_json::to_vec(&manager.config).unwrap();
+        let resolved = manager.resolve_launch(&generation, &request).unwrap();
+        assert_eq!(resolved.working_directory.as_deref(), launcher_path.parent());
+        assert_eq!(resolved.executable.mode, ExecutableMode::BottleInPlace);
+        assert_eq!(
+            format!("sha256:{}", resolved.executable.sha256.as_ref().unwrap()),
+            generation.launcher_digests["main"]
+        );
+        let scoped = manager
+            .launch_context(&generation, resolved.working_directory.as_deref())
+            .unwrap();
+        let mut launch: LaunchRequest =
+            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+        launch.bottle_id = generation.bottle_id.clone();
+        launch.executable.path = resolved.source.to_string_lossy().into_owned();
+        launch.executable.mode = resolved.executable.mode;
+        launch.executable.sha256 = resolved.executable.sha256;
+        let prepared = PreparedLaunch::prepare(&scoped, &launcher_path, &launch).unwrap();
+        assert_eq!(
+            PathBuf::from(&prepared.plan().process.working_directory),
+            launcher_path.parent().unwrap()
+        );
+        prepared.authorize(&scoped).unwrap();
+        assert_eq!(
+            InstalledRuntime::from_config(&manager.config, &prepared.plan().runtime).unwrap(),
+            generation.runtime.clone().unwrap()
+        );
+        assert_eq!(serde_json::to_vec(&manager.config).unwrap(), baseline);
+        let mut updated = app.clone();
+        updated.launchers[0].working_directory = Some("other/resources".into());
+        manager.registry.upsert_application(updated).unwrap();
+        assert_eq!(
+            manager.resolve_launch(&generation, &request).unwrap().working_directory,
+            resolved.working_directory
+        );
+        let install: JobRequest = serde_json::from_value(serde_json::json!({
+            "schemaVersion":"1","applicationId":app.id,"kind":"install", "executablePath":root.join(app.installer.as_ref().unwrap().file_name.clone())})).unwrap();
+        assert!(manager
+            .resolve_launch(&generation, &install)
+            .unwrap()
+            .working_directory
+            .is_none());
+        assert!(manager.launch_context(&generation, Some(&root)).is_err());
+        let mut changed = std::fs::read(&launcher_path).unwrap();
+        changed.push(42);
+        std::fs::write(&launcher_path, changed).unwrap();
+        assert!(matches!(
+            PreparedLaunch::prepare(&scoped, &launcher_path, &launch),
+            Err(compatforge_orchestrator::PreparationError::DigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn launcher_working_directory_omission_keeps_default_plan_and_definition_digest() {
+        use sha2::Digest;
+        let (manager, _, _, app) = managed_fixture(false);
+        let path = write_managed_launcher(&manager, &app);
+        manager.poll("job-managed", 0).unwrap();
+        let generation = manager.registry.lifecycle.selected(&app.id).unwrap();
+        let request: JobRequest =
+            serde_json::from_value(serde_json::json!({"schemaVersion":"1","applicationId":app.id,"kind":"launch"}))
+                .unwrap();
+        let resolved = manager.resolve_launch(&generation, &request).unwrap();
+        assert!(resolved.working_directory.is_none());
+        let scoped = manager.launch_context(&generation, None).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&scoped).unwrap(),
+            serde_json::to_vec(&manager.config).unwrap()
+        );
+        let mut launch: LaunchRequest =
+            serde_json::from_str(include_str!("../../../examples/launch-request.json")).unwrap();
+        launch.bottle_id = generation.bottle_id.clone();
+        launch.executable.path = path.to_string_lossy().into_owned();
+        launch.executable.mode = resolved.executable.mode;
+        launch.executable.sha256 = resolved.executable.sha256;
+        let prepared = PreparedLaunch::prepare(&scoped, &path, &launch).unwrap();
+        assert_eq!(
+            PathBuf::from(&prepared.plan().process.working_directory),
+            manager
+                .registry
+                .lifecycle
+                .launcher_path(&generation, "")
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&generation.definition).unwrap()["launchers"][0].get("workingDirectory"),
+            None
+        );
+        assert_eq!(
+            generation.definition_digest,
+            format!("sha256:{:x}", sha2::Sha256::digest(serde_json::to_vec(&app).unwrap()))
+        );
     }
 
     #[test]

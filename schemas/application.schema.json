@@ -89,6 +89,13 @@
           "arguments": {
             "$ref": "#/$defs/arguments"
           },
+          "workingDirectory": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?![\\s\\S]*[\\\\:\\u0000-\\u001f\\u007f])(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))[^/]+(?:/[^/]+)*$",
+            "description": "Directory relative to the selected generation's prefix/drive_c. Normal portable components only. Every ancestor must exist without symlinks or reparse points and the target must be a directory. Omission preserves the existing runtime/default working directory."
+          },
           "environment": {
             "$ref": "#/$defs/environment"
           }

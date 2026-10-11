@@ -1,7 +1,7 @@
 //! Managed application generations. A generation owns a fresh physical Bottle;
 //! the application selection and its operation lease commit in one JSON record.
 
-use crate::model::{ApplicationDefinition, JobKind, JobRecord, JobStatus};
+use crate::model::{ApplicationDefinition, JobKind, JobRecord, JobStatus, LauncherDefinition};
 use crate::registry::{now_milliseconds, RegistryError};
 use compatforge_domain::{
     validate_digest, validate_id, CoreConfig, RuntimeBinding, RuntimeSelection, SCHEMA_VERSION_V1,
@@ -573,9 +573,38 @@ impl LifecycleStore {
             .join(executable)
     }
 
+    pub(crate) fn launcher_working_directory(
+        &self,
+        generation: &ApplicationGeneration,
+        launcher: &LauncherDefinition,
+    ) -> Result<Option<PathBuf>, RegistryError> {
+        let Some(relative) = &launcher.working_directory else {
+            return Ok(None);
+        };
+        // Validation is repeated here so stored definitions never turn into
+        // unchecked host paths, even if a caller bypasses model admission.
+        generation
+            .definition
+            .validate()
+            .map_err(|error| RegistryError::InvalidOwned(error.to_string()))?;
+        let drive = self.launcher_path(generation, "");
+        let directory = drive.join(relative);
+        if !directory.starts_with(&drive) {
+            return Err(RegistryError::Conflict(
+                "launcher working directory escapes selected generation",
+            ));
+        }
+        check_path(&directory, false)?;
+        if !directory.is_dir() {
+            return Err(RegistryError::Conflict("launcher working directory is not a directory"));
+        }
+        Ok(Some(directory))
+    }
+
     fn launcher_digests(&self, generation: &ApplicationGeneration) -> Result<BTreeMap<String, String>, RegistryError> {
         let mut digests = BTreeMap::new();
         for launcher in &generation.definition.launchers {
+            self.launcher_working_directory(generation, launcher)?;
             let path = self.launcher_path(generation, &launcher.executable);
             check_path(&path, false)?;
             let inspection = compatforge_inspect::inspect_path(&path).map_err(|error| {
@@ -831,6 +860,73 @@ mod tests {
         launchers(store, &generation, 2);
         store.finish(&job(app, id, JobStatus::Succeeded)).unwrap();
         store.selected(&app.id).unwrap()
+    }
+
+    #[test]
+    fn launcher_working_directory_must_exist_before_generation_is_ready() {
+        let (store, mut app, runtime) = fixture();
+        app.launchers[0].working_directory = Some("missing/resources".into());
+        let generation = stage(&store, &app, &runtime, "job-working-directory-missing");
+        launchers(&store, &generation, 2);
+        assert!(
+            store.launcher_digests(&generation).is_err(),
+            "missing launcher directory was accepted"
+        );
+    }
+
+    #[test]
+    fn launcher_working_directory_rejects_non_directories_and_other_generations() {
+        let (store, mut app, runtime) = fixture();
+        app.launchers[0].working_directory = Some("Program Files/Example".into());
+        let generation = installed(&store, &app, &runtime, "job-working-directory");
+        let original_digest = generation.launcher_digests.clone();
+        let directory = store
+            .launcher_working_directory(&generation, &generation.definition.launchers[0])
+            .unwrap()
+            .unwrap();
+        assert!(directory.starts_with(store.launcher_path(&generation, "")));
+        assert_eq!(store.launcher_digests(&generation).unwrap(), original_digest);
+        for relative in [
+            "Program Files/Example/main.exe",
+            "missing",
+            "../gen-other/prefix/drive_c",
+        ] {
+            let mut invalid = generation.clone();
+            invalid.definition.launchers[0].working_directory = Some(relative.into());
+            assert!(
+                store
+                    .launcher_working_directory(&invalid, &invalid.definition.launchers[0])
+                    .is_err(),
+                "accepted {relative}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_working_directory_rejects_inside_outside_and_ancestor_symlinks() {
+        let (store, app, runtime) = fixture();
+        let generation = installed(&store, &app, &runtime, "job-working-directory-links");
+        let drive = store.launcher_path(&generation, "");
+        let inside = drive.join("Program Files/Example");
+        let outside = store.storage_root.join("bottles/other/prefix/drive_c");
+        fs::create_dir_all(&outside).unwrap();
+        for (name, target, relative) in [
+            ("inside-link", &inside, "inside-link"),
+            ("outside-link", &outside, "outside-link"),
+            ("ancestor-link", &inside, "ancestor-link/child"),
+        ] {
+            fs::create_dir_all(inside.join("child")).unwrap();
+            std::os::unix::fs::symlink(target, drive.join(name)).unwrap();
+            let mut invalid = generation.clone();
+            invalid.definition.launchers[0].working_directory = Some(relative.into());
+            assert!(
+                store
+                    .launcher_working_directory(&invalid, &invalid.definition.launchers[0])
+                    .is_err(),
+                "accepted {name}"
+            );
+        }
     }
 
     #[test]

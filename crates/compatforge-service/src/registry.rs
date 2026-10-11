@@ -590,6 +590,7 @@ fn baseline_application(
             id: "main".into(),
             name: executable_name.into(),
             executable: executable.into(),
+            working_directory: None,
             arguments: Vec::new(),
             environment: BTreeMap::new(),
         }],

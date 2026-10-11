@@ -146,6 +146,9 @@ pub struct LauncherDefinition {
     pub id: String,
     pub name: String,
     pub executable: String,
+    /// Relative to this launcher's selected generation's prefix/drive_c.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -239,6 +242,18 @@ impl ApplicationDefinition {
             }
             validate_text("launcher.name", &launcher.name)?;
             validate_relative_path("launcher.executable", &launcher.executable)?;
+            if let Some(directory) = &launcher.working_directory {
+                validate_relative_path("launcher.workingDirectory", directory)?;
+                if directory
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                    || directory.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    return Err(ModelError::Invalid(
+                        "launcher working directory must contain normal components",
+                    ));
+                }
+            }
             validate_arguments(&launcher.arguments)?;
             validate_environment(&launcher.environment)?;
         }
@@ -788,6 +803,56 @@ fn validate_sha256(value: &str) -> Result<(), ModelError> {
 #[cfg(test)]
 mod appearance_tests {
     use super::*;
+
+    #[test]
+    fn launcher_working_directory_is_optional_portable_and_round_trips() {
+        let legacy = serde_json::json!({"schemaVersion":"1", "id":"artha", "name":"Artha",
+            "version":"1.0.3.0", "publisher":"upstream", "category":"education",
+            "bottleId":"gui-artha", "launchers":[{"id":"main","name":"Artha",
+            "executable":"Artha/bin/artha.exe"}], "compatibilityRating":"unknown"});
+        let decoded: ApplicationDefinition = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        let legacy_bytes = serde_json::to_vec(&decoded).unwrap();
+        let mut explicit = legacy.clone();
+        explicit["launchers"][0]["workingDirectory"] = serde_json::json!("Artha/bin");
+        let decoded: ApplicationDefinition =
+            serde_json::from_value(explicit.clone()).expect("reviewed per-launcher working directory");
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), explicit);
+        assert_ne!(serde_json::to_vec(&decoded).unwrap(), legacy_bytes);
+        assert_eq!(
+            serde_json::to_vec(&serde_json::from_value::<ApplicationDefinition>(legacy).unwrap()).unwrap(),
+            legacy_bytes
+        );
+        for unsafe_path in [
+            "",
+            ".",
+            "..",
+            "../other",
+            "Artha/../other",
+            "Artha/./bin",
+            "Artha//bin",
+            "Artha/bin/",
+            "/tmp",
+            "C:/Artha",
+            "C:\\Artha",
+            "Artha\\bin",
+            "Artha/\u{0}bin",
+            "Artha\n/../bin",
+            "Artha\n/bin\u{0}",
+            "Artha\n/bin:other",
+            "Artha\n/bin",
+            "Artha/bin\t",
+            "Artha/bin\u{7f}",
+        ] {
+            explicit["launchers"][0]["workingDirectory"] = serde_json::json!(unsafe_path);
+            let decoded: ApplicationDefinition = serde_json::from_value(explicit.clone()).unwrap();
+            assert!(
+                decoded.validate().is_err(),
+                "accepted unsafe working directory {unsafe_path:?}"
+            );
+        }
+    }
 
     #[test]
     fn classic_install_expectation_is_closed_and_survives_submission() {
