@@ -1,0 +1,21 @@
+name: Version metadata
+on:
+  push:
+    branches: ["chore/version-management-20261012"]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify existing version sources
+        run: python3 scripts/version_manager.py check
+      - name: Verify repository bindings and safe updates
+        run: python3 scripts/test_versioning.py -v
+      - name: Verify version-manager regression suite
+        run: python3 -m unittest discover -s scripts/version_tests -p "test_*.py" -v
