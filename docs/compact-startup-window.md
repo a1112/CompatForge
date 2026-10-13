@@ -8,4 +8,4 @@ Normal geometry is saved in app_config_dir/window-geometry-main-v1.txt, using ph
 
 Source: `apps/desktop/src-tauri/src/window_geometry.rs` and `window_placement.rs`, installed from the desktop setup callback. No new framework or dependency is introduced.
 
-Verification: the five geometry tests cover small/Retina screens, a valid larger saved window, negative monitor coordinates and display removal, edge/work-area-sized saved geometry, and invalid saved values. The helper is also compiled against Tauri's real API. Full application Cargo checks are recorded in the task report. Actual native window interaction and Windows/Linux appearance have not been visually verified in this task.
+Verification: the six geometry tests cover small/Retina screens, a valid larger saved window, negative monitor coordinates and display removal, edge/work-area-sized saved geometry, invalid saved values, and smaller saved geometry on a larger display. The helper is also compiled against Tauri's real API. Full application Cargo checks are recorded in the task report. Actual native window interaction and Windows/Linux appearance have not been visually verified in this task.
