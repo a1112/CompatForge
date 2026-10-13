@@ -15,16 +15,21 @@
       {
         "label": "main",
         "title": "CompatForge",
-        "width": 1360,
-        "height": 860,
-        "minWidth": 940,
-        "minHeight": 640,
+        "width": 1080,
+        "height": 720,
+        "minWidth": 820,
+        "minHeight": 560,
         "resizable": true,
         "fullscreen": false,
         "decorations": false,
         "hiddenTitle": true,
         "titleBarStyle": "Overlay",
-        "trafficLightPosition": { "x": 18, "y": 20 }
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 20
+        },
+        "maximized": false,
+        "visible": false
       }
     ],
     "security": {
@@ -33,7 +38,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "在 macOS 上管理和运行 Windows 应用",
     "longDescription": "CompatForge 使用受控 Wine Runtime、Bottle 和 PreparedLaunch 在 macOS 上管理 Windows 应用。",
