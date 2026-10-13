@@ -83,12 +83,13 @@ fn apply(window: &WebviewWindow, saved: Option<Geometry>, default: (f64, f64), m
         _ => (0.0, 32.0),
     };
     let (geometry, min) = window_geometry::fit(saved, default, minimum, screen, frame);
-    let _ = window.set_min_size(Some(tauri::LogicalSize::new(min.0, min.1)));
-    let _ = window.set_size(tauri::LogicalSize::new(geometry.width, geometry.height));
+    // Adopt the destination monitor before applying logical dimensions.
     let _ = window.set_position(tauri::PhysicalPosition::new(
         geometry.x.round() as i32,
         geometry.y.round() as i32,
     ));
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(min.0, min.1)));
+    let _ = window.set_size(tauri::LogicalSize::new(geometry.width, geometry.height));
 }
 
 pub fn install(app: &tauri::App, label: &str, default: (f64, f64), minimum: (f64, f64), show: bool) {
