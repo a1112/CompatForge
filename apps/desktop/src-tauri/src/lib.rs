@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod window_geometry;
+mod window_placement;
 use compatforge_capability::{ContextCapabilityQuery, HostProbe};
 use compatforge_domain::{validate_portable_relative_path, CapabilityReport, ProviderDescriptor, SCHEMA_VERSION_V1};
 use compatforge_provider_macos::{create_local_context, MacOsLocalContextReceipt, MacOsLocalContextRequest};
@@ -492,6 +494,7 @@ where
         .plugin(project_resource_monitor::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            window_placement::install(app, "main", (1080.0, 720.0), (820.0, 560.0), true);
             let base = app.path().app_local_data_dir()?;
             let default_root = base.clone();
             let smoke_mode = std::env::var_os("COMPATFORGE_DESKTOP_SMOKE").is_some();
