@@ -365,12 +365,19 @@ function isTitlebarDragTarget(target: EventTarget | null): boolean {
 
 async function refreshData(): Promise<void> {
   if (!runtime.runtimeReady) return;
-  [applications, bottles, jobs, uiSettings] = await Promise.all([
+  const requests = [
     api<ApplicationSummary[]>("applications.list"),
     api<BottleSummary[]>("bottles.list"),
     api<JobRecord[]>("jobs.list"),
     api<UiSettings>("settings.get"),
-  ]);
+  ] as const;
+  try {
+    [applications, bottles, jobs, uiSettings] = await Promise.all(requests);
+  } catch (error) {
+    // A rejected result must not abandon sibling IPC requests from this batch.
+    await Promise.allSettled(requests);
+    throw error;
+  }
   document.documentElement.classList.toggle("reduced-motion", uiSettings.reducedMotion);
   document.documentElement.classList.toggle("compact-grid", uiSettings.compactApplicationGrid);
 }
@@ -465,9 +472,11 @@ async function start(): Promise<void> {
     transientError = String(error);
   }
   render();
+  let pollingJobs = false;
   window.setInterval(async () => {
     const active = activeJobs();
-    if (!active.length || busy) return;
+    if (!active.length || busy || pollingJobs) return;
+    pollingJobs = true;
     try {
       for (const job of active) await api("jobs.poll", { id: job.id, timeoutMilliseconds: 0 });
       await refreshData();
@@ -475,6 +484,8 @@ async function start(): Promise<void> {
     } catch (error) {
       transientError = String(error);
       render();
+    } finally {
+      pollingJobs = false;
     }
   }, 300);
 }

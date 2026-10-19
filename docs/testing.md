@@ -14,6 +14,16 @@ CompatForge 的核心交付物不是“能启动一次”，而是可复现的�
 | App smoke | 代表应用真实路径 | 安装、首启、窗口、文件读写、退出 | Release candidate |
 | Non-functional | 性能、安全、资源与稳定性 | 冷启动、FPS、内存、温控、fuzz、长跑 | 发布门禁 |
 
+## 桌面任务轮询离线回归
+
+`apps/desktop/tests/job-polling.test.cjs` 使用 Node.js 24 内置测试 runner 和 TypeScript 擦除，在 VM 中执行完整 `main.ts`，将四个 imports 替换为封闭的合成 IPC、窗口、DOM 和时钟。它覆盖慢任务/刷新阶段的轮询重叠、混合拒绝与挂起刷新、串行任务、失败重试、busy 和终态门禁；不会启动 Tauri、用户程序、Wine 或兼容性环境，也不产生原生或 RAM 验收结论。
+
+从仓库根目录运行：
+
+```text
+node --test --test-reporter=tap --test-concurrency=1 apps/desktop/tests/job-polling.test.cjs
+```
+
 ## 兼容结果主键
 
 结果必须绑定：
